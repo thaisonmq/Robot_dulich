@@ -23,7 +23,9 @@ VIDEO_FRAME_TIMEOUT_SECONDS = 10
 VIDEO_JITTER_BUFFER_FRAMES = 2
 VIDEO_PIPE_BUFFER_FRAMES = 4
 VIDEO_PACER_BASE_BITRATE = 8_000_000
-VIDEO_PACER_MAX_LATENCY_MS = 60
+VIDEO_PACER_FRAME_FRACTION_MS = 750
+VIDEO_PACER_MIN_LATENCY_MS = 12
+VIDEO_PACER_MAX_LATENCY_MS = 35
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,22 @@ class EncodedVideoPlan:
 def video_pipe_buffer_limit(frame_size: int) -> int:
     """Keep asyncio from pausing FFmpeg dozens of times inside one raw frame."""
     return frame_size * VIDEO_PIPE_BUFFER_FRAMES
+
+
+def video_pacer_max_latency_ms(fps: int) -> int:
+    """Finish pacing an encoded frame before the following frame is due.
+
+    LiveKit's leaky-bucket pacer runs every 5 ms and raises its temporary
+    bitrate when the queue would otherwise exceed this deadline. Keeping the
+    deadline below one frame prevents a large RTSP IDR from delaying the delta
+    frame behind it, while the pacer still protects the network from a single
+    packet burst. This calculation is independent of CPU architecture.
+    """
+    frame_aware_latency = round(VIDEO_PACER_FRAME_FRACTION_MS / max(1, fps))
+    return min(
+        VIDEO_PACER_MAX_LATENCY_MS,
+        max(VIDEO_PACER_MIN_LATENCY_MS, frame_aware_latency),
+    )
 
 
 def rtsp_input_args(source: str, transport: str) -> list[str]:
@@ -563,6 +581,7 @@ class MediaPublisher:
         ]
 
     def _publisher_command(self, token: str, pipeline: list[str]) -> list[str]:
+        fps = self._publisher_video_fps()
         return [
             "gstreamer-publisher",
             "--url",
@@ -572,10 +591,18 @@ class MediaPublisher:
             "--pacer-bitrate",
             str(max(self.config.video_bitrate, VIDEO_PACER_BASE_BITRATE)),
             "--pacer-max-latency-ms",
-            str(VIDEO_PACER_MAX_LATENCY_MS),
+            str(video_pacer_max_latency_ms(fps)),
             "--",
             *pipeline,
         ]
+
+    def _publisher_video_fps(self) -> int:
+        # A direct H.264 USB camera keeps its capture cadence. RTSP and all
+        # transcoded paths use VIDEO_FPS. Selecting by source type keeps one
+        # image portable across x86, Raspberry Pi and Orange Pi.
+        if self.config.simulator_media_source_type == "camera":
+            return self.config.simulator_camera_fps
+        return self.config.video_fps
 
     def _video_encoder_args(
         self,
@@ -748,9 +775,13 @@ class MediaPublisher:
                     )
 
                 logger.info(
-                    "encoded video publisher started mode=%s encoder=%s",
+                    "encoded video publisher started mode=%s encoder=%s "
+                    "fps=%d pacer_bitrate=%d pacer_latency_ms=%d",
                     plan.mode,
                     plan.encoder,
+                    self._publisher_video_fps(),
+                    max(self.config.video_bitrate, VIDEO_PACER_BASE_BITRATE),
+                    video_pacer_max_latency_ms(self._publisher_video_fps()),
                 )
                 waiters = [asyncio.create_task(process.wait()) for process in processes]
                 done, pending = await asyncio.wait(

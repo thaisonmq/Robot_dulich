@@ -2,6 +2,10 @@ import {
   Room, RoomEvent, Track, VideoQuality, type RemoteTrack, type RemoteTrackPublication,
   type RemoteParticipant,
 } from "livekit-client";
+import {
+  AdaptiveVideoBuffer,
+  VIDEO_BUFFER_INITIAL_TARGET_MS,
+} from "./AdaptiveVideoBuffer";
 
 export interface IMediaTransport {
   connect(url: string, token: string): Promise<void>;
@@ -25,6 +29,13 @@ export class LiveKitMediaTransport implements IMediaTransport {
   private connection: { url: string; token: string } | null = null;
   private videoKeyframeReady = false;
   private videoTrackGeneration = 0;
+  private videoTrack: RemoteTrack | null = null;
+  private audioTrack: RemoteTrack | null = null;
+  private readonly adaptiveVideoBuffer = new AdaptiveVideoBuffer();
+  private videoBufferUpdatePending = false;
+  private renderedGapCount = 0;
+  private lastRenderedFrameAt = 0;
+  private expectedFrameIntervalMs = 40;
 
   constructor(
     private readonly videoElement: HTMLVideoElement,
@@ -50,7 +61,12 @@ export class LiveKitMediaTransport implements IMediaTransport {
       if (!participant.identity.startsWith("robot:")) return;
       if (track.kind === Track.Kind.Video) {
         const generation = ++this.videoTrackGeneration;
+        this.videoTrack = track;
         this.videoKeyframeReady = false;
+        this.adaptiveVideoBuffer.reset();
+        this.renderedGapCount = 0;
+        this.lastRenderedFrameAt = 0;
+        this.expectedFrameIntervalMs = 40;
         this.stopFrameCallback();
         // A passthrough RTSP stream may begin between two IDR frames. Chromium
         // can render the undecodable delta frames as a green image, so keep the
@@ -66,14 +82,10 @@ export class LiveKitMediaTransport implements IMediaTransport {
         } catch {
           // Older Safari versions expose contentHint as read-only.
         }
-        // Keep a small stability margin. Forcing this to exactly zero makes
-        // late H.264 delta frames miss playout and corrupts/freezes the GOP.
-        // 50 ms is still suitable for driving while absorbing normal LAN,
-        // USB-capture and scheduling jitter.
-        track.setPlayoutDelay(0.05);
-        if (track.receiver && "jitterBufferTarget" in track.receiver) {
-          track.receiver.jitterBufferTarget = 50;
-        }
+        // Begin with a small motion-first margin. The stats controller raises
+        // it only when this track actually sees jitter or a rendered gap and
+        // lowers it slowly after the path is stable.
+        this.applyMediaPlayoutTarget(VIDEO_BUFFER_INITIAL_TARGET_MS);
         track.attach(this.videoElement);
         this.lastFrameAt = performance.now();
         this.lastVideoTime = this.videoElement.currentTime;
@@ -82,21 +94,35 @@ export class LiveKitMediaTransport implements IMediaTransport {
         void this.videoElement.play().catch(() => undefined);
       }
       if (track.kind === Track.Kind.Audio) {
-        // Use the same small target for audio so A/V remains synchronized.
-        track.setPlayoutDelay(0.05);
-        if (track.receiver && "jitterBufferTarget" in track.receiver) {
-          track.receiver.jitterBufferTarget = 50;
-        }
+        this.audioTrack = track;
+        // Follow the current video target so A/V remains synchronized.
+        this.applyMediaPlayoutTarget(this.adaptiveVideoBuffer.currentTargetMs);
         track.attach(this.audioElement);
         this.audioElement.muted = this.speakerMuted;
       }
     });
     room.on(RoomEvent.TrackUnsubscribed, (track, _publication, participant) => {
-      if (participant.identity.startsWith("robot:") && track.kind === Track.Kind.Video) {
+      if (
+        participant.identity.startsWith("robot:")
+        && track.kind === Track.Kind.Video
+        && this.videoTrack === track
+      ) {
         this.videoTrackGeneration += 1;
+        this.videoTrack = null;
         this.videoKeyframeReady = false;
+        this.adaptiveVideoBuffer.reset();
+        this.videoBufferUpdatePending = false;
+        this.renderedGapCount = 0;
+        this.lastRenderedFrameAt = 0;
         this.stopFrameCallback();
         this.showRecoveryFrame();
+      }
+      if (
+        participant.identity.startsWith("robot:")
+        && track.kind === Track.Kind.Audio
+        && this.audioTrack === track
+      ) {
+        this.audioTrack = null;
       }
     });
     room.on(RoomEvent.Reconnecting, () => {
@@ -130,7 +156,13 @@ export class LiveKitMediaTransport implements IMediaTransport {
   async disconnect(clearRecoveryFrame = true): Promise<void> {
     this.manualDisconnect = true;
     this.videoTrackGeneration += 1;
+    this.videoTrack = null;
+    this.audioTrack = null;
     this.videoKeyframeReady = false;
+    this.adaptiveVideoBuffer.reset();
+    this.videoBufferUpdatePending = false;
+    this.renderedGapCount = 0;
+    this.lastRenderedFrameAt = 0;
     this.connection = null;
     this.stopMonitoring();
     if (clearRecoveryFrame) {
@@ -165,10 +197,21 @@ export class LiveKitMediaTransport implements IMediaTransport {
         this.frameCallback = this.videoElement.requestVideoFrameCallback(frame);
         return;
       }
+      if (this.lastRenderedFrameAt > 0 && !document.hidden) {
+        const frameGapMs = now - this.lastRenderedFrameAt;
+        const gapThresholdMs = Math.max(80, this.expectedFrameIntervalMs * 2);
+        // Browser suspension is not network jitter. Ignore gaps of a second or
+        // more; the existing watchdog handles a genuinely stalled stream.
+        if (frameGapMs > gapThresholdMs && frameGapMs < 1000) {
+          this.renderedGapCount += 1;
+        }
+      }
+      this.lastRenderedFrameAt = now;
       this.recoveryAttempts = 0;
+      const wasRecovering = this.videoElement.classList.contains("is-recovering");
       this.clearStaleSnapshotTimer();
       this.videoElement.classList.remove("is-recovering");
-      this.onState("connected");
+      if (wasRecovering) this.onState("connected");
       this.frameCallback = this.videoElement.requestVideoFrameCallback(frame);
     };
     this.frameCallback = this.videoElement.requestVideoFrameCallback(frame);
@@ -274,15 +317,17 @@ export class LiveKitMediaTransport implements IMediaTransport {
     this.lastVideoTime = this.videoElement.currentTime;
     this.watchdog = window.setInterval(() => {
       if (!this.room) return;
+      void this.updateAdaptiveVideoBuffer();
       const currentTime = this.videoElement.currentTime;
       if (currentTime > this.lastVideoTime + .01) {
         this.lastVideoTime = currentTime;
         this.lastFrameAt = performance.now();
         this.recoveryAttempts = 0;
         if (this.videoElement.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+          const wasRecovering = this.videoElement.classList.contains("is-recovering");
           this.clearStaleSnapshotTimer();
           this.videoElement.classList.remove("is-recovering");
-          this.onState("connected");
+          if (wasRecovering) this.onState("connected");
         }
         return;
       }
@@ -290,6 +335,66 @@ export class LiveKitMediaTransport implements IMediaTransport {
       this.showRecoveryFrame();
       void this.recoverVideoTrack();
     }, 1000);
+  }
+
+  private async updateAdaptiveVideoBuffer(): Promise<void> {
+    const track = this.videoTrack;
+    const receiver = track?.receiver;
+    if (!track || !receiver || this.videoBufferUpdatePending) return;
+
+    this.videoBufferUpdatePending = true;
+    try {
+      const report = await receiver.getStats();
+      if (this.videoTrack !== track) return;
+      for (const rawStat of report.values()) {
+        if (
+          rawStat.type !== "inbound-rtp"
+          || (rawStat.kind !== "video" && rawStat.mediaType !== "video")
+        ) continue;
+        const stat = rawStat as RTCInboundRtpStreamStats & {
+          freezeCount?: number;
+          totalFreezesDuration?: number;
+          framesPerSecond?: number;
+        };
+        const framesPerSecond = stat.framesPerSecond ?? 0;
+        if (framesPerSecond >= 5 && framesPerSecond <= 60) {
+          this.expectedFrameIntervalMs = 1000 / framesPerSecond;
+        }
+        const previousTarget = this.adaptiveVideoBuffer.currentTargetMs;
+        const target = this.adaptiveVideoBuffer.update({
+          jitterMs: (stat.jitter ?? 0) * 1000,
+          freezeCount: stat.freezeCount ?? 0,
+          totalFreezesDuration: stat.totalFreezesDuration ?? 0,
+          renderedGapCount: this.renderedGapCount,
+        });
+        if (target !== previousTarget) {
+          this.applyMediaPlayoutTarget(target);
+        }
+        break;
+      }
+    } catch {
+      // Stats can disappear for one sample while ICE changes route.
+    } finally {
+      this.videoBufferUpdatePending = false;
+    }
+  }
+
+  private applyMediaPlayoutTarget(targetMs: number): void {
+    for (const track of [this.videoTrack, this.audioTrack]) {
+      if (!track) continue;
+      try {
+        track.setPlayoutDelay(targetMs / 1000);
+      } catch {
+        // Unsupported on older WebKit.
+      }
+      try {
+        if (track.receiver && "jitterBufferTarget" in track.receiver) {
+          track.receiver.jitterBufferTarget = targetMs;
+        }
+      } catch {
+        // Some older browsers expose a read-only compatibility property.
+      }
+    }
   }
 
   private async recoverVideoTrack(): Promise<void> {
@@ -344,6 +449,7 @@ export class LiveKitMediaTransport implements IMediaTransport {
     this.stopFrameCallback();
     this.recovering = false;
     this.recoveryAttempts = 0;
+    this.videoBufferUpdatePending = false;
   }
 
   private stopFrameCallback(): void {

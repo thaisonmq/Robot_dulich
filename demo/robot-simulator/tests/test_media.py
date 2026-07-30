@@ -9,6 +9,7 @@ from simulator.media import (
     EncodedVideoPlan,
     MediaPublisher,
     VIDEO_JITTER_BUFFER_FRAMES,
+    video_pacer_max_latency_ms,
     video_pipe_buffer_limit,
 )
 
@@ -82,8 +83,34 @@ def test_encoded_publisher_paces_large_frames_without_reencoding(
     command = publisher._publisher_command("secret", ["h264parse"])
 
     assert command[command.index("--pacer-bitrate") + 1] == pacer_bitrate
-    assert command[command.index("--pacer-max-latency-ms") + 1] == "60"
+    assert command[command.index("--pacer-max-latency-ms") + 1] == "30"
     assert command[-2:] == ["--", "h264parse"]
+
+
+@pytest.mark.parametrize(
+    ("fps", "latency_ms"),
+    [(10, 35), (25, 30), (30, 25), (60, 12)],
+)
+def test_pacer_deadline_stays_below_the_next_frame(
+    fps: int,
+    latency_ms: int,
+) -> None:
+    assert video_pacer_max_latency_ms(fps) == latency_ms
+    assert latency_ms < 1000 / fps
+
+
+def test_direct_usb_camera_pacer_uses_capture_fps() -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="camera",
+            simulator_camera_fps=60,
+            video_fps=25,
+        )
+    )
+
+    command = publisher._publisher_command("secret", ["h264parse"])
+
+    assert command[command.index("--pacer-max-latency-ms") + 1] == "12"
 
 
 def test_usb_camera_uses_v4l2_device_settings() -> None:
