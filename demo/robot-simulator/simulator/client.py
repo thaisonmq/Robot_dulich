@@ -1,0 +1,1016 @@
+import asyncio
+import hashlib
+import hmac
+import json
+import logging
+import os
+import platform
+import random
+import ssl
+import time
+from collections import deque
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+
+import httpx
+import websockets
+
+from simulator.config import SimulatorConfig
+from simulator.media_devices import (
+    discover_media_sources,
+    prepare_audio_source,
+    probe_audio_source,
+)
+from simulator.media import MediaPublisher, rtsp_input_args
+from simulator.messages import Message, make_message
+from simulator.motion import MotionSimulator
+from simulator.navigation import NavigationSimulator
+
+logger = logging.getLogger("simulator.gateway")
+
+
+class RobotConnectionClient:
+    def __init__(self, config: SimulatorConfig) -> None:
+        self.config = config
+        self.motion = MotionSimulator(config)
+        self.navigation = NavigationSimulator(self.motion)
+        self.media = MediaPublisher(config, self._media_token)
+        self.sequence = 0
+        self.processed_ids: set[str] = set()
+        self.processed_order: deque[str] = deque()
+        self.running = True
+        self.socket: Any = None
+        self.media_restart_requested = asyncio.Event()
+        self.media_lease_changed = asyncio.Event()
+        self.media_leases: dict[str, float] = {}
+        self.robot_access_token = ""
+        self._used_enrollment_token_hash = ""
+        self._configured_robot_id = config.robot_id
+        self._configured_robot_credential = config.robot_credential
+        self._configured_enrollment_token = config.robot_enrollment_token
+        self._configured_configuration = self._configuration_snapshot()
+        self._state_loaded = False
+        self._load_device_state()
+
+    @property
+    def url(self) -> str:
+        separator = "&" if "?" in self.config.center_robot_ws_url else "?"
+        return self.config.center_robot_ws_url + separator + urlencode(
+            {"robot_id": self.config.robot_id}
+        )
+
+    @property
+    def state_path(self) -> Path:
+        if self.config.robot_state_file:
+            return Path(self.config.robot_state_file).expanduser()
+        return Path.home() / ".config" / "rovera" / "device.json"
+
+    def _load_device_state(self) -> None:
+        try:
+            state = json.loads(self.state_path.read_text())
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            logger.warning("cannot read device state path=%s error=%s", self.state_path, exc)
+            return
+        except ValueError as exc:
+            logger.warning("ignoring invalid device state path=%s error=%s", self.state_path, exc)
+            return
+        if not isinstance(state, dict):
+            logger.warning("ignoring non-object device state path=%s", self.state_path)
+            return
+        if not self._state_belongs_to_this_device(state):
+            return
+        robot_id = str(state.get("robot_id", ""))
+        credential = str(state.get("credential", ""))
+        used_token_hash = str(state.get("enrollment_token_hash", ""))
+        if self.config.robot_enrollment_token:
+            supplied_token_hash = hashlib.sha256(
+                self.config.robot_enrollment_token.encode()
+            ).hexdigest()
+            if not used_token_hash or not hmac.compare_digest(
+                supplied_token_hash, used_token_hash
+            ):
+                return
+            self.config.robot_enrollment_token = ""
+        if robot_id and credential:
+            self.config.robot_id = robot_id
+            self.config.robot_credential = credential
+            self._used_enrollment_token_hash = used_token_hash
+            self._state_loaded = True
+            configuration = state.get("configuration")
+            if isinstance(configuration, dict):
+                try:
+                    self._apply_configuration(configuration)
+                except (TypeError, ValueError) as exc:
+                    logger.warning("ignoring invalid saved configuration error=%s", exc)
+            if not state.get("device_fingerprint"):
+                try:
+                    self._save_device_state()
+                    logger.info("migrated legacy device state with local fingerprint")
+                except OSError as exc:
+                    logger.warning("cannot migrate legacy device state error=%s", exc)
+
+    def _state_belongs_to_this_device(self, state: dict[str, Any]) -> bool:
+        stored_fingerprint = str(state.get("device_fingerprint", "")).strip()
+        current_fingerprint = self._device_fingerprint()
+        if stored_fingerprint:
+            if hmac.compare_digest(stored_fingerprint, current_fingerprint):
+                return True
+            logger.warning(
+                "ignoring device state copied from another machine path=%s",
+                self.state_path,
+            )
+            return False
+
+        # Compatibility for state files created before fingerprints existed.
+        # A copied legacy file still contains the previous robot address.
+        configuration = state.get("configuration")
+        stored_address = (
+            str(configuration.get("device_ip", "")).strip()
+            if isinstance(configuration, dict)
+            else ""
+        )
+        configured_address = self.config.robot_management_address.strip()
+        if (
+            stored_address
+            and configured_address
+            and stored_address.casefold() != configured_address.casefold()
+        ):
+            logger.warning(
+                "ignoring legacy device state for another address "
+                "saved_address=%s configured_address=%s",
+                stored_address,
+                configured_address,
+            )
+            return False
+        return True
+
+    def _configuration_snapshot(self) -> dict[str, Any]:
+        video_source = self.config.simulator_media_source
+        if self.config.simulator_media_source_type == "test":
+            video_source = "generated://test-pattern"
+        elif (
+            self.config.simulator_media_source_type == "camera"
+            and not video_source
+        ):
+            video_source = self.config.simulator_camera_device
+        return {
+            "device_ip": self.config.device_ip,
+            "video_source_type": self.config.simulator_media_source_type,
+            "video_source": video_source,
+            "video_profile": self.config.video_profile,
+            "rtsp_transport": self.config.rtsp_transport,
+            "camera_label": self.config.camera_label,
+            "audio_source_type": self.config.simulator_audio_source_type,
+            "audio_source": self.config.simulator_audio_source,
+            "microphone_label": self.config.microphone_label,
+        }
+
+    def _save_device_state(self) -> None:
+        path = self.state_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._move_invalid_state_target(path)
+        temporary = path.with_suffix(".tmp")
+        self._move_invalid_state_target(temporary)
+        temporary.write_text(
+            json.dumps(
+                {
+                    "robot_id": self.config.robot_id,
+                    "credential": self.config.robot_credential,
+                    "device_fingerprint": self._device_fingerprint(),
+                    "enrollment_token_hash": self._used_enrollment_token_hash,
+                    "configuration": self._configuration_snapshot(),
+                }
+            )
+        )
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        self._state_loaded = True
+
+    @staticmethod
+    def _move_invalid_state_target(path: Path) -> None:
+        if not path.is_symlink() and (not path.exists() or path.is_file()):
+            return
+        timestamp = int(time.time())
+        backup = path.with_name(f"{path.name}.invalid-{timestamp}")
+        counter = 1
+        while backup.exists() or backup.is_symlink():
+            backup = path.with_name(f"{path.name}.invalid-{timestamp}-{counter}")
+            counter += 1
+        path.rename(backup)
+        logger.warning(
+            "moved non-file device state target path=%s backup=%s",
+            path,
+            backup,
+        )
+
+    def _reset_identity_if_state_removed(self) -> bool:
+        if not self._state_loaded or self.state_path.is_file():
+            return False
+        logger.warning(
+            "device state was removed; clearing in-memory identity and reclaiming"
+        )
+        self.config.robot_id = self._configured_robot_id
+        self.config.robot_credential = self._configured_robot_credential
+        self.config.robot_enrollment_token = self._configured_enrollment_token
+        self._used_enrollment_token_hash = ""
+        self.robot_access_token = ""
+        self._state_loaded = False
+        try:
+            self._apply_configuration(self._configured_configuration)
+        except (TypeError, ValueError) as exc:
+            logger.warning("cannot restore environment configuration error=%s", exc)
+        return True
+
+    def _device_fingerprint(self) -> str:
+        machine_id = ""
+        try:
+            machine_id = Path("/etc/machine-id").read_text().strip()
+        except OSError:
+            pass
+        return f"{platform.node()}:{machine_id or 'unknown-device'}"
+
+    @property
+    def http_verify(self) -> bool | str:
+        return self.config.center_tls_ca_file or self.config.center_tls_verify
+
+    def websocket_ssl_context(self) -> ssl.SSLContext | None:
+        if not self.url.startswith("wss://"):
+            return None
+        if not self.config.center_tls_verify:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            return context
+        return ssl.create_default_context(
+            cafile=self.config.center_tls_ca_file or None
+        )
+
+    async def _authenticate(self) -> None:
+        self._reset_identity_if_state_removed()
+        if self.config.robot_enrollment_token:
+            await self._enroll()
+        elif not self.config.robot_credential:
+            if self.config.robot_username and self.config.robot_password:
+                await self._claim()
+            else:
+                await self._enroll()
+        async with httpx.AsyncClient(
+            base_url=self.config.center_api_url.rstrip("/"),
+            verify=self.http_verify,
+            timeout=8,
+        ) as client:
+            response = await client.post(
+                "/api/robot-auth/token",
+                json={
+                    "robot_id": self.config.robot_id,
+                    "credential": self.config.robot_credential,
+                },
+            )
+            if (
+                response.status_code == 401
+                and self.config.robot_username
+                and self.config.robot_password
+            ):
+                self.config.robot_credential = ""
+                await self._claim()
+                response = await client.post(
+                    "/api/robot-auth/token",
+                    json={
+                        "robot_id": self.config.robot_id,
+                        "credential": self.config.robot_credential,
+                    },
+                )
+            response.raise_for_status()
+            self.robot_access_token = str(response.json()["access_token"])
+            if not self.state_path.is_file():
+                self._save_device_state()
+
+    async def _claim(self) -> None:
+        management_address = (
+            self.config.robot_management_address.strip()
+            or self.config.device_ip.strip()
+        )
+        if not management_address:
+            raise RuntimeError("Robot chưa khai báo địa chỉ quản lý")
+        async with httpx.AsyncClient(
+            base_url=self.config.center_api_url.rstrip("/"),
+            verify=self.http_verify,
+            timeout=15,
+        ) as client:
+            response = await client.post(
+                "/api/robot-auth/claim",
+                json={
+                    "management_address": management_address,
+                    "username": self.config.robot_username,
+                    "password": self.config.robot_password,
+                    "device_fingerprint": self._device_fingerprint(),
+                },
+            )
+            response.raise_for_status()
+            claimed = response.json()
+            self.config.robot_id = str(claimed["robot_id"])
+            self.config.robot_credential = str(claimed["credential"])
+            self._save_device_state()
+            logger.info("robot credential claim completed robot_id=%s", self.config.robot_id)
+
+    async def _enroll(self) -> None:
+        if not self.config.robot_enrollment_token:
+            raise RuntimeError(
+                "Robot chưa được ghép nối; cần ROBOT_ENROLLMENT_TOKEN"
+            )
+        enrollment_token = self.config.robot_enrollment_token
+        async with httpx.AsyncClient(
+            base_url=self.config.center_api_url.rstrip("/"),
+            verify=self.http_verify,
+            timeout=8,
+        ) as client:
+            response = await client.post(
+                "/api/robot-auth/enroll",
+                json={
+                    "enrollment_token": enrollment_token,
+                    "device_fingerprint": self._device_fingerprint(),
+                },
+            )
+            response.raise_for_status()
+            enrollment = response.json()
+            self.config.robot_id = str(enrollment["robot_id"])
+            self.config.robot_credential = str(enrollment["credential"])
+            self._used_enrollment_token_hash = hashlib.sha256(
+                enrollment_token.encode()
+            ).hexdigest()
+            self.config.robot_enrollment_token = ""
+            self._save_device_state()
+            logger.info("robot enrollment completed robot_id=%s", self.config.robot_id)
+
+    async def _media_token(self, purpose: str = "main") -> str:
+        if purpose not in {"main", "video"}:
+            raise ValueError(f"unsupported media token purpose: {purpose}")
+        if not self.robot_access_token:
+            await self._authenticate()
+        async with httpx.AsyncClient(
+            base_url=self.config.center_api_url.rstrip("/"),
+            verify=self.http_verify,
+            timeout=8,
+        ) as client:
+            response = await client.post(
+                "/api/robot-auth/media-token",
+                params={"purpose": purpose},
+                headers={"Authorization": f"Bearer {self.robot_access_token}"},
+            )
+            if response.status_code == 401:
+                await self._authenticate()
+                response = await client.post(
+                    "/api/robot-auth/media-token",
+                    params={"purpose": purpose},
+                    headers={"Authorization": f"Bearer {self.robot_access_token}"},
+                )
+            response.raise_for_status()
+            media = response.json()
+            self.config.livekit_url = str(media["url"])
+            return str(media["token"])
+
+    async def run(self) -> None:
+        delay = 1.0
+        while self.running:
+            try:
+                await self._authenticate()
+                async with websockets.connect(
+                    self.url,
+                    additional_headers={
+                        "Authorization": f"Bearer {self.robot_access_token}"
+                    },
+                    ssl=self.websocket_ssl_context(),
+                    open_timeout=8,
+                    ping_interval=10,
+                    ping_timeout=8,
+                    max_size=65_536,
+                ) as socket:
+                    self.socket = socket
+                    delay = 1.0
+                    logger.info("gateway connected robot_id=%s", self.config.robot_id)
+                    warm_task = asyncio.create_task(self._warm_media_source())
+                    try:
+                        await self._connected(socket)
+                    finally:
+                        if not warm_task.done():
+                            warm_task.cancel()
+                        await asyncio.gather(warm_task, return_exceptions=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("gateway reconnect robot_id=%s error=%s", self.config.robot_id, exc)
+            finally:
+                self.motion.stop()
+                self.socket = None
+                self.media_leases.clear()
+                self.media_lease_changed.set()
+                await self.media.disconnect()
+            await asyncio.sleep(delay + random.uniform(0, min(1, delay / 4)))
+            delay = min(15.0, delay * 2)
+
+    async def _connected(self, socket: Any) -> None:
+        local_address = getattr(socket, "local_address", None)
+        if (
+            local_address
+            and self.config.device_ip in {"", "127.0.0.1", "localhost"}
+        ):
+            self.config.device_ip = str(local_address[0])
+        tasks = [
+            asyncio.create_task(self._receive_loop(socket)),
+            asyncio.create_task(self._simulation_loop()),
+            asyncio.create_task(self._telemetry_loop(socket)),
+            asyncio.create_task(self._heartbeat_loop(socket)),
+            asyncio.create_task(self._media_loop()),
+        ]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in done:
+            if task.exception():
+                raise task.exception()
+
+    async def _media_loop(self) -> None:
+        if not self.config.media_enabled:
+            return
+        delay = 1.0
+        while True:
+            self._prune_media_leases()
+            if not self.media_leases:
+                if self.media.connected:
+                    logger.info("media lease ended; camera stopped")
+                    await self.media.disconnect()
+                self.media_lease_changed.clear()
+                try:
+                    await asyncio.wait_for(
+                        self.media_lease_changed.wait(), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            if self.media_restart_requested.is_set():
+                self.media_restart_requested.clear()
+                await self.media.disconnect()
+            if self.media.connected:
+                delay = 1.0
+                self.media_lease_changed.clear()
+                try:
+                    await asyncio.wait_for(
+                        self.media_lease_changed.wait(), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            try:
+                logger.info(
+                    "media lease active; starting camera leases=%d",
+                    len(self.media_leases),
+                )
+                await self.media.connect()
+                delay = 1.0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "media unavailable; retrying in %.1fs while control remains active: %s",
+                    delay,
+                    exc,
+                )
+                await self.media.disconnect()
+                self.media_lease_changed.clear()
+                try:
+                    await asyncio.wait_for(
+                        self.media_lease_changed.wait(), timeout=delay
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                delay = min(15.0, delay * 2)
+
+    async def _warm_media_source(self) -> None:
+        try:
+            await asyncio.to_thread(self.media.warm_video_source)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("video source warmup skipped error=%s", exc)
+        else:
+            logger.info("video source warmup completed")
+
+    def _prune_media_leases(self) -> None:
+        now = time.monotonic()
+        for lease_id, expires_at in list(self.media_leases.items()):
+            if expires_at <= now:
+                self.media_leases.pop(lease_id, None)
+
+    def _start_media_lease(self, payload: dict[str, Any]) -> str:
+        lease_id = str(payload.get("lease_id", "")).strip()
+        if not lease_id or len(lease_id) > 160:
+            raise ValueError("Media lease không hợp lệ")
+        try:
+            ttl_seconds = float(payload.get("ttl_seconds", 30))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Thời hạn media lease không hợp lệ") from exc
+        ttl_seconds = min(120.0, max(5.0, ttl_seconds))
+        self.media_leases[lease_id] = time.monotonic() + ttl_seconds
+        self.media_lease_changed.set()
+        return lease_id
+
+    def _stop_media_lease(self, payload: dict[str, Any]) -> str:
+        lease_id = str(payload.get("lease_id", "")).strip()
+        if not lease_id:
+            raise ValueError("Media lease không hợp lệ")
+        self.media_leases.pop(lease_id, None)
+        self.media_lease_changed.set()
+        return lease_id
+
+    async def _receive_loop(self, socket: Any) -> None:
+        async for raw in socket:
+            message = Message.model_validate_json(raw)
+            if message.message_type == "gateway.welcome":
+                continue
+            message_id = str(message.message_id)
+            if message_id in self.processed_ids:
+                await self._ack(socket, message, "accepted")
+                continue
+            self._remember(message_id)
+            if message.expired():
+                await self._ack(socket, message, "expired")
+                continue
+            if message.message_type == "control.velocity":
+                self.navigation.cancel() if self.navigation.status == "moving" else None
+                self.motion.set_velocity(
+                    float(message.payload.get("linear_x", 0)),
+                    float(message.payload.get("angular_z", 0)),
+                )
+                await self._ack(socket, message, "accepted")
+            elif message.message_type == "control.stop":
+                self.motion.stop()
+                await self._ack(socket, message, "completed")
+            elif message.message_type == "media.start":
+                try:
+                    self._start_media_lease(message.payload)
+                    await self._ack(socket, message, "accepted")
+                except ValueError:
+                    await self._ack(socket, message, "rejected")
+            elif message.message_type == "media.stop":
+                try:
+                    self._stop_media_lease(message.payload)
+                    await self._ack(socket, message, "completed")
+                except ValueError:
+                    await self._ack(socket, message, "rejected")
+            elif message.message_type == "navigation.goal":
+                self.navigation.start(
+                    str(message.payload["route_id"]), list(message.payload["points"])
+                )
+                await self._ack(socket, message, "accepted")
+                await self._navigation_status(socket)
+            elif message.message_type == "navigation.cancel":
+                self.navigation.cancel()
+                await self._ack(socket, message, "completed")
+                await self._navigation_status(socket)
+            elif message.message_type == "configuration.get":
+                await self._configuration_state(
+                    socket, str(message.payload.get("request_id", ""))
+                )
+            elif message.message_type == "configuration.update":
+                request_id = str(message.payload.get("request_id", ""))
+                try:
+                    self._apply_configuration(message.payload)
+                    self._save_device_state()
+                    await self._configuration_state(socket, request_id)
+                    self.media_restart_requested.set()
+                    asyncio.create_task(self._warm_media_source())
+                except (OSError, TypeError, ValueError) as exc:
+                    await self._configuration_state(socket, request_id, str(exc))
+            elif message.message_type == "diagnostics.ping":
+                await self._diagnostics_result(
+                    socket,
+                    str(message.payload.get("request_id", "")),
+                    "connection",
+                    {
+                        "ok": True,
+                        "gateway": "online",
+                        "media": "online" if self.media.connected else "offline",
+                        "device_ip": self.config.device_ip,
+                    },
+                )
+            elif message.message_type == "media.sources.get":
+                await self._media_sources(
+                    socket,
+                    str(message.payload.get("request_id", "")),
+                    str(message.payload.get("media_kind", "all")),
+                )
+            elif message.message_type == "media.probe":
+                request_id = str(message.payload.get("request_id", ""))
+                result = await self._probe_media(message.payload)
+                await self._diagnostics_result(
+                    socket, request_id, str(message.payload.get("media_kind", "")), result
+                )
+            else:
+                await self._ack(socket, message, "rejected")
+
+    def _public_video_source(self) -> str:
+        if self.config.simulator_media_source_type == "test":
+            return "generated://test-pattern"
+        if self.config.simulator_media_source_type == "camera":
+            return (
+                self.config.simulator_media_source
+                or self.config.simulator_camera_device
+            )
+        if self.config.simulator_media_source_type == "file":
+            return self.config.simulator_media_source
+        source = self.config.simulator_media_source.strip()
+        if not source:
+            return "rtsp://camera.local/live"
+        parsed = urlsplit(source)
+        path = parsed.path
+        if self.config.simulator_rtsp_path and path in ("", "/"):
+            path = "/" + self.config.simulator_rtsp_path.lstrip("/")
+        hostname = parsed.hostname or "camera.local"
+        port = f":{parsed.port}" if parsed.port else ""
+        return urlunsplit(
+            (parsed.scheme or "rtsp", f"{hostname}{port}", path, parsed.query, parsed.fragment)
+        )
+
+    def _source_with_preserved_credentials(self, source: str) -> str:
+        return self._source_with_credentials_from(
+            source, self.config.simulator_media_source
+        )
+
+    @staticmethod
+    def _source_with_credentials_from(source: str, current_source: str) -> str:
+        requested = urlsplit(source)
+        current = urlsplit(current_source)
+        if requested.username is not None or current.username is None:
+            return source
+        credentials = quote(current.username, safe="")
+        if current.password is not None:
+            credentials += ":" + quote(current.password, safe="")
+        hostname = requested.hostname or ""
+        port = f":{requested.port}" if requested.port else ""
+        return urlunsplit(
+            (
+                requested.scheme,
+                f"{credentials}@{hostname}{port}",
+                requested.path,
+                requested.query,
+                requested.fragment,
+            )
+        )
+
+    def _public_audio_source(self) -> str:
+        source = self.config.simulator_audio_source.strip()
+        parsed = urlsplit(source)
+        if not parsed.hostname or parsed.username is None:
+            return source
+        port = f":{parsed.port}" if parsed.port else ""
+        return urlunsplit(
+            (
+                parsed.scheme,
+                f"{parsed.hostname}{port}",
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+
+    def _apply_configuration(self, payload: dict[str, Any]) -> None:
+        profile = str(payload.get("video_profile", ""))
+        profiles = {
+            "full_hd": (1920, 1080, 8_000_000),
+            "balanced": (1280, 720, 2_500_000),
+            "low_bandwidth": (854, 480, 1_200_000),
+        }
+        if profile not in profiles:
+            raise ValueError("Profile video không hợp lệ")
+        transport = str(payload.get("rtsp_transport", ""))
+        if transport not in {"tcp", "udp"}:
+            raise ValueError("Giao thức RTSP không hợp lệ")
+        source_type = str(payload.get("video_source_type", ""))
+        if source_type not in {"rtsp", "camera", "file", "test"}:
+            raise ValueError("Loại nguồn video không hợp lệ")
+        source = str(payload.get("video_source", "")).strip()
+        if source_type == "rtsp" and not source.lower().startswith(
+            ("rtsp://", "rtsps://")
+        ):
+            raise ValueError("Nguồn RTSP không hợp lệ")
+        if source_type == "camera" and not source.startswith("/dev/"):
+            raise ValueError("Thiết bị camera USB không hợp lệ")
+        if not source:
+            raise ValueError("Nguồn video không được để trống")
+        audio_source_type = str(
+            payload.get("audio_source_type", "silent")
+        )
+        if audio_source_type not in {"silent", "device", "file"}:
+            raise ValueError("Loại nguồn microphone không hợp lệ")
+        requested_audio_source = str(payload.get("audio_source", "")).strip()
+        if audio_source_type != "silent" and not requested_audio_source:
+            raise ValueError("Hãy chọn nguồn microphone")
+        if audio_source_type == "device":
+            unavailable_reason = prepare_audio_source(requested_audio_source)
+            if unavailable_reason:
+                raise ValueError(unavailable_reason)
+        self.config.device_ip = str(payload.get("device_ip", "")).strip()
+        self.config.camera_label = str(payload.get("camera_label", "")).strip()
+        self.config.simulator_audio_source_type = audio_source_type
+        self.config.simulator_audio_source = self._source_with_credentials_from(
+            requested_audio_source, self.config.simulator_audio_source
+        )
+        self.config.microphone_label = str(
+            payload.get("microphone_label", "Microphone chính")
+        ).strip()
+        self.config.video_profile = profile
+        self.config.rtsp_transport = transport
+        self.config.video_width, self.config.video_height, self.config.video_bitrate = (
+            profiles[profile]
+        )
+        self.config.simulator_media_source = (
+            self._source_with_preserved_credentials(source)
+            if source_type == "rtsp"
+            else source
+        )
+        self.config.simulator_rtsp_path = ""
+        self.config.simulator_media_source_type = source_type
+
+    async def _configuration_state(
+        self, socket: Any, request_id: str, error: str | None = None
+    ) -> None:
+        await socket.send(
+            json.dumps(
+                make_message(
+                    "configuration.state",
+                    self.config.robot_id,
+                    self._next_sequence(),
+                    {
+                        "request_id": request_id,
+                        "ok": error is None,
+                        "error": error,
+                        "robot_id": self.config.robot_id,
+                        "device_ip": self.config.device_ip,
+                        "video_source_type": self.config.simulator_media_source_type,
+                        "video_source": self._public_video_source(),
+                        "video_profile": self.config.video_profile,
+                        "rtsp_transport": self.config.rtsp_transport,
+                        "camera_label": self.config.camera_label,
+                        "audio_source_type": self.config.simulator_audio_source_type,
+                        "audio_source": self._public_audio_source(),
+                        "microphone_label": self.config.microphone_label,
+                        "software_version": "sim-1.0",
+                        "connection_status": "online",
+                    },
+                )
+            )
+        )
+
+    async def _media_sources(
+        self, socket: Any, request_id: str, media_kind: str = "all"
+    ) -> None:
+        sources = await asyncio.to_thread(discover_media_sources, media_kind)
+        await socket.send(
+            json.dumps(
+                make_message(
+                    "media.sources",
+                    self.config.robot_id,
+                    self._next_sequence(),
+                    {
+                        "request_id": request_id,
+                        "ok": True,
+                        "media_kind": media_kind,
+                        **sources,
+                    },
+                )
+            )
+        )
+
+    async def _probe_media(self, payload: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
+        kind = str(payload.get("media_kind", ""))
+        configuration = dict(payload.get("configuration") or {})
+        success_detail = "Nguồn media hoạt động"
+        if kind == "video" and configuration.get("video_source_type") == "test":
+            return {"ok": True, "latency_ms": 0, "detail": "Nguồn kiểm thử sẵn sàng"}
+        if kind == "audio" and configuration.get("audio_source_type") == "silent":
+            return {
+                "ok": False,
+                "latency_ms": 0,
+                "detail": "Chưa chọn microphone để kiểm tra",
+            }
+        process: asyncio.subprocess.Process | None = None
+        try:
+            if kind == "video":
+                source_type = str(configuration.get("video_source_type", "rtsp"))
+                source = str(configuration.get("video_source", ""))
+                if source_type == "camera":
+                    input_args = [
+                        "-f", "v4l2", "-framerate", "15", "-i", source
+                    ]
+                    success_detail = "Camera USB đã trả về hình ảnh"
+                elif source_type == "rtsp":
+                    source = self._source_with_preserved_credentials(source)
+                    input_args = rtsp_input_args(
+                        source,
+                        str(configuration.get("rtsp_transport", "tcp")),
+                    )
+                    success_detail = "Luồng RTSP đã trả về hình ảnh"
+                else:
+                    input_args = ["-i", source]
+                    success_detail = "Tệp hoặc stream video đã trả về hình ảnh"
+                command = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    *input_args, "-t", "2", "-an", "-f", "null", "-",
+                ]
+            else:
+                audio_type = str(configuration.get("audio_source_type", "device"))
+                audio_source = str(configuration.get("audio_source", "default"))
+                if audio_type == "device":
+                    ok, detail = await asyncio.to_thread(
+                        probe_audio_source, audio_source
+                    )
+                    return {
+                        "ok": ok,
+                        "latency_ms": round(
+                            (time.monotonic() - started) * 1000
+                        ),
+                        "detail": detail,
+                    }
+                if audio_type == "file":
+                    audio_source = self._source_with_credentials_from(
+                        audio_source, self.config.simulator_audio_source
+                    )
+                    success_detail = "Tệp hoặc stream âm thanh đã giải mã thành công"
+                input_args = ["-i", audio_source]
+                command = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    *input_args, "-t", "2", "-vn", "-f", "null", "-",
+                ]
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=7)
+            detail = stderr.decode(errors="replace").strip()[-300:]
+            source = str(
+                configuration.get("video_source")
+                or configuration.get("audio_source")
+                or ""
+            )
+            if source:
+                detail = detail.replace(source, "<media-source>")
+            return {
+                "ok": process.returncode == 0,
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "detail": detail or (
+                    success_detail if process.returncode == 0
+                    else "Không đọc được nguồn media"
+                ),
+            }
+        except asyncio.TimeoutError:
+            if process and process.returncode is None:
+                process.kill()
+                await process.wait()
+            return {
+                "ok": False,
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "detail": "Nguồn media không phản hồi trong 7 giây",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "detail": str(exc),
+            }
+
+    async def _diagnostics_result(
+        self,
+        socket: Any,
+        request_id: str,
+        diagnostic: str,
+        result: dict[str, Any],
+    ) -> None:
+        await socket.send(
+            json.dumps(
+                make_message(
+                    "diagnostics.result",
+                    self.config.robot_id,
+                    self._next_sequence(),
+                    {
+                        "request_id": request_id,
+                        "diagnostic": diagnostic,
+                        **result,
+                    },
+                )
+            )
+        )
+
+    def _remember(self, message_id: str) -> None:
+        self.processed_ids.add(message_id)
+        self.processed_order.append(message_id)
+        while len(self.processed_order) > 2048:
+            self.processed_ids.discard(self.processed_order.popleft())
+
+    async def _ack(self, socket: Any, command: Message, status: str) -> None:
+        await socket.send(
+            json.dumps(
+                make_message(
+                    "command.ack",
+                    self.config.robot_id,
+                    self._next_sequence(),
+                    {"command_message_id": str(command.message_id), "status": status},
+                    command.session_id,
+                )
+            )
+        )
+
+    async def _simulation_loop(self) -> None:
+        period = 1 / self.config.simulation_hz
+        previous = time.monotonic()
+        while True:
+            started = time.monotonic()
+            dt = min(0.1, started - previous)
+            previous = started
+            self.navigation.update()
+            self.motion.watchdog(started)
+            self.motion.step(dt)
+            await asyncio.sleep(max(0, period - (time.monotonic() - started)))
+
+    async def _telemetry_loop(self, socket: Any) -> None:
+        previous_status = self.navigation.status
+        while True:
+            await socket.send(
+                json.dumps(
+                    make_message(
+                        "robot.pose",
+                        self.config.robot_id,
+                        self._next_sequence(),
+                        self.motion.as_payload(),
+                    )
+                )
+            )
+            await socket.send(
+                json.dumps(
+                    make_message(
+                        "robot.health",
+                        self.config.robot_id,
+                        self._next_sequence(),
+                        {
+                            "battery_percent": 78,
+                            "network_rtt_ms": random.randint(36, 68),
+                            "packet_loss_percent": round(random.uniform(0.0, 0.7), 2),
+                            "camera": "online" if self.media.connected else "offline",
+                            "audio": "online" if self.media.connected else "offline",
+                            "navigation": self.navigation.status,
+                            "simulator": "running",
+                        },
+                    )
+                )
+            )
+            if previous_status != self.navigation.status:
+                previous_status = self.navigation.status
+                await self._navigation_status(socket)
+            await asyncio.sleep(1 / self.config.telemetry_hz)
+
+    async def _navigation_status(self, socket: Any) -> None:
+        await socket.send(
+            json.dumps(
+                make_message(
+                    "navigation.status",
+                    self.config.robot_id,
+                    self._next_sequence(),
+                    {
+                        "route_id": self.navigation.route_id,
+                        "status": self.navigation.status,
+                        "point_index": self.navigation.point_index,
+                    },
+                )
+            )
+        )
+
+    async def _heartbeat_loop(self, socket: Any) -> None:
+        while True:
+            if self._reset_identity_if_state_removed():
+                raise RuntimeError("device state removed; reconnecting to reclaim")
+            await socket.send(
+                json.dumps(
+                    make_message(
+                        "robot.heartbeat",
+                        self.config.robot_id,
+                        self._next_sequence(),
+                        {"uptime": time.monotonic()},
+                    )
+                )
+            )
+            await asyncio.sleep(self.config.heartbeat_seconds)
+
+    def _next_sequence(self) -> int:
+        self.sequence += 1
+        return self.sequence
+
+    async def stop(self) -> None:
+        self.running = False
+        self.motion.stop()
+        if self.socket:
+            await self.socket.close()

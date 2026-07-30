@@ -1,0 +1,26 @@
+[Unit]
+Description=ROVERA Robot Edge Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rovera
+SupplementaryGroups=docker video audio
+UMask=0077
+StateDirectory=rovera
+StateDirectoryMode=0700
+WorkingDirectory=/opt/rovera
+Environment=ROBOT_ENV_FILE=/etc/rovera/robot.env
+Environment=ROVERA_RUNTIME=container
+ExecStart=/opt/rovera/demo/robot-simulator/run.sh
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rovera
+
+[Install]
+WantedBy=multi-user.target

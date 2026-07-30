@@ -1,0 +1,628 @@
+import { useEffect, useRef, useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import {
+  Activity, ArrowLeft, Camera, Check, CircleDot, Cpu, EthernetPort, Mic2,
+  Play, RadioTower, RefreshCw, Save, ServerCog, Square, Video, WifiOff,
+} from "lucide-react";
+import { api } from "../api/client";
+import { Brand } from "../components/Brand";
+import { useNavigate, useParams } from "../router";
+import type {
+  MediaSource, RejectedMediaSource, RobotConfigurationUpdate,
+} from "../types";
+import type { LiveKitMediaTransport } from "../transports/MediaTransport";
+
+const EMPTY_CONFIGURATION: RobotConfigurationUpdate = {
+  device_ip: "",
+  video_source_type: "rtsp",
+  video_source: "",
+  video_profile: "full_hd",
+  rtsp_transport: "tcp",
+  camera_label: "Camera chính",
+  audio_source_type: "silent",
+  audio_source: "",
+  microphone_label: "Microphone chính",
+};
+
+function configurationForm(
+  configuration: RobotConfigurationUpdate,
+): RobotConfigurationUpdate {
+  const {
+    device_ip, video_source_type, video_source, video_profile, rtsp_transport,
+    camera_label, audio_source_type, audio_source, microphone_label,
+  } = configuration;
+  return {
+    device_ip, video_source_type, video_source, video_profile, rtsp_transport,
+    camera_label, audio_source_type, audio_source, microphone_label,
+  };
+}
+
+export function RobotConfigurationPage() {
+  const navigate = useNavigate();
+  const { robotId = "" } = useParams();
+  const [form, setForm] = useState<RobotConfigurationUpdate>(EMPTY_CONFIGURATION);
+  const [saved, setSaved] = useState(false);
+  const [tab, setTab] = useState<"connection" | "video" | "audio">("video");
+  const [previewState, setPreviewState] = useState("idle");
+  const [videoSources, setVideoSources] = useState<MediaSource[]>([]);
+  const [audioSources, setAudioSources] = useState<MediaSource[]>([]);
+  const [rejectedVideoSources, setRejectedVideoSources] = useState<RejectedMediaSource[]>([]);
+  const [rejectedAudioSources, setRejectedAudioSources] = useState<RejectedMediaSource[]>([]);
+  const [sourcesScanned, setSourcesScanned] = useState({
+    video: false,
+    audio: false,
+  });
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const previewTransport = useRef<LiveKitMediaTransport | null>(null);
+  const previewLeaseId = useRef<string | null>(null);
+
+  const robotQuery = useQuery({
+    queryKey: ["robot", robotId],
+    queryFn: () => api.robot(robotId),
+    enabled: Boolean(robotId),
+  });
+  const configurationQuery = useQuery({
+    queryKey: ["robot-configuration", robotId],
+    queryFn: () => api.robotConfiguration(robotId),
+    enabled: Boolean(robotId),
+    retry: false,
+  });
+  useEffect(() => {
+    if (!configurationQuery.data) return;
+    setForm(configurationForm(configurationQuery.data));
+  }, [configurationQuery.data]);
+  useEffect(() => {
+    setVideoSources([]);
+    setAudioSources([]);
+    setRejectedVideoSources([]);
+    setRejectedAudioSources([]);
+    setSourcesScanned({ video: false, audio: false });
+  }, [robotId]);
+  useEffect(() => {
+    const heartbeat = window.setInterval(() => {
+      const leaseId = previewLeaseId.current;
+      if (leaseId) {
+        void api.renewRobotPreview(robotId, leaseId).catch(async () => {
+          previewLeaseId.current = null;
+          await previewTransport.current?.disconnect();
+          previewTransport.current = null;
+          setPreviewState("Phiên xem trước đã kết thúc");
+        });
+      }
+    }, 10_000);
+    return () => {
+      window.clearInterval(heartbeat);
+      void previewTransport.current?.disconnect();
+      previewTransport.current = null;
+      const leaseId = previewLeaseId.current;
+      previewLeaseId.current = null;
+      if (leaseId) void api.stopRobotPreview(robotId, leaseId).catch(() => undefined);
+    };
+  }, [robotId]);
+
+  const save = useMutation({
+    mutationFn: () => api.updateRobotConfiguration(robotId, form),
+    onSuccess: (configuration) => {
+      setForm(configurationForm(configuration));
+      setSaved(true);
+      window.setTimeout(() => setSaved(false), 2200);
+    },
+  });
+  const connectionTest = useMutation({
+    mutationFn: () => api.testRobotConnection(robotId),
+  });
+  const mediaTest = useMutation({
+    mutationFn: (mediaKind: "video" | "audio") =>
+      api.testRobotMedia(robotId, mediaKind, form),
+  });
+  const mediaSourceScan = useMutation({
+    mutationFn: (mediaKind: "video" | "audio") =>
+      api.robotMediaSources(robotId, mediaKind),
+    onSuccess: (sources, mediaKind) => {
+      if (mediaKind === "video") {
+        setVideoSources(sources.video_sources);
+        setRejectedVideoSources(sources.rejected_video_sources ?? []);
+        if (sources.video_sources.length) {
+          setForm((current) => current.video_source_type === "camera"
+            ? current
+            : { ...current, video_source_type: "camera", video_source: "" });
+        }
+      } else {
+        setAudioSources(sources.audio_sources);
+        setRejectedAudioSources(sources.rejected_audio_sources ?? []);
+        if (sources.audio_sources.length) {
+          setForm((current) => current.audio_source_type === "device"
+            ? current
+            : { ...current, audio_source_type: "device", audio_source: "" });
+        }
+      }
+      setSourcesScanned((current) => ({ ...current, [mediaKind]: true }));
+    },
+  });
+
+  function scanMediaSources(mediaKind: "video" | "audio") {
+    mediaSourceScan.reset();
+    mediaSourceScan.mutate(mediaKind);
+  }
+
+  async function togglePreview() {
+    if (previewTransport.current) {
+      await previewTransport.current.disconnect();
+      previewTransport.current = null;
+      const leaseId = previewLeaseId.current;
+      previewLeaseId.current = null;
+      if (leaseId) {
+        await api.stopRobotPreview(robotId, leaseId).catch(() => undefined);
+      }
+      setPreviewState("idle");
+      return;
+    }
+    if (!videoRef.current || !audioRef.current) return;
+    setPreviewState("connecting");
+    let leaseId: string | null = null;
+    try {
+      const access = await api.robotPreviewToken(robotId);
+      leaseId = access.lease_id;
+      previewLeaseId.current = leaseId;
+      const { LiveKitMediaTransport } = await import("../transports/MediaTransport");
+      const transport = new LiveKitMediaTransport(
+        videoRef.current,
+        audioRef.current,
+        setPreviewState,
+      );
+      previewTransport.current = transport;
+      await transport.connect(access.url, access.token);
+    } catch (reason) {
+      previewTransport.current = null;
+      previewLeaseId.current = null;
+      if (leaseId) {
+        await api.stopRobotPreview(robotId, leaseId).catch(() => undefined);
+      }
+      setPreviewState(reason instanceof Error ? reason.message : "failed");
+    }
+  }
+
+  const robot = robotQuery.data;
+  const configuration = configurationQuery.data;
+  const loading = robotQuery.isLoading || configurationQuery.isLoading;
+
+  return (
+    <main className="configuration-page">
+      <header className="app-header">
+        <Brand compact />
+        <div className="app-header__context">
+          <span>Cấu hình thiết bị</span>
+          <strong>{robot?.name ?? robotId}</strong>
+        </div>
+        <button type="button" className="header-action" onClick={() => navigate("/robots")}>
+          <ArrowLeft size={18} /> Danh sách robot
+        </button>
+      </header>
+
+      <section className="configuration-shell">
+        <aside className="configuration-summary">
+          <div className="device-orbit"><RadioTower size={36} /></div>
+          <div>
+            <p className="eyebrow">THIẾT BỊ ĐANG CHỌN</p>
+            <h1>{robot?.name ?? "Đang tải robot"}</h1>
+            <p>{robotId}</p>
+          </div>
+          <div className="configuration-health">
+            <span><CircleDot size={17} /><small>Kết nối</small><strong>{robot?.status === "online" ? "Trực tuyến" : "Ngoại tuyến"}</strong></span>
+            <span><Cpu size={17} /><small>Phiên bản</small><strong>{configuration?.software_version ?? "—"}</strong></span>
+            <span><Video size={17} /><small>Profile</small><strong>{form.video_profile === "full_hd" ? "Full HD" : form.video_profile === "balanced" ? "Cân bằng" : "Băng thông thấp"}</strong></span>
+          </div>
+          <div className={`config-preview ${previewState === "connected" ? "is-live" : ""}`}>
+            <video ref={videoRef} autoPlay playsInline aria-label="Xem trước camera robot" />
+            <audio ref={audioRef} autoPlay />
+            <span>
+              <Camera size={18} />
+              {previewState === "connected"
+                ? "Camera trực tiếp"
+                : previewState === "connecting"
+                  ? "Đang mở camera…"
+                  : "Chưa xem trước"}
+            </span>
+          </div>
+          <p className="configuration-note">
+            Cấu hình được đọc và áp dụng trực tiếp tại simulator. Thông tin đăng nhập RTSP luôn được ẩn khỏi trình duyệt.
+          </p>
+        </aside>
+
+        <form
+          className="configuration-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            save.mutate();
+          }}
+        >
+          <div className="configuration-form__heading">
+            <div>
+              <p className="eyebrow">KẾT NỐI & HÌNH ẢNH</p>
+              <h2>Thông số robot</h2>
+            </div>
+            <span className={robot?.status === "online" ? "connection-chip is-online" : "connection-chip"}>
+              <i /> {robot?.status === "online" ? "Đang kết nối" : "Chưa kết nối"}
+            </span>
+          </div>
+          <nav className="configuration-tabs" aria-label="Nhóm cấu hình">
+            <button
+              type="button"
+              className={tab === "connection" ? "is-active" : ""}
+              onClick={() => setTab("connection")}
+            >
+              <EthernetPort size={16} /> Kết nối
+            </button>
+            <button
+              type="button"
+              className={tab === "video" ? "is-active" : ""}
+              onClick={() => setTab("video")}
+            >
+              <Camera size={16} /> Camera
+            </button>
+            <button
+              type="button"
+              className={tab === "audio" ? "is-active" : ""}
+              onClick={() => setTab("audio")}
+            >
+              <Mic2 size={16} /> Microphone
+            </button>
+          </nav>
+
+          {loading ? (
+            <div className="configuration-loading">Đang gọi cấu hình từ simulator…</div>
+          ) : configurationQuery.isError ? (
+            <div className="configuration-error" role="alert">
+              <span><WifiOff size={24} /></span>
+              <h3>Không kết nối được simulator</h3>
+              <p>
+                {configurationQuery.error instanceof Error
+                  ? configurationQuery.error.message
+                  : "Simulator không phản hồi yêu cầu cấu hình"}
+              </p>
+              <button
+                type="button"
+                className="button button--outline"
+                onClick={() => configurationQuery.refetch()}
+                disabled={configurationQuery.isFetching}
+              >
+                <RefreshCw size={17} />
+                {configurationQuery.isFetching ? "Đang thử lại…" : "Thử kết nối lại"}
+              </button>
+            </div>
+          ) : (
+            <div className="configuration-fields">
+              {tab === "connection" && (
+                <>
+                  <label className="config-field config-field--wide">
+                    <span><EthernetPort size={17} /> Địa chỉ IP robot</span>
+                    <input
+                      value={form.device_ip}
+                      onChange={(event) => setForm({ ...form, device_ip: event.target.value })}
+                      placeholder="192.168.1.20"
+                      required
+                    />
+                    <small>Địa chỉ do edge agent báo về; không cần mở cổng inbound.</small>
+                  </label>
+                  <section className="diagnostic-card config-field--wide">
+                    <span><Activity size={20} /></span>
+                    <div>
+                      <strong>Kiểm tra kênh điều khiển</strong>
+                      <small>Đo phản hồi WSS và trạng thái publisher media trên robot.</small>
+                    </div>
+                    <button
+                      type="button"
+                      className="button button--outline"
+                      disabled={connectionTest.isPending}
+                      onClick={() => connectionTest.mutate()}
+                    >
+                      <RefreshCw size={16} /> {connectionTest.isPending ? "Đang kiểm tra…" : "Kiểm tra kết nối"}
+                    </button>
+                    {connectionTest.data && (
+                      <p className={connectionTest.data.ok ? "diagnostic-result is-ok" : "diagnostic-result"}>
+                        {connectionTest.data.ok
+                          ? `Gateway ${connectionTest.data.gateway} · Media ${connectionTest.data.media}`
+                          : connectionTest.data.detail}
+                      </p>
+                    )}
+                  </section>
+                </>
+              )}
+
+              {tab === "video" && (
+                <>
+                  <label className="config-field">
+                    <span><Camera size={17} /> Loại nguồn video</span>
+                    <select
+                      value={form.video_source_type}
+                      onChange={(event) => {
+                        const video_source_type = event.target.value as RobotConfigurationUpdate["video_source_type"];
+                        setForm({
+                          ...form,
+                          video_source_type,
+                          video_source: video_source_type === "camera"
+                            ? ""
+                            : video_source_type === "rtsp"
+                              ? "rtsp://camera.local/live"
+                              : video_source_type === "test"
+                                ? "generated://test-pattern"
+                                : "",
+                        });
+                      }}
+                    >
+                      <option value="rtsp">Camera mạng · RTSP</option>
+                      <option value="camera">Camera USB · V4L2</option>
+                      <option value="file">Tệp hoặc HTTP stream</option>
+                      <option value="test">Ảnh kiểm thử tự động</option>
+                    </select>
+                  </label>
+                  <label className="config-field">
+                    <span><ServerCog size={17} /> Tên camera</span>
+                    <input
+                      value={form.camera_label}
+                      onChange={(event) => setForm({ ...form, camera_label: event.target.value })}
+                      required
+                    />
+                  </label>
+                  <label className="config-field config-field--wide">
+                    <span><Camera size={17} /> Nguồn phát video</span>
+                    <div className="source-picker">
+                      {form.video_source_type === "camera" ? (
+                          <select
+                            value={form.video_source}
+                            onChange={(event) => setForm({ ...form, video_source: event.target.value })}
+                            required
+                            aria-describedby="video-source-status"
+                          >
+                            <option value="" disabled>
+                              {sourcesScanned.video
+                                ? videoSources.length
+                                  ? "Chọn camera vừa tìm thấy"
+                                  : "Không tìm thấy camera V4L2"
+                                : "Bấm Quét để tìm camera trên robot"}
+                            </option>
+                            {form.video_source && !videoSources.some((source) => source.value === form.video_source) && (
+                              <option value={form.video_source}>
+                                {sourcesScanned.video ? "Không còn kết nối" : "Cấu hình hiện tại"} · {form.video_source}
+                              </option>
+                            )}
+                            {videoSources.map((source) => (
+                              <option value={source.value} key={`${source.type}-${source.value}`}>
+                                {source.label} · {source.value}
+                              </option>
+                            ))}
+                          </select>
+                      ) : (
+                        <input
+                          value={form.video_source}
+                          disabled={form.video_source_type === "test"}
+                          onChange={(event) => setForm({ ...form, video_source: event.target.value })}
+                          placeholder={form.video_source_type === "rtsp" ? "rtsp://camera.local/live" : "/media/video.mp4"}
+                          required
+                        />
+                      )}
+                      <button
+                        type="button"
+                        className="source-scan-button"
+                        onClick={() => scanMediaSources("video")}
+                        disabled={robot?.status !== "online" || mediaSourceScan.isPending}
+                      >
+                        <RefreshCw
+                          size={17}
+                          className={mediaSourceScan.isPending && mediaSourceScan.variables === "video" ? "is-spinning" : ""}
+                        />
+                        {mediaSourceScan.isPending && mediaSourceScan.variables === "video" ? "Đang quét…" : "Quét"}
+                      </button>
+                    </div>
+                    <small id="video-source-status" className={
+                      mediaSourceScan.isError && mediaSourceScan.variables === "video"
+                        ? "source-scan-status is-error"
+                        : "source-scan-status"
+                    }>
+                      {mediaSourceScan.isPending && mediaSourceScan.variables === "video"
+                        ? "Robot đang dò thiết bị camera trên máy đang chạy…"
+                        : mediaSourceScan.isError && mediaSourceScan.variables === "video"
+                          ? mediaSourceScan.error instanceof Error
+                            ? mediaSourceScan.error.message
+                            : "Không quét được camera trên robot"
+                          : sourcesScanned.video
+                            ? videoSources.length
+                              ? `Đã xác minh ${videoSources.length} camera trả về hình ảnh.${rejectedVideoSources.length ? ` Loại ${rejectedVideoSources.length} nguồn không hoạt động.` : ""}`
+                              : rejectedVideoSources.length
+                                ? `Không có camera hoạt động. ${rejectedVideoSources[0].reason}`
+                                : "Robot không phát hiện camera nào. Kiểm tra kết nối USB và quyền truy cập thiết bị."
+                            : form.video_source_type === "camera"
+                              ? "Bấm Quét để chỉ giữ camera thực sự trả về được frame hình ảnh."
+                              : "Bấm Quét để dò camera USB; nguồn không trả về hình ảnh sẽ bị loại."}
+                    </small>
+                  </label>
+                  <label className="config-field">
+                    <span>Chất lượng video</span>
+                    <select
+                      value={form.video_profile}
+                      onChange={(event) => setForm({
+                        ...form,
+                        video_profile: event.target.value as RobotConfigurationUpdate["video_profile"],
+                      })}
+                    >
+                      <option value="full_hd">Full HD · 1080p</option>
+                      <option value="balanced">Cân bằng · 720p</option>
+                      <option value="low_bandwidth">Băng thông thấp · 480p</option>
+                    </select>
+                  </label>
+                  <label className="config-field">
+                    <span>Giao thức RTSP</span>
+                    <select
+                      value={form.rtsp_transport}
+                      disabled={form.video_source_type !== "rtsp"}
+                      onChange={(event) => setForm({
+                        ...form,
+                        rtsp_transport: event.target.value as RobotConfigurationUpdate["rtsp_transport"],
+                      })}
+                    >
+                      <option value="tcp">TCP · ưu tiên ổn định</option>
+                      <option value="udp">UDP · ưu tiên độ trễ</option>
+                    </select>
+                  </label>
+                  <div className="media-test-actions config-field--wide">
+                    <button type="button" className="button button--outline" disabled={mediaTest.isPending} onClick={() => mediaTest.mutate("video")}>
+                      <Activity size={16} /> Kiểm tra nguồn camera
+                    </button>
+                    <button type="button" className="button button--outline" onClick={() => void togglePreview()}>
+                      {previewTransport.current ? <Square size={15} /> : <Play size={15} />}
+                      {previewTransport.current ? "Dừng xem trước" : "Xem trước camera"}
+                    </button>
+                    {mediaTest.data?.diagnostic === "video" && (
+                      <span className={mediaTest.data.ok ? "is-ok" : ""}>
+                        {mediaTest.data.detail ?? (
+                          mediaTest.data.ok ? "Nguồn video hoạt động" : "Nguồn video không hoạt động"
+                        )}
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {tab === "audio" && (
+                <>
+                  <label className="config-field">
+                    <span><Mic2 size={17} /> Loại nguồn âm thanh</span>
+                    <select
+                      value={form.audio_source_type}
+                      onChange={(event) => {
+                        const audio_source_type = event.target.value as RobotConfigurationUpdate["audio_source_type"];
+                        setForm({
+                          ...form,
+                          audio_source_type,
+                          audio_source: "",
+                        });
+                      }}
+                    >
+                      <option value="device">Microphone USB/ALSA</option>
+                      <option value="file">Tệp hoặc audio stream</option>
+                      <option value="silent">Không dùng microphone</option>
+                    </select>
+                  </label>
+                  <label className="config-field">
+                    <span>Tên microphone</span>
+                    <input
+                      value={form.microphone_label}
+                      onChange={(event) => setForm({ ...form, microphone_label: event.target.value })}
+                      required
+                    />
+                  </label>
+                  <label className="config-field config-field--wide">
+                    <span><Mic2 size={17} /> Nguồn microphone</span>
+                    <div className="source-picker">
+                      {form.audio_source_type === "device" ? (
+                          <select
+                            value={form.audio_source}
+                            onChange={(event) => setForm({ ...form, audio_source: event.target.value })}
+                            required
+                            aria-describedby="audio-source-status"
+                          >
+                            <option value="" disabled>
+                              {sourcesScanned.audio
+                                ? audioSources.length
+                                  ? "Chọn microphone vừa tìm thấy"
+                                  : "Không tìm thấy microphone ALSA"
+                                : "Bấm Quét để tìm microphone trên robot"}
+                            </option>
+                            {form.audio_source && !audioSources.some((source) => source.value === form.audio_source) && (
+                              <option value={form.audio_source}>
+                                {sourcesScanned.audio ? "Không còn kết nối" : "Cấu hình hiện tại"} · {form.audio_source}
+                              </option>
+                            )}
+                            {audioSources.map((source) => (
+                              <option value={source.value} key={`${source.type}-${source.value}`}>
+                                {source.label} · {source.value}
+                              </option>
+                            ))}
+                          </select>
+                      ) : (
+                        <input
+                          value={form.audio_source}
+                          disabled={form.audio_source_type === "silent"}
+                          onChange={(event) => setForm({ ...form, audio_source: event.target.value })}
+                          placeholder="/media/microphone.wav hoặc URL audio"
+                          required={form.audio_source_type === "file"}
+                        />
+                      )}
+                      <button
+                        type="button"
+                        className="source-scan-button"
+                        onClick={() => scanMediaSources("audio")}
+                        disabled={robot?.status !== "online" || mediaSourceScan.isPending}
+                      >
+                        <RefreshCw
+                          size={17}
+                          className={mediaSourceScan.isPending && mediaSourceScan.variables === "audio" ? "is-spinning" : ""}
+                        />
+                        {mediaSourceScan.isPending && mediaSourceScan.variables === "audio" ? "Đang quét…" : "Quét"}
+                      </button>
+                    </div>
+                    <small id="audio-source-status" className={
+                      mediaSourceScan.isError && mediaSourceScan.variables === "audio"
+                        ? "source-scan-status is-error"
+                        : "source-scan-status"
+                    }>
+                      {mediaSourceScan.isPending && mediaSourceScan.variables === "audio"
+                        ? "Robot đang dò ALSA, PipeWire và Bluetooth; hãy nói vào microphone…"
+                        : mediaSourceScan.isError && mediaSourceScan.variables === "audio"
+                          ? mediaSourceScan.error instanceof Error
+                            ? mediaSourceScan.error.message
+                            : "Không quét được microphone trên robot"
+                          : sourcesScanned.audio
+                            ? audioSources.length
+                              ? `Đã xác minh ${audioSources.length} microphone có tín hiệu.${rejectedAudioSources.length ? ` Loại ${rejectedAudioSources.length} nguồn không hoạt động.` : ""} Cấu hình âm thanh chưa thay đổi; bấm Lưu cấu hình để áp dụng.`
+                              : rejectedAudioSources.length
+                                ? (() => {
+                                    const rejectedSource = rejectedAudioSources.find((source) => source.type === "pulse")
+                                      ?? rejectedAudioSources[0];
+                                    return `Không có microphone hoạt động. ${rejectedSource.label}: ${rejectedSource.reason}`;
+                                  })()
+                                : "Robot không phát hiện microphone nào. Với Bluetooth, chọn HSP/HFP, bật tiếng rồi quét khi đang nói."
+                            : form.audio_source_type === "device"
+                              ? "Bấm Quét và nói vào microphone; thao tác quét không thay đổi cấu hình âm thanh."
+                              : "Bấm Quét để dò nguồn đang hoạt động; chỉ nút Lưu cấu hình mới áp dụng thay đổi âm thanh."}
+                    </small>
+                  </label>
+                  <div className="media-test-actions config-field--wide">
+                    <button type="button" className="button button--outline" disabled={mediaTest.isPending} onClick={() => mediaTest.mutate("audio")}>
+                      <Mic2 size={16} /> Kiểm tra microphone
+                    </button>
+                    {mediaTest.data?.diagnostic === "audio" && (
+                      <span className={mediaTest.data.ok ? "is-ok" : ""}>
+                        {mediaTest.data.detail ?? (
+                          mediaTest.data.ok ? "Microphone có tín hiệu" : "Microphone không hoạt động"
+                        )}
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {save.isError && (
+            <p role="alert" className="form-error">
+              {save.error instanceof Error ? save.error.message : "Không lưu được cấu hình"}
+            </p>
+          )}
+          <div className="configuration-actions">
+            <span>{saved && <><Check size={17} /> Đã lưu cấu hình</>}</span>
+            <button type="button" className="button button--outline" onClick={() => navigate("/robots")}>Huỷ</button>
+            <button
+              type="submit"
+              className="button button--primary"
+              disabled={loading || configurationQuery.isError || save.isPending}
+            >
+              <Save size={18} /> {save.isPending ? "Đang lưu…" : "Lưu cấu hình"}
+            </button>
+          </div>
+        </form>
+      </section>
+    </main>
+  );
+}

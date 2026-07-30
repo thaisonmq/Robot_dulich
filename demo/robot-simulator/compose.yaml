@@ -1,0 +1,62 @@
+name: rovera-robot-edge
+
+services:
+  robot-simulator:
+    build:
+      context: .
+      args:
+        ROVERA_EDGE_VERSION: "1.1.0"
+    hostname: ${ROBOT_CONTAINER_HOSTNAME:-rovera-robot-edge}
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 10s
+
+    env_file:
+      - .env
+    environment:
+      # Đường dẫn ổn định bên trong container. Thư mục host được cấu hình
+      # riêng bằng ROBOT_STATE_DIR và không mất khi compose down/up.
+      ROBOT_STATE_FILE: /var/lib/rovera/device.json
+      # Cho phép FFmpeg/pactl trong container thấy nguồn thu PipeWire/PulseAudio
+      # của user trên host (đặc biệt là microphone Bluetooth HSP/HFP).
+      PULSE_SERVER: unix:/run/rovera-pulse/native
+
+    user: "${ROBOT_UID:-1000}:${ROBOT_GID:-1000}"
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${AUDIO_GID:-29}"
+      # Intel/AMD VA-API and RK3588 DRM buffers use /dev/dri/renderD*.
+      - "${RENDER_GID:-110}"
+
+    volumes:
+      - type: bind
+        source: ${ROBOT_STATE_DIR:-./state}
+        target: /var/lib/rovera
+      - type: bind
+        source: /etc/machine-id
+        target: /etc/machine-id
+        read_only: true
+      # Cho phép Center liệt kê và lựa chọn camera/microphone sau khi robot
+      # online mà không cần khai báo trước /dev/videoN trong .env.
+      - type: bind
+        source: /dev
+        target: /dev
+      - type: bind
+        source: ${PULSE_SOCKET_DIR:-/run/user/1000/pulse}
+        target: /run/rovera-pulse
+        read_only: true
+
+    device_cgroup_rules:
+      - "c 81:* rmw"
+      - "c 116:* rmw"
+      - "c 226:* rmw"
+      # Rockchip MPP/RGA are misc devices on vendor kernels. DMA heap normally
+      # uses a dynamic high major; 254 covers the Orange Pi 5 BSP images.
+      - "c 10:* rmw"
+      - "c 254:* rmw"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

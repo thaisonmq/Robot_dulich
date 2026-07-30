@@ -1,0 +1,150 @@
+name: rovera
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rovera}
+      POSTGRES_USER: ${POSTGRES_USER:-rovera}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rovera-dev-password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+    networks: [rovera]
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [rovera]
+
+  livekit:
+    image: livekit/livekit-server:v1.12.0
+    command: ["--config", "/etc/livekit.yaml"]
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-dev-secret-at-least-32-characters-long}"
+      # Advertise the host/LAN address instead of Docker's 172.x bridge address.
+      NODE_IP: "${LIVEKIT_NODE_IP:-192.168.6.145}"
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "${LIVEKIT_HTTP_PORT:-7880}:7880"
+      - "${LIVEKIT_TCP_PORT:-7881}:7881"
+      - "${LIVEKIT_UDP_START:-51000}-${LIVEKIT_UDP_END:-51020}:51000-51020/udp"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:7880"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    networks: [rovera]
+
+  coturn:
+    image: coturn/coturn:4.6.3-r3
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    ports:
+      - "${TURN_PORT:-3478}:3478/tcp"
+      - "${TURN_PORT:-3478}:3478/udp"
+      - "${TURN_UDP_START:-49160}-${TURN_UDP_END:-49200}:49160-49200/udp"
+    networks: [rovera]
+
+  center-backend:
+    build:
+      context: ../apps/center-backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-rovera}:${POSTGRES_PASSWORD:-rovera-dev-password}@postgres:5432/${POSTGRES_DB:-rovera}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-change-me}
+      DEMO_EMAIL: ${DEMO_EMAIL:-demo@rovera.local}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-demo123}
+      ROBOT_ID: ${ROBOT_ID:-ROBOT-001}
+      ROBOT_CREDENTIAL: ${ROBOT_CREDENTIAL:-robot-001-change-me}
+      LIVEKIT_URL: ${LIVEKIT_PUBLIC_URL:-ws://localhost:7880}
+      LIVEKIT_ROBOT_URL: ${LIVEKIT_ROBOT_URL:-ws://livekit:7880}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-dev-secret-at-least-32-characters-long}
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+      SAMPLE_DATA_DIR: /sample-data
+    volumes:
+      - ../../sample-data:/sample-data:ro
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 8s
+      timeout: 4s
+      retries: 15
+    networks: [rovera]
+
+  robot-simulator:
+    build:
+      context: ../../demo/robot-simulator
+    environment:
+      CENTER_API_URL: http://center-backend:8000
+      CENTER_ROBOT_WS_URL: ws://center-backend:8000/ws/robot/connect
+      ROBOT_ID: ${ROBOT_ID:-ROBOT-001}
+      ROBOT_CREDENTIAL: ${ROBOT_CREDENTIAL:-robot-001-change-me}
+      SIMULATOR_MEDIA_SOURCE_TYPE: ${SIMULATOR_MEDIA_SOURCE_TYPE:-test}
+      SIMULATOR_MEDIA_SOURCE: ${SIMULATOR_MEDIA_SOURCE:-}
+      SIMULATOR_AUDIO_SOURCE: ${SIMULATOR_AUDIO_SOURCE:-}
+      SIMULATOR_CAMERA_DEVICE: ${SIMULATOR_CAMERA_DEVICE:-/dev/video0}
+      SIMULATOR_CAMERA_FORMAT: ${SIMULATOR_CAMERA_FORMAT:-}
+      SIMULATOR_CAMERA_WIDTH: ${SIMULATOR_CAMERA_WIDTH:-1920}
+      SIMULATOR_CAMERA_HEIGHT: ${SIMULATOR_CAMERA_HEIGHT:-1080}
+      SIMULATOR_CAMERA_FPS: ${SIMULATOR_CAMERA_FPS:-25}
+      MEDIA_ENABLED: ${MEDIA_ENABLED:-true}
+      VIDEO_WIDTH: ${VIDEO_WIDTH:-1920}
+      VIDEO_HEIGHT: ${VIDEO_HEIGHT:-1080}
+      VIDEO_FPS: ${VIDEO_FPS:-25}
+      VIDEO_BITRATE: ${VIDEO_BITRATE:-8000000}
+      SIMULATOR_RTSP_PATH: ${SIMULATOR_RTSP_PATH:-}
+    volumes:
+      - ../../sample-data/media:/media:ro
+    depends_on:
+      center-backend:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    restart: unless-stopped
+    networks: [rovera]
+
+  center-frontend:
+    build:
+      context: ../apps/center-frontend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      center-backend:
+        condition: service_healthy
+    networks: [rovera]
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  rovera:
+    driver: bridge

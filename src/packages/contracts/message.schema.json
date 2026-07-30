@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rovera.local/schemas/message.schema.json",
+  "title": "RealtimeMessage",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "message_id",
+    "schema_version",
+    "message_type",
+    "robot_id",
+    "session_id",
+    "sequence",
+    "timestamp",
+    "ttl_ms",
+    "payload"
+  ],
+  "properties": {
+    "message_id": { "type": "string", "format": "uuid" },
+    "schema_version": { "const": "1.0" },
+    "message_type": {
+      "enum": [
+        "control.velocity",
+        "control.stop",
+        "command.ack",
+        "robot.heartbeat",
+        "robot.pose",
+        "robot.health",
+        "navigation.goal",
+        "navigation.cancel",
+        "navigation.status",
+        "configuration.get",
+        "configuration.update",
+        "configuration.state",
+        "diagnostics.ping",
+        "diagnostics.result",
+        "media.sources.get",
+        "media.sources",
+        "media.probe",
+        "gateway.welcome"
+      ]
+    },
+    "robot_id": { "type": "string", "pattern": "^[A-Z0-9-]{3,64}$" },
+    "session_id": { "type": "string", "maxLength": 128 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "ttl_ms": { "type": "integer", "minimum": 0, "maximum": 30000 },
+    "payload": { "type": "object" }
+  }
+}

@@ -1,0 +1,69 @@
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Square } from "lucide-react";
+import type { InputState, InputAction, OnScreenControlAdapter } from "../utils/input";
+
+interface Props {
+  adapter: OnScreenControlAdapter;
+  input: InputState;
+  disabled: boolean;
+}
+
+const controls: { action: InputAction; label: string; icon: typeof ArrowUp; className: string }[] = [
+  { action: "forward", label: "Tiến", icon: ArrowUp, className: "control-pad__up" },
+  { action: "left", label: "Trái", icon: ArrowLeft, className: "control-pad__left" },
+  { action: "right", label: "Phải", icon: ArrowRight, className: "control-pad__right" },
+  { action: "backward", label: "Lùi", icon: ArrowDown, className: "control-pad__down" },
+];
+
+export function ControlPad({ adapter, input, disabled }: Props) {
+  const pointerDown = (event: React.PointerEvent<HTMLButtonElement>, action: InputAction) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    adapter.press(action);
+  };
+  const pointerUp = (event: React.PointerEvent<HTMLButtonElement>, action: InputAction) => {
+    event.preventDefault();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    adapter.release(action);
+  };
+  const direction = controls.find(({ action }) => input[action as keyof InputState])?.action ?? "idle";
+  return (
+    <div className={`control-pad control-pad--${direction}`} aria-label="Điều khiển robot">
+      <div className="control-pad__orbit" aria-hidden="true">
+        <i /><i /><i /><i />
+      </div>
+      <div className="control-pad__motion" aria-hidden="true" />
+      {controls.map(({ action, label, icon: Icon, className }) => (
+        <button
+          type="button"
+          key={action}
+          className={`${className} ${input[action as keyof InputState] ? "is-pressed" : ""}`}
+          aria-label={label}
+          aria-pressed={input[action as keyof InputState]}
+          disabled={disabled}
+          onPointerDown={(event) => pointerDown(event, action)}
+          onPointerUp={(event) => pointerUp(event, action)}
+          onPointerCancel={() => adapter.cancel()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <Icon size={28} strokeWidth={1.8} />
+          <span>{label}</span>
+        </button>
+      ))}
+      <button
+        type="button"
+        className="control-pad__stop"
+        aria-label="Dừng khẩn cấp"
+        disabled={disabled}
+        onClick={() => {
+          adapter.press("emergencyStop");
+          adapter.release("emergencyStop");
+        }}
+      >
+        <Square size={19} fill="currentColor" />
+        <span>DỪNG</span>
+      </button>
+    </div>
+  );
+}

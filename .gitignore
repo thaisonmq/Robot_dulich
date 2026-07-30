@@ -1,0 +1,13 @@
+.env
+node_modules/
+dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.db
+playwright-report/
+test-results/
+.DS_Store
+demo/robot-simulator/state/

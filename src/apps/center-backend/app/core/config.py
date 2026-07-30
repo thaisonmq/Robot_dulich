@@ -1,0 +1,46 @@
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    app_name: str = "ROVERA Center"
+    environment: str = "development"
+    database_url: str = "sqlite:///./rovera.db"
+    redis_url: str = "redis://localhost:6379/0"
+    jwt_secret: str = "change-me-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 480
+    demo_email: str = "demo@rovera.local"
+    demo_password: str = "demo123"
+    seed_demo_robot: bool = False
+    robot_id: str = "ROBOT-001"
+    robot_credential: str = "robot-001-change-me"
+    robot_token_expire_minutes: int = 15
+    session_timeout_seconds: int = 1800
+    heartbeat_timeout_seconds: int = 8
+    media_lease_ttl_seconds: int = 30
+    media_lease_renew_seconds: int = 10
+    livekit_url: str = "ws://localhost:7880"
+    livekit_robot_url: str = ""
+    livekit_api_key: str = "devkey"
+    livekit_api_secret: str = "dev-secret-at-least-32-characters-long"
+    simulator_media_source: str = ""
+    simulator_rtsp_path: str = ""
+    cors_origins: str = "http://localhost:5173,http://localhost:8080"
+    sample_data_dir: str = "/sample-data"
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [value.strip() for value in self.cors_origins.split(",") if value.strip()]
+
+    @property
+    def robot_livekit_url(self) -> str:
+        return self.livekit_robot_url.strip() or self.livekit_url
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

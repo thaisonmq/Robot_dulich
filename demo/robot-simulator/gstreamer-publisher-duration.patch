@@ -1,0 +1,180 @@
+diff --git a/main.go b/main.go
+index b2ab7a4..7790f9f 100644
+--- a/main.go
++++ b/main.go
+@@ -49,15 +49,27 @@ func main() {
+ 				Usage:    "access token for authentication. canPublish permission is required",
+ 				Required: true,
+ 			},
++			&cli.IntFlag{
++				Name:  "pacer-bitrate",
++				Usage: "base RTP pacing bitrate in bits per second; zero disables pacing",
++				Value: 8000000,
++			},
++			&cli.IntFlag{
++				Name:  "pacer-max-latency-ms",
++				Usage: "maximum RTP pacer queue latency in milliseconds",
++				Value: 60,
++			},
+ 			&cli.BoolFlag{
+ 				Name: "verbose",
+ 			},
+ 		},
+ 		Action: func(_ context.Context, c *cli.Command) error {
+ 			publisher := NewPublisher(PublisherParams{
+-				URL:            c.String("url"),
+-				Token:          c.String("token"),
+-				PipelineString: strings.Join(c.Args().Slice(), " "),
++				URL:             c.String("url"),
++				Token:           c.String("token"),
++				PipelineString:  strings.Join(c.Args().Slice(), " "),
++				PacerBitrate:    c.Int("pacer-bitrate"),
++				PacerMaxLatency: time.Duration(c.Int("pacer-max-latency-ms")) * time.Millisecond,
+ 			})
+ 			if delay := c.Int("delay"); delay != 0 {
+ 				time.Sleep(time.Duration(delay) * time.Second)
+diff --git a/publish.go b/publish.go
+index d5ec92f..946f5bc 100644
+--- a/publish.go
++++ b/publish.go
+@@ -20,10 +20,12 @@ import (
+ 	"os/signal"
+ 	"slices"
+ 	"syscall"
++	"time"
+ 
+ 	"github.com/go-gst/go-glib/glib"
+ 	"github.com/go-gst/go-gst/gst"
+ 
++	"github.com/livekit/mediatransportutil/pkg/pacer"
+ 	"github.com/livekit/protocol/livekit"
+ 	"github.com/livekit/protocol/logger"
+ 	lksdk "github.com/livekit/server-sdk-go/v2"
+@@ -42,9 +44,11 @@ var (
+ )
+ 
+ type PublisherParams struct {
+-	URL            string
+-	Token          string
+-	PipelineString string
++	URL             string
++	Token           string
++	PipelineString  string
++	PacerBitrate    int
++	PacerMaxLatency time.Duration
+ }
+ 
+ type Publisher struct {
+@@ -80,9 +84,18 @@ func (p *Publisher) Start() error {
+ 		// TODO: stop publishing and exit
+ 	}
+ 	p.room = lksdk.NewRoom(cb)
+-	err := p.room.JoinWithToken(p.params.URL, p.params.Token,
++	connectOptions := []lksdk.ConnectOption{
+ 		lksdk.WithAutoSubscribe(false),
+-	)
++	}
++	if p.params.PacerBitrate > 0 && p.params.PacerMaxLatency > 0 {
++		pacerFactory := pacer.NewPacerFactory(
++			pacer.LeakyBucketPacer,
++			pacer.WithBitrate(p.params.PacerBitrate),
++			pacer.WithMaxLatency(p.params.PacerMaxLatency),
++		)
++		connectOptions = append(connectOptions, lksdk.WithPacer(pacerFactory))
++	}
++	err := p.room.JoinWithToken(p.params.URL, p.params.Token, connectOptions...)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/track.go b/track.go
+index f6494a6..cdf1e40 100644
+--- a/track.go
++++ b/track.go
+@@ -37,6 +37,7 @@ type publisherTrack struct {
+ 	publication *lksdk.LocalTrackPublication
+ 	isEnded     atomic.Bool
+ 	onEOS       func()
++	lastTimestamp gst.ClockTime
+ }
+ 
+ func createPublisherTrack(mimeType string) (*publisherTrack, error) {
+@@ -61,8 +62,9 @@ func createPublisherTrack(mimeType string) (*publisherTrack, error) {
+ 	}
+ 
+ 	pt := &publisherTrack{
+-		mimeType: webrtcMime,
+-		sink:     sink,
++		mimeType:      webrtcMime,
++		sink:          sink,
++		lastTimestamp: gst.ClockTimeNone,
+ 	}
+ 	sink.SetCallbacks(&app.SinkCallbacks{
+ 		EOSFunc:       pt.handleEOS,
+@@ -112,13 +114,9 @@ func (t *publisherTrack) handleSample(sink *app.Sink) gst.FlowReturn {
+ 		return gst.FlowError
+ 	}
+ 
+-	duration := buffer.Duration()
+-	// pts := buffer.PresentationTimestamp()
+-	// ts := time.Duration(segment.ToRunningTime(gst.FormatTime, uint64(pts)))
+-
+ 	err := t.track.WriteSample(media.Sample{
+ 		Data:     buffer.Bytes(),
+-		Duration: time.Duration(duration),
++		Duration: t.sampleDuration(s, buffer),
+ 	}, nil)
+ 
+ 	switch {
+@@ -131,6 +129,52 @@ func (t *publisherTrack) handleSample(sink *app.Sink) gst.FlowReturn {
+ 	}
+ }
+ 
++func (t *publisherTrack) sampleDuration(s *gst.Sample, buffer *gst.Buffer) time.Duration {
++	if duration := buffer.Duration().AsDuration(); duration != nil && *duration > 0 {
++		t.rememberTimestamp(buffer)
++		return *duration
++	}
++
++	timestamp := buffer.PresentationTimestamp()
++	if timestamp == gst.ClockTimeNone {
++		timestamp = buffer.DecodingTimestamp()
++	}
++	if timestamp != gst.ClockTimeNone {
++		if t.lastTimestamp != gst.ClockTimeNone && timestamp > t.lastTimestamp {
++			duration := time.Duration(timestamp - t.lastTimestamp)
++			t.lastTimestamp = timestamp
++			if duration >= time.Millisecond && duration <= time.Second {
++				return duration
++			}
++		} else {
++			t.lastTimestamp = timestamp
++		}
++	}
++
++	if caps := s.GetCaps(); caps != nil && caps.GetSize() > 0 {
++		if value, err := caps.GetStructureAt(0).GetValue("framerate"); err == nil {
++			if framerate, ok := value.(*gst.FractionValue); ok {
++				if framerate.Num() > 0 && framerate.Denom() > 0 {
++					return time.Second * time.Duration(framerate.Denom()) /
++						time.Duration(framerate.Num())
++				}
++			}
++		}
++	}
++
++	// A missing GStreamer duration becomes -1 ns when cast directly to
++	// time.Duration. That makes the outgoing RTP timestamp jump backwards and
++	// Chromium renders the stream in bursts. Keep a safe live-video fallback.
++	return time.Second / 30
++}
++
++func (t *publisherTrack) rememberTimestamp(buffer *gst.Buffer) {
++	t.lastTimestamp = buffer.PresentationTimestamp()
++	if t.lastTimestamp == gst.ClockTimeNone {
++		t.lastTimestamp = buffer.DecodingTimestamp()
++	}
++}
++
+ func (t *publisherTrack) onRTCP(packet rtcp.Packet) {
+ 	// TODO: handle PLI by instructing the encoder to send a keyframe
+ }

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <rect width="1600" height="1000" fill="#f7f6f2"/>
+  <g fill="none" stroke="#c8ced8" stroke-width="8">
+    <path d="M80 80H1520V920H80Z"/>
+    <path d="M80 310H420V80M420 310V540H80M420 420H820V80M820 420H1160V80M1160 310H1520"/>
+    <path d="M80 760H360V540M360 760H700V920M700 650H1080V920M1080 540V760H1520"/>
+  </g>
+  <g fill="#dfe3e9">
+    <rect x="470" y="150" width="220" height="110"/>
+    <rect x="900" y="150" width="180" height="110"/>
+    <rect x="170" y="620" width="120" height="70"/>
+    <rect x="760" y="700" width="180" height="100"/>
+    <rect x="1200" y="610" width="200" height="100"/>
+  </g>
+  <g fill="#eaebe7" stroke="#c8ced8" stroke-width="3">
+    <rect x="100" y="360" width="1400" height="120"/>
+    <rect x="500" y="500" width="600" height="110"/>
+  </g>
+</svg>

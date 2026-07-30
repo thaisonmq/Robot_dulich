@@ -1,0 +1,11 @@
+{
+  "route_id": "ROUTE-SAMPLE-001",
+  "robot_id": "ROBOT-001",
+  "destination_id": "DEST-001",
+  "points": [
+    { "x": 5.5, "y": 6.0 },
+    { "x": 7.85, "y": 6.0 },
+    { "x": 10.2, "y": 5.6 }
+  ],
+  "distance_m": 5.1
+}

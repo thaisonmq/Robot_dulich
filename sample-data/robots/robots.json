@@ -1,0 +1,15 @@
+[
+  {
+    "robot_id": "ROBOT-001",
+    "name": "Tour Guide 01",
+    "site_id": "Bảo tàng trung tâm",
+    "map_id": "MAP-001",
+    "credential_env": "ROBOT_CREDENTIAL",
+    "capabilities": {
+      "media": ["video", "audio"],
+      "control": ["velocity", "stop"],
+      "navigation": true,
+      "source": "simulator"
+    }
+  }
+]

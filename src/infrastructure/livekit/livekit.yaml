@@ -1,0 +1,12 @@
+port: 7880
+bind_addresses:
+  - "0.0.0.0"
+rtc:
+  tcp_port: 7881
+  port_range_start: 51000
+  port_range_end: 51020
+  use_external_ip: false
+redis:
+  address: redis:6379
+logging:
+  level: info

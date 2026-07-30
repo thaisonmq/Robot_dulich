@@ -1,0 +1,10 @@
+__pycache__
+.pytest_cache
+.env
+.venv
+dist
+state
+.pytest_cache
+**/__pycache__
+tests
+tests
