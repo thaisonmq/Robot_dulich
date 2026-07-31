@@ -138,7 +138,10 @@ class ConnectionHub:
             robot.last_seen_at = datetime.now(timezone.utc)
             return old
 
-    async def unregister_robot(self, robot_id: str, socket: WebSocket) -> None:
+    async def unregister_robot(
+        self, robot_id: str, socket: WebSocket
+    ) -> SessionRuntime | None:
+        closed_session: SessionRuntime | None = None
         async with self.lock:
             if self.robot_sockets.get(robot_id) is socket:
                 self.robot_sockets.pop(robot_id, None)
@@ -152,7 +155,10 @@ class ConnectionHub:
                         if not future.done():
                             future.set_exception(ConnectionError("robot_offline"))
                         self.pending_robot_requests.pop(request_id, None)
-                await self._close_session_for_robot(robot_id)
+                closed_session = self._close_session_for_robot(robot_id)
+        if closed_session is not None:
+            await self.notify_session_ended(closed_session)
+        return closed_session
 
     async def create_session(self, robot_id: str, user_id: str, timeout_seconds: int) -> SessionRuntime:
         async with self.lock:
@@ -162,8 +168,12 @@ class ConnectionHub:
                 raise KeyError("robot_not_found")
             if robot.status != "online":
                 raise ValueError("robot_offline")
-            if robot_id in self.robot_session:
-                raise RuntimeError("robot_busy")
+            existing_session_id = self.robot_session.get(robot_id)
+            if existing_session_id is not None:
+                existing_session = self.sessions.get(existing_session_id)
+                if existing_session is not None and existing_session.status == "active":
+                    raise RuntimeError("robot_busy")
+                self.robot_session.pop(robot_id, None)
             session = SessionRuntime(
                 session_id=str(uuid4()),
                 robot_id=robot_id,
@@ -214,13 +224,51 @@ class ConnectionHub:
         await self.notify_session_ended(closed_session)
         return True
 
-    async def _close_session_for_robot(self, robot_id: str) -> None:
+    def _close_session_for_robot(self, robot_id: str) -> SessionRuntime | None:
         session_id = self.robot_session.pop(robot_id, None)
         if session_id and session_id in self.sessions:
             session = self.sessions[session_id]
             session.status = "ended"
             session.ended_at = datetime.now(timezone.utc)
             session.end_reason = "robot_disconnected"
+            return session
+        return None
+
+    async def expire_unconnected_sessions(
+        self, connect_timeout_seconds: int
+    ) -> list[SessionRuntime]:
+        """Release sessions whose browser never opened the control channel."""
+        now = datetime.now(timezone.utc)
+        closed_sessions: list[SessionRuntime] = []
+        async with self.lock:
+            for session in self.sessions.values():
+                if (
+                    session.status != "active"
+                    or session.control_connected
+                    or (now - session.started_at).total_seconds()
+                    < connect_timeout_seconds
+                ):
+                    continue
+                session.status = "ended"
+                session.ended_at = now
+                session.end_reason = "control_connect_timeout"
+                if self.robot_session.get(session.robot_id) == session.session_id:
+                    self.robot_session.pop(session.robot_id, None)
+                robot = self.robots.get(session.robot_id)
+                if robot:
+                    robot.availability = (
+                        "available" if robot.status == "online" else "offline"
+                    )
+                closed_sessions.append(session)
+
+        for session in closed_sessions:
+            await self.set_media_lease(
+                session.robot_id,
+                f"session:{session.session_id}",
+                active=False,
+            )
+            await self.notify_session_ended(session)
+        return closed_sessions
 
     def _expire_sessions(self) -> None:
         now = datetime.now(timezone.utc)
@@ -521,6 +569,16 @@ class ConnectionHub:
         return route
 
     def robot_view(self, robot: RobotRuntime) -> dict[str, Any]:
+        session_id = self.robot_session.get(robot.robot_id)
+        session = self.sessions.get(session_id) if session_id else None
+        if session_id and (session is None or session.status != "active"):
+            self.robot_session.pop(robot.robot_id, None)
+            session_id = None
+        robot.availability = (
+            "offline"
+            if robot.status != "online"
+            else "busy" if session_id else "available"
+        )
         return {
             "robot_id": robot.robot_id,
             "name": robot.name,

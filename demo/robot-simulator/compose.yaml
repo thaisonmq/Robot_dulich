@@ -8,7 +8,10 @@ services:
         ROVERA_EDGE_VERSION: "1.1.0"
     hostname: ${ROBOT_CONTAINER_HOSTNAME:-rovera-robot-edge}
     network_mode: host
-    restart: unless-stopped
+    # The container is started by the per-user systemd unit after the host
+    # PipeWire/Pulse socket exists.  Letting Docker restore it during boot
+    # would make Docker create /run/user/1000/pulse as root before login.
+    restart: "no"
     stop_grace_period: 10s
 
     env_file:
@@ -45,6 +48,9 @@ services:
         source: ${PULSE_SOCKET_DIR:-/run/user/1000/pulse}
         target: /run/rovera-pulse
         read_only: true
+        bind:
+          # Never let Docker create the host's per-user runtime directory.
+          create_host_path: false
 
     device_cgroup_rules:
       - "c 81:* rmw"

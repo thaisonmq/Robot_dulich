@@ -25,6 +25,17 @@ async def presence_monitor() -> None:
             settings.media_lease_ttl_seconds,
             settings.media_lease_renew_seconds,
         )
+        abandoned_sessions = await hub.expire_unconnected_sessions(
+            settings.session_connect_timeout_seconds
+        )
+        if abandoned_sessions:
+            with SessionLocal.begin() as database:
+                for session in abandoned_sessions:
+                    record = database.get(ControlSession, session.session_id)
+                    if record:
+                        record.status = "ended"
+                        record.ended_at = session.ended_at
+                        record.end_reason = session.end_reason
         hub.expire_preview_leases()
         now = datetime.now(timezone.utc)
         for robot_id, robot in hub.robots.items():

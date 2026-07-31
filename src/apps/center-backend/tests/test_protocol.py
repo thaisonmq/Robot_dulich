@@ -44,6 +44,77 @@ async def test_session_lock_allows_only_one_controller() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_without_control_channel_releases_robot_lock() -> None:
+    hub = ConnectionHub()
+    sent: list[dict] = []
+
+    class Socket:
+        async def send_json(self, data: dict) -> None:
+            sent.append(data)
+
+    robot = hub.sync_registry_robot(
+        "ROBOT-001", "Test robot", "Test site", "MAP-001", enrolled=True
+    )
+    robot.status = "online"
+    hub.robot_sockets["ROBOT-001"] = Socket()  # type: ignore[assignment]
+    abandoned = await hub.create_session("ROBOT-001", "user-a", 60)
+    abandoned.started_at = datetime.now(timezone.utc) - timedelta(seconds=16)
+
+    closed = await hub.expire_unconnected_sessions(15)
+
+    assert [session.session_id for session in closed] == [abandoned.session_id]
+    assert abandoned.status == "ended"
+    assert abandoned.end_reason == "control_connect_timeout"
+    assert "ROBOT-001" not in hub.robot_session
+    assert robot.availability == "available"
+    assert sent[-1]["message_type"] == "media.stop"
+
+    replacement = await hub.create_session("ROBOT-001", "user-b", 60)
+    replacement.control_connected = True
+    replacement.started_at = datetime.now(timezone.utc) - timedelta(seconds=16)
+    assert await hub.expire_unconnected_sessions(15) == []
+    assert hub.robot_session["ROBOT-001"] == replacement.session_id
+
+
+@pytest.mark.asyncio
+async def test_robot_disconnect_releases_session_and_notifies_controller() -> None:
+    hub = ConnectionHub()
+    notifications: list[dict] = []
+
+    class RobotSocket:
+        async def send_json(self, _data: dict) -> None:
+            pass
+
+    class UserSocket:
+        async def send_json(self, data: dict) -> None:
+            notifications.append(data)
+
+        async def close(self, **_kwargs: object) -> None:
+            pass
+
+    robot_socket = RobotSocket()
+    robot = hub.sync_registry_robot(
+        "ROBOT-001", "Test robot", "Test site", "MAP-001", enrolled=True
+    )
+    hub.robot_sockets["ROBOT-001"] = robot_socket  # type: ignore[assignment]
+    robot.status = "online"
+    session = await hub.create_session("ROBOT-001", "user-a", 60)
+    hub.session_sockets[session.session_id] = {UserSocket()}  # type: ignore[arg-type]
+
+    closed = await hub.unregister_robot(
+        "ROBOT-001", robot_socket  # type: ignore[arg-type]
+    )
+
+    assert closed is session
+    assert session.status == "ended"
+    assert session.end_reason == "robot_disconnected"
+    assert "ROBOT-001" not in hub.robot_session
+    assert robot.availability == "offline"
+    assert notifications[0]["message_type"] == "session.ended"
+    assert notifications[0]["payload"]["reason"] == "robot_disconnected"
+
+
+@pytest.mark.asyncio
 async def test_robot_routing_targets_only_selected_socket() -> None:
     hub = ConnectionHub()
     sent: list[dict] = []

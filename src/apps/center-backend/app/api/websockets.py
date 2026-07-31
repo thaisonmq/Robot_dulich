@@ -110,13 +110,20 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
     except (WebSocketDisconnect, ValueError, json.JSONDecodeError):
         pass
     finally:
-        await hub.unregister_robot(robot_id, socket)
+        closed_session = await hub.unregister_robot(robot_id, socket)
         with SessionLocal.begin() as database:
             entity = database.query(Robot).filter(Robot.robot_id == robot_id).first()
             if entity:
-                entity.status = "offline"
-                entity.availability = "offline"
-                entity.last_seen_at = hub.robots[robot_id].last_seen_at
+                runtime = hub.robots[robot_id]
+                entity.status = runtime.status
+                entity.availability = runtime.availability
+                entity.last_seen_at = runtime.last_seen_at
+            if closed_session is not None:
+                record = database.get(ControlSession, closed_session.session_id)
+                if record:
+                    record.status = "ended"
+                    record.ended_at = closed_session.ended_at
+                    record.end_reason = closed_session.end_reason
             connection = database.get(RobotConnection, connection_id)
             if connection:
                 connection.disconnected_at = datetime.now(timezone.utc)

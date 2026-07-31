@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     robot_credential: str = "robot-001-change-me"
     robot_token_expire_minutes: int = 15
     session_timeout_seconds: int = 1800
+    session_connect_timeout_seconds: int = 15
     heartbeat_timeout_seconds: int = 8
     media_lease_ttl_seconds: int = 30
     media_lease_renew_seconds: int = 10

@@ -243,7 +243,7 @@ export const api = {
       body: JSON.stringify({ camera_id: cameraId }),
     }),
   deleteSession: (sessionId: string) =>
-    request(`/api/sessions/${sessionId}`, { method: "DELETE" }),
+    request(`/api/sessions/${sessionId}`, { method: "DELETE", keepalive: true }),
   map: (mapId: string) => request<MapData>(`/api/maps/${mapId}`),
   destinations: (mapId: string) =>
     request<Destination[]>(`/api/maps/${mapId}/destinations`),
