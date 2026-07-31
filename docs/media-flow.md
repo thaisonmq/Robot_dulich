@@ -10,7 +10,14 @@ Each robot uses room `robot-{robot_id}`.
   replace each other.
 - Browser subscribes to robot tracks and only publishes its microphone after an
   explicit click.
-- Simulator subscribes to user audio and reports the received level.
+- Simulator subscribes only to `user:*` audio, converts it to 48 kHz mono PCM,
+  and plays it through the configured ALSA or PipeWire/PulseAudio speaker. A
+  bounded latest-frame queue prevents an interrupted output from accumulating
+  stale conversation audio; the output process reconnects with capped backoff.
+  Device capture/playback uses native `arecord`/`aplay` or `pacat`: ALSA uses a
+  60 ms buffer with a 20 ms period, Pulse playback targets 60/20 ms, and Pulse
+  capture targets 20/10 ms. FFmpeg remains the fallback and its Pulse output is
+  explicitly capped at 60 ms instead of the roughly two-second default.
 
 The backend signs short-lived, room-scoped tokens for both operator and robot.
 LiveKit API secrets never reach the browser, simulator, or Orange Pi. The edge
@@ -34,6 +41,13 @@ with the supplied coturn service or a managed TURN endpoint.
 Set `SIMULATOR_AUDIO_SOURCE` to a file/stream readable by FFmpeg. Without it,
 the simulator publishes a silent audio track so the media contract remains
 present. Sources reconnect with capped exponential delay.
+
+The robot speaker is selected separately through `audio_output_type` and
+`audio_output`. Hardware discovery probes ALSA playback devices and available
+PipeWire/PulseAudio sinks without an audible tone. The explicit speaker
+diagnostic plays a short low-volume tone before the operator saves the
+configuration. The container runner exposes `/dev/snd` and, when available,
+the host Pulse socket to the edge process.
 
 `VIDEO_PIPELINE=auto` is the default. At startup the edge checks the source
 codec and probes each encoder by encoding one real test frame. It selects
@@ -68,8 +82,8 @@ delta frames.
   For minimum startup latency, configure the RTSP camera's I-frame/GOP interval
   to about one second.
 - The browser explicitly requests the highest video layer and monitors decoded
-  frame progress. Its 50 ms playout target absorbs normal LAN and USB capture
-  jitter without adding a large surveillance-style delay. During a short
+  frame progress. Its adaptive 60–140 ms playout target absorbs normal LAN and
+  USB capture jitter without adding a large surveillance-style delay. During a short
   reconnect it captures one reduced recovery frame, then restores the live
   element when decoded frames resume. It does not read pixels or copy Full HD
   frames periodically during healthy playback.

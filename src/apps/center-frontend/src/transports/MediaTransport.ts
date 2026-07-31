@@ -17,6 +17,7 @@ export interface IMediaTransport {
 export class LiveKitMediaTransport implements IMediaTransport {
   private room: Room | null = null;
   private speakerMuted = false;
+  private microphoneEnabled = false;
   private watchdog: number | null = null;
   private frameCallback: number | null = null;
   private lastFrameAt = 0;
@@ -45,7 +46,7 @@ export class LiveKitMediaTransport implements IMediaTransport {
   ) {}
 
   async connect(url: string, token: string): Promise<void> {
-    await this.disconnect(false);
+    await this.disconnect(false, true);
     this.manualDisconnect = false;
     this.connection = { url, token };
     this.onState("connecting");
@@ -140,12 +141,16 @@ export class LiveKitMediaTransport implements IMediaTransport {
       this.scheduleRoomReconnect();
     });
     await room.connect(url, token);
+    if (this.microphoneEnabled) {
+      await room.localParticipant.setMicrophoneEnabled(true);
+    }
     this.startWatchdog();
   }
 
   async enableMicrophone(enabled: boolean): Promise<void> {
     if (!this.room) throw new Error("Media chưa kết nối");
     await this.room.localParticipant.setMicrophoneEnabled(enabled);
+    this.microphoneEnabled = enabled;
   }
 
   setSpeakerMuted(muted: boolean): void {
@@ -153,8 +158,12 @@ export class LiveKitMediaTransport implements IMediaTransport {
     this.audioElement.muted = muted;
   }
 
-  async disconnect(clearRecoveryFrame = true): Promise<void> {
+  async disconnect(
+    clearRecoveryFrame = true,
+    preserveMicrophone = false,
+  ): Promise<void> {
     this.manualDisconnect = true;
+    if (!preserveMicrophone) this.microphoneEnabled = false;
     this.videoTrackGeneration += 1;
     this.videoTrack = null;
     this.audioTrack = null;

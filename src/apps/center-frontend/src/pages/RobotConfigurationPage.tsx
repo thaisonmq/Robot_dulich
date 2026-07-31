@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Activity, ArrowLeft, Camera, Check, CircleDot, Cpu, EthernetPort, Mic2,
-  Play, RadioTower, RefreshCw, Save, ServerCog, Square, Video, WifiOff,
+  Play, RadioTower, RefreshCw, Save, ServerCog, Square, Video, Volume2, WifiOff,
 } from "lucide-react";
 import { api } from "../api/client";
 import { Brand } from "../components/Brand";
@@ -24,6 +24,9 @@ const EMPTY_CONFIGURATION: RobotConfigurationUpdate = {
   audio_source_type: "silent",
   audio_source: "",
   microphone_label: "Microphone chính",
+  audio_output_type: "disabled",
+  audio_output: "",
+  speaker_label: "Loa chính",
 };
 
 function configurationForm(
@@ -32,10 +35,14 @@ function configurationForm(
   const {
     device_ip, video_source_type, video_source, video_profile, rtsp_transport,
     camera_label, audio_source_type, audio_source, microphone_label,
+    audio_output_type, audio_output, speaker_label,
   } = configuration;
   return {
     device_ip, video_source_type, video_source, video_profile, rtsp_transport,
     camera_label, audio_source_type, audio_source, microphone_label,
+    audio_output_type: audio_output_type ?? "disabled",
+    audio_output: audio_output ?? "",
+    speaker_label: speaker_label ?? "Loa chính",
   };
 }
 
@@ -49,11 +56,14 @@ export function RobotConfigurationPage() {
   const [previewState, setPreviewState] = useState("idle");
   const [videoSources, setVideoSources] = useState<MediaSource[]>([]);
   const [audioSources, setAudioSources] = useState<MediaSource[]>([]);
+  const [speakerSources, setSpeakerSources] = useState<MediaSource[]>([]);
   const [rejectedVideoSources, setRejectedVideoSources] = useState<RejectedMediaSource[]>([]);
   const [rejectedAudioSources, setRejectedAudioSources] = useState<RejectedMediaSource[]>([]);
+  const [rejectedSpeakerSources, setRejectedSpeakerSources] = useState<RejectedMediaSource[]>([]);
   const [sourcesScanned, setSourcesScanned] = useState({
     video: false,
     audio: false,
+    speaker: false,
   });
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -78,9 +88,11 @@ export function RobotConfigurationPage() {
   useEffect(() => {
     setVideoSources([]);
     setAudioSources([]);
+    setSpeakerSources([]);
     setRejectedVideoSources([]);
     setRejectedAudioSources([]);
-    setSourcesScanned({ video: false, audio: false });
+    setRejectedSpeakerSources([]);
+    setSourcesScanned({ video: false, audio: false, speaker: false });
   }, [robotId]);
   useEffect(() => {
     const heartbeat = window.setInterval(() => {
@@ -116,11 +128,11 @@ export function RobotConfigurationPage() {
     mutationFn: () => api.testRobotConnection(robotId),
   });
   const mediaTest = useMutation({
-    mutationFn: (mediaKind: "video" | "audio") =>
+    mutationFn: (mediaKind: "video" | "audio" | "speaker") =>
       api.testRobotMedia(robotId, mediaKind, form),
   });
   const mediaSourceScan = useMutation({
-    mutationFn: (mediaKind: "video" | "audio") =>
+    mutationFn: (mediaKind: "video" | "audio" | "speaker") =>
       api.robotMediaSources(robotId, mediaKind),
     onSuccess: (sources, mediaKind) => {
       if (mediaKind === "video") {
@@ -131,7 +143,7 @@ export function RobotConfigurationPage() {
             ? current
             : { ...current, video_source_type: "camera", video_source: "" });
         }
-      } else {
+      } else if (mediaKind === "audio") {
         setAudioSources(sources.audio_sources);
         setRejectedAudioSources(sources.rejected_audio_sources ?? []);
         if (sources.audio_sources.length) {
@@ -139,12 +151,21 @@ export function RobotConfigurationPage() {
             ? current
             : { ...current, audio_source_type: "device", audio_source: "" });
         }
+      } else {
+        const availableSpeakers = sources.speaker_sources ?? [];
+        setSpeakerSources(availableSpeakers);
+        setRejectedSpeakerSources(sources.rejected_speaker_sources ?? []);
+        if (availableSpeakers.length) {
+          setForm((current) => current.audio_output_type === "device"
+            ? current
+            : { ...current, audio_output_type: "device", audio_output: "" });
+        }
       }
       setSourcesScanned((current) => ({ ...current, [mediaKind]: true }));
     },
   });
 
-  function scanMediaSources(mediaKind: "video" | "audio") {
+  function scanMediaSources(mediaKind: "video" | "audio" | "speaker") {
     mediaSourceScan.reset();
     mediaSourceScan.mutate(mediaKind);
   }
@@ -270,7 +291,7 @@ export function RobotConfigurationPage() {
               className={tab === "audio" ? "is-active" : ""}
               onClick={() => setTab("audio")}
             >
-              <Mic2 size={16} /> {t("Microphone")}
+              <Volume2 size={16} /> {t("Âm thanh")}
             </button>
           </nav>
 
@@ -481,6 +502,119 @@ export function RobotConfigurationPage() {
                       <span className={mediaTest.data.ok ? "is-ok" : ""}>
                         {mediaTest.data.detail ?? (
                           mediaTest.data.ok ? t("Nguồn video hoạt động") : t("Nguồn video không hoạt động")
+                        )}
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {tab === "audio" && (
+                <>
+                  <div className="audio-section-title config-field--wide">
+                    <Volume2 size={18} />
+                    <span>
+                      <strong>{t("Loa phát đàm thoại")}</strong>
+                      <small>{t("Âm thanh microphone của người điều khiển sẽ phát qua loa này.")}</small>
+                    </span>
+                  </div>
+                  <label className="config-field">
+                    <span><Volume2 size={17} /> {t("Đầu ra âm thanh")}</span>
+                    <select
+                      value={form.audio_output_type}
+                      onChange={(event) => {
+                        const audio_output_type = event.target.value as RobotConfigurationUpdate["audio_output_type"];
+                        setForm({ ...form, audio_output_type, audio_output: "" });
+                      }}
+                    >
+                      <option value="device">{t("Loa thiết bị")}</option>
+                      <option value="disabled">{t("Không phát loa")}</option>
+                    </select>
+                  </label>
+                  <label className="config-field">
+                    <span>{t("Tên loa")}</span>
+                    <input
+                      value={form.speaker_label}
+                      onChange={(event) => setForm({ ...form, speaker_label: event.target.value })}
+                      required
+                    />
+                  </label>
+                  <label className="config-field config-field--wide">
+                    <span><Volume2 size={17} /> {t("Thiết bị loa")}</span>
+                    <div className="source-picker">
+                      <select
+                        value={form.audio_output}
+                        disabled={form.audio_output_type === "disabled"}
+                        onChange={(event) => setForm({ ...form, audio_output: event.target.value })}
+                        required={form.audio_output_type === "device"}
+                        aria-describedby="speaker-source-status"
+                      >
+                        <option value="" disabled>
+                          {sourcesScanned.speaker
+                            ? speakerSources.length
+                              ? t("Chọn loa vừa tìm thấy")
+                              : t("Không tìm thấy loa trên robot")
+                            : t("Bấm Quét để tìm loa trên robot")}
+                        </option>
+                        {form.audio_output && !speakerSources.some((source) => source.value === form.audio_output) && (
+                          <option value={form.audio_output}>
+                            {sourcesScanned.speaker ? t("Không còn kết nối") : t("Cấu hình hiện tại")} · {form.audio_output}
+                          </option>
+                        )}
+                        {speakerSources.map((source) => (
+                          <option value={source.value} key={`${source.type}-${source.value}`}>
+                            {source.label} · {source.value}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        className="source-scan-button"
+                        onClick={() => scanMediaSources("speaker")}
+                        disabled={robot?.status !== "online" || mediaSourceScan.isPending}
+                      >
+                        <RefreshCw
+                          size={17}
+                          className={mediaSourceScan.isPending && mediaSourceScan.variables === "speaker" ? "is-spinning" : ""}
+                        />
+                        {mediaSourceScan.isPending && mediaSourceScan.variables === "speaker" ? t("Đang quét…") : t("Quét")}
+                      </button>
+                    </div>
+                    <small id="speaker-source-status" className={
+                      mediaSourceScan.isError && mediaSourceScan.variables === "speaker"
+                        ? "source-scan-status is-error"
+                        : "source-scan-status"
+                    }>
+                      {mediaSourceScan.isPending && mediaSourceScan.variables === "speaker"
+                        ? t("Robot đang dò đầu ra ALSA và PipeWire/PulseAudio…")
+                        : mediaSourceScan.isError && mediaSourceScan.variables === "speaker"
+                          ? mediaSourceScan.error instanceof Error
+                            ? mediaSourceScan.error.message
+                            : t("Không quét được loa trên robot")
+                          : sourcesScanned.speaker
+                            ? speakerSources.length
+                              ? `${t("Đã xác minh {count} đầu ra loa.", { count: speakerSources.length })}${rejectedSpeakerSources.length ? ` ${t("Loại {count} đầu ra không hoạt động.", { count: rejectedSpeakerSources.length })}` : ""} ${t("Chọn loa, kiểm tra âm báo rồi lưu cấu hình.")}`
+                              : rejectedSpeakerSources.length
+                                ? `${t("Không có loa hoạt động.")} ${rejectedSpeakerSources[0].label}: ${rejectedSpeakerSources[0].reason}`
+                                : t("Robot không phát hiện loa nào. Kiểm tra USB, Bluetooth hoặc dịch vụ PipeWire/PulseAudio.")
+                            : form.audio_output_type === "device"
+                              ? t("Bấm Quét để tìm loa; quá trình quét không phát âm thanh.")
+                              : t("Chọn Loa thiết bị rồi bấm Quét để cấu hình đàm thoại hai chiều.")}
+                    </small>
+                  </label>
+                  <div className="media-test-actions config-field--wide">
+                    <button
+                      type="button"
+                      className="button button--outline"
+                      disabled={mediaTest.isPending || form.audio_output_type === "disabled" || !form.audio_output}
+                      onClick={() => mediaTest.mutate("speaker")}
+                    >
+                      <Volume2 size={16} /> {t("Phát âm kiểm tra loa")}
+                    </button>
+                    {mediaTest.data?.diagnostic === "speaker" && (
+                      <span className={mediaTest.data.ok ? "is-ok" : ""}>
+                        {mediaTest.data.detail ?? (
+                          mediaTest.data.ok ? t("Loa phát âm thanh thành công") : t("Loa không hoạt động")
                         )}
                       </span>
                     )}

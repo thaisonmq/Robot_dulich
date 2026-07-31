@@ -191,13 +191,13 @@ export const api = {
     request<DiagnosticResult>(`/api/robots/${robotId}/diagnostics/connection`, {
       method: "POST",
     }),
-  robotMediaSources: (robotId: string, mediaKind: "video" | "audio") =>
+  robotMediaSources: (robotId: string, mediaKind: "video" | "audio" | "speaker") =>
     request<MediaSources>(
       `/api/robots/${robotId}/media-sources?media_kind=${mediaKind}`,
     ),
   testRobotMedia: (
     robotId: string,
-    mediaKind: "video" | "audio",
+    mediaKind: "video" | "audio" | "speaker",
     configuration: RobotConfigurationUpdate,
   ) => request<DiagnosticResult>(`/api/robots/${robotId}/diagnostics/media`, {
     method: "POST",

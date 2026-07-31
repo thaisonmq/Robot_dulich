@@ -1,4 +1,6 @@
 import asyncio
+from fractions import Fraction
+from subprocess import CompletedProcess
 
 import pytest
 from livekit import rtc
@@ -6,9 +8,12 @@ from livekit.rtc._proto import room_pb2 as proto_room
 
 from simulator.config import SimulatorConfig
 from simulator.media import (
+    AUDIO_PLAYBACK_BUFFER_FRAMES,
+    CameraCaptureProfile,
     EncodedVideoPlan,
     MediaPublisher,
     VIDEO_JITTER_BUFFER_FRAMES,
+    parse_v4l2_capture_profile,
     video_pacer_max_latency_ms,
     video_pipe_buffer_limit,
 )
@@ -131,12 +136,91 @@ def test_usb_camera_uses_v4l2_device_settings() -> None:
         "-fflags", "+discardcorrupt+nobuffer",
         "-flags", "low_delay",
         "-thread_queue_size", "1",
+        "-use_wallclock_as_timestamps", "1",
         "-f", "v4l2",
         "-framerate", "30",
         "-video_size", "1280x720",
         "-input_format", "mjpeg",
         "-i", "/dev/video2",
     ]
+
+
+def test_v4l2_profile_parser_uses_negotiated_fractional_rate() -> None:
+    profile = parse_v4l2_capture_profile(
+        """
+Format Video Capture:
+    Width/Height      : 1920/1080
+    Pixel Format      : 'MJPG' (Motion-JPEG, compressed)
+Streaming Parameters Video Capture:
+    Frames per second: 29.970 (30000/1001)
+""",
+        device="/dev/video2",
+        fallback_format="",
+        fallback_width=1280,
+        fallback_height=720,
+        fallback_fps=Fraction(25, 1),
+    )
+
+    assert profile == CameraCaptureProfile(
+        device="/dev/video2",
+        input_format="mjpeg",
+        width=1920,
+        height=1080,
+        fps=Fraction(30000, 1001),
+    )
+
+
+def test_camera_profile_reads_back_what_v4l2_actually_accepted(
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs) -> CompletedProcess[str]:
+        commands.append(command)
+        if "--list-formats-ext" in command:
+            return CompletedProcess(
+                command,
+                0,
+                "[0]: 'MJPG' (Motion-JPEG, compressed)\n",
+                "",
+            )
+        if "--get-parm" in command:
+            return CompletedProcess(
+                command,
+                0,
+                """
+Format Video Capture:
+    Width/Height      : 1920/1080
+    Pixel Format      : 'MJPG' (Motion-JPEG, compressed)
+Streaming Parameters Video Capture:
+    Frames per second: 30.000 (30/1)
+""",
+                "",
+            )
+        return CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        "simulator.media.shutil.which",
+        lambda binary: f"/usr/bin/{binary}" if binary == "v4l2-ctl" else None,
+    )
+    monkeypatch.setattr("simulator.media.subprocess.run", run)
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="camera",
+            simulator_media_source="/dev/video2",
+            simulator_camera_fps=25,
+        )
+    )
+
+    profile = publisher._camera_capture_profile_for_source()
+
+    assert profile.fps == Fraction(30, 1)
+    assert profile.input_format == "mjpeg"
+    set_command = next(command for command in commands if "--set-parm" in command)
+    assert set_command[set_command.index("--set-parm") + 1] == "25"
+    arguments = publisher._video_input_args()
+    assert arguments[arguments.index("-framerate") + 1] == "30"
+    assert arguments[arguments.index("-input_format") + 1] == "mjpeg"
 
 
 def test_bluetooth_microphone_uses_pipewire_pulse_source(monkeypatch) -> None:
@@ -155,9 +239,196 @@ def test_bluetooth_microphone_uses_pipewire_pulse_source(monkeypatch) -> None:
     assert publisher._audio_input_args() == [
         "-f",
         "pulse",
+        "-sample_rate",
+        "48000",
+        "-channels",
+        "1",
+        "-fragment_size",
+        "1920",
         "-i",
         "bluez_input.41_42_FF_68_01_59.headset-head-unit",
     ]
+
+
+def test_bluetooth_microphone_uses_low_latency_native_capture(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "simulator.media.prepare_audio_source", lambda source: None
+    )
+    monkeypatch.setattr(
+        "simulator.media.shutil.which", lambda binary: f"/usr/bin/{binary}"
+    )
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_audio_source_type="device",
+            simulator_audio_source="pulse:bluez_input.test.headset-head-unit",
+        )
+    )
+
+    command = publisher._audio_capture_command(48_000, 1)
+
+    assert command[0] == "pacat"
+    assert "--record" in command
+    assert "--device=bluez_input.test.headset-head-unit" in command
+    assert "--latency-msec=20" in command
+    assert "--process-time-msec=10" in command
+
+
+def test_alsa_microphone_uses_bounded_native_buffer(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "simulator.media.prepare_audio_source", lambda source: None
+    )
+    monkeypatch.setattr(
+        "simulator.media.shutil.which", lambda binary: f"/usr/bin/{binary}"
+    )
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_audio_source_type="device",
+            simulator_audio_source="plughw:CARD=Mic,DEV=0",
+        )
+    )
+
+    command = publisher._audio_capture_command(48_000, 1)
+
+    assert command[0] == "arecord"
+    assert "--device=plughw:CARD=Mic,DEV=0" in command
+    assert "--buffer-time=60000" in command
+    assert "--period-time=20000" in command
+
+
+def test_pulse_speaker_uses_selected_device_with_low_latency(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "simulator.media.prepare_audio_output", lambda output: None
+    )
+    monkeypatch.setattr(
+        "simulator.media.audio_output_args",
+        lambda output: ["-f", "pulse", output.removeprefix("pulse:")],
+    )
+    monkeypatch.setattr(
+        "simulator.media.shutil.which", lambda binary: f"/usr/bin/{binary}"
+    )
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_audio_output_type="device",
+            simulator_audio_output="pulse:alsa_output.usb-speaker",
+        )
+    )
+
+    command = publisher._audio_output_command()
+
+    assert command[0] == "pacat"
+    assert "--playback" in command
+    assert "--device=alsa_output.usb-speaker" in command
+    assert "--latency-msec=60" in command
+    assert "--process-time-msec=20" in command
+
+
+def test_alsa_speaker_uses_bounded_native_buffer(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "simulator.media.prepare_audio_output", lambda output: None
+    )
+    monkeypatch.setattr(
+        "simulator.media.audio_output_args",
+        lambda output: ["-f", "alsa", output],
+    )
+    monkeypatch.setattr(
+        "simulator.media.shutil.which", lambda binary: f"/usr/bin/{binary}"
+    )
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_audio_output_type="device",
+            simulator_audio_output="plughw:CARD=Speaker,DEV=0",
+        )
+    )
+
+    command = publisher._audio_output_command()
+
+    assert command[0] == "aplay"
+    assert "--device=plughw:CARD=Speaker,DEV=0" in command
+    assert "--buffer-time=60000" in command
+    assert "--period-time=20000" in command
+
+
+def test_speaker_queue_discards_old_audio_before_it_adds_latency() -> None:
+    frames: asyncio.Queue[bytes] = asyncio.Queue(
+        maxsize=AUDIO_PLAYBACK_BUFFER_FRAMES
+    )
+    for index in range(AUDIO_PLAYBACK_BUFFER_FRAMES + 3):
+        MediaPublisher._queue_latest_audio_frame(frames, bytes([index]))
+
+    queued = [frames.get_nowait() for _ in range(frames.qsize())]
+
+    assert len(queued) == AUDIO_PLAYBACK_BUFFER_FRAMES
+    assert queued[0] == bytes([3])
+    assert queued[-1] == bytes([AUDIO_PLAYBACK_BUFFER_FRAMES + 2])
+
+
+@pytest.mark.asyncio
+async def test_speaker_playback_writes_pcm_to_native_player(monkeypatch) -> None:
+    writes: list[bytes] = []
+
+    class Stdin:
+        def write(self, data: bytes) -> None:
+            writes.append(data)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class Process:
+        def __init__(self) -> None:
+            self.stdin = Stdin()
+            self.stdout = None
+            self.stderr = None
+            self.returncode = None
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return int(self.returncode or 0)
+
+    async def create_process(*args, **kwargs):
+        return Process()
+
+    async def capture_output(_process) -> str:
+        await asyncio.Future()
+        return ""
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(
+        "simulator.media.prepare_audio_output", lambda output: None
+    )
+    monkeypatch.setattr(
+        "simulator.media.audio_output_args",
+        lambda output: ["-f", "alsa", output],
+    )
+    monkeypatch.setattr(
+        MediaPublisher, "_capture_process_output", staticmethod(capture_output)
+    )
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_audio_output_type="device",
+            simulator_audio_output="plughw:CARD=Speaker,DEV=0",
+        )
+    )
+    frames: asyncio.Queue[bytes] = asyncio.Queue(maxsize=2)
+    task = asyncio.create_task(publisher._audio_playback_loop(frames))
+
+    frames.put_nowait(b"pcm-frame")
+    for _ in range(5):
+        await asyncio.sleep(0)
+        if writes:
+            break
+
+    assert writes == [b"pcm-frame"]
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -342,6 +613,108 @@ def test_usb_h264_direct_pipeline_keeps_requested_capture_profile() -> None:
     assert "enc" not in command
 
 
+@pytest.mark.parametrize(
+    ("capture_fps", "video_fps", "expected_fps"),
+    [
+        (Fraction(30, 1), 25, Fraction(25, 1)),
+        (Fraction(60, 1), 30, Fraction(30, 1)),
+        (Fraction(15, 1), 25, Fraction(15, 1)),
+        (Fraction(30000, 1001), 30, Fraction(30000, 1001)),
+    ],
+)
+def test_camera_bridge_drops_surplus_frames_without_upsampling(
+    monkeypatch,
+    capture_fps: Fraction,
+    video_fps: int,
+    expected_fps: Fraction,
+) -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="camera",
+            simulator_media_source="/dev/video2",
+            simulator_camera_format="mjpeg",
+            video_fps=video_fps,
+        )
+    )
+    profile = CameraCaptureProfile(
+        device="/dev/video2",
+        input_format="mjpeg",
+        width=1920,
+        height=1080,
+        fps=capture_fps,
+    )
+    monkeypatch.setattr(
+        publisher, "_camera_capture_profile_for_source", lambda: profile
+    )
+
+    plan = EncodedVideoPlan("bridge", "mjpeg", "libx264")
+    command = publisher._encoded_ffmpeg_command(plan)
+    video_filter = command[command.index("-vf") + 1]
+
+    expected_text = (
+        str(expected_fps.numerator)
+        if expected_fps.denominator == 1
+        else f"{expected_fps.numerator}/{expected_fps.denominator}"
+    )
+    assert "setpts=PTS-STARTPTS" in video_filter
+    assert f"fps=fps={expected_text}:round=down:eof_action=pass" in video_filter
+    assert command[command.index("-framerate") + 1] == (
+        str(capture_fps.numerator)
+        if capture_fps.denominator == 1
+        else f"{capture_fps.numerator}/{capture_fps.denominator}"
+    )
+    assert command[command.index("-fps_mode") + 1] == "passthrough"
+    assert command[command.index("-g") + 1] == str(round(float(expected_fps)))
+
+
+@pytest.mark.parametrize(
+    ("capture_fps", "video_fps", "expected_mode", "expected_encoder"),
+    [
+        (Fraction(30, 1), 30, "direct", "copy"),
+        (Fraction(60, 1), 30, "bridge", "libx264"),
+    ],
+)
+def test_h264_camera_only_uses_passthrough_when_no_frame_drop_is_needed(
+    monkeypatch,
+    capture_fps: Fraction,
+    video_fps: int,
+    expected_mode: str,
+    expected_encoder: str,
+) -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="camera",
+            simulator_media_source="/dev/video2",
+            simulator_camera_format="h264",
+            video_fps=video_fps,
+        )
+    )
+    profile = CameraCaptureProfile(
+        device="/dev/video2",
+        input_format="h264",
+        width=1920,
+        height=1080,
+        fps=capture_fps,
+    )
+    monkeypatch.setattr(
+        publisher, "_camera_capture_profile_for_source", lambda: profile
+    )
+    monkeypatch.setattr(publisher, "_probe_source_codec", lambda: "h264")
+    monkeypatch.setattr(
+        publisher, "_select_video_encoder", lambda: ("libx264", "ffmpeg")
+    )
+    monkeypatch.setattr("simulator.media.shutil.which", lambda _binary: "/usr/bin/tool")
+    monkeypatch.setattr(
+        "simulator.media.subprocess.run",
+        lambda command, **_kwargs: CompletedProcess(command, 0, "", ""),
+    )
+
+    plan = publisher._build_encoded_video_plan()
+
+    assert plan.mode == expected_mode
+    assert plan.encoder == expected_encoder
+
+
 def test_h264_file_bridge_copies_codec_without_raw_video_pipe() -> None:
     publisher = MediaPublisher(
         SimulatorConfig(
@@ -409,8 +782,10 @@ def test_vaapi_bridge_uses_cqp_for_older_intel_drivers() -> None:
     assert command[command.index("-async_depth") + 1] == "1"
     assert command[command.index("-low_power") + 1] == "1"
     assert command[command.index("-quality") + 1] == "8"
-    assert "setpts=N/(25*TB)" in command[command.index("-vf") + 1]
-    assert "fps=" not in command[command.index("-vf") + 1]
+    assert "setpts=PTS-STARTPTS" in command[command.index("-vf") + 1]
+    assert "fps=fps=25:round=down:eof_action=pass" in command[
+        command.index("-vf") + 1
+    ]
     assert "-b:v" not in command
     assert "-maxrate" not in command
 

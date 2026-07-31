@@ -5,6 +5,9 @@ simulator độc lập trong [`demo`](./demo). Simulator và robot thật dùng 
 WebSocket/WebRTC contract; frontend không có nhánh logic dành riêng cho
 simulator.
 
+pi@192.168.6.170
+yahboom
+
 ## Chạy bằng một lệnh
 
 Yêu cầu Docker Engine + Docker Compose:
@@ -15,9 +18,7 @@ docker compose up -d
 
 Mở <http://localhost:8080>.
 
-- Email: `demo@rovera.local`
-- Mật khẩu: `demo123`
-- Admin cao nhất: `admin` / `admin123`
+
 - OpenAPI: <http://localhost:8080/docs>
 - Backend dành cho robot/LAN: `http://<CENTER_IP>:8888`
 - LiveKit: `ws://localhost:7880`
@@ -160,13 +161,22 @@ Màn **Danh sách robot** là device registry của Center:
 - chỉ lưu PBKDF2 hash của mật khẩu quản trị và SHA-256 của device credential
   trong database. Credential rõ chỉ được trả cho edge agent khi claim.
 
-Khi robot online, trang cấu hình đọc trực tiếp danh sách camera/microphone trên
-máy edge sau khi người vận hành bấm **Quét**. Camera và microphone phần cứng
-được chọn từ danh sách thay vì nhập tay `/dev/video0` hoặc
-`plughw:CARD=Camera,DEV=0`; trang cũng cho phép thử WSS, thử từng nguồn media và
-xem trước luồng camera. Quét chỉ giữ camera trả về được frame và microphone có
-kết nối/tín hiệu; endpoint rút cáp, bị tắt hoặc chỉ trả digital silence không
-được đưa vào danh sách chọn.
+Khi robot online, trang cấu hình đọc trực tiếp danh sách camera, microphone và
+loa trên máy edge sau khi người vận hành bấm **Quét**. Thiết bị phần cứng được
+chọn từ danh sách thay vì nhập tay `/dev/video0` hoặc
+`plughw:CARD=Camera,DEV=0`; trang cũng cho phép thử WSS, thử từng nguồn media,
+phát âm báo kiểm tra loa và xem trước luồng camera. Quét chỉ giữ camera trả về
+được frame, microphone có tín hiệu và đầu ra loa mở được; endpoint rút cáp, bị
+tắt hoặc không hoạt động không được đưa vào danh sách chọn.
+
+Để đàm thoại hai chiều trên thiết bị thật, mở **Cấu hình → Âm thanh**, quét và
+chọn microphone, chọn **Loa thiết bị**, quét/chọn loa, bấm **Phát âm kiểm tra
+loa**, rồi **Lưu cấu hình**. Trong Dashboard, người điều khiển bấm bật micro;
+browser phát microphone lên LiveKit, robot phát luồng nhận được qua loa đã lưu,
+và chiều ngược lại vẫn dùng microphone robot. Thu/phát thiết bị dùng buffer
+native 20–60 ms; hàng đợi chỉ giữ tối đa khoảng 40 ms âm thanh mới nhất để
+không tích luỹ độ trễ khi mạng chập chờn. Trình duyệt vận hành từ máy khác phải
+mở Center qua HTTPS (hoặc chạy trên `localhost`) và được cấp quyền micro.
 
 ## Chạy từng service bằng `run.sh`
 
@@ -272,11 +282,11 @@ credential người dùng. Với mạng LAN không có DNS/TLS, có thể dùng 
 `http/ws` để thử nghiệm; triển khai thật phải đặt reverse proxy TLS và dùng
 `https/wss`.
 
-Không cần khai báo nguồn camera/microphone trên máy edge trước khi chạy. Agent
-khởi động bằng test pattern, kết nối Center, rồi operator chọn USB camera, RTSP
-hoặc microphone trong màn **Cấu hình**. Lựa chọn được lưu cùng device state và
-được khôi phục sau khi reboot. Thiếu `/dev/video0` chỉ tạo cảnh báo, không chặn
-robot online.
+Không cần khai báo nguồn camera/microphone/loa trên máy edge trước khi chạy.
+Agent khởi động bằng test pattern, kết nối Center, rồi operator chọn USB camera,
+RTSP, microphone và loa trong màn **Cấu hình**. Lựa chọn được lưu cùng device
+state và được khôi phục sau khi reboot. Thiếu `/dev/video0` chỉ tạo cảnh báo,
+không chặn robot online.
 
 ## Dữ liệu và migration
 
@@ -295,8 +305,8 @@ PostgreSQL.
 
 - Route preview dùng đường Manhattan hợp lệ trong map mẫu, không phải Nav2.
 - Pin/network health simulator dùng giá trị mô phỏng.
-- Nguồn `test` phát moving test pattern và silent audio; file/RTSP/camera dùng
-  FFmpeg thật.
+- Nguồn `test` phát moving test pattern và silent audio; file/RTSP/camera,
+  microphone và loa thiết bị dùng FFmpeg thật.
 - Persistence adapter demo giữ presence/session realtime trong memory. Schema
   PostgreSQL đầy đủ; production multi-instance nên chuyển lock/presence sang
   Redis lease.

@@ -79,6 +79,12 @@ fi
 if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "Cảnh báo: chưa có FFmpeg; video/audio simulator sẽ không phát được." >&2
 fi
+if ! command -v aplay >/dev/null 2>&1 || ! command -v arecord >/dev/null 2>&1; then
+  echo "Cảnh báo: cài alsa-utils để thu/phát ALSA với độ trễ thấp." >&2
+fi
+if ! command -v pacat >/dev/null 2>&1; then
+  echo "Cảnh báo: cài pulseaudio-utils để thu/phát PipeWire/PulseAudio với độ trễ thấp." >&2
+fi
 
 export CENTER_API_URL="${CENTER_API_URL:-http://localhost:8888}"
 export CENTER_ROBOT_WS_URL="${CENTER_ROBOT_WS_URL:-ws://localhost:8888/ws/robot/connect}"

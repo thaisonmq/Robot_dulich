@@ -361,7 +361,7 @@ async def test_robot_connection(
 @router.get("/{robot_id}/media-sources")
 async def get_robot_media_sources(
     robot_id: str,
-    media_kind: Literal["video", "audio", "all"] = Query(default="all"),
+    media_kind: Literal["video", "audio", "speaker", "all"] = Query(default="all"),
     _: str = Depends(operator_user_id),
 ) -> dict:
     return await configuration_from_simulator(

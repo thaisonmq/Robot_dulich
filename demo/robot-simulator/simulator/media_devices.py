@@ -23,8 +23,13 @@ _ALSA_DEVICE = re.compile(
 _MAX_VOLUME = re.compile(r"max_volume:\s*(?P<value>-?inf|-?\d+(?:\.\d+)?)\s*dB")
 _AUDIO_SIGNAL_FLOOR_DB = -85.0
 _PULSE_PREFIX = "pulse:"
+_PULSE_PLAYBACK_BUFFER_MS = 60
+_PULSE_PLAYBACK_MIN_REQUEST_BYTES = 960
 _BLUETOOTH_SOURCE = re.compile(
     r"^bluez_input\.(?P<device>.+)\.headset-head-unit$"
+)
+_BLUETOOTH_SINK = re.compile(
+    r"^bluez_output\.(?P<device>.+)\.(?P<profile>.+)$"
 )
 _BLUETOOTH_PROFILES = (
     "headset-head-unit-msbc",
@@ -100,6 +105,11 @@ def parse_arecord_devices(output: str) -> list[dict[str, str]]:
     return _unique_sources(sources)
 
 
+def parse_aplay_devices(output: str) -> list[dict[str, str]]:
+    """Parse ALSA playback hardware using the same layout as ``arecord -l``."""
+    return parse_arecord_devices(output)
+
+
 def parse_pulse_sources(output: str) -> list[dict[str, str]]:
     """Parse capture sources exposed by PulseAudio or PipeWire's Pulse server."""
     sources: list[dict[str, str]] = []
@@ -115,6 +125,29 @@ def parse_pulse_sources(output: str) -> list[dict[str, str]]:
         label = match.group("label").strip()
         if name.endswith(".monitor") or label.lower().startswith("monitor of "):
             continue
+        sources.append(
+            {
+                "type": "pulse",
+                "value": f"{_PULSE_PREFIX}{name}",
+                "label": label,
+            }
+        )
+    return _unique_sources(sources)
+
+
+def parse_pulse_sinks(output: str) -> list[dict[str, str]]:
+    """Parse playback sinks exposed by PulseAudio or PipeWire's Pulse server."""
+    sources: list[dict[str, str]] = []
+    for raw_line in output.splitlines():
+        match = re.match(
+            r"^\s*\*?\s*(?P<name>\S+)\s+\[(?P<label>.+)]"
+            r"(?:\s+\([^)]*\))?\s*$",
+            raw_line,
+        )
+        if not match:
+            continue
+        name = match.group("name").strip()
+        label = match.group("label").strip()
         sources.append(
             {
                 "type": "pulse",
@@ -201,8 +234,23 @@ def discover_pulse_sources() -> list[dict[str, str]]:
     return _unique_sources(sources)
 
 
-def _discover_audio_sources_from_proc(
+def discover_pulse_sinks() -> list[dict[str, str]]:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-sinks", "pulse"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return parse_pulse_sinks(result.stdout)
+
+
+def _discover_audio_devices_from_proc(
     proc_asound_root: Path,
+    capability: str,
 ) -> list[dict[str, str]]:
     try:
         pcm_lines = (proc_asound_root / "pcm").read_text().splitlines()
@@ -212,7 +260,7 @@ def _discover_audio_sources_from_proc(
     sources: list[dict[str, str]] = []
     for line in pcm_lines:
         match = _PROC_PCM.match(line.strip())
-        if not match or "capture" not in match.group("capabilities").lower():
+        if not match or capability not in match.group("capabilities").lower():
             continue
         card_index = int(match.group("card_index"))
         device_index = int(match.group("device_index"))
@@ -232,6 +280,18 @@ def _discover_audio_sources_from_proc(
             }
         )
     return _unique_sources(sources)
+
+
+def _discover_audio_sources_from_proc(
+    proc_asound_root: Path,
+) -> list[dict[str, str]]:
+    return _discover_audio_devices_from_proc(proc_asound_root, "capture")
+
+
+def _discover_speaker_sources_from_proc(
+    proc_asound_root: Path,
+) -> list[dict[str, str]]:
+    return _discover_audio_devices_from_proc(proc_asound_root, "playback")
 
 
 def discover_audio_candidates(
@@ -254,6 +314,30 @@ def discover_audio_candidates(
         sources = _discover_audio_sources_from_proc(proc_asound_root)
     sources.extend(discover_pulse_sources())
     return _unique_sources(sources)
+
+
+def discover_speaker_candidates(
+    proc_asound_root: Path = Path("/proc/asound"),
+) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    try:
+        result = subprocess.run(
+            ["aplay", "-l"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=3,
+        )
+        sources = parse_aplay_devices(result.stdout)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    if not sources:
+        sources = _discover_speaker_sources_from_proc(proc_asound_root)
+    # Prefer the Pulse/PipeWire entry in the UI when both it and the raw ALSA
+    # device exist. Keeping both still allows headless edge images without a
+    # user audio server to select the hardware path directly.
+    return _unique_sources([*discover_pulse_sinks(), *sources])
 
 
 def _last_error(stderr: str, source: str) -> str:
@@ -292,6 +376,11 @@ def probe_video_source(source: str) -> tuple[bool, str]:
     except OSError:
         return False, "Không chạy được FFmpeg để kiểm tra camera"
     if result.returncode != 0:
+        # The selected camera is normally held open by the live FFmpeg process.
+        # Treat an exclusive-open failure as proof that this is a real capture
+        # device, otherwise refreshing the list would hide the camera in use.
+        if "device or resource busy" in result.stderr.lower():
+            return True, "Camera đang được luồng trực tiếp sử dụng"
         return False, _last_error(result.stderr, source)
     return True, "Camera đã trả về frame hình ảnh"
 
@@ -379,6 +468,23 @@ def _pulse_source_names() -> set[str]:
     }
 
 
+def _pulse_sink_names() -> set[str]:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-sinks", "pulse"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return {
+        source["value"].removeprefix(_PULSE_PREFIX)
+        for source in parse_pulse_sinks(result.stdout)
+    }
+
+
 def _bluetooth_card_name(source: str) -> str | None:
     if not source.startswith(_PULSE_PREFIX):
         return None
@@ -386,6 +492,71 @@ def _bluetooth_card_name(source: str) -> str | None:
     if not match:
         return None
     return f"bluez_card.{match.group('device')}"
+
+
+def _bluetooth_sink_device(output: str) -> str | None:
+    if not output.startswith(_PULSE_PREFIX):
+        return None
+    match = _BLUETOOTH_SINK.match(output.removeprefix(_PULSE_PREFIX))
+    return match.group("device") if match else None
+
+
+def resolve_audio_output(output: str) -> tuple[str, str]:
+    """Resolve a configured output to an FFmpeg muxer and current device name.
+
+    Bluetooth changes the suffix of its Pulse sink when the headset switches
+    between A2DP and HSP/HFP. Match the stable device part so a saved speaker
+    remains usable after enabling that headset's microphone.
+    """
+    if not output.startswith(_PULSE_PREFIX):
+        return "alsa", output
+    requested_sink = output.removeprefix(_PULSE_PREFIX)
+    available_sinks = _pulse_sink_names()
+    if requested_sink in available_sinks:
+        return "pulse", requested_sink
+    bluetooth_device = _bluetooth_sink_device(output)
+    if bluetooth_device:
+        prefix = f"bluez_output.{bluetooth_device}."
+        replacement = next(
+            (sink for sink in sorted(available_sinks) if sink.startswith(prefix)),
+            None,
+        )
+        if replacement:
+            return "pulse", replacement
+    raise ValueError("Loa PipeWire/PulseAudio không còn khả dụng")
+
+
+def audio_output_args(output: str) -> list[str]:
+    output_format, resolved_output = resolve_audio_output(output)
+    if output_format == "pulse":
+        # FFmpeg's Pulse output defaults to a roughly two-second buffer. Keep
+        # the fallback and the speaker diagnostic conversational instead. The
+        # native runtime path uses pacat/aplay with the same latency goal.
+        return [
+            "-f",
+            output_format,
+            "-buffer_duration",
+            str(_PULSE_PLAYBACK_BUFFER_MS),
+            "-prebuf",
+            "0",
+            "-minreq",
+            str(_PULSE_PLAYBACK_MIN_REQUEST_BYTES),
+            resolved_output,
+        ]
+    return ["-f", output_format, resolved_output]
+
+
+def prepare_audio_output(output: str) -> str | None:
+    """Check that a logical speaker output can resolve to a current sink."""
+    if not output:
+        return "Hãy chọn loa trên robot"
+    if not output.startswith(_PULSE_PREFIX):
+        return None
+    try:
+        resolve_audio_output(output)
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def _active_bluetooth_profile(card_name: str) -> str | None:
@@ -482,6 +653,30 @@ def _pulse_input_unavailable(source: str) -> str | None:
     return None
 
 
+def _pulse_output_unavailable(output: str) -> str | None:
+    if not output.startswith(_PULSE_PREFIX):
+        return None
+    try:
+        _, pulse_sink = resolve_audio_output(output)
+    except ValueError as exc:
+        return str(exc)
+    try:
+        result = subprocess.run(
+            ["pactl", "get-sink-mute", pulse_sink],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode == 0 and re.search(
+        r"\b(?:yes|true)\b", result.stdout, re.IGNORECASE
+    ):
+        return "Loa đang bị tắt tiếng (mute) trên máy robot"
+    return None
+
+
 def _probe_audio_source(source: str) -> tuple[bool, str]:
     unavailable_reason = _analog_input_unavailable(source)
     if unavailable_reason:
@@ -565,13 +760,70 @@ def probe_audio_source(
     return result
 
 
+def probe_audio_output(
+    output: str,
+    *,
+    audible: bool = False,
+) -> tuple[bool, str]:
+    """Open a speaker sink and optionally play a short, low-volume test tone."""
+    unavailable_reason = _pulse_output_unavailable(output)
+    if unavailable_reason:
+        return False, unavailable_reason
+    try:
+        output_args = audio_output_args(output)
+    except ValueError as exc:
+        return False, str(exc)
+    generator = (
+        "sine=frequency=880:sample_rate=48000"
+        if audible
+        else "anullsrc=r=48000:cl=mono"
+    )
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        generator,
+        "-t",
+        "0.45" if audible else "0.2",
+        "-ac",
+        "1",
+    ]
+    if audible:
+        command.extend(["-filter:a", "volume=0.18"])
+    command.extend(output_args)
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=3,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Loa không nhận dữ liệu trong thời gian kiểm tra"
+    except OSError:
+        return False, "Không chạy được FFmpeg để kiểm tra loa"
+    if result.returncode != 0:
+        return False, _last_error(result.stderr, output)
+    if audible:
+        return True, "Đã phát âm báo kiểm tra qua loa"
+    return True, "Loa đã nhận luồng âm thanh kiểm tra"
+
+
 def _active_sources(
     candidates: list[dict[str, str]],
     probe: Callable[[str], tuple[bool, str]],
+    *,
+    max_workers: int = 4,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     if not candidates:
         return [], []
-    worker_count = min(4, len(candidates))
+    worker_count = min(max_workers, len(candidates))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         results = list(executor.map(lambda item: probe(item["value"]), candidates))
     active: list[dict[str, str]] = []
@@ -585,11 +837,23 @@ def _active_sources(
 
 
 def discover_video_sources() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    return _active_sources(discover_video_candidates(), probe_video_source)
+    # Probe sequentially. Multiple /dev/videoN nodes can belong to one physical
+    # UVC camera and opening them concurrently can make a valid node look busy.
+    return _active_sources(
+        discover_video_candidates(), probe_video_source, max_workers=1
+    )
 
 
 def discover_audio_sources() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     return _active_sources(discover_audio_candidates(), probe_audio_source)
+
+
+def discover_speaker_sources() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    # Raw ALSA and Pulse entries can refer to the same physical device. Probe
+    # them sequentially so the direct ALSA open does not race the sound server.
+    return _active_sources(
+        discover_speaker_candidates(), probe_audio_output, max_workers=1
+    )
 
 
 def discover_media_sources(media_kind: str = "all") -> dict[str, Any]:
@@ -597,13 +861,23 @@ def discover_media_sources(media_kind: str = "all") -> dict[str, Any]:
     rejected_video_sources: list[dict[str, str]] = []
     audio_sources: list[dict[str, str]] = []
     rejected_audio_sources: list[dict[str, str]] = []
+    speaker_sources: list[dict[str, str]] = []
+    rejected_speaker_sources: list[dict[str, str]] = []
     if media_kind in {"all", "video"}:
-        video_sources, rejected_video_sources = discover_video_sources()
+        video_sources, _rejected_video_sources = discover_video_sources()
+        # Camera pickers must contain only usable sources. Raspberry Pi exposes
+        # many codec, ISP and metadata nodes under /dev/video*; returning them as
+        # rejected entries still makes some Center views render them as choices.
+        rejected_video_sources = []
     if media_kind in {"all", "audio"}:
         audio_sources, rejected_audio_sources = discover_audio_sources()
+    if media_kind in {"all", "speaker"}:
+        speaker_sources, rejected_speaker_sources = discover_speaker_sources()
     return {
         "video_sources": video_sources,
         "audio_sources": audio_sources,
+        "speaker_sources": speaker_sources,
         "rejected_video_sources": rejected_video_sources,
         "rejected_audio_sources": rejected_audio_sources,
+        "rejected_speaker_sources": rejected_speaker_sources,
     }

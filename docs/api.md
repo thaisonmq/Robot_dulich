@@ -23,12 +23,12 @@ Interactive OpenAPI is available at `/docs`.
   kết ghép nối mới; robot phải offline
 - `GET /api/robots/{robot_id}/configuration`
 - `PATCH /api/robots/{robot_id}/configuration`
-- `GET /api/robots/{robot_id}/media-sources?media_kind=video|audio` — yêu cầu
-  edge agent quét camera V4L2 hoặc microphone ALSA ngay trên máy robot. Kết quả
-  chỉ chứa camera trả về được frame và microphone có kết nối/tín hiệu thực;
-  endpoint phát hiện nhưng không hoạt động nằm trong `rejected_*_sources`.
+- `GET /api/robots/{robot_id}/media-sources?media_kind=video|audio|speaker` —
+  yêu cầu edge agent quét camera V4L2, microphone hoặc loa ALSA/
+  PipeWire/PulseAudio ngay trên máy robot. Kết quả chỉ chứa thiết bị đã probe
+  thành công; endpoint phát hiện nhưng không hoạt động nằm trong
+  `rejected_*_sources`.
 - `POST /api/robots/{robot_id}/diagnostics/connection`
-- `GET /api/robots/{robot_id}/media-sources`
 - `POST /api/robots/{robot_id}/diagnostics/media`
 - `POST /api/robots/{robot_id}/preview-token`
 - `POST /api/robots/{robot_id}/connect`

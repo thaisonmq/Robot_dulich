@@ -251,6 +251,9 @@ class RobotConfigurationUpdate(BaseModel):
     microphone_label: str = Field(
         default="Microphone chính", min_length=1, max_length=120
     )
+    audio_output_type: Literal["disabled", "device"] = "disabled"
+    audio_output: str = Field(default="", max_length=512)
+    speaker_label: str = Field(default="Loa chính", min_length=1, max_length=120)
 
     @field_validator("video_source")
     @classmethod
@@ -268,11 +271,13 @@ class RobotConfigurationUpdate(BaseModel):
             raise ValueError("Camera USB phải dùng đường dẫn thiết bị /dev/video*")
         if self.audio_source_type != "silent" and not self.audio_source.strip():
             raise ValueError("Hãy chọn nguồn microphone")
+        if self.audio_output_type == "device" and not self.audio_output.strip():
+            raise ValueError("Hãy chọn loa trên robot")
         return self
 
 
 class MediaProbeRequest(BaseModel):
-    media_kind: Literal["video", "audio"]
+    media_kind: Literal["video", "audio", "speaker"]
     configuration: RobotConfigurationUpdate
 
 

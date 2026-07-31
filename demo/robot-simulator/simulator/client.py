@@ -18,9 +18,11 @@ import websockets
 
 from simulator.config import SimulatorConfig
 from simulator.media_devices import (
-    discover_video_candidates,
     discover_media_sources,
+    discover_video_sources,
+    prepare_audio_output,
     prepare_audio_source,
+    probe_audio_output,
     probe_audio_source,
 )
 from simulator.media import MediaPublisher, rtsp_input_args
@@ -167,6 +169,9 @@ class RobotConnectionClient:
             "audio_source_type": self.config.simulator_audio_source_type,
             "audio_source": self.config.simulator_audio_source,
             "microphone_label": self.config.microphone_label,
+            "audio_output_type": self.config.simulator_audio_output_type,
+            "audio_output": self.config.simulator_audio_output,
+            "speaker_label": self.config.speaker_label,
         }
 
     def _save_device_state(self) -> None:
@@ -730,6 +735,18 @@ class RobotConnectionClient:
             unavailable_reason = prepare_audio_source(requested_audio_source)
             if unavailable_reason:
                 raise ValueError(unavailable_reason)
+        audio_output_type = str(
+            payload.get("audio_output_type", "disabled")
+        )
+        if audio_output_type not in {"disabled", "device"}:
+            raise ValueError("Loại đầu ra loa không hợp lệ")
+        requested_audio_output = str(payload.get("audio_output", "")).strip()
+        if audio_output_type == "device" and not requested_audio_output:
+            raise ValueError("Hãy chọn loa trên robot")
+        if audio_output_type == "device":
+            unavailable_reason = prepare_audio_output(requested_audio_output)
+            if unavailable_reason:
+                raise ValueError(unavailable_reason)
         self.config.device_ip = str(payload.get("device_ip", "")).strip()
         self.config.camera_label = str(payload.get("camera_label", "")).strip()
         self.config.simulator_audio_source_type = audio_source_type
@@ -738,6 +755,11 @@ class RobotConnectionClient:
         )
         self.config.microphone_label = str(
             payload.get("microphone_label", "Microphone chính")
+        ).strip()
+        self.config.simulator_audio_output_type = audio_output_type
+        self.config.simulator_audio_output = requested_audio_output
+        self.config.speaker_label = str(
+            payload.get("speaker_label", "Loa chính")
         ).strip()
         self.config.video_profile = profile
         self.config.rtsp_transport = transport
@@ -775,6 +797,9 @@ class RobotConnectionClient:
                         "audio_source_type": self.config.simulator_audio_source_type,
                         "audio_source": self._public_audio_source(),
                         "microphone_label": self.config.microphone_label,
+                        "audio_output_type": self.config.simulator_audio_output_type,
+                        "audio_output": self.config.simulator_audio_output,
+                        "speaker_label": self.config.speaker_label,
                         "software_version": "sim-1.0",
                         "connection_status": "online",
                     },
@@ -803,7 +828,7 @@ class RobotConnectionClient:
         )
 
     async def _camera_sources(self, socket: Any, request_id: str) -> None:
-        sources = await asyncio.to_thread(discover_video_candidates)
+        sources, _rejected = await asyncio.to_thread(discover_video_sources)
         selected_source = ""
         if self.config.simulator_media_source_type == "camera":
             selected_source = (
@@ -832,10 +857,10 @@ class RobotConnectionClient:
         if source_type != "camera" or not source.startswith("/dev/video"):
             raise ValueError("Nguồn camera trực tiếp không hợp lệ")
         available = {
-            item["value"] for item in discover_video_candidates()
+            item["value"] for item in discover_video_sources()[0]
         }
         if source not in available:
-            raise ValueError("Camera đã bị rút khỏi robot")
+            raise ValueError("Camera không trả về hình ảnh hoặc đã bị rút khỏi robot")
         self.config.simulator_media_source_type = "camera"
         self.config.simulator_media_source = source
         self.config.camera_label = (
@@ -878,6 +903,12 @@ class RobotConnectionClient:
                 "latency_ms": 0,
                 "detail": "Chưa chọn microphone để kiểm tra",
             }
+        if kind == "speaker" and configuration.get("audio_output_type") == "disabled":
+            return {
+                "ok": False,
+                "latency_ms": 0,
+                "detail": "Chưa chọn loa để kiểm tra",
+            }
         process: asyncio.subprocess.Process | None = None
         try:
             if kind == "video":
@@ -902,7 +933,7 @@ class RobotConnectionClient:
                     "ffmpeg", "-hide_banner", "-loglevel", "error",
                     *input_args, "-t", "2", "-an", "-f", "null", "-",
                 ]
-            else:
+            elif kind == "audio":
                 audio_type = str(configuration.get("audio_source_type", "device"))
                 audio_source = str(configuration.get("audio_source", "default"))
                 if audio_type == "device":
@@ -926,6 +957,22 @@ class RobotConnectionClient:
                     "ffmpeg", "-hide_banner", "-loglevel", "error",
                     *input_args, "-t", "2", "-vn", "-f", "null", "-",
                 ]
+            elif kind == "speaker":
+                audio_output = str(configuration.get("audio_output", ""))
+                ok, detail = await asyncio.to_thread(
+                    probe_audio_output, audio_output, audible=True
+                )
+                return {
+                    "ok": ok,
+                    "latency_ms": round((time.monotonic() - started) * 1000),
+                    "detail": detail,
+                }
+            else:
+                return {
+                    "ok": False,
+                    "latency_ms": 0,
+                    "detail": "Loại media kiểm tra không hợp lệ",
+                }
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -936,6 +983,7 @@ class RobotConnectionClient:
             source = str(
                 configuration.get("video_source")
                 or configuration.get("audio_source")
+                or configuration.get("audio_output")
                 or ""
             )
             if source:

@@ -52,7 +52,7 @@ export function DashboardPage() {
   const { control, manager, screen, inputState } = useTeleoperation();
   const [micEnabled, setMicEnabled] = useState(false);
   const [speakerMuted, setSpeakerMuted] = useState(false);
-  const [translationEnabled, setTranslationEnabled] = useState(language !== ROBOT_LANGUAGE_CODE);
+  const translationEnabled = false;
   const [conversationExpanded, setConversationExpanded] = useState(false);
   const [selectedDestination, setSelectedDestination] = useState<Destination | null>(null);
   const [connectionError, setConnectionError] = useState("");
@@ -61,10 +61,6 @@ export function DashboardPage() {
   const robotLanguageOption = getLanguage(ROBOT_LANGUAGE_CODE);
   const sameLanguage = language === ROBOT_LANGUAGE_CODE;
   const isSpectator = session?.mode === "spectator";
-
-  useEffect(() => {
-    if (sameLanguage) setTranslationEnabled(false);
-  }, [sameLanguage]);
 
   const telemetry = useMemo(() => new WebSocketTelemetryTransport({
     onPose: setPose,
@@ -105,6 +101,7 @@ export function DashboardPage() {
     staleTime: 5000,
     retry: 1,
   });
+  const cameraItems = camerasQuery.data?.items ?? [];
   const selectCamera = useMutation({
     mutationFn: (cameraId: string) => api.selectSessionCamera(session!.session_id, cameraId),
     onSuccess: (selected) => {
@@ -306,20 +303,31 @@ export function DashboardPage() {
                       : t("ĐANG KẾT NỐI")}
               </span>
               <div className="video-panel__tools">
-                {Boolean(camerasQuery.data?.items.length) && (
+                {cameraItems.length === 1 && (
+                  <div className="camera-source-picker" aria-label={t("Nguồn camera")}>
+                    <Camera size={14} />
+                    <span>
+                      {cameraItems[0].label}
+                      {cameraItems[0].source && user?.role !== "guest"
+                        ? ` · ${cameraItems[0].source}`
+                        : ""}
+                    </span>
+                  </div>
+                )}
+                {cameraItems.length > 1 && (
                   <label className="camera-source-picker">
                     <Camera size={14} />
                     <span className="sr-only">{t("Nguồn camera")}</span>
                     <select
-                      value={camerasQuery.data?.items.find((item) => item.selected)?.id ?? ""}
+                      value={cameraItems.find((item) => item.selected)?.id ?? ""}
                       disabled={Boolean(isSpectator || selectCamera.isPending || sessionEndedReason)}
                       onChange={(event) => selectCamera.mutate(event.target.value)}
                       aria-label={t("Chọn nguồn camera")}
                     >
-                      {!camerasQuery.data?.items.some((item) => item.selected) && (
+                      {!cameraItems.some((item) => item.selected) && (
                         <option value="">{t("Chọn camera")}</option>
                       )}
-                      {camerasQuery.data?.items.map((camera) => (
+                      {cameraItems.map((camera) => (
                         <option key={camera.id} value={camera.id}>
                           {camera.label}
                           {camera.source && user?.role !== "guest" ? ` · ${camera.source}` : ""}
@@ -361,22 +369,21 @@ export function DashboardPage() {
               </header>
 
               <div className="conversation-dock__controls">
-                <label className={`translation-control ${sameLanguage ? "is-disabled" : ""}`}>
+                <label className="translation-control is-disabled">
                   <span className="translation-control__icon"><Languages size={19} /></span>
                   <span className="translation-control__copy">
                     <strong>
-                      {sameLanguage ? t("Không cần dịch") : translationEnabled ? t("Dịch realtime") : t("Không dịch")}
+                      {sameLanguage ? t("Không cần dịch") : t("Dịch realtime chưa kích hoạt")}
                     </strong>
                     <small>
-                      {sameLanguage ? t("Cùng ngôn ngữ") : translationEnabled ? t("Hai chiều") : t("Nói chuyện trực tiếp")}
+                      {sameLanguage ? t("Cùng ngôn ngữ") : t("Đang dùng âm thanh trực tiếp")}
                     </small>
                   </span>
                   <input
                     type="checkbox"
                     checked={translationEnabled}
-                    onChange={(event) => setTranslationEnabled(event.target.checked)}
                     aria-label={t("Dịch realtime")}
-                    disabled={sameLanguage}
+                    disabled
                   />
                   <span className="toggle-switch" aria-hidden="true"><i /></span>
                 </label>

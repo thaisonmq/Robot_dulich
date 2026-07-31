@@ -238,3 +238,34 @@ async def test_media_source_scan_forwards_requested_kind(monkeypatch) -> None:
     assert forwarded == [
         ("ROBOT-229", "media.sources.get", {"media_kind": "audio"})
     ]
+
+
+@pytest.mark.asyncio
+async def test_speaker_scan_forwards_output_kind(monkeypatch) -> None:
+    forwarded: list[tuple[str, str, dict]] = []
+
+    async def fake_configuration_request(
+        robot_id: str,
+        message_type: str,
+        payload: dict,
+        **_: object,
+    ) -> dict:
+        forwarded.append((robot_id, message_type, payload))
+        return {
+            "ok": True,
+            "media_kind": "speaker",
+            "speaker_sources": [],
+        }
+
+    monkeypatch.setattr(
+        robot_api, "configuration_from_simulator", fake_configuration_request
+    )
+
+    response = await robot_api.get_robot_media_sources(
+        "ROBOT-229", "speaker", "user-1"
+    )
+
+    assert response["media_kind"] == "speaker"
+    assert forwarded == [
+        ("ROBOT-229", "media.sources.get", {"media_kind": "speaker"})
+    ]

@@ -46,6 +46,45 @@ async def test_camera_starts_only_while_media_lease_is_active() -> None:
     await asyncio.gather(task, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_live_camera_picker_returns_only_probed_working_sources(
+    monkeypatch,
+) -> None:
+    active = [
+        {"type": "camera", "value": "/dev/video0", "label": "USB Camera"}
+    ]
+    rejected = [
+        {
+            "type": "camera",
+            "value": "/dev/video1",
+            "label": "USB metadata",
+            "reason": "Không có frame",
+        }
+    ]
+    monkeypatch.setattr(
+        "simulator.client.discover_video_sources", lambda: (active, rejected)
+    )
+    client = RobotConnectionClient(
+        SimulatorConfig(
+            simulator_media_source_type="camera",
+            simulator_media_source="/dev/video0",
+        )
+    )
+
+    class Socket:
+        sent: list[str] = []
+
+        async def send(self, message: str) -> None:
+            self.sent.append(message)
+
+    socket = Socket()
+    await client._camera_sources(socket, "request-camera-list")
+    message = json.loads(socket.sent[0])
+
+    assert message["payload"]["video_sources"] == active
+    assert message["payload"]["selected_source"] == "/dev/video0"
+
+
 def test_configuration_is_owned_and_applied_by_simulator() -> None:
     client = RobotConnectionClient(
         SimulatorConfig(
@@ -235,6 +274,9 @@ def test_center_media_configuration_is_persisted_in_device_state(tmp_path) -> No
             "audio_source_type": "device",
             "audio_source": "default",
             "microphone_label": "Microphone USB",
+            "audio_output_type": "device",
+            "audio_output": "plughw:CARD=Speaker,DEV=0",
+            "speaker_label": "Loa USB",
         }
     )
     first._save_device_state()
@@ -254,6 +296,9 @@ def test_center_media_configuration_is_persisted_in_device_state(tmp_path) -> No
     assert restarted.config.video_profile == "balanced"
     assert restarted.config.simulator_audio_source_type == "device"
     assert restarted.config.simulator_audio_source == "default"
+    assert restarted.config.simulator_audio_output_type == "device"
+    assert restarted.config.simulator_audio_output == "plughw:CARD=Speaker,DEV=0"
+    assert restarted.config.speaker_label == "Loa USB"
 
 
 def test_device_microphone_requires_a_selected_alsa_source() -> None:
@@ -339,6 +384,31 @@ async def test_device_audio_probe_requires_a_real_signal(monkeypatch) -> None:
 
     assert result["ok"] is False
     assert result["detail"] == "Không thu được tín hiệu microphone (-91.0 dB)"
+
+
+@pytest.mark.asyncio
+async def test_speaker_probe_plays_an_audible_tone(monkeypatch) -> None:
+    client = RobotConnectionClient(SimulatorConfig())
+    calls: list[tuple[str, bool]] = []
+
+    def probe(output: str, *, audible: bool = False) -> tuple[bool, str]:
+        calls.append((output, audible))
+        return True, "Đã phát âm báo kiểm tra qua loa"
+
+    monkeypatch.setattr("simulator.client.probe_audio_output", probe)
+
+    result = await client._probe_media(
+        {
+            "media_kind": "speaker",
+            "configuration": {
+                "audio_output_type": "device",
+                "audio_output": "plughw:CARD=Speaker,DEV=0",
+            },
+        }
+    )
+
+    assert result["ok"] is True
+    assert calls == [("plughw:CARD=Speaker,DEV=0", True)]
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,8 @@ class SimulatorConfig(BaseSettings):
     simulator_media_source: str = ""
     simulator_audio_source: str = ""
     simulator_audio_source_type: str = "silent"
+    simulator_audio_output: str = ""
+    simulator_audio_output_type: str = "disabled"
     simulator_camera_device: str = "/dev/video0"
     simulator_camera_format: str = ""
     simulator_camera_width: int = Field(default=1920, ge=320, le=3840)
@@ -40,6 +42,7 @@ class SimulatorConfig(BaseSettings):
     device_ip: str = "127.0.0.1"
     camera_label: str = "Camera chính"
     microphone_label: str = "Microphone chính"
+    speaker_label: str = "Loa chính"
     video_profile: str = "full_hd"
     # Robot and its IP camera normally share the same LAN. UDP avoids TCP
     # head-of-line bursts that turn a steady 25 fps RTP stream into alternating

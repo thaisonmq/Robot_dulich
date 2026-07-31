@@ -19,6 +19,12 @@ Auto-detected sources for pulse:
   bluez_output.41_42_FF_68_01_59.headset-head-unit.monitor [Monitor of A11ULTIMATE]
 """
 
+PULSE_SINK_OUTPUT = """\
+Auto-detected sinks for pulse:
+* alsa_output.usb-Logitech_Speaker-00.analog-stereo [Logitech USB Speaker] (none)
+  bluez_output.41_42_FF_68_01_59.a2dp-sink [A11ULTIMATE] (none)
+"""
+
 BLUETOOTH_CARD_OUTPUT = """\
 Card #4430
     Name: bluez_card.41_42_FF_68_01_59
@@ -54,6 +60,21 @@ def test_pulse_scan_keeps_capture_source_but_excludes_monitors() -> None:
             ),
             "label": "A11ULTIMATE",
         }
+    ]
+
+
+def test_pulse_scan_returns_playback_sinks() -> None:
+    assert media_devices.parse_pulse_sinks(PULSE_SINK_OUTPUT) == [
+        {
+            "type": "pulse",
+            "value": "pulse:alsa_output.usb-Logitech_Speaker-00.analog-stereo",
+            "label": "Logitech USB Speaker",
+        },
+        {
+            "type": "pulse",
+            "value": "pulse:bluez_output.41_42_FF_68_01_59.a2dp-sink",
+            "label": "A11ULTIMATE",
+        },
     ]
 
 
@@ -106,6 +127,32 @@ def test_audio_scan_falls_back_to_proc_asound(tmp_path: Path, monkeypatch) -> No
     }
 
 
+def test_speaker_scan_falls_back_to_proc_playback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        media_devices.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+    (tmp_path / "pcm").write_text(
+        "02-00: USB Audio : USB Speaker : playback 1 : capture 0\n"
+    )
+    card_path = tmp_path / "card2"
+    card_path.mkdir()
+    (card_path / "id").write_text("Speaker\n")
+
+    sources = media_devices.discover_speaker_candidates(tmp_path)
+
+    assert sources == [
+        {
+            "type": "device",
+            "value": "plughw:CARD=Speaker,DEV=0",
+            "label": "USB Speaker",
+        }
+    ]
+
+
 def test_video_scan_uses_v4l2_names_and_natural_device_order(
     tmp_path: Path,
 ) -> None:
@@ -126,6 +173,46 @@ def test_video_scan_uses_v4l2_names_and_natural_device_order(
         str(device_root / "video10"),
     ]
     assert sources[0]["label"] == "Camera video0"
+
+
+def test_video_probe_keeps_camera_already_used_by_live_stream(monkeypatch) -> None:
+    monkeypatch.setattr(
+        media_devices.subprocess,
+        "run",
+        lambda command, **_kwargs: CompletedProcess(
+            command,
+            1,
+            "",
+            "/dev/video0: Device or resource busy\n",
+        ),
+    )
+
+    ok, detail = media_devices.probe_video_source("/dev/video0")
+
+    assert ok
+    assert "luồng trực tiếp" in detail
+
+
+def test_video_scan_payload_exposes_only_working_cameras(monkeypatch) -> None:
+    active = [
+        {"type": "camera", "value": "/dev/video0", "label": "USB Camera"}
+    ]
+    rejected = [
+        {
+            "type": "camera",
+            "value": "/dev/video1",
+            "label": "USB metadata",
+            "reason": "Không có frame",
+        }
+    ]
+    monkeypatch.setattr(
+        media_devices, "discover_video_sources", lambda: (active, rejected)
+    )
+
+    result = media_devices.discover_media_sources("video")
+
+    assert result["video_sources"] == active
+    assert result["rejected_video_sources"] == []
 
 
 def test_audio_probe_rejects_disconnected_analog_microphone(monkeypatch) -> None:
@@ -274,6 +361,76 @@ def test_audio_probe_rejects_muted_pulse_microphone(monkeypatch) -> None:
 
     assert not ok
     assert "tắt tiếng" in detail
+
+
+def test_bluetooth_speaker_survives_profile_name_change(monkeypatch) -> None:
+    monkeypatch.setattr(
+        media_devices,
+        "_pulse_sink_names",
+        lambda: {
+            "bluez_output.41_42_FF_68_01_59.headset-head-unit",
+        },
+    )
+
+    output_format, output = media_devices.resolve_audio_output(
+        "pulse:bluez_output.41_42_FF_68_01_59.a2dp-sink"
+    )
+
+    assert output_format == "pulse"
+    assert output == "bluez_output.41_42_FF_68_01_59.headset-head-unit"
+
+
+def test_pulse_output_fallback_has_conversation_sized_buffer(monkeypatch) -> None:
+    monkeypatch.setattr(
+        media_devices,
+        "_pulse_sink_names",
+        lambda: {"alsa_output.usb-speaker"},
+    )
+
+    arguments = media_devices.audio_output_args(
+        "pulse:alsa_output.usb-speaker"
+    )
+
+    assert arguments == [
+        "-f",
+        "pulse",
+        "-buffer_duration",
+        "60",
+        "-prebuf",
+        "0",
+        "-minreq",
+        "960",
+        "alsa_output.usb-speaker",
+    ]
+
+
+def test_speaker_probe_plays_short_test_tone(monkeypatch) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        media_devices, "_pulse_output_unavailable", lambda output: None
+    )
+    monkeypatch.setattr(
+        media_devices,
+        "audio_output_args",
+        lambda output: ["-f", "alsa", output],
+    )
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(media_devices.subprocess, "run", run)
+
+    ok, detail = media_devices.probe_audio_output(
+        "plughw:CARD=Speaker,DEV=0", audible=True
+    )
+
+    assert ok
+    assert "âm báo" in detail
+    assert "sine=frequency=880:sample_rate=48000" in commands[0]
+    assert commands[0][-3:] == ["-f", "alsa", "plughw:CARD=Speaker,DEV=0"]
+
+
 def test_scan_separates_active_and_rejected_sources() -> None:
     candidates = [
         {"type": "camera", "value": "/dev/video0", "label": "Camera 0"},

@@ -80,4 +80,30 @@ describe("Robot media source scan", () => {
       "plughw:CARD=Camera,DEV=0",
     );
   });
+
+  it("requests speaker outputs independently from microphones", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        media_kind: "speaker",
+        video_sources: [],
+        audio_sources: [],
+        speaker_sources: [{
+          type: "pulse",
+          value: "pulse:alsa_output.usb-speaker",
+          label: "USB Speaker",
+        }],
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const sources = await api.robotMediaSources("ROBOT-229", "speaker");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/robots/ROBOT-229/media-sources?media_kind=speaker",
+      expect.any(Object),
+    );
+    expect(sources.speaker_sources[0].label).toBe("USB Speaker");
+  });
 });

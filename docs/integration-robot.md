@@ -47,9 +47,10 @@ ROBOT_PASSWORD=<local-management-password>
 ROBOT_STATE_FILE=~/.config/rovera/device.json
 ```
 
-Camera và microphone không cần cấu hình trong environment. Khi robot online,
-Center đọc danh sách thiết bị từ edge, cho operator chọn nguồn và lưu lựa chọn
-vào device state quyền `0600`.
+Camera, microphone và loa không cần cấu hình trong environment. Khi robot
+online, Center đọc danh sách thiết bị từ edge, cho operator chọn nguồn và lưu
+lựa chọn vào device state quyền `0600`. Luồng microphone của browser được robot
+subscribe và phát ra loa đã chọn; microphone robot vẫn publish về browser.
 
 Mở outbound TCP 443 tới Center/reverse proxy, TCP 7881 và UDP
 `51000-51020` tới LiveKit (hoặc TURN 3478/443 theo cấu hình). Không cần mở
@@ -64,6 +65,14 @@ Repo có sẵn
 reconnect sau reboot. Unit mặc định chạy image container cố định; Python,
 FFmpeg và pip trên host không được sử dụng. Device state đã claim sẽ được tái
 sử dụng; không phải cập nhật Center theo từng lần khởi động.
+
+USB/analog audio đi trực tiếp qua `/dev/snd` và group `audio`. Với loa hoặc
+headset Bluetooth do PipeWire/PulseAudio quản lý, service phải thấy socket của
+đúng user âm thanh: đặt `PULSE_UID=<uid>` hoặc
+`PULSE_SOCKET_DIR=/run/user/<uid>/pulse` trong `/etc/rovera/robot.env`. Sau khi
+robot online, xác nhận bằng **Cấu hình → Âm thanh → Quét → Phát âm kiểm tra
+loa** trước khi mở phiên đàm thoại. Trang vận hành phải chạy trong secure
+context HTTPS (ngoại lệ `localhost`) để trình duyệt cho phép publish micro.
 
 Dockerfile tự nhận kiến trúc khi build. Trên Orange Pi 5/ARM64 image build
 Rockchip MPP và FFmpeg có `h264_rkmpp`; trên x86_64 image cài VA-API. Runtime

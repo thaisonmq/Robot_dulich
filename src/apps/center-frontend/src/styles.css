@@ -1330,11 +1330,30 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .connection-chip.is-online { color: var(--green); background: #edf8f3; }
 .connection-chip.is-online i { background: var(--green); }
 .configuration-fields {
+  flex: 1;
+  min-height: 0;
   margin-top: clamp(16px, 2.5vh, 26px);
+  padding: 0 10px 14px 0;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
   gap: clamp(18px, 3vh, 28px) 22px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scrollbar-color: #b7c3d5 transparent;
+  scrollbar-width: thin;
 }
+.configuration-fields::-webkit-scrollbar { width: 8px; }
+.configuration-fields::-webkit-scrollbar-track { background: transparent; }
+.configuration-fields::-webkit-scrollbar-thumb {
+  background: #c3ccda;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+.configuration-fields::-webkit-scrollbar-thumb:hover { background-color: #9facbf; }
 .config-field { display: grid; gap: 8px; font-size: 11px; font-weight: 700; }
 .config-field--wide { grid-column: 1 / -1; }
 .config-field > span { display: flex; align-items: center; gap: 8px; }
@@ -1389,6 +1408,18 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .source-scan-button:disabled { opacity: .52; cursor: not-allowed; }
 .source-scan-button .is-spinning { animation: source-scan-spin .8s linear infinite; }
 .config-field small.source-scan-status.is-error { color: var(--red); }
+.audio-section-title {
+  margin-top: 2px;
+  padding-top: 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--line);
+}
+.audio-section-title > svg { color: var(--blue); }
+.audio-section-title > span { display: grid; gap: 3px; }
+.audio-section-title strong { font-size: 11px; }
+.audio-section-title small { color: var(--muted); font-size: 9px; }
 @keyframes source-scan-spin { to { transform: rotate(360deg); } }
 .configuration-loading { flex: 1; display: grid; place-items: center; color: var(--muted); font-size: 12px; }
 .config-preview {
@@ -2431,7 +2462,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   .editor-actions { flex-wrap: wrap; }
   .configuration-summary { display: none; }
   .configuration-form { min-height: calc(100dvh - 84px); padding: 20px; }
-  .configuration-fields { grid-template-columns: 1fr; }
+  .configuration-fields {
+    flex: none;
+    min-height: auto;
+    padding-right: 0;
+    grid-template-columns: 1fr;
+    overflow: visible;
+    scrollbar-gutter: auto;
+  }
   .config-field--wide { grid-column: auto; }
   .source-picker { grid-template-columns: 1fr; }
   .source-scan-button { width: 100%; }

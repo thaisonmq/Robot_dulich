@@ -127,6 +127,9 @@ export interface RobotConfiguration {
   audio_source_type: "silent" | "device" | "file";
   audio_source: string;
   microphone_label: string;
+  audio_output_type: "disabled" | "device";
+  audio_output: string;
+  speaker_label: string;
   software_version: string;
   connection_status: Robot["status"];
 }
@@ -135,6 +138,7 @@ export type RobotConfigurationUpdate = Pick<
   RobotConfiguration,
   "device_ip" | "video_source_type" | "video_source" | "video_profile" | "rtsp_transport" | "camera_label"
   | "audio_source_type" | "audio_source" | "microphone_label"
+  | "audio_output_type" | "audio_output" | "speaker_label"
 >;
 
 export interface MediaSource {
@@ -148,11 +152,13 @@ export interface RejectedMediaSource extends MediaSource {
 }
 
 export interface MediaSources {
-  media_kind: "video" | "audio" | "all";
+  media_kind: "video" | "audio" | "speaker" | "all";
   video_sources: MediaSource[];
   audio_sources: MediaSource[];
+  speaker_sources: MediaSource[];
   rejected_video_sources?: RejectedMediaSource[];
   rejected_audio_sources?: RejectedMediaSource[];
+  rejected_speaker_sources?: RejectedMediaSource[];
 }
 
 export interface DiagnosticResult {

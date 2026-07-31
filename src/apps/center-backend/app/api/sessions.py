@@ -174,6 +174,9 @@ async def select_robot_camera(
                 "audio_source_type",
                 "audio_source",
                 "microphone_label",
+                "audio_output_type",
+                "audio_output",
+                "speaker_label",
             )
             if key in current
         }
