@@ -30,7 +30,7 @@ export function useTeleoperation() {
         setControlState("active");
         const parts = [
           command.linear_x > 0 ? "Tiến" : command.linear_x < 0 ? "Lùi" : "",
-          command.angular_z > 0 ? "trái" : command.angular_z < 0 ? "phải" : "",
+          command.angular_z > 0 ? "Trái" : command.angular_z < 0 ? "Phải" : "",
         ].filter(Boolean);
         setCommandStatus(parts.join(" + ") || "Giữ vị trí");
       },

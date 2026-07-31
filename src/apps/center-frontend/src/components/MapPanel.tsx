@@ -1,4 +1,5 @@
 import { Flag, LocateFixed, Navigation, Route as RouteIcon, X } from "lucide-react";
+import { useI18n } from "../i18n/I18nProvider";
 import type { Destination, MapData, Pose, Route } from "../types";
 
 interface Props {
@@ -9,6 +10,7 @@ interface Props {
   selected: Destination | null;
   loading: boolean;
   navigationStatus: string;
+  readOnly?: boolean;
   onSelect: (destination: Destination) => void;
   onGo: () => void;
   onCancel: () => void;
@@ -22,23 +24,25 @@ const point = ({ x, y }: { x: number; y: number }) =>
 export function MapPanel({
   map, destinations, pose, route, selected, loading,
   navigationStatus, onSelect, onGo, onCancel,
+  readOnly = false,
 }: Props) {
+  const { t } = useI18n();
   return (
     <section className="map-section" aria-labelledby="map-title">
       <div className="section-heading">
         <div>
-          <p className="eyebrow">ĐỊNH VỊ THỜI GIAN THỰC</p>
-          <h2 id="map-title">Bản đồ hành trình</h2>
+          <p className="eyebrow">{t("ĐỊNH VỊ THỜI GIAN THỰC")}</p>
+          <h2 id="map-title">{t("Bản đồ hành trình")}</h2>
         </div>
         <div className="map-legend">
           <span><i className="legend-dot legend-dot--robot" />Robot</span>
-          <span><i className="legend-dot legend-dot--route" />Tuyến dự kiến</span>
-          <button type="button" title="Căn bản đồ"><LocateFixed size={17} /> Fit map</button>
+          <span><i className="legend-dot legend-dot--route" />{t("Tuyến dự kiến")}</span>
+          <button type="button" title={t("Căn bản đồ")}><LocateFixed size={17} /> Fit map</button>
         </div>
       </div>
       <div className="map-layout">
         <div className="map-canvas">
-          <img src={map.image_url} alt={`Sơ đồ ${map.name}`} />
+          <img src={map.image_url} alt={t("Sơ đồ {name}", { name: map.name })} />
           <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
             {route && (
               <polyline
@@ -59,8 +63,9 @@ export function MapPanel({
                 left: `${(destination.x / WORLD_WIDTH) * 100}%`,
                 top: `${100 - (destination.y / WORLD_HEIGHT) * 100}%`,
               }}
+              disabled={readOnly}
               onClick={() => onSelect(destination)}
-              aria-label={`Chọn ${destination.name}`}
+              aria-label={t("Chọn {name}", { name: destination.name })}
             >
               <Flag size={15} />
               <span>{destination.name}</span>
@@ -73,26 +78,33 @@ export function MapPanel({
               top: `${100 - (pose.y / WORLD_HEIGHT) * 100}%`,
               transform: `translate(-50%, -50%) rotate(${-pose.yaw}rad)`,
             }}
-            aria-label={`Robot tại ${pose.x.toFixed(1)}, ${pose.y.toFixed(1)}`}
+            aria-label={t("Robot tại {x}, {y}", {
+              x: pose.x.toFixed(1),
+              y: pose.y.toFixed(1),
+            })}
           >
             <Navigation size={20} fill="currentColor" />
           </div>
         </div>
         <aside className="destination-panel">
           <div>
-            <p className="eyebrow">ĐIỂM ĐẾN</p>
-            <h3>{selected ? selected.name : "Chọn nơi muốn đến"}</h3>
+            <p className="eyebrow">{t("ĐIỂM ĐẾN")}</p>
+            <h3>{selected ? selected.name : t("Chọn nơi muốn đến")}</h3>
             <p className="destination-panel__copy">
               {selected
                 ? route
-                  ? `${route.distance_m.toFixed(1)} m · khoảng ${route.estimated_seconds} giây`
-                  : loading ? "Đang tính tuyến đường an toàn…" : "Sẵn sàng xem trước tuyến đường."
-                : "Chọn một điểm trên bản đồ. Trung tâm sẽ kiểm tra và trả về tuyến phù hợp."}
+                  ? t("{distance} m · khoảng {seconds} giây", {
+                      distance: route.distance_m.toFixed(1),
+                      seconds: route.estimated_seconds,
+                    })
+                  : loading ? t("Đang tính tuyến đường an toàn…") : t("Sẵn sàng xem trước tuyến đường.")
+                : t("Chọn một điểm trên bản đồ. Trung tâm sẽ kiểm tra và trả về tuyến phù hợp.")}
             </p>
           </div>
           <label className="destination-select">
-            <span>Điểm cần đến</span>
+            <span>{t("Điểm cần đến")}</span>
             <select
+              disabled={readOnly}
               value={selected?.destination_id ?? ""}
               onChange={(event) => {
                 const destination = destinations.find(
@@ -101,7 +113,7 @@ export function MapPanel({
                 if (destination) onSelect(destination);
               }}
             >
-              <option value="" disabled>Chọn khu vực…</option>
+              <option value="" disabled>{t("Chọn khu vực…")}</option>
               {destinations.map((destination) => (
                 <option key={destination.destination_id} value={destination.destination_id}>
                   {destination.name}
@@ -109,13 +121,15 @@ export function MapPanel({
               ))}
             </select>
           </label>
-          {navigationStatus === "moving" ? (
+          {readOnly ? (
+            <div className="map-readonly-notice">{t("Đang theo dõi vị trí và hành trình của phiên khách.")}</div>
+          ) : navigationStatus === "moving" ? (
             <button type="button" className="button button--danger-outline" onClick={onCancel}>
-              <X size={18} /> Huỷ hành trình
+              <X size={18} /> {t("Huỷ hành trình")}
             </button>
           ) : (
             <button type="button" className="button button--primary" disabled={!route || loading} onClick={onGo}>
-              <RouteIcon size={18} /> Đi đến
+              <RouteIcon size={18} /> {t("Đi đến")}
             </button>
           )}
         </aside>

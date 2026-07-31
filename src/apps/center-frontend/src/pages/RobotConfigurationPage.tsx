@@ -6,6 +6,8 @@ import {
 } from "lucide-react";
 import { api } from "../api/client";
 import { Brand } from "../components/Brand";
+import { GlobalLanguageSelect } from "../components/GlobalLanguageSelect";
+import { useI18n } from "../i18n/I18nProvider";
 import { useNavigate, useParams } from "../router";
 import type {
   MediaSource, RejectedMediaSource, RobotConfigurationUpdate,
@@ -39,6 +41,7 @@ function configurationForm(
 
 export function RobotConfigurationPage() {
   const navigate = useNavigate();
+  const { t } = useI18n();
   const { robotId = "" } = useParams();
   const [form, setForm] = useState<RobotConfigurationUpdate>(EMPTY_CONFIGURATION);
   const [saved, setSaved] = useState(false);
@@ -192,11 +195,12 @@ export function RobotConfigurationPage() {
       <header className="app-header">
         <Brand compact />
         <div className="app-header__context">
-          <span>Cấu hình thiết bị</span>
+          <span>{t("Cấu hình thiết bị")}</span>
           <strong>{robot?.name ?? robotId}</strong>
         </div>
+        <GlobalLanguageSelect />
         <button type="button" className="header-action" onClick={() => navigate("/robots")}>
-          <ArrowLeft size={18} /> Danh sách robot
+          <ArrowLeft size={18} /> {t("Danh sách robot")}
         </button>
       </header>
 
@@ -204,29 +208,29 @@ export function RobotConfigurationPage() {
         <aside className="configuration-summary">
           <div className="device-orbit"><RadioTower size={36} /></div>
           <div>
-            <p className="eyebrow">THIẾT BỊ ĐANG CHỌN</p>
-            <h1>{robot?.name ?? "Đang tải robot"}</h1>
+            <p className="eyebrow">{t("THIẾT BỊ ĐANG CHỌN")}</p>
+            <h1>{robot?.name ?? t("Đang tải robot")}</h1>
             <p>{robotId}</p>
           </div>
           <div className="configuration-health">
-            <span><CircleDot size={17} /><small>Kết nối</small><strong>{robot?.status === "online" ? "Trực tuyến" : "Ngoại tuyến"}</strong></span>
-            <span><Cpu size={17} /><small>Phiên bản</small><strong>{configuration?.software_version ?? "—"}</strong></span>
-            <span><Video size={17} /><small>Profile</small><strong>{form.video_profile === "full_hd" ? "Full HD" : form.video_profile === "balanced" ? "Cân bằng" : "Băng thông thấp"}</strong></span>
+            <span><CircleDot size={17} /><small>{t("Kết nối")}</small><strong>{robot?.status === "online" ? t("Trực tuyến") : t("Ngoại tuyến")}</strong></span>
+            <span><Cpu size={17} /><small>{t("Phiên bản")}</small><strong>{configuration?.software_version ?? "—"}</strong></span>
+            <span><Video size={17} /><small>Profile</small><strong>{form.video_profile === "full_hd" ? "Full HD" : form.video_profile === "balanced" ? t("Cân bằng") : t("Băng thông thấp")}</strong></span>
           </div>
           <div className={`config-preview ${previewState === "connected" ? "is-live" : ""}`}>
-            <video ref={videoRef} autoPlay playsInline aria-label="Xem trước camera robot" />
+            <video ref={videoRef} autoPlay playsInline aria-label={t("Xem trước camera robot")} />
             <audio ref={audioRef} autoPlay />
             <span>
               <Camera size={18} />
               {previewState === "connected"
-                ? "Camera trực tiếp"
+                ? t("Camera trực tiếp")
                 : previewState === "connecting"
-                  ? "Đang mở camera…"
-                  : "Chưa xem trước"}
+                  ? t("Đang mở camera…")
+                  : t("Chưa xem trước")}
             </span>
           </div>
           <p className="configuration-note">
-            Cấu hình được đọc và áp dụng trực tiếp tại simulator. Thông tin đăng nhập RTSP luôn được ẩn khỏi trình duyệt.
+            {t("Cấu hình được đọc và áp dụng trực tiếp tại simulator. Thông tin đăng nhập RTSP luôn được ẩn khỏi trình duyệt.")}
           </p>
         </aside>
 
@@ -239,47 +243,47 @@ export function RobotConfigurationPage() {
         >
           <div className="configuration-form__heading">
             <div>
-              <p className="eyebrow">KẾT NỐI & HÌNH ẢNH</p>
-              <h2>Thông số robot</h2>
+              <p className="eyebrow">{t("KẾT NỐI & HÌNH ẢNH")}</p>
+              <h2>{t("Thông số robot")}</h2>
             </div>
             <span className={robot?.status === "online" ? "connection-chip is-online" : "connection-chip"}>
-              <i /> {robot?.status === "online" ? "Đang kết nối" : "Chưa kết nối"}
+              <i /> {robot?.status === "online" ? t("Đang kết nối") : t("Chưa kết nối")}
             </span>
           </div>
-          <nav className="configuration-tabs" aria-label="Nhóm cấu hình">
+          <nav className="configuration-tabs" aria-label={t("Nhóm cấu hình")}>
             <button
               type="button"
               className={tab === "connection" ? "is-active" : ""}
               onClick={() => setTab("connection")}
             >
-              <EthernetPort size={16} /> Kết nối
+              <EthernetPort size={16} /> {t("Kết nối")}
             </button>
             <button
               type="button"
               className={tab === "video" ? "is-active" : ""}
               onClick={() => setTab("video")}
             >
-              <Camera size={16} /> Camera
+              <Camera size={16} /> {t("Camera")}
             </button>
             <button
               type="button"
               className={tab === "audio" ? "is-active" : ""}
               onClick={() => setTab("audio")}
             >
-              <Mic2 size={16} /> Microphone
+              <Mic2 size={16} /> {t("Microphone")}
             </button>
           </nav>
 
           {loading ? (
-            <div className="configuration-loading">Đang gọi cấu hình từ simulator…</div>
+            <div className="configuration-loading">{t("Đang gọi cấu hình từ simulator…")}</div>
           ) : configurationQuery.isError ? (
             <div className="configuration-error" role="alert">
               <span><WifiOff size={24} /></span>
-              <h3>Không kết nối được simulator</h3>
+              <h3>{t("Không kết nối được simulator")}</h3>
               <p>
                 {configurationQuery.error instanceof Error
                   ? configurationQuery.error.message
-                  : "Simulator không phản hồi yêu cầu cấu hình"}
+                  : t("Simulator không phản hồi yêu cầu cấu hình")}
               </p>
               <button
                 type="button"
@@ -288,7 +292,7 @@ export function RobotConfigurationPage() {
                 disabled={configurationQuery.isFetching}
               >
                 <RefreshCw size={17} />
-                {configurationQuery.isFetching ? "Đang thử lại…" : "Thử kết nối lại"}
+                {configurationQuery.isFetching ? t("Đang thử lại…") : t("Thử kết nối lại")}
               </button>
             </div>
           ) : (
@@ -296,20 +300,20 @@ export function RobotConfigurationPage() {
               {tab === "connection" && (
                 <>
                   <label className="config-field config-field--wide">
-                    <span><EthernetPort size={17} /> Địa chỉ IP robot</span>
+                    <span><EthernetPort size={17} /> {t("Địa chỉ IP robot")}</span>
                     <input
                       value={form.device_ip}
                       onChange={(event) => setForm({ ...form, device_ip: event.target.value })}
                       placeholder="192.168.1.20"
                       required
                     />
-                    <small>Địa chỉ do edge agent báo về; không cần mở cổng inbound.</small>
+                    <small>{t("Địa chỉ do edge agent báo về; không cần mở cổng inbound.")}</small>
                   </label>
                   <section className="diagnostic-card config-field--wide">
                     <span><Activity size={20} /></span>
                     <div>
-                      <strong>Kiểm tra kênh điều khiển</strong>
-                      <small>Đo phản hồi WSS và trạng thái publisher media trên robot.</small>
+                      <strong>{t("Kiểm tra kênh điều khiển")}</strong>
+                      <small>{t("Đo phản hồi WSS và trạng thái publisher media trên robot.")}</small>
                     </div>
                     <button
                       type="button"
@@ -317,7 +321,7 @@ export function RobotConfigurationPage() {
                       disabled={connectionTest.isPending}
                       onClick={() => connectionTest.mutate()}
                     >
-                      <RefreshCw size={16} /> {connectionTest.isPending ? "Đang kiểm tra…" : "Kiểm tra kết nối"}
+                      <RefreshCw size={16} /> {connectionTest.isPending ? t("Đang kiểm tra…") : t("Kiểm tra kết nối")}
                     </button>
                     {connectionTest.data && (
                       <p className={connectionTest.data.ok ? "diagnostic-result is-ok" : "diagnostic-result"}>
@@ -333,7 +337,7 @@ export function RobotConfigurationPage() {
               {tab === "video" && (
                 <>
                   <label className="config-field">
-                    <span><Camera size={17} /> Loại nguồn video</span>
+                    <span><Camera size={17} /> {t("Loại nguồn video")}</span>
                     <select
                       value={form.video_source_type}
                       onChange={(event) => {
@@ -351,14 +355,14 @@ export function RobotConfigurationPage() {
                         });
                       }}
                     >
-                      <option value="rtsp">Camera mạng · RTSP</option>
+                      <option value="rtsp">{t("Camera mạng")} · RTSP</option>
                       <option value="camera">Camera USB · V4L2</option>
-                      <option value="file">Tệp hoặc HTTP stream</option>
-                      <option value="test">Ảnh kiểm thử tự động</option>
+                      <option value="file">{t("Tệp hoặc HTTP stream")}</option>
+                      <option value="test">{t("Ảnh kiểm thử tự động")}</option>
                     </select>
                   </label>
                   <label className="config-field">
-                    <span><ServerCog size={17} /> Tên camera</span>
+                    <span><ServerCog size={17} /> {t("Tên camera")}</span>
                     <input
                       value={form.camera_label}
                       onChange={(event) => setForm({ ...form, camera_label: event.target.value })}
@@ -366,7 +370,7 @@ export function RobotConfigurationPage() {
                     />
                   </label>
                   <label className="config-field config-field--wide">
-                    <span><Camera size={17} /> Nguồn phát video</span>
+                    <span><Camera size={17} /> {t("Nguồn phát video")}</span>
                     <div className="source-picker">
                       {form.video_source_type === "camera" ? (
                           <select
@@ -378,13 +382,13 @@ export function RobotConfigurationPage() {
                             <option value="" disabled>
                               {sourcesScanned.video
                                 ? videoSources.length
-                                  ? "Chọn camera vừa tìm thấy"
-                                  : "Không tìm thấy camera V4L2"
-                                : "Bấm Quét để tìm camera trên robot"}
+                                  ? t("Chọn camera vừa tìm thấy")
+                                  : t("Không tìm thấy camera V4L2")
+                                : t("Bấm Quét để tìm camera trên robot")}
                             </option>
                             {form.video_source && !videoSources.some((source) => source.value === form.video_source) && (
                               <option value={form.video_source}>
-                                {sourcesScanned.video ? "Không còn kết nối" : "Cấu hình hiện tại"} · {form.video_source}
+                                {sourcesScanned.video ? t("Không còn kết nối") : t("Cấu hình hiện tại")} · {form.video_source}
                               </option>
                             )}
                             {videoSources.map((source) => (
@@ -412,7 +416,7 @@ export function RobotConfigurationPage() {
                           size={17}
                           className={mediaSourceScan.isPending && mediaSourceScan.variables === "video" ? "is-spinning" : ""}
                         />
-                        {mediaSourceScan.isPending && mediaSourceScan.variables === "video" ? "Đang quét…" : "Quét"}
+                        {mediaSourceScan.isPending && mediaSourceScan.variables === "video" ? t("Đang quét…") : t("Quét")}
                       </button>
                     </div>
                     <small id="video-source-status" className={
@@ -421,24 +425,24 @@ export function RobotConfigurationPage() {
                         : "source-scan-status"
                     }>
                       {mediaSourceScan.isPending && mediaSourceScan.variables === "video"
-                        ? "Robot đang dò thiết bị camera trên máy đang chạy…"
+                        ? t("Robot đang dò thiết bị camera trên máy đang chạy…")
                         : mediaSourceScan.isError && mediaSourceScan.variables === "video"
                           ? mediaSourceScan.error instanceof Error
                             ? mediaSourceScan.error.message
-                            : "Không quét được camera trên robot"
+                            : t("Không quét được camera trên robot")
                           : sourcesScanned.video
                             ? videoSources.length
-                              ? `Đã xác minh ${videoSources.length} camera trả về hình ảnh.${rejectedVideoSources.length ? ` Loại ${rejectedVideoSources.length} nguồn không hoạt động.` : ""}`
+                              ? `${t("Đã xác minh {count} camera trả về hình ảnh.", { count: videoSources.length })}${rejectedVideoSources.length ? ` ${t("Loại {count} nguồn không hoạt động.", { count: rejectedVideoSources.length })}` : ""}`
                               : rejectedVideoSources.length
-                                ? `Không có camera hoạt động. ${rejectedVideoSources[0].reason}`
-                                : "Robot không phát hiện camera nào. Kiểm tra kết nối USB và quyền truy cập thiết bị."
+                                ? `${t("Không có camera hoạt động.")} ${rejectedVideoSources[0].reason}`
+                                : t("Robot không phát hiện camera nào. Kiểm tra kết nối USB và quyền truy cập thiết bị.")
                             : form.video_source_type === "camera"
-                              ? "Bấm Quét để chỉ giữ camera thực sự trả về được frame hình ảnh."
-                              : "Bấm Quét để dò camera USB; nguồn không trả về hình ảnh sẽ bị loại."}
+                              ? t("Bấm Quét để chỉ giữ camera thực sự trả về được frame hình ảnh.")
+                              : t("Bấm Quét để dò camera USB; nguồn không trả về hình ảnh sẽ bị loại.")}
                     </small>
                   </label>
                   <label className="config-field">
-                    <span>Chất lượng video</span>
+                    <span>{t("Chất lượng video")}</span>
                     <select
                       value={form.video_profile}
                       onChange={(event) => setForm({
@@ -447,12 +451,12 @@ export function RobotConfigurationPage() {
                       })}
                     >
                       <option value="full_hd">Full HD · 1080p</option>
-                      <option value="balanced">Cân bằng · 720p</option>
-                      <option value="low_bandwidth">Băng thông thấp · 480p</option>
+                      <option value="balanced">{t("Cân bằng")} · 720p</option>
+                      <option value="low_bandwidth">{t("Băng thông thấp")} · 480p</option>
                     </select>
                   </label>
                   <label className="config-field">
-                    <span>Giao thức RTSP</span>
+                    <span>{t("Giao thức RTSP")}</span>
                     <select
                       value={form.rtsp_transport}
                       disabled={form.video_source_type !== "rtsp"}
@@ -461,22 +465,22 @@ export function RobotConfigurationPage() {
                         rtsp_transport: event.target.value as RobotConfigurationUpdate["rtsp_transport"],
                       })}
                     >
-                      <option value="tcp">TCP · ưu tiên ổn định</option>
-                      <option value="udp">UDP · ưu tiên độ trễ</option>
+                      <option value="tcp">TCP · {t("ưu tiên ổn định")}</option>
+                      <option value="udp">UDP · {t("ưu tiên độ trễ")}</option>
                     </select>
                   </label>
                   <div className="media-test-actions config-field--wide">
                     <button type="button" className="button button--outline" disabled={mediaTest.isPending} onClick={() => mediaTest.mutate("video")}>
-                      <Activity size={16} /> Kiểm tra nguồn camera
+                      <Activity size={16} /> {t("Kiểm tra nguồn camera")}
                     </button>
                     <button type="button" className="button button--outline" onClick={() => void togglePreview()}>
                       {previewTransport.current ? <Square size={15} /> : <Play size={15} />}
-                      {previewTransport.current ? "Dừng xem trước" : "Xem trước camera"}
+                      {previewTransport.current ? t("Dừng xem trước") : t("Xem trước camera")}
                     </button>
                     {mediaTest.data?.diagnostic === "video" && (
                       <span className={mediaTest.data.ok ? "is-ok" : ""}>
                         {mediaTest.data.detail ?? (
-                          mediaTest.data.ok ? "Nguồn video hoạt động" : "Nguồn video không hoạt động"
+                          mediaTest.data.ok ? t("Nguồn video hoạt động") : t("Nguồn video không hoạt động")
                         )}
                       </span>
                     )}
@@ -487,7 +491,7 @@ export function RobotConfigurationPage() {
               {tab === "audio" && (
                 <>
                   <label className="config-field">
-                    <span><Mic2 size={17} /> Loại nguồn âm thanh</span>
+                    <span><Mic2 size={17} /> {t("Loại nguồn âm thanh")}</span>
                     <select
                       value={form.audio_source_type}
                       onChange={(event) => {
@@ -500,12 +504,12 @@ export function RobotConfigurationPage() {
                       }}
                     >
                       <option value="device">Microphone USB/ALSA</option>
-                      <option value="file">Tệp hoặc audio stream</option>
-                      <option value="silent">Không dùng microphone</option>
+                      <option value="file">{t("Tệp hoặc audio stream")}</option>
+                      <option value="silent">{t("Không dùng microphone")}</option>
                     </select>
                   </label>
                   <label className="config-field">
-                    <span>Tên microphone</span>
+                    <span>{t("Tên microphone")}</span>
                     <input
                       value={form.microphone_label}
                       onChange={(event) => setForm({ ...form, microphone_label: event.target.value })}
@@ -513,7 +517,7 @@ export function RobotConfigurationPage() {
                     />
                   </label>
                   <label className="config-field config-field--wide">
-                    <span><Mic2 size={17} /> Nguồn microphone</span>
+                    <span><Mic2 size={17} /> {t("Nguồn microphone")}</span>
                     <div className="source-picker">
                       {form.audio_source_type === "device" ? (
                           <select
@@ -525,13 +529,13 @@ export function RobotConfigurationPage() {
                             <option value="" disabled>
                               {sourcesScanned.audio
                                 ? audioSources.length
-                                  ? "Chọn microphone vừa tìm thấy"
-                                  : "Không tìm thấy microphone ALSA"
-                                : "Bấm Quét để tìm microphone trên robot"}
+                                  ? t("Chọn microphone vừa tìm thấy")
+                                  : t("Không tìm thấy microphone ALSA")
+                                : t("Bấm Quét để tìm microphone trên robot")}
                             </option>
                             {form.audio_source && !audioSources.some((source) => source.value === form.audio_source) && (
                               <option value={form.audio_source}>
-                                {sourcesScanned.audio ? "Không còn kết nối" : "Cấu hình hiện tại"} · {form.audio_source}
+                                {sourcesScanned.audio ? t("Không còn kết nối") : t("Cấu hình hiện tại")} · {form.audio_source}
                               </option>
                             )}
                             {audioSources.map((source) => (
@@ -545,7 +549,7 @@ export function RobotConfigurationPage() {
                           value={form.audio_source}
                           disabled={form.audio_source_type === "silent"}
                           onChange={(event) => setForm({ ...form, audio_source: event.target.value })}
-                          placeholder="/media/microphone.wav hoặc URL audio"
+                          placeholder={t("/media/microphone.wav hoặc URL audio")}
                           required={form.audio_source_type === "file"}
                         />
                       )}
@@ -559,7 +563,7 @@ export function RobotConfigurationPage() {
                           size={17}
                           className={mediaSourceScan.isPending && mediaSourceScan.variables === "audio" ? "is-spinning" : ""}
                         />
-                        {mediaSourceScan.isPending && mediaSourceScan.variables === "audio" ? "Đang quét…" : "Quét"}
+                        {mediaSourceScan.isPending && mediaSourceScan.variables === "audio" ? t("Đang quét…") : t("Quét")}
                       </button>
                     </div>
                     <small id="audio-source-status" className={
@@ -568,34 +572,34 @@ export function RobotConfigurationPage() {
                         : "source-scan-status"
                     }>
                       {mediaSourceScan.isPending && mediaSourceScan.variables === "audio"
-                        ? "Robot đang dò ALSA, PipeWire và Bluetooth; hãy nói vào microphone…"
+                        ? t("Robot đang dò ALSA, PipeWire và Bluetooth; hãy nói vào microphone…")
                         : mediaSourceScan.isError && mediaSourceScan.variables === "audio"
                           ? mediaSourceScan.error instanceof Error
                             ? mediaSourceScan.error.message
-                            : "Không quét được microphone trên robot"
+                            : t("Không quét được microphone trên robot")
                           : sourcesScanned.audio
                             ? audioSources.length
-                              ? `Đã xác minh ${audioSources.length} microphone có tín hiệu.${rejectedAudioSources.length ? ` Loại ${rejectedAudioSources.length} nguồn không hoạt động.` : ""} Cấu hình âm thanh chưa thay đổi; bấm Lưu cấu hình để áp dụng.`
+                              ? `${t("Đã xác minh {count} microphone có tín hiệu.", { count: audioSources.length })}${rejectedAudioSources.length ? ` ${t("Loại {count} nguồn không hoạt động.", { count: rejectedAudioSources.length })}` : ""} ${t("Cấu hình âm thanh chưa thay đổi; bấm Lưu cấu hình để áp dụng.")}`
                               : rejectedAudioSources.length
                                 ? (() => {
                                     const rejectedSource = rejectedAudioSources.find((source) => source.type === "pulse")
                                       ?? rejectedAudioSources[0];
-                                    return `Không có microphone hoạt động. ${rejectedSource.label}: ${rejectedSource.reason}`;
+                                    return `${t("Không có microphone hoạt động.")} ${rejectedSource.label}: ${rejectedSource.reason}`;
                                   })()
-                                : "Robot không phát hiện microphone nào. Với Bluetooth, chọn HSP/HFP, bật tiếng rồi quét khi đang nói."
+                                : t("Robot không phát hiện microphone nào. Với Bluetooth, chọn HSP/HFP, bật tiếng rồi quét khi đang nói.")
                             : form.audio_source_type === "device"
-                              ? "Bấm Quét và nói vào microphone; thao tác quét không thay đổi cấu hình âm thanh."
-                              : "Bấm Quét để dò nguồn đang hoạt động; chỉ nút Lưu cấu hình mới áp dụng thay đổi âm thanh."}
+                              ? t("Bấm Quét và nói vào microphone; thao tác quét không thay đổi cấu hình âm thanh.")
+                              : t("Bấm Quét để dò nguồn đang hoạt động; chỉ nút Lưu cấu hình mới áp dụng thay đổi âm thanh.")}
                     </small>
                   </label>
                   <div className="media-test-actions config-field--wide">
                     <button type="button" className="button button--outline" disabled={mediaTest.isPending} onClick={() => mediaTest.mutate("audio")}>
-                      <Mic2 size={16} /> Kiểm tra microphone
+                      <Mic2 size={16} /> {t("Kiểm tra microphone")}
                     </button>
                     {mediaTest.data?.diagnostic === "audio" && (
                       <span className={mediaTest.data.ok ? "is-ok" : ""}>
                         {mediaTest.data.detail ?? (
-                          mediaTest.data.ok ? "Microphone có tín hiệu" : "Microphone không hoạt động"
+                          mediaTest.data.ok ? t("Microphone có tín hiệu") : t("Microphone không hoạt động")
                         )}
                       </span>
                     )}
@@ -607,18 +611,18 @@ export function RobotConfigurationPage() {
 
           {save.isError && (
             <p role="alert" className="form-error">
-              {save.error instanceof Error ? save.error.message : "Không lưu được cấu hình"}
+              {save.error instanceof Error ? save.error.message : t("Không lưu được cấu hình")}
             </p>
           )}
           <div className="configuration-actions">
-            <span>{saved && <><Check size={17} /> Đã lưu cấu hình</>}</span>
-            <button type="button" className="button button--outline" onClick={() => navigate("/robots")}>Huỷ</button>
+            <span>{saved && <><Check size={17} /> {t("Đã lưu cấu hình")}</>}</span>
+            <button type="button" className="button button--outline" onClick={() => navigate("/robots")}>{t("Huỷ")}</button>
             <button
               type="submit"
               className="button button--primary"
               disabled={loading || configurationQuery.isError || save.isPending}
             >
-              <Save size={18} /> {save.isPending ? "Đang lưu…" : "Lưu cấu hình"}
+              <Save size={18} /> {save.isPending ? t("Đang lưu…") : t("Lưu cấu hình")}
             </button>
           </div>
         </form>

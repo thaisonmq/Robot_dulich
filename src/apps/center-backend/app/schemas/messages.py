@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import re
 from typing import Any, Literal
 from uuid import UUID
 
@@ -45,9 +46,101 @@ class RealtimeMessage(BaseModel):
         return self.ttl_ms > 0 and age_ms > self.ttl_ms
 
 
+USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def normalize_email(value: str) -> str:
+    email = value.strip().casefold()
+    if len(email) > 255 or not EMAIL_PATTERN.fullmatch(email):
+        raise ValueError("Email không hợp lệ")
+    return email
+
+
+def normalize_username(value: str) -> str:
+    username = value.strip().casefold()
+    if not USERNAME_PATTERN.fullmatch(username):
+        raise ValueError(
+            "Tên đăng nhập cần 3–32 ký tự, chỉ gồm chữ thường, số, dấu chấm, gạch ngang hoặc gạch dưới"
+        )
+    return username
+
+
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    identifier: str | None = Field(default=None, min_length=3, max_length=255)
+    email: str | None = Field(default=None, min_length=3, max_length=255)
+    password: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def require_identifier(self) -> "LoginRequest":
+        if not (self.identifier or self.email):
+            raise ValueError("Hãy nhập tên đăng nhập hoặc email")
+        return self
+
+    @property
+    def login_identifier(self) -> str:
+        return str(self.identifier or self.email).strip().casefold()
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    email: str = Field(min_length=5, max_length=255)
+    full_name: str = Field(min_length=2, max_length=120)
+    password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        return normalize_username(value)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        return normalize_email(value)
+
+    @field_validator("full_name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return " ".join(value.strip().split())
+
+
+class ProfileUpdateRequest(BaseModel):
+    full_name: str = Field(min_length=2, max_length=120)
+
+    @field_validator("full_name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return " ".join(value.strip().split())
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(default="", max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class OAuthExchangeRequest(BaseModel):
+    code: str = Field(min_length=32, max_length=512)
+
+
+class AdminUserCreateRequest(RegisterRequest):
+    role: Literal["operator", "guest"] = "operator"
+    must_change_password: bool = True
+
+
+class AdminUserUpdateRequest(BaseModel):
+    full_name: str | None = Field(default=None, min_length=2, max_length=120)
+    role: Literal["operator", "guest"] | None = None
+    active: bool | None = None
+
+    @field_validator("full_name")
+    @classmethod
+    def normalize_optional_name(cls, value: str | None) -> str | None:
+        return " ".join(value.strip().split()) if value is not None else None
+
+
+class AdminPasswordResetRequest(BaseModel):
+    new_password: str = Field(min_length=8, max_length=128)
+    must_change_password: bool = True
 
 
 class RobotTokenRequest(BaseModel):
@@ -140,6 +233,10 @@ class RobotUpdate(BaseModel):
 
 class SessionCreate(BaseModel):
     robot_id: str
+
+
+class SessionCameraSelect(BaseModel):
+    camera_id: str = Field(min_length=8, max_length=128)
 
 
 class RobotConfigurationUpdate(BaseModel):

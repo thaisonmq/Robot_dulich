@@ -1,7 +1,8 @@
 import type {
   Destination, MapData, Robot, RobotConfiguration, RobotConfigurationUpdate,
   DiagnosticResult, MediaSources, RobotCreateInput, RobotEnrollment, RobotPage,
-  RobotQuickCreateInput, RobotUpdateInput, Route, Session, User,
+  RobotQuickCreateInput, RobotUpdateInput, Route, Session, User, UserPage,
+  RegisterInput, AdminUserCreateInput, ActiveControlSession, SessionCamera,
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "";
@@ -16,12 +17,40 @@ export const authStorage = {
   clear: () => sessionStorage.removeItem(TOKEN_KEY),
 };
 
+export const userStorage = {
+  get: (): User | null => {
+    const raw = sessionStorage.getItem(USER_KEY);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as User;
+    } catch {
+      sessionStorage.removeItem(USER_KEY);
+      return null;
+    }
+  },
+  set: (user: User) => sessionStorage.setItem(USER_KEY, JSON.stringify(user)),
+  clear: () => sessionStorage.removeItem(USER_KEY),
+};
+
+export function persistSession(accessToken: string, user: User): void {
+  authStorage.set(accessToken);
+  userStorage.set(user);
+}
+
+export function clearSession(): void {
+  authStorage.clear();
+  userStorage.clear();
+}
+
+export function googleLoginUrl(): string {
+  return `${API_BASE}/api/auth/google/login`;
+}
+
 function expireUserSession(token: string): void {
   // Nhiều request có thể cùng nhận 401. Chỉ request đầu tiên phát sự kiện
   // để tránh điều hướng và reset trạng thái lặp lại.
   if (authStorage.get() !== token) return;
-  authStorage.clear();
-  sessionStorage.removeItem(USER_KEY);
+  clearSession();
   window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
 }
 
@@ -53,12 +82,75 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
-  async login(email: string, password: string): Promise<{ access_token: string; user: User }> {
+  async login(identifier: string, password: string): Promise<{ access_token: string; user: User }> {
     return request("/api/auth/login", {
       method: "POST",
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ identifier, password }),
     });
   },
+  register: (input: RegisterInput) =>
+    request<{ access_token: string; user: User }>("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  me: () => request<User>("/api/auth/me"),
+  updateProfile: (fullName: string) =>
+    request<User>("/api/auth/me", {
+      method: "PATCH",
+      body: JSON.stringify({ full_name: fullName }),
+    }),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    request<{ status: string }>("/api/auth/me/password", {
+      method: "POST",
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    }),
+  googleStatus: () => request<{ enabled: boolean }>("/api/auth/google/status"),
+  exchangeGoogleCode: (code: string) =>
+    request<{ access_token: string; user: User }>("/api/auth/google/exchange", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    }),
+  users: (
+    options: {
+      page?: number;
+      pageSize?: number;
+      search?: string;
+      role?: string;
+      status?: string;
+    } = {},
+  ) => {
+    const params = new URLSearchParams({
+      page: String(options.page ?? 1),
+      page_size: String(options.pageSize ?? 10),
+      search: options.search ?? "",
+      role: options.role ?? "all",
+      status: options.status ?? "all",
+    });
+    return request<UserPage>(`/api/admin/users?${params}`);
+  },
+  createUser: (input: AdminUserCreateInput) =>
+    request<User>("/api/admin/users", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateUser: (
+    userId: string,
+    input: { full_name?: string; role?: "operator" | "guest"; active?: boolean },
+  ) => request<User>(`/api/admin/users/${userId}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  }),
+  resetUserPassword: (userId: string, newPassword: string) =>
+    request<{ status: string }>(`/api/admin/users/${userId}/reset-password`, {
+      method: "POST",
+      body: JSON.stringify({
+        new_password: newPassword,
+        must_change_password: true,
+      }),
+    }),
   robots: (options: { page?: number; pageSize?: number; search?: string; status?: string } = {}) => {
     const params = new URLSearchParams({
       page: String(options.page ?? 1),
@@ -129,6 +221,26 @@ export const api = {
     request<Session>("/api/sessions", {
       method: "POST",
       body: JSON.stringify({ robot_id: robotId }),
+    }),
+  activeGuestSessions: () =>
+    request<ActiveControlSession[]>("/api/sessions/active"),
+  spectateSession: (sessionId: string) =>
+    request<Session>(`/api/sessions/${sessionId}/spectate`, {
+      method: "POST",
+    }),
+  forceEndSession: (sessionId: string) =>
+    request<{ session_id: string; status: string }>(
+      `/api/sessions/${sessionId}/force-end`,
+      { method: "POST" },
+    ),
+  sessionCameras: (sessionId: string) =>
+    request<{ robot_id: string; items: SessionCamera[] }>(
+      `/api/sessions/${sessionId}/cameras`,
+    ),
+  selectSessionCamera: (sessionId: string, cameraId: string) =>
+    request<SessionCamera>(`/api/sessions/${sessionId}/camera`, {
+      method: "PUT",
+      body: JSON.stringify({ camera_id: cameraId }),
     }),
   deleteSession: (sessionId: string) =>
     request(`/api/sessions/${sessionId}`, { method: "DELETE" }),

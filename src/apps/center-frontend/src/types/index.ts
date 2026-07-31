@@ -13,9 +13,49 @@ export type NavigationState =
 
 export interface User {
   id: string;
+  username: string;
   email: string;
   name: string;
-  role: string;
+  full_name: string;
+  role: "admin" | "operator" | "guest";
+  active: boolean;
+  email_verified: boolean;
+  avatar_url: string | null;
+  must_change_password: boolean;
+  password_enabled: boolean;
+  auth_providers: string[];
+  permissions: string[];
+  created_by_id: string | null;
+  last_login_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UserPage {
+  items: User[];
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
+  summary: {
+    total: number;
+    admin: number;
+    operator: number;
+    guest: number;
+    inactive: number;
+  };
+}
+
+export interface RegisterInput {
+  username: string;
+  email: string;
+  full_name: string;
+  password: string;
+}
+
+export interface AdminUserCreateInput extends RegisterInput {
+  role: "operator" | "guest";
+  must_change_password: boolean;
 }
 
 export interface Robot {
@@ -129,10 +169,39 @@ export interface Session {
   session_id: string;
   robot_id: string;
   status: string;
+  mode: "control" | "spectator";
+  started_at: string;
   expires_at: string;
+  controller: SessionController | null;
   media: { url: string; room_name: string; token: string };
   control_websocket_url: string;
   telemetry_websocket_url: string;
+}
+
+export interface SessionController {
+  id: string;
+  name: string;
+  username: string;
+  role: User["role"];
+}
+
+export interface ActiveControlSession {
+  session_id: string;
+  robot_id: string;
+  robot_name: string;
+  status: string;
+  started_at: string;
+  expires_at: string;
+  duration_seconds: number;
+  controller: SessionController;
+}
+
+export interface SessionCamera {
+  id: string;
+  label: string;
+  selected: boolean;
+  source_type?: string;
+  source?: string;
 }
 
 export interface Pose {

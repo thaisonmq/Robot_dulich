@@ -6,6 +6,8 @@ import {
 } from "lucide-react";
 import { api } from "../api/client";
 import { Brand } from "../components/Brand";
+import { GlobalLanguageSelect } from "../components/GlobalLanguageSelect";
+import { useI18n } from "../i18n/I18nProvider";
 import { useNavigate, useParams } from "../router";
 import type {
   RobotQuickCreateInput, RobotUpdateInput,
@@ -29,6 +31,7 @@ const EMPTY_EDIT_FORM: RobotUpdateInput = {
 
 export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
   const navigate = useNavigate();
+  const { t } = useI18n();
   const queryClient = useQueryClient();
   const { robotId = "" } = useParams();
   const [quickForm, setQuickForm] = useState(EMPTY_QUICK_FORM);
@@ -102,11 +105,12 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
       <header className="app-header">
         <Brand compact />
         <div className="app-header__context">
-          <span>Quản lý thiết bị</span>
-          <strong>{mode === "create" ? "Thêm robot" : editForm.name || robotId}</strong>
+          <span>{t("Quản lý thiết bị")}</span>
+          <strong>{mode === "create" ? t("Thêm robot") : editForm.name || robotId}</strong>
         </div>
+        <GlobalLanguageSelect />
         <button type="button" className="header-action" onClick={() => navigate("/robots")}>
-          <ArrowLeft size={18} /> Danh sách robot
+          <ArrowLeft size={18} /> {t("Danh sách robot")}
         </button>
       </header>
 
@@ -114,16 +118,16 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
         <aside className="robot-editor-guide">
           <span className="editor-device-icon"><Bot size={38} /></span>
           <p className="eyebrow">ROBOT CONNECTION</p>
-          <h1>{mode === "create" ? "Thêm robot trong vài giây" : "Thông tin quản lý"}</h1>
+          <h1>{mode === "create" ? t("Thêm robot trong vài giây") : t("Thông tin quản lý")}</h1>
           <p>
             {mode === "create"
-              ? "Nhập đúng thông tin đăng nhập có sẵn trên robot. Center sẽ nhận diện thiết bị khi edge agent hoạt động."
-              : "Tên và khu vực thuộc Center; camera, microphone và kết nối phần cứng vẫn thuộc robot."}
+              ? t("Nhập đúng thông tin đăng nhập có sẵn trên robot. Center sẽ nhận diện thiết bị khi edge agent hoạt động.")
+              : t("Tên và khu vực thuộc Center; camera, microphone và kết nối phần cứng vẫn thuộc robot.")}
           </p>
           <ol>
-            <li><span>01</span>Nhập địa chỉ và tài khoản robot</li>
-            <li><span>02</span>Center lưu mật khẩu dưới dạng hash</li>
-            <li><span>03</span>Robot chạy sẽ tự chuyển online</li>
+            <li><span>01</span>{t("Nhập địa chỉ và tài khoản robot")}</li>
+            <li><span>02</span>{t("Center lưu mật khẩu dưới dạng hash")}</li>
+            <li><span>03</span>{t("Robot chạy sẽ tự chuyển online")}</li>
           </ol>
         </aside>
 
@@ -137,12 +141,12 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
         >
           <div className="editor-form-heading">
             <div>
-              <p className="eyebrow">{mode === "create" ? "KẾT NỐI NHANH" : "HỒ SƠ ROBOT"}</p>
-              <h2>{mode === "create" ? "Thông tin đăng nhập robot" : "Chỉnh sửa robot"}</h2>
+              <p className="eyebrow">{mode === "create" ? t("KẾT NỐI NHANH") : t("HỒ SƠ ROBOT")}</p>
+              <h2>{mode === "create" ? t("Thông tin đăng nhập robot") : t("Chỉnh sửa robot")}</h2>
             </div>
             {mode === "edit" && (
               <span className={`connection-chip ${isOnline ? "is-online" : ""}`}>
-                <i /> {isOnline ? "Đang online" : "Đang offline"}
+                <i /> {isOnline ? t("Đang online") : t("Đang offline")}
               </span>
             )}
           </div>
@@ -150,20 +154,19 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
           {mode === "create" && createdRobotId ? (
             <section className="quick-add-success">
               <span><Check size={30} /></span>
-              <p className="eyebrow">ĐÃ THÊM ROBOT</p>
+              <p className="eyebrow">{t("ĐÃ THÊM ROBOT")}</p>
               <h3>{createdRobotId}</h3>
               <p>
-                Robot đang được theo dõi. Nếu edge agent đang chạy, trạng thái sẽ
-                tự chuyển online; nếu đang tắt, robot tiếp tục hiển thị offline.
+                {t("Robot đang được theo dõi. Nếu edge agent đang chạy, trạng thái sẽ tự chuyển online; nếu đang tắt, robot tiếp tục hiển thị offline.")}
               </p>
               <button type="button" className="button button--primary" onClick={() => navigate("/robots")}>
-                Xem danh sách robot
+                {t("Xem danh sách robot")}
               </button>
               <button type="button" className="text-action" onClick={() => {
                 setCreatedRobotId("");
                 setQuickForm(EMPTY_QUICK_FORM);
               }}>
-                Thêm robot khác
+                {t("Thêm robot khác")}
               </button>
             </section>
           ) : (
@@ -171,7 +174,7 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
               {mode === "create" ? (
                 <div className="editor-fields editor-fields--quick">
                   <label className="config-field config-field--wide">
-                    <span><Network size={17} /> IP hoặc hostname robot</span>
+                    <span><Network size={17} /> {t("IP hoặc hostname robot")}</span>
                     <input
                       value={quickForm.management_address}
                       onChange={(event) => setQuickForm({
@@ -182,10 +185,10 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                       autoComplete="off"
                       required
                     />
-                    <small>Địa chỉ quản lý mà edge agent báo về Center.</small>
+                    <small>{t("Địa chỉ quản lý mà edge agent báo về Center.")}</small>
                   </label>
                   <label className="config-field">
-                    <span><UserRound size={17} /> Tài khoản robot</span>
+                    <span><UserRound size={17} /> {t("Tài khoản robot")}</span>
                     <input
                       value={quickForm.username}
                       onChange={(event) => setQuickForm({
@@ -198,7 +201,7 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                     />
                   </label>
                   <label className="config-field">
-                    <span><LockKeyhole size={17} /> Mật khẩu robot</span>
+                    <span><LockKeyhole size={17} /> {t("Mật khẩu robot")}</span>
                     <span className="password-control">
                       <input
                         type={showPassword ? "text" : "password"}
@@ -207,14 +210,14 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                           ...quickForm,
                           password: event.target.value,
                         })}
-                        placeholder="Ít nhất 6 ký tự"
+                        placeholder={t("Ít nhất 6 ký tự")}
                         minLength={6}
                         autoComplete="current-password"
                         required
                       />
                       <button
                         type="button"
-                        aria-label={showPassword ? "Ẩn mật khẩu" : "Hiện mật khẩu"}
+                        aria-label={showPassword ? t("Ẩn mật khẩu") : t("Hiện mật khẩu")}
                         onClick={() => setShowPassword((value) => !value)}
                       >
                         {showPassword ? <EyeOff size={17} /> : <Eye size={17} />}
@@ -224,22 +227,22 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                   <div className="quick-add-note config-field--wide">
                     <LockKeyhole size={18} />
                     <span>
-                      <strong>Không lưu mật khẩu rõ</strong>
-                      <small>Center chỉ lưu hash PBKDF2. Robot luôn chủ động kết nối outbound.</small>
+                      <strong>{t("Không lưu mật khẩu rõ")}</strong>
+                      <small>{t("Center chỉ lưu hash PBKDF2. Robot luôn chủ động kết nối outbound.")}</small>
                     </span>
                   </div>
                 </div>
               ) : robotQuery.isLoading ? (
-                <div className="configuration-loading">Đang tải hồ sơ robot…</div>
+                <div className="configuration-loading">{t("Đang tải hồ sơ robot…")}</div>
               ) : robotQuery.isError ? (
                 <div className="configuration-error" role="alert">
-                  <h3>Không tải được robot</h3>
-                  <p>{robotQuery.error instanceof Error ? robotQuery.error.message : "Robot không tồn tại"}</p>
+                  <h3>{t("Không tải được robot")}</h3>
+                  <p>{robotQuery.error instanceof Error ? robotQuery.error.message : t("Robot không tồn tại")}</p>
                 </div>
               ) : (
                 <div className="editor-fields">
                   <label className="config-field">
-                    <span>Tên hiển thị</span>
+                    <span>{t("Tên hiển thị")}</span>
                     <input
                       value={editForm.name}
                       onChange={(event) => setEditForm({ ...editForm, name: event.target.value })}
@@ -247,7 +250,7 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                     />
                   </label>
                   <label className="config-field">
-                    <span>Khu vực hoạt động</span>
+                    <span>{t("Khu vực hoạt động")}</span>
                     <input
                       value={editForm.site_id}
                       onChange={(event) => setEditForm({ ...editForm, site_id: event.target.value })}
@@ -255,7 +258,7 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                     />
                   </label>
                   <label className="config-field">
-                    <span>IP hoặc hostname robot</span>
+                    <span>{t("IP hoặc hostname robot")}</span>
                     <input
                       value={editForm.management_address}
                       onChange={(event) => setEditForm({
@@ -266,7 +269,7 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                     />
                   </label>
                   <label className="config-field">
-                    <span>Tài khoản robot</span>
+                    <span>{t("Tài khoản robot")}</span>
                     <input
                       value={editForm.management_username}
                       onChange={(event) => setEditForm({
@@ -276,17 +279,17 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                     />
                   </label>
                   <label className="config-field">
-                    <span>Map mặc định</span>
+                    <span>{t("Map mặc định")}</span>
                     <select
                       value={editForm.map_id}
                       onChange={(event) => setEditForm({ ...editForm, map_id: event.target.value })}
                     >
-                      <option value="MAP-001">MAP-001 · Bản đồ bảo tàng</option>
+                      <option value="MAP-001">MAP-001 · {t("Bản đồ bảo tàng")}</option>
                     </select>
                   </label>
                   {changePassword ? (
                     <label className="config-field">
-                      <span>Mật khẩu mới</span>
+                      <span>{t("Mật khẩu mới")}</span>
                       <input
                         type="password"
                         name="rovera-robot-password-change"
@@ -295,7 +298,7 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                           ...editForm,
                           management_password: event.target.value,
                         })}
-                        placeholder="Ít nhất 6 ký tự"
+                        placeholder={t("Ít nhất 6 ký tự")}
                         minLength={6}
                         autoComplete="off"
                         required
@@ -308,18 +311,18 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                           setEditForm({ ...editForm, management_password: "" });
                         }}
                       >
-                        Không đổi mật khẩu
+                        {t("Không đổi mật khẩu")}
                       </button>
                     </label>
                   ) : (
                     <div className="password-reset-action">
                       <span><KeyRound size={17} /></span>
                       <div>
-                        <strong>Mật khẩu robot</strong>
-                        <small>Chỉ thay đổi khi bạn chủ động yêu cầu.</small>
+                        <strong>{t("Mật khẩu robot")}</strong>
+                        <small>{t("Chỉ thay đổi khi bạn chủ động yêu cầu.")}</small>
                       </div>
                       <button type="button" onClick={() => setChangePassword(true)}>
-                        Đổi mật khẩu
+                        {t("Đổi mật khẩu")}
                       </button>
                     </div>
                   )}
@@ -330,8 +333,11 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                       onChange={(event) => setEditForm({ ...editForm, enabled: event.target.checked })}
                     />
                     <span>
-                      <strong>Cho phép robot kết nối</strong>
-                      <small>{isOnline ? "Có thể sửa IP, tài khoản và mật khẩu mà không ngắt phiên hiện tại." : "Vô hiệu hoá để chặn robot lấy JWT."}</small>
+                      <strong>{t("Cho phép robot kết nối")}</strong>
+                      <small>{isOnline
+                        ? t("Có thể sửa IP, tài khoản và mật khẩu mà không ngắt phiên hiện tại.")
+                        : t("Vô hiệu hoá để chặn robot lấy JWT.")}
+                      </small>
                     </span>
                   </label>
                 </div>
@@ -339,7 +345,7 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
 
               {error && (
                 <p role="alert" className="form-error">
-                  {error instanceof Error ? error.message : "Không thể lưu robot"}
+                  {error instanceof Error ? error.message : t("Không thể lưu robot")}
                 </p>
               )}
 
@@ -355,12 +361,12 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                     }}
                   >
                     <Trash2 size={17} />
-                    {confirmDelete ? "Nhấn lại để xác nhận xoá" : "Xoá robot"}
+                    {confirmDelete ? t("Nhấn lại để xác nhận xoá") : t("Xoá robot")}
                   </button>
                 )}
-                <span>{saved ? "Đã lưu thay đổi" : ""}</span>
+                <span>{saved ? t("Đã lưu thay đổi") : ""}</span>
                 <button type="button" className="button button--outline" onClick={() => navigate("/robots")}>
-                  Huỷ
+                  {t("Huỷ")}
                 </button>
                 <button
                   type="submit"
@@ -369,10 +375,10 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
                 >
                   <Save size={18} />
                   {create.isPending || update.isPending
-                    ? "Đang lưu…"
+                    ? t("Đang lưu…")
                     : mode === "create"
-                      ? "Thêm robot"
-                      : "Lưu thay đổi"}
+                      ? t("Thêm robot")
+                      : t("Lưu thay đổi")}
                 </button>
               </div>
             </>

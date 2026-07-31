@@ -1,4 +1,5 @@
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Square } from "lucide-react";
+import { useI18n } from "../i18n/I18nProvider";
 import type { InputState, InputAction, OnScreenControlAdapter } from "../utils/input";
 
 interface Props {
@@ -15,6 +16,7 @@ const controls: { action: InputAction; label: string; icon: typeof ArrowUp; clas
 ];
 
 export function ControlPad({ adapter, input, disabled }: Props) {
+  const { t } = useI18n();
   const pointerDown = (event: React.PointerEvent<HTMLButtonElement>, action: InputAction) => {
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -29,7 +31,7 @@ export function ControlPad({ adapter, input, disabled }: Props) {
   };
   const direction = controls.find(({ action }) => input[action as keyof InputState])?.action ?? "idle";
   return (
-    <div className={`control-pad control-pad--${direction}`} aria-label="Điều khiển robot">
+    <div className={`control-pad control-pad--${direction}`} aria-label={t("Điều khiển robot")}>
       <div className="control-pad__orbit" aria-hidden="true">
         <i /><i /><i /><i />
       </div>
@@ -39,7 +41,7 @@ export function ControlPad({ adapter, input, disabled }: Props) {
           type="button"
           key={action}
           className={`${className} ${input[action as keyof InputState] ? "is-pressed" : ""}`}
-          aria-label={label}
+          aria-label={t(label)}
           aria-pressed={input[action as keyof InputState]}
           disabled={disabled}
           onPointerDown={(event) => pointerDown(event, action)}
@@ -48,13 +50,13 @@ export function ControlPad({ adapter, input, disabled }: Props) {
           onContextMenu={(event) => event.preventDefault()}
         >
           <Icon size={28} strokeWidth={1.8} />
-          <span>{label}</span>
+          <span>{t(label)}</span>
         </button>
       ))}
       <button
         type="button"
         className="control-pad__stop"
-        aria-label="Dừng khẩn cấp"
+        aria-label={t("Dừng khẩn cấp")}
         disabled={disabled}
         onClick={() => {
           adapter.press("emergencyStop");
@@ -62,7 +64,7 @@ export function ControlPad({ adapter, input, disabled }: Props) {
         }}
       >
         <Square size={19} fill="currentColor" />
-        <span>DỪNG</span>
+        <span>{t("DỪNG")}</span>
       </button>
     </div>
   );

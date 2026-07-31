@@ -48,6 +48,8 @@ export class WebSocketControlTransport implements IControlTransport {
           const messageType = this.commandTypes.get(commandId);
           this.commandTypes.delete(commandId);
           this.onAck(message.payload.status ?? "unknown", messageType);
+        } else if (message.message_type === "session.ended") {
+          this.onAck("session_ended");
         }
       };
       this.socket.onclose = () => {

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from app.core.config import Settings, get_settings
 from app.core.security import decode_robot_token, decode_token
 from app.models.database import SessionLocal
-from app.models.entities import Robot, RobotConnection
+from app.models.entities import ControlSession, Robot, RobotConnection, User
 from app.schemas.messages import RealtimeMessage
 from app.services.hub import hub
 
@@ -96,7 +96,11 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
             elif message.message_type == "robot.health":
                 hub.robots[robot_id].health.update(message.payload)
             elif message.message_type in {
-                "configuration.state", "diagnostics.result", "media.sources"
+                "configuration.state",
+                "diagnostics.result",
+                "media.sources",
+                "media.cameras",
+                "media.source.state",
             }:
                 request_id = str(message.payload.get("request_id", ""))
                 if hub.resolve_robot_request(robot_id, request_id, message.payload):
@@ -118,19 +122,38 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
                 connection.disconnected_at = datetime.now(timezone.utc)
 
 
-def ws_user(socket: WebSocket, settings: Settings) -> str | None:
+def ws_user(socket: WebSocket, settings: Settings) -> tuple[str, str] | None:
     token = socket.query_params.get("token", "")
     try:
-        return decode_token(token, settings)
+        user_id = decode_token(token, settings)
     except Exception:
         return None
+    with SessionLocal() as database:
+        user = database.get(User, user_id)
+        if user is None or not user.active:
+            return None
+        return user_id, user.role
+
+
+def can_watch_session(
+    user: tuple[str, str], session_user_id: str
+) -> bool:
+    user_id, role = user
+    if user_id == session_user_id:
+        return True
+    if role not in {"admin", "operator"}:
+        return False
+    with SessionLocal() as database:
+        owner = database.get(User, session_user_id)
+        return owner is not None and owner.active and owner.role == "guest"
 
 
 @router.websocket("/ws/user/control/{robot_id}")
 async def user_control(
     socket: WebSocket, robot_id: str, settings: Settings = Depends(get_settings)
 ) -> None:
-    user_id = ws_user(socket, settings)
+    user = ws_user(socket, settings)
+    user_id = user[0] if user else None
     session_id = socket.query_params.get("session_id", "")
     session = hub.get_session(session_id, user_id) if user_id else None
     await socket.accept()
@@ -138,6 +161,8 @@ async def user_control(
         await ws_error(socket, status.WS_1008_POLICY_VIOLATION, "invalid session")
         return
     session.control_connected = True
+    hub.control_sockets[session_id] = socket
+    hub.session_sockets.setdefault(session_id, set()).add(socket)
     try:
         while True:
             raw = await socket.receive_text()
@@ -146,7 +171,9 @@ async def user_control(
                 return
             message = RealtimeMessage.model_validate_json(raw)
             ack_status = "accepted"
-            if message.robot_id != robot_id or message.session_id != session_id:
+            if session.status != "active":
+                ack_status = "invalid_session"
+            elif message.robot_id != robot_id or message.session_id != session_id:
                 ack_status = "invalid_session"
             elif message.expired():
                 ack_status = "expired"
@@ -178,35 +205,55 @@ async def user_control(
         pass
     finally:
         session.control_connected = False
-        await hub.forward_to_robot(
-            robot_id,
-            {
-                "message_id": str(uuid4()),
-                "schema_version": "1.0",
-                "message_type": "control.stop",
-                "robot_id": robot_id,
-                "session_id": session_id,
-                "sequence": session.last_sequence + 1,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "ttl_ms": 1000,
-                "payload": {"reason": "user_control_disconnected"},
-            },
-        )
-        await hub.close_session(session_id, user_id)
+        hub.session_sockets.get(session_id, set()).discard(socket)
+        if hub.control_sockets.get(session_id) is socket:
+            hub.control_sockets.pop(session_id, None)
+        if session.status == "active":
+            await hub.forward_to_robot(
+                robot_id,
+                {
+                    "message_id": str(uuid4()),
+                    "schema_version": "1.0",
+                    "message_type": "control.stop",
+                    "robot_id": robot_id,
+                    "session_id": session_id,
+                    "sequence": session.last_sequence + 1,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "ttl_ms": 1000,
+                    "payload": {"reason": "user_control_disconnected"},
+                },
+            )
+            closed = await hub.close_session(
+                session_id, user_id, reason="user_control_disconnected"
+            )
+            if closed:
+                with SessionLocal.begin() as database:
+                    record = database.get(ControlSession, session_id)
+                    if record:
+                        record.status = "ended"
+                        record.ended_at = datetime.now(timezone.utc)
+                        record.ended_by_user_id = user_id
+                        record.end_reason = "user_control_disconnected"
 
 
 @router.websocket("/ws/user/telemetry/{robot_id}")
 async def user_telemetry(
     socket: WebSocket, robot_id: str, settings: Settings = Depends(get_settings)
 ) -> None:
-    user_id = ws_user(socket, settings)
+    user = ws_user(socket, settings)
     session_id = socket.query_params.get("session_id", "")
-    session = hub.get_session(session_id, user_id) if user_id else None
+    session = hub.get_session(session_id) if user else None
     await socket.accept()
-    if not session or session.robot_id != robot_id:
+    if (
+        not session
+        or session.robot_id != robot_id
+        or user is None
+        or not can_watch_session(user, session.user_id)
+    ):
         await ws_error(socket, status.WS_1008_POLICY_VIOLATION, "invalid session")
         return
     hub.telemetry_sockets.setdefault(robot_id, set()).add(socket)
+    hub.session_sockets.setdefault(session_id, set()).add(socket)
     robot = hub.robots[robot_id]
     await socket.send_json(
         {
@@ -228,3 +275,4 @@ async def user_telemetry(
         pass
     finally:
         hub.telemetry_sockets.get(robot_id, set()).discard(socket)
+        hub.session_sockets.get(session_id, set()).discard(socket)

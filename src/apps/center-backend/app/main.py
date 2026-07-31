@@ -7,11 +7,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api import auth, maps, navigation, robot_auth, robots, sessions, websockets
+from app.api import auth, maps, navigation, robot_auth, robots, sessions, users, websockets
 from app.core.config import get_settings
 from app.models.database import Base, engine
 from app.models.database import SessionLocal
-from app.models.entities import Robot
+from app.models.entities import ControlSession, Robot
 from app.services.hub import hub
 from app.services.seed import seed_database
 
@@ -42,7 +42,16 @@ async def presence_monitor() -> None:
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     seed_database()
-    with SessionLocal() as database:
+    with SessionLocal.begin() as database:
+        now = datetime.now(timezone.utc)
+        for stale in (
+            database.query(ControlSession)
+            .filter(ControlSession.status == "active")
+            .all()
+        ):
+            stale.status = "ended"
+            stale.ended_at = now
+            stale.end_reason = "center_restarted"
         for robot in database.query(Robot).all():
             hub.sync_registry_robot(
                 robot.robot_id,
@@ -69,6 +78,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth.router)
+app.include_router(users.router)
 app.include_router(robot_auth.router)
 app.include_router(robots.router)
 app.include_router(sessions.router)

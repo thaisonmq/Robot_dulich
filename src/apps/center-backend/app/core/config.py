@@ -13,6 +13,16 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 480
     demo_email: str = "demo@rovera.local"
     demo_password: str = "demo123"
+    bootstrap_admin_username: str = "admin"
+    bootstrap_admin_password: str = "admin123"
+    bootstrap_admin_email: str = "admin@rovera.local"
+    bootstrap_admin_name: str = "Quản trị hệ thống"
+    frontend_public_url: str = "http://localhost:8080"
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = ""
+    oauth_state_expire_minutes: int = 10
+    oauth_login_code_expire_seconds: int = 120
     seed_demo_robot: bool = False
     robot_id: str = "ROBOT-001"
     robot_credential: str = "robot-001-change-me"
@@ -39,6 +49,10 @@ class Settings(BaseSettings):
     @property
     def robot_livekit_url(self) -> str:
         return self.livekit_robot_url.strip() or self.livekit_url
+
+    @property
+    def google_oauth_enabled(self) -> bool:
+        return bool(self.google_client_id.strip() and self.google_client_secret.strip())
 
 
 @lru_cache

@@ -9,10 +9,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.security import current_user, hash_robot_password
+from app.core.security import authenticated_user, hash_robot_password, operator_user_id
 from app.core.config import Settings, get_settings
 from app.models.database import get_db
-from app.models.entities import MapRecord, Robot
+from app.models.entities import MapRecord, Robot, User
 from app.schemas.messages import (
     RobotConfigurationUpdate,
     MediaProbeRequest,
@@ -26,7 +26,7 @@ from app.services.media import create_preview_media_token
 router = APIRouter(prefix="/api/robots", tags=["robots"])
 
 
-def sync_robot(entity: Robot) -> dict:
+def sync_robot(entity: Robot, *, detailed: bool = True) -> dict:
     runtime = hub.sync_registry_robot(
         entity.robot_id,
         entity.name,
@@ -39,9 +39,9 @@ def sync_robot(entity: Robot) -> dict:
     )
     return {
         **hub.robot_view(runtime),
-        "management_address": entity.management_address,
-        "management_username": entity.management_username,
-        "connection_method": entity.connection_method,
+        "management_address": entity.management_address if detailed else None,
+        "management_username": entity.management_username if detailed else None,
+        "connection_method": entity.connection_method if detailed else "token",
     }
 
 
@@ -59,11 +59,12 @@ async def list_robots(
     page_size: int = Query(default=6, ge=1, le=50),
     search: str = Query(default="", max_length=120),
     status_filter: str = Query(default="all", alias="status"),
-    _: str = Depends(current_user),
+    actor: User = Depends(authenticated_user),
     database: Session = Depends(get_db),
 ) -> dict:
     entities = list(database.scalars(select(Robot).order_by(Robot.created_at.desc())))
-    items = [sync_robot(entity) for entity in entities]
+    detailed = actor.role in {"admin", "operator"}
+    items = [sync_robot(entity, detailed=detailed) for entity in entities]
     normalized_search = search.strip().casefold()
     if normalized_search:
         items = [
@@ -85,7 +86,9 @@ async def list_robots(
     total = len(items)
     start = (page - 1) * page_size
     paged_items = items[start:start + page_size]
-    all_views = [sync_robot(entity) for entity in entities]
+    all_views = [
+        sync_robot(entity, detailed=detailed) for entity in entities
+    ]
     return {
         "items": paged_items,
         "page": page,
@@ -110,7 +113,7 @@ async def list_robots(
 async def create_robot(
     body: RobotCreate,
     request: Request,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
     database: Session = Depends(get_db),
 ) -> dict:
     if database.scalar(select(Robot).where(Robot.robot_id == body.robot_id)):
@@ -146,7 +149,7 @@ async def create_robot(
 @router.post("/quick-add", status_code=201)
 async def quick_add_robot(
     body: RobotQuickCreate,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
     database: Session = Depends(get_db),
 ) -> dict:
     existing = database.scalar(
@@ -190,20 +193,22 @@ async def quick_add_robot(
 @router.get("/{robot_id}")
 async def get_robot(
     robot_id: str,
-    _: str = Depends(current_user),
+    actor: User = Depends(authenticated_user),
     database: Session = Depends(get_db),
 ) -> dict:
     entity = database.scalar(select(Robot).where(Robot.robot_id == robot_id))
     if entity is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy robot")
-    return sync_robot(entity)
+    return sync_robot(
+        entity, detailed=actor.role in {"admin", "operator"}
+    )
 
 
 @router.patch("/{robot_id}")
 async def update_robot(
     robot_id: str,
     body: RobotUpdate,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
     database: Session = Depends(get_db),
 ) -> dict:
     entity = database.scalar(select(Robot).where(Robot.robot_id == robot_id))
@@ -253,7 +258,7 @@ async def update_robot(
 async def renew_robot_enrollment(
     robot_id: str,
     request: Request,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
     database: Session = Depends(get_db),
 ) -> dict:
     entity = database.scalar(select(Robot).where(Robot.robot_id == robot_id))
@@ -279,7 +284,7 @@ async def renew_robot_enrollment(
 @router.delete("/{robot_id}", status_code=204)
 async def delete_robot(
     robot_id: str,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
     database: Session = Depends(get_db),
 ) -> Response:
     entity = database.scalar(select(Robot).where(Robot.robot_id == robot_id))
@@ -329,7 +334,7 @@ async def configuration_from_simulator(
 @router.get("/{robot_id}/configuration")
 async def get_robot_configuration(
     robot_id: str,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
 ) -> dict:
     return await configuration_from_simulator(robot_id, "configuration.get", {})
 
@@ -338,7 +343,7 @@ async def get_robot_configuration(
 async def update_robot_configuration(
     robot_id: str,
     body: RobotConfigurationUpdate,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
 ) -> dict:
     return await configuration_from_simulator(
         robot_id, "configuration.update", body.model_dump()
@@ -348,7 +353,7 @@ async def update_robot_configuration(
 @router.post("/{robot_id}/diagnostics/connection")
 async def test_robot_connection(
     robot_id: str,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
 ) -> dict:
     return await configuration_from_simulator(robot_id, "diagnostics.ping", {})
 
@@ -357,7 +362,7 @@ async def test_robot_connection(
 async def get_robot_media_sources(
     robot_id: str,
     media_kind: Literal["video", "audio", "all"] = Query(default="all"),
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
 ) -> dict:
     return await configuration_from_simulator(
         robot_id, "media.sources.get", {"media_kind": media_kind}
@@ -368,7 +373,7 @@ async def get_robot_media_sources(
 async def test_robot_media(
     robot_id: str,
     body: MediaProbeRequest,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
 ) -> dict:
     return await configuration_from_simulator(
         robot_id,
@@ -381,7 +386,7 @@ async def test_robot_media(
 @router.post("/{robot_id}/preview-token")
 async def preview_robot_media(
     robot_id: str,
-    user_id: str = Depends(current_user),
+    user_id: str = Depends(operator_user_id),
     settings: Settings = Depends(get_settings),
 ) -> dict:
     robot = hub.robots.get(robot_id)
@@ -410,7 +415,7 @@ async def preview_robot_media(
 async def renew_robot_media_preview(
     robot_id: str,
     lease_id: str,
-    user_id: str = Depends(current_user),
+    user_id: str = Depends(operator_user_id),
     settings: Settings = Depends(get_settings),
 ) -> dict:
     if not await hub.renew_preview_lease(
@@ -427,7 +432,7 @@ async def renew_robot_media_preview(
 async def stop_robot_media_preview(
     robot_id: str,
     lease_id: str,
-    user_id: str = Depends(current_user),
+    user_id: str = Depends(operator_user_id),
 ) -> Response:
     if not await hub.close_preview_lease(robot_id, lease_id, user_id):
         raise HTTPException(status_code=404, detail="Không tìm thấy phiên xem trước")
@@ -435,7 +440,7 @@ async def stop_robot_media_preview(
 
 
 @router.post("/{robot_id}/connect")
-async def connect_robot(robot_id: str, _: str = Depends(current_user)) -> dict:
+async def connect_robot(robot_id: str, _: str = Depends(operator_user_id)) -> dict:
     robot = hub.robots.get(robot_id)
     if robot is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy robot")
@@ -445,7 +450,7 @@ async def connect_robot(robot_id: str, _: str = Depends(current_user)) -> dict:
 
 
 @router.post("/{robot_id}/disconnect")
-async def disconnect_robot(robot_id: str, _: str = Depends(current_user)) -> dict:
+async def disconnect_robot(robot_id: str, _: str = Depends(operator_user_id)) -> dict:
     session_id = hub.robot_session.get(robot_id)
     if session_id:
         await hub.close_session(session_id)

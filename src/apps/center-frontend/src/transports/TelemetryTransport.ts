@@ -5,6 +5,7 @@ interface TelemetryCallbacks {
   onPose: (pose: Pose) => void;
   onHealth: (health: Health) => void;
   onNavigation: (status: string) => void;
+  onSessionEnded: (reason: string) => void;
   onDisconnect: () => void;
 }
 
@@ -33,6 +34,8 @@ export class WebSocketTelemetryTransport {
           this.callbacks.onHealth(message.payload as unknown as Health);
         } else if (message.message_type === "navigation.status") {
           this.callbacks.onNavigation(String(message.payload.status));
+        } else if (message.message_type === "session.ended") {
+          this.callbacks.onSessionEnded(String(message.payload.reason ?? "session_ended"));
         }
       };
       this.socket.onclose = () => this.callbacks.onDisconnect();
@@ -45,4 +48,3 @@ export class WebSocketTelemetryTransport {
     this.lastSequence = -1;
   }
 }
-

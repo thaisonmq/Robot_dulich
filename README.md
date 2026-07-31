@@ -10,20 +10,54 @@ simulator.
 Yêu cầu Docker Engine + Docker Compose:
 
 ```bash
-cp .env.example .env
-docker compose up --build
+docker compose up -d
 ```
 
 Mở <http://localhost:8080>.
 
 - Email: `demo@rovera.local`
 - Mật khẩu: `demo123`
-- OpenAPI: <http://localhost:8888/docs>
+- Admin cao nhất: `admin` / `admin123`
+- OpenAPI: <http://localhost:8080/docs>
+- Backend dành cho robot/LAN: `http://<CENTER_IP>:8888`
 - LiveKit: `ws://localhost:7880`
 
-Robot `ROBOT-001` chuyển sang online sau khi container simulator kết nối.
+Compose tự build lại source backend/frontend, chạy migration database và chờ
+các dependency sẵn sàng. File `.env` là tùy chọn; khi không có file này hệ
+thống dùng cấu hình mặc định dành cho môi trường demo.
+
+Simulator không cần thiết để chạy backend/frontend. Khi muốn chạy thêm robot
+mô phỏng, dùng:
+
+```bash
+docker compose --profile demo up -d
+```
+
+Robot `ROBOT-001` chuyển sang online sau khi được seed/enroll và container
+simulator kết nối.
 Dashboard vẫn điều khiển/map được nếu LiveKit hoặc nguồn media tạm lỗi. Khi
 không có nguồn thật, màn video hiển thị rõ trạng thái chưa có tín hiệu.
+
+## Tài khoản và phân quyền
+
+Tài khoản được lưu trong PostgreSQL; mật khẩu chỉ lưu dưới dạng PBKDF2 hash.
+Hệ thống có ba vai trò:
+
+- `admin`: toàn quyền, tạo/khoá tài khoản và phân quyền nhân viên;
+- `operator`: quản lý, cấu hình và vận hành robot;
+- `guest`: vai trò mặc định khi tự đăng ký; được kết nối/điều khiển robot nhưng không xem hay sửa cấu hình kỹ thuật.
+- `operator`: quản lý robot và chỉ quản lý các tài khoản `guest`; có thể xem cùng hoặc cưỡng bức kết thúc phiên điều khiển của khách.
+
+Menu avatar mở trang hồ sơ cho mọi tài khoản; admin có thêm màn **Quản lý tài
+khoản**. Tài khoản admin khởi tạo mặc định là `admin` / `admin123` và được đánh
+dấu yêu cầu đổi mật khẩu. Có thể đổi credential khởi tạo bằng các biến
+`BOOTSTRAP_ADMIN_*`.
+
+Để bật đăng nhập/đăng ký Google, tạo OAuth 2.0 Web Client trong Google Cloud,
+khai báo redirect URI `http://<CENTER_HOST>:8080/api/auth/google/callback`, rồi
+đặt `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` và
+`FRONTEND_PUBLIC_URL` trong `.env`. Khi chưa cấu hình, nút Google vẫn hiển thị
+nhưng ở trạng thái vô hiệu hoá.
 
 ## Cấu trúc
 

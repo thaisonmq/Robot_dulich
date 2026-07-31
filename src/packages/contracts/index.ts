@@ -15,6 +15,10 @@ export type MessageType =
   | "diagnostics.result"
   | "media.sources.get"
   | "media.sources"
+  | "media.cameras.get"
+  | "media.cameras"
+  | "media.source.select"
+  | "media.source.state"
   | "media.probe"
   | "gateway.welcome";
 

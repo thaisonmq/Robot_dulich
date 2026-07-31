@@ -1,17 +1,12 @@
 import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
+import { userStorage } from "./api/client";
+import { I18nProvider } from "./i18n/I18nProvider";
 import { useAppStore } from "./state/appStore";
 import "./styles.css";
 
-const savedUser = sessionStorage.getItem("rovera_user");
-if (savedUser) {
-  try {
-    useAppStore.getState().setUser(JSON.parse(savedUser));
-  } catch {
-    sessionStorage.removeItem("rovera_user");
-  }
-}
+useAppStore.getState().setUser(userStorage.get());
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -22,6 +17,8 @@ const queryClient = new QueryClient({
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <QueryClientProvider client={queryClient}>
-    <App />
+    <I18nProvider>
+      <App />
+    </I18nProvider>
   </QueryClientProvider>,
 );

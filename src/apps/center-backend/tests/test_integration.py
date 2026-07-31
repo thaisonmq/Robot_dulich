@@ -1,4 +1,5 @@
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -7,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.database import SessionLocal
-from app.models.entities import Robot
+from app.models.entities import ControlSession, Robot
 from app.services.hub import hub
 
 
@@ -322,3 +323,169 @@ def test_operator_quick_add_and_edge_credential_claim_flow() -> None:
         assert client.delete(
             f"/api/robots/{robot_id}", headers=headers
         ).status_code == 204
+
+
+def test_guest_control_camera_privacy_and_supervisor_force_end() -> None:
+    hub.robot_sockets.clear()
+    hub.sessions.clear()
+    hub.robot_session.clear()
+    hub.camera_sources.clear()
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/auth/register",
+            json={
+                "username": "camera.guest",
+                "email": "camera.guest@example.com",
+                "full_name": "Khách camera",
+                "password": "guest-camera-password",
+            },
+        ).json()
+        guest_token = registered["access_token"]
+        guest_headers = {"Authorization": f"Bearer {guest_token}"}
+        assert "robots.operate" in registered["user"]["permissions"]
+
+        operator = client.post(
+            "/api/auth/login",
+            json={"identifier": "demo", "password": "demo123"},
+        ).json()
+        operator_headers = {
+            "Authorization": f"Bearer {operator['access_token']}"
+        }
+        robot_login = client.post(
+            "/api/robot-auth/token",
+            json={
+                "robot_id": "ROBOT-001",
+                "credential": "robot-001-change-me",
+            },
+        ).json()
+        robot_headers = {
+            "Authorization": f"Bearer {robot_login['access_token']}"
+        }
+
+        with client.websocket_connect(
+            "/ws/robot/connect?robot_id=ROBOT-001", headers=robot_headers
+        ) as robot_ws:
+            assert robot_ws.receive_json()["message_type"] == "gateway.welcome"
+            session_response = client.post(
+                "/api/sessions",
+                headers=guest_headers,
+                json={"robot_id": "ROBOT-001"},
+            )
+            assert session_response.status_code == 200
+            session = session_response.json()
+            assert session["mode"] == "control"
+            assert session["controller"]["role"] == "guest"
+            assert robot_ws.receive_json()["message_type"] == "media.start"
+            assert client.get(
+                "/api/robots/ROBOT-001/configuration",
+                headers=guest_headers,
+            ).status_code == 403
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending_cameras = executor.submit(
+                    client.get,
+                    f"/api/sessions/{session['session_id']}/cameras",
+                    headers=guest_headers,
+                )
+                camera_request = robot_ws.receive_json()
+                assert camera_request["message_type"] == "media.cameras.get"
+                robot_ws.send_json(
+                    envelope(
+                        "media.cameras",
+                        "",
+                        20,
+                        {
+                            "request_id": camera_request["payload"]["request_id"],
+                            "ok": True,
+                            "selected_source": "/dev/video0",
+                            "video_sources": [
+                                {
+                                    "type": "camera",
+                                    "value": "/dev/video0",
+                                    "label": "Logitech Brio",
+                                },
+                                {
+                                    "type": "camera",
+                                    "value": "/dev/video2",
+                                    "label": "Camera hành lang",
+                                },
+                            ],
+                        },
+                    )
+                )
+                cameras_response = pending_cameras.result(timeout=5)
+
+            assert cameras_response.status_code == 200
+            cameras = cameras_response.json()["items"]
+            assert [item["label"] for item in cameras] == [
+                "Camera 1",
+                "Camera 2",
+            ]
+            assert all("source" not in item for item in cameras)
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending_select = executor.submit(
+                    client.put,
+                    f"/api/sessions/{session['session_id']}/camera",
+                    headers=guest_headers,
+                    json={"camera_id": cameras[1]["id"]},
+                )
+                select_request = robot_ws.receive_json()
+                assert select_request["message_type"] == "media.source.select"
+                assert select_request["payload"]["source"] == "/dev/video2"
+                robot_ws.send_json(
+                    envelope(
+                        "media.source.state",
+                        "",
+                        21,
+                        {
+                            "request_id": select_request["payload"]["request_id"],
+                            "ok": True,
+                            "selected_source": "/dev/video2",
+                        },
+                    )
+                )
+                selected_response = pending_select.result(timeout=5)
+            assert selected_response.status_code == 200
+            assert selected_response.json()["label"] == "Camera 2"
+            assert "source" not in selected_response.json()
+
+            active = client.get(
+                "/api/sessions/active", headers=operator_headers
+            )
+            assert active.status_code == 200
+            assert active.json()[0]["controller"]["username"] == "camera.guest"
+
+            spectator = client.post(
+                f"/api/sessions/{session['session_id']}/spectate",
+                headers=operator_headers,
+            )
+            assert spectator.status_code == 200
+            assert spectator.json()["mode"] == "spectator"
+            assert spectator.json()["control_websocket_url"] == ""
+            spectator_claims = jwt.decode(
+                spectator.json()["media"]["token"],
+                options={"verify_signature": False},
+            )
+            assert spectator_claims["video"]["canSubscribe"] is True
+            assert spectator_claims["video"].get("canPublish", False) is False
+
+            forced = client.post(
+                f"/api/sessions/{session['session_id']}/force-end",
+                headers=operator_headers,
+            )
+            assert forced.status_code == 200
+            assert robot_ws.receive_json()["message_type"] == "control.stop"
+            assert robot_ws.receive_json()["message_type"] == "media.stop"
+            assert client.get(
+                "/api/sessions/active", headers=operator_headers
+            ).json() == []
+
+            with SessionLocal() as database:
+                record = database.get(
+                    ControlSession, session["session_id"]
+                )
+                assert record is not None
+                assert record.status == "ended"
+                assert record.ended_by_user_id == operator["user"]["id"]
+                assert record.end_reason == "force_ended_by_supervisor"

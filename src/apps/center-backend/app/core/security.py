@@ -7,14 +7,18 @@ from datetime import datetime, timedelta, timezone
 import jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
+from app.models.database import get_db
+from app.models.entities import User
 
 bearer = HTTPBearer(auto_error=False)
 ROBOT_PASSWORD_ITERATIONS = 600_000
+USER_ROLES = frozenset({"admin", "operator", "guest"})
 
 
-def hash_robot_password(password: str) -> str:
+def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac(
         "sha256", password.encode(), salt, ROBOT_PASSWORD_ITERATIONS
@@ -29,7 +33,7 @@ def hash_robot_password(password: str) -> str:
     )
 
 
-def verify_robot_password(password: str, encoded: str | None) -> bool:
+def verify_password(password: str, encoded: str | None) -> bool:
     if not encoded:
         return False
     try:
@@ -45,6 +49,10 @@ def verify_robot_password(password: str, encoded: str | None) -> bool:
     except (ValueError, TypeError):
         return False
     return hmac.compare_digest(supplied, expected)
+
+
+hash_robot_password = hash_password
+verify_robot_password = verify_password
 
 
 def create_access_token(subject: str, settings: Settings) -> str:
@@ -93,10 +101,45 @@ def decode_robot_token(token: str, settings: Settings) -> str:
     return decode_typed_token(token, settings, "robot")
 
 
-def current_user(
+def authenticated_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     settings: Settings = Depends(get_settings),
-) -> str:
+    database: Session = Depends(get_db),
+) -> User:
     if credentials is None:
         raise HTTPException(status_code=401, detail="Thiếu access token")
-    return decode_token(credentials.credentials, settings)
+    user_id = decode_token(credentials.credentials, settings)
+    user = database.get(User, user_id)
+    if user is None or not user.active:
+        raise HTTPException(
+            status_code=401,
+            detail="Tài khoản không tồn tại hoặc đã bị vô hiệu hoá",
+        )
+    return user
+
+
+def current_user(user: User = Depends(authenticated_user)) -> str:
+    return user.id
+
+
+def operator_user_id(user: User = Depends(authenticated_user)) -> str:
+    if user.role not in {"admin", "operator"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Tài khoản khách không có quyền xem hoặc thay đổi cấu hình kỹ thuật",
+        )
+    return user.id
+
+
+def require_roles(*roles: str):
+    allowed = frozenset(roles)
+
+    def role_dependency(user: User = Depends(authenticated_user)) -> User:
+        if user.role not in allowed:
+            raise HTTPException(
+                status_code=403,
+                detail="Tài khoản không có quyền thực hiện thao tác này",
+            )
+        return user
+
+    return role_dependency

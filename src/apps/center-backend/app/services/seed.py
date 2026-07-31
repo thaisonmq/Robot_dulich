@@ -1,8 +1,9 @@
 import hashlib
 from datetime import datetime, timezone
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.core.config import get_settings
+from app.core.security import hash_password
 from app.models.database import SessionLocal
 from app.models.entities import Destination, MapRecord, Robot, User
 from app.services.maps import DESTINATIONS, MAP
@@ -42,14 +43,47 @@ def seed_database() -> None:
     """Insert the deterministic demo records without overwriting operator data."""
     settings = get_settings()
     with SessionLocal.begin() as database:
-        if database.scalar(select(User).where(User.email == settings.demo_email)) is None:
-            database.add(
-                User(
-                    email=settings.demo_email,
-                    password_hash="managed-by-demo-environment",
-                    role="operator",
+        admin = database.scalar(
+            select(User).where(
+                or_(
+                    User.username == settings.bootstrap_admin_username.casefold(),
+                    User.email == settings.bootstrap_admin_email.casefold(),
                 )
             )
+        )
+        if admin is None:
+            database.add(
+                User(
+                    username=settings.bootstrap_admin_username.casefold(),
+                    email=settings.bootstrap_admin_email.casefold(),
+                    password_hash=hash_password(settings.bootstrap_admin_password),
+                    full_name=settings.bootstrap_admin_name,
+                    role="admin",
+                    active=True,
+                    email_verified=True,
+                    must_change_password=True,
+                )
+            )
+
+        demo = database.scalar(
+            select(User).where(User.email == settings.demo_email.casefold())
+        )
+        if demo is None:
+            database.add(
+                User(
+                    username="demo",
+                    email=settings.demo_email.casefold(),
+                    password_hash=hash_password(settings.demo_password),
+                    full_name="Nguyễn Minh",
+                    role="operator",
+                    active=True,
+                    email_verified=True,
+                )
+            )
+        elif demo.password_hash == "managed-by-demo-environment":
+            demo.password_hash = hash_password(settings.demo_password)
+            demo.full_name = demo.full_name or "Nguyễn Minh"
+            demo.username = demo.username or "demo"
 
         if settings.seed_demo_robot:
             _seed_demo_robot(database, settings)

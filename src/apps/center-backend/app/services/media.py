@@ -25,6 +25,25 @@ def create_media_token(
     )
 
 
+def create_spectator_media_token(
+    settings: Settings, robot_id: str, user_id: str, session_id: str
+) -> str:
+    grant = api.VideoGrants(
+        room_join=True,
+        room=f"robot-{robot_id}",
+        can_publish=False,
+        can_subscribe=True,
+    )
+    return (
+        api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
+        .with_identity(f"spectator:{user_id}:session:{session_id}")
+        .with_name("ROVERA supervisor")
+        .with_grants(grant)
+        .with_ttl(timedelta(minutes=30))
+        .to_jwt()
+    )
+
+
 def create_robot_media_token(
     settings: Settings, robot_id: str, purpose: str = "main"
 ) -> str:

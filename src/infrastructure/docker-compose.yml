@@ -35,7 +35,7 @@ services:
     environment:
       LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-dev-secret-at-least-32-characters-long}"
       # Advertise the host/LAN address instead of Docker's 172.x bridge address.
-      NODE_IP: "${LIVEKIT_NODE_IP:-192.168.6.145}"
+      NODE_IP: "${LIVEKIT_NODE_IP:-127.0.0.1}"
     volumes:
       - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
     ports:
@@ -66,12 +66,23 @@ services:
   center-backend:
     build:
       context: ../apps/center-backend
+    # Rebuild application code when running `docker compose up -d`, even when
+    # an older local image already exists.
+    pull_policy: build
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-rovera}:${POSTGRES_PASSWORD:-rovera-dev-password}@postgres:5432/${POSTGRES_DB:-rovera}
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-change-me}
       DEMO_EMAIL: ${DEMO_EMAIL:-demo@rovera.local}
       DEMO_PASSWORD: ${DEMO_PASSWORD:-demo123}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-admin123}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@rovera.local}
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Quản trị hệ thống}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-http://localhost:8080}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
       ROBOT_ID: ${ROBOT_ID:-ROBOT-001}
       ROBOT_CREDENTIAL: ${ROBOT_CREDENTIAL:-robot-001-change-me}
       LIVEKIT_URL: ${LIVEKIT_PUBLIC_URL:-ws://localhost:7880}
@@ -84,7 +95,8 @@ services:
       - ../../sample-data:/sample-data:ro
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     ports:
-      - "${BACKEND_PORT:-8000}:8000"
+      # Robot/edge agents connect directly to this port from the LAN.
+      - "${BACKEND_PORT:-8888}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -97,9 +109,11 @@ services:
       interval: 8s
       timeout: 4s
       retries: 15
+    restart: unless-stopped
     networks: [rovera]
 
   robot-simulator:
+    profiles: ["demo"]
     build:
       context: ../../demo/robot-simulator
     environment:
@@ -134,11 +148,13 @@ services:
   center-frontend:
     build:
       context: ../apps/center-frontend
+    pull_policy: build
     ports:
       - "${FRONTEND_PORT:-8080}:80"
     depends_on:
       center-backend:
         condition: service_healthy
+    restart: unless-stopped
     networks: [rovera]
 
 volumes:

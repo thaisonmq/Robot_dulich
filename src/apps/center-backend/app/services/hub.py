@@ -1,5 +1,6 @@
 import asyncio
 import random
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -59,6 +60,17 @@ class SessionRuntime:
     last_sequence: int = -1
     media_renewed_at: datetime | None = None
     control_connected: bool = False
+    ended_at: datetime | None = None
+    end_reason: str | None = None
+
+
+@dataclass(slots=True)
+class CameraSourceRuntime:
+    camera_id: str
+    source_type: str
+    source: str
+    label: str
+    selected: bool = False
 
 
 @dataclass(slots=True)
@@ -78,8 +90,11 @@ class ConnectionHub:
             str, tuple[str, asyncio.Future[dict[str, Any]]]
         ] = {}
         self.telemetry_sockets: dict[str, set[WebSocket]] = {}
+        self.session_sockets: dict[str, set[WebSocket]] = {}
+        self.control_sockets: dict[str, WebSocket] = {}
         self.sessions: dict[str, SessionRuntime] = {}
         self.robot_session: dict[str, str] = {}
+        self.camera_sources: dict[str, dict[str, CameraSourceRuntime]] = {}
         self.preview_leases: dict[str, PreviewLeaseRuntime] = {}
         self.robots: dict[str, RobotRuntime] = {}
         self.routes: dict[str, dict[str, Any]] = {}
@@ -169,13 +184,23 @@ class ConnectionHub:
             return None
         return session if session and session.status == "active" else None
 
-    async def close_session(self, session_id: str, user_id: str | None = None) -> bool:
+    async def close_session(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+        *,
+        reason: str = "session_ended",
+    ) -> bool:
         closed_session: SessionRuntime | None = None
         async with self.lock:
             session = self.sessions.get(session_id)
             if not session or (user_id and session.user_id != user_id):
                 return False
+            if session.status != "active":
+                return False
             session.status = "ended"
+            session.ended_at = datetime.now(timezone.utc)
+            session.end_reason = reason
             closed_session = session
             self.robot_session.pop(session.robot_id, None)
             robot = self.robots.get(session.robot_id)
@@ -186,19 +211,99 @@ class ConnectionHub:
             f"session:{closed_session.session_id}",
             active=False,
         )
+        await self.notify_session_ended(closed_session)
         return True
 
     async def _close_session_for_robot(self, robot_id: str) -> None:
         session_id = self.robot_session.pop(robot_id, None)
         if session_id and session_id in self.sessions:
-            self.sessions[session_id].status = "ended"
+            session = self.sessions[session_id]
+            session.status = "ended"
+            session.ended_at = datetime.now(timezone.utc)
+            session.end_reason = "robot_disconnected"
 
     def _expire_sessions(self) -> None:
         now = datetime.now(timezone.utc)
         for session in self.sessions.values():
             if session.status == "active" and session.expires_at <= now:
                 session.status = "expired"
+                session.ended_at = now
+                session.end_reason = "session_expired"
                 self.robot_session.pop(session.robot_id, None)
+                robot = self.robots.get(session.robot_id)
+                if robot:
+                    robot.availability = (
+                        "available" if robot.status == "online" else "offline"
+                    )
+
+    async def notify_session_ended(self, session: SessionRuntime) -> None:
+        message = {
+            "message_id": str(uuid4()),
+            "schema_version": "1.0",
+            "message_type": "session.ended",
+            "robot_id": session.robot_id,
+            "session_id": session.session_id,
+            "sequence": session.last_sequence + 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ttl_ms": 0,
+            "payload": {"reason": session.end_reason or "session_ended"},
+        }
+        sockets = set(self.session_sockets.get(session.session_id, set()))
+        control_socket = self.control_sockets.get(session.session_id)
+        if control_socket is not None:
+            sockets.add(control_socket)
+        for socket in sockets:
+            try:
+                await socket.send_json(message)
+                await socket.close(code=4003, reason="session ended")
+            except Exception:
+                pass
+        self.session_sockets.pop(session.session_id, None)
+        self.control_sockets.pop(session.session_id, None)
+
+    def remember_camera_sources(
+        self,
+        robot_id: str,
+        sources: list[dict[str, Any]],
+        selected_source: str = "",
+    ) -> list[CameraSourceRuntime]:
+        previous = self.camera_sources.get(robot_id, {})
+        previous_by_source = {
+            item.source: item for item in previous.values()
+        }
+        remembered: dict[str, CameraSourceRuntime] = {}
+        for index, source in enumerate(sources):
+            value = str(source.get("value", "")).strip()
+            if not value:
+                continue
+            prior = previous_by_source.get(value)
+            camera = CameraSourceRuntime(
+                camera_id=(
+                    prior.camera_id if prior else secrets.token_urlsafe(12)
+                ),
+                source_type=str(source.get("type", "camera")),
+                source=value,
+                label=str(source.get("label") or f"Camera {index + 1}"),
+                selected=value == selected_source,
+            )
+            remembered[camera.camera_id] = camera
+        self.camera_sources[robot_id] = remembered
+        return list(remembered.values())
+
+    def camera_source(
+        self, robot_id: str, camera_id: str
+    ) -> CameraSourceRuntime | None:
+        return self.camera_sources.get(robot_id, {}).get(camera_id)
+
+    def select_camera_source(
+        self, robot_id: str, camera_id: str
+    ) -> CameraSourceRuntime | None:
+        selected = self.camera_source(robot_id, camera_id)
+        if selected is None:
+            return None
+        for source in self.camera_sources.get(robot_id, {}).values():
+            source.selected = source.camera_id == camera_id
+        return selected
 
     async def forward_to_robot(self, robot_id: str, message: dict[str, Any]) -> bool:
         socket = self.robot_sockets.get(robot_id)

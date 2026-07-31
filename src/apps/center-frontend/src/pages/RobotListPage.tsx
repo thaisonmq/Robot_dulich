@@ -1,42 +1,64 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Battery, Bot, ChevronLeft, ChevronRight, Clock3, LogOut, MapPin,
-  Plus, PlugZap, RadioTower, Search, Server, Settings2, SlidersHorizontal,
-  Wifi,
+  Battery, Bot, ChevronLeft, ChevronRight, Clock3, MapPin,
+  MonitorPlay, OctagonX, Plus, PlugZap, RadioTower, Search, Server,
+  Settings2, SlidersHorizontal, UserRound, Wifi,
 } from "lucide-react";
-import { api, authStorage } from "../api/client";
+import { api } from "../api/client";
+import { AccountMenu } from "../components/AccountMenu";
 import { Brand } from "../components/Brand";
+import { GlobalLanguageSelect } from "../components/GlobalLanguageSelect";
+import { useI18n } from "../i18n/I18nProvider";
 import { useNavigate } from "../router";
 import { useAppStore } from "../state/appStore";
 import type { Robot } from "../types";
 
-function statusLabel(robot: Robot) {
-  if (robot.enrollment_status === "pending") return "Chờ robot chạy";
-  if (!robot.enabled) return "Đã vô hiệu hoá";
-  if (robot.status === "offline") return "Ngoại tuyến";
-  if (robot.availability === "busy") return "Đang bận";
-  if (robot.status === "error") return "Có lỗi";
-  return "Sẵn sàng";
-}
-
 export function RobotListPage() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const { language, t } = useI18n();
   const user = useAppStore((state) => state.user);
-  const setUser = useAppStore((state) => state.setUser);
   const selectRobot = useAppStore((state) => state.selectRobot);
   const setSession = useAppStore((state) => state.setSession);
   const setConnectionState = useAppStore((state) => state.setConnectionState);
   const [connectingId, setConnectingId] = useState("");
+  const [watchingId, setWatchingId] = useState("");
   const [error, setError] = useState("");
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
+  const canOperate = user?.role === "admin" || user?.role === "operator";
+
+  function statusLabel(robot: Robot) {
+    if (robot.enrollment_status === "pending") return t("Chờ robot chạy");
+    if (!robot.enabled) return t("Đã vô hiệu hoá");
+    if (robot.status === "offline") return t("Ngoại tuyến");
+    if (robot.availability === "busy") return t("Đang bận");
+    if (robot.status === "error") return t("Có lỗi");
+    return t("Sẵn sàng");
+  }
 
   const robotsQuery = useQuery({
     queryKey: ["robots", page, search, status],
     queryFn: () => api.robots({ page, pageSize: 6, search, status }),
     refetchInterval: 2000,
+  });
+  const activeSessionsQuery = useQuery({
+    queryKey: ["active-guest-sessions"],
+    queryFn: api.activeGuestSessions,
+    enabled: canOperate,
+    refetchInterval: 2000,
+  });
+  const forceEndMutation = useMutation({
+    mutationFn: api.forceEndSession,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["active-guest-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["robots"] });
+    },
+    onError: (reason) => {
+      setError(reason instanceof Error ? reason.message : t("Không thể kết thúc phiên"));
+    },
   });
   const robots = robotsQuery.data?.items ?? [];
   const summary = robotsQuery.data?.summary ?? {
@@ -55,17 +77,29 @@ export function RobotListPage() {
       navigate(`/control/${robot.robot_id}`);
     } catch (reason) {
       setConnectionState(robot.status === "offline" ? "offline" : "error");
-      setError(reason instanceof Error ? reason.message : "Không thể kết nối robot");
+      setError(reason instanceof Error ? reason.message : t("Không thể kết nối robot"));
     } finally {
       setConnectingId("");
     }
   }
 
-  function logout() {
-    authStorage.clear();
-    sessionStorage.removeItem("rovera_user");
-    setUser(null);
-    navigate("/");
+  async function watchSession(sessionId: string, robotId: string) {
+    setWatchingId(sessionId);
+    setError("");
+    try {
+      const [robot, spectatorSession] = await Promise.all([
+        api.robot(robotId),
+        api.spectateSession(sessionId),
+      ]);
+      selectRobot(robot);
+      setSession(spectatorSession);
+      setConnectionState("connected");
+      navigate(`/control/${robotId}`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : t("Không thể xem phiên điều khiển"));
+    } finally {
+      setWatchingId("");
+    }
   }
 
   return (
@@ -74,33 +108,80 @@ export function RobotListPage() {
         <div className="roster-header__title">
           <Brand compact />
           <span className="header-divider" />
-          <h1>Quản lý robot</h1>
+          <h1>{t("Quản lý robot")}</h1>
         </div>
         <div className="system-summary">
-          <span><i className="status-dot online" /><small>Gateway</small><strong>Hoạt động</strong></span>
-          <span><Server size={20} /><small>Đang online</small><strong>{summary.online} / {summary.total}</strong></span>
-          <span><RadioTower size={20} /><small>Chờ kết nối</small><strong>{summary.pending}</strong></span>
+          <span><i className="status-dot online" /><small>Gateway</small><strong>{t("Hoạt động")}</strong></span>
+          <span><Server size={20} /><small>{t("Đang online")}</small><strong>{summary.online} / {summary.total}</strong></span>
+          <span><RadioTower size={20} /><small>{t("Chờ kết nối")}</small><strong>{summary.pending}</strong></span>
         </div>
-        <div className="operator">
-          <span className="operator__avatar">{user?.name?.slice(0, 1) ?? "N"}</span>
-          <span><strong>{user?.name ?? "Nguyễn Minh"}</strong><small>Operator</small></span>
-          <button type="button" onClick={logout}><LogOut size={19} /> Đăng xuất</button>
-        </div>
+        <GlobalLanguageSelect />
+        <AccountMenu />
       </header>
 
       <div className="fleet-manager__content">
         <section className="fleet-manager__heading">
           <div>
             <p className="eyebrow">DEVICE REGISTRY · LIVE STATUS</p>
-            <h2>Danh sách robot</h2>
-            <p>Đăng ký thiết bị, theo dõi kết nối và mở phiên điều khiển.</p>
+            <h2>{t("Danh sách robot")}</h2>
+            <p>{t("Đăng ký thiết bị, theo dõi kết nối và mở phiên điều khiển.")}</p>
           </div>
-          <button type="button" className="button button--primary" onClick={() => navigate("/robots/new")}>
-            <Plus size={19} /> Thêm robot
-          </button>
+          {canOperate && (
+            <button type="button" className="button button--primary" onClick={() => navigate("/robots/new")}>
+              <Plus size={19} /> {t("Thêm robot")}
+            </button>
+          )}
         </section>
 
-        <section className="fleet-toolbar" aria-label="Bộ lọc robot">
+        {!canOperate && (
+          <div className="guest-access-notice">
+            <span><PlugZap size={18} /></span>
+            <div>
+              <strong>{t("Quyền điều khiển tiêu chuẩn")}</strong>
+              <p>{t("Tài khoản khách được kết nối và điều khiển robot; cấu hình kỹ thuật được bảo vệ ở cấp vận hành.")}</p>
+            </div>
+          </div>
+        )}
+
+        {canOperate && Boolean(activeSessionsQuery.data?.length) && (
+          <section className="active-session-strip" aria-label={t("Phiên khách đang điều khiển")}>
+            <header>
+              <span><i className="status-dot online" /> {t("Phiên khách đang điều khiển")}</span>
+              <small>{activeSessionsQuery.data?.length} {t("phiên hoạt động")}</small>
+            </header>
+            <div>
+              {activeSessionsQuery.data?.map((activeSession) => (
+                <article key={activeSession.session_id}>
+                  <span className="active-session-strip__user"><UserRound size={17} /></span>
+                  <span>
+                    <strong>{activeSession.controller.name}</strong>
+                    <small>@{activeSession.controller.username} · {activeSession.robot_name}</small>
+                  </span>
+                  <time>{Math.max(1, Math.ceil(activeSession.duration_seconds / 60))} {t("phút")}</time>
+                  <button
+                    type="button"
+                    className="button button--outline"
+                    disabled={Boolean(watchingId)}
+                    onClick={() => void watchSession(activeSession.session_id, activeSession.robot_id)}
+                  >
+                    <MonitorPlay size={16} />
+                    {watchingId === activeSession.session_id ? t("Đang mở…") : t("Xem cùng")}
+                  </button>
+                  <button
+                    type="button"
+                    className="button button--danger-outline"
+                    disabled={forceEndMutation.isPending}
+                    onClick={() => forceEndMutation.mutate(activeSession.session_id)}
+                  >
+                    <OctagonX size={16} /> {t("Kết thúc")}
+                  </button>
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
+
+        <section className="fleet-toolbar" aria-label={t("Bộ lọc robot")}>
           <label className="fleet-search">
             <Search size={17} />
             <input
@@ -109,7 +190,7 @@ export function RobotListPage() {
                 setSearch(event.target.value);
                 setPage(1);
               }}
-              placeholder="Tìm theo mã, tên hoặc khu vực…"
+              placeholder={t("Tìm theo mã, tên hoặc khu vực…")}
             />
           </label>
           <label className="fleet-filter">
@@ -121,21 +202,21 @@ export function RobotListPage() {
                 setPage(1);
               }}
             >
-              <option value="all">Tất cả trạng thái</option>
-              <option value="online">Đang online</option>
-              <option value="offline">Ngoại tuyến</option>
-              <option value="pending">Chờ robot chạy</option>
+              <option value="all">{t("Tất cả trạng thái")}</option>
+              <option value="online">{t("Đang online")}</option>
+              <option value="offline">{t("Ngoại tuyến")}</option>
+              <option value="pending">{t("Chờ robot chạy")}</option>
             </select>
           </label>
           <div className="fleet-toolbar__metrics">
-            <span><strong>{summary.available}</strong> sẵn sàng</span>
-            <span><strong>{summary.online}</strong> đang kết nối</span>
+            <span><strong>{summary.available}</strong> {t("sẵn sàng")}</span>
+            <span><strong>{summary.online}</strong> {t("đang kết nối")}</span>
           </div>
         </section>
 
         {error && <div role="alert" className="notice notice--error">{error}</div>}
 
-        <section className="managed-robot-grid" aria-label="Danh sách robot">
+        <section className="managed-robot-grid" aria-label={t("Danh sách robot")}>
           {robotsQuery.isLoading ? (
             Array.from({ length: 6 }, (_, index) => (
               <div className="managed-robot-card robot-card--loading" key={index} />
@@ -143,11 +224,13 @@ export function RobotListPage() {
           ) : robots.length === 0 ? (
             <div className="fleet-empty">
               <span><Bot size={34} /></span>
-              <h3>Chưa có robot phù hợp</h3>
-              <p>Thay đổi bộ lọc hoặc đăng ký robot đầu tiên.</p>
-              <button type="button" className="button button--primary" onClick={() => navigate("/robots/new")}>
-                <Plus size={18} /> Thêm robot
-              </button>
+              <h3>{t("Chưa có robot phù hợp")}</h3>
+              <p>{t("Thay đổi bộ lọc hoặc đăng ký robot đầu tiên.")}</p>
+              {canOperate && (
+                <button type="button" className="button button--primary" onClick={() => navigate("/robots/new")}>
+                  <Plus size={18} /> {t("Thêm robot")}
+                </button>
+              )}
             </div>
           ) : robots.map((robot) => {
             const canConnect = (
@@ -162,14 +245,16 @@ export function RobotListPage() {
                   <span className={`availability-tag availability-tag--${robot.status}`}>
                     <i /> {statusLabel(robot)}
                   </span>
-                  <button
-                    type="button"
-                    className="robot-card__settings"
-                    aria-label={`Sửa ${robot.name}`}
-                    onClick={() => navigate(`/robots/${robot.robot_id}/edit`)}
-                  >
-                    <Settings2 size={17} />
-                  </button>
+                  {canOperate && (
+                    <button
+                      type="button"
+                      className="robot-card__settings"
+                      aria-label={t("Sửa {name}", { name: robot.name })}
+                      onClick={() => navigate(`/robots/${robot.robot_id}/edit`)}
+                    >
+                      <Settings2 size={17} />
+                    </button>
+                  )}
                 </div>
 
                 <div className="managed-robot-card__identity">
@@ -182,30 +267,44 @@ export function RobotListPage() {
                 </div>
 
                 <div className="managed-robot-card__telemetry">
-                  <span><Wifi size={15} /><small>Độ trễ</small><strong>{robot.status === "online" ? `${robot.network_rtt_ms} ms` : "—"}</strong></span>
-                  <span><Battery size={15} /><small>Pin</small><strong>{robot.status === "online" ? `${Math.round(robot.battery_percent)}%` : "—"}</strong></span>
-                  <span><Clock3 size={15} /><small>Cập nhật</small><strong>{robot.last_seen_at ? new Date(robot.last_seen_at).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" }) : "Chưa có"}</strong></span>
+                  <span><Wifi size={15} /><small>{t("Độ trễ")}</small><strong>{robot.status === "online" ? `${robot.network_rtt_ms} ms` : "—"}</strong></span>
+                  <span><Battery size={15} /><small>{t("Pin")}</small><strong>{robot.status === "online" ? `${Math.round(robot.battery_percent)}%` : "—"}</strong></span>
+                  <span><Clock3 size={15} /><small>{t("Cập nhật")}</small><strong>{robot.last_seen_at ? new Date(robot.last_seen_at).toLocaleTimeString(language, { hour: "2-digit", minute: "2-digit" }) : t("Chưa có")}</strong></span>
                 </div>
 
                 <div className="managed-robot-card__actions">
-                  <button
-                    type="button"
-                    className="button button--outline"
-                    aria-label={`Cấu hình ${robot.name}`}
-                    disabled={robot.enrollment_status === "pending"}
-                    onClick={() => navigate(`/robots/${robot.robot_id}/configuration`)}
-                  >
-                    Cấu hình
-                  </button>
-                  <button
-                    type="button"
-                    className="button button--primary"
-                    disabled={!canConnect || Boolean(connectingId)}
-                    onClick={() => void connect(robot)}
-                  >
-                    <PlugZap size={17} />
-                    {connectingId === robot.robot_id ? "Đang kết nối…" : "Kết nối"}
-                  </button>
+                  {canOperate ? (
+                    <>
+                      <button
+                        type="button"
+                        className="button button--outline"
+                        aria-label={t("Cấu hình {name}", { name: robot.name })}
+                        disabled={robot.enrollment_status === "pending"}
+                        onClick={() => navigate(`/robots/${robot.robot_id}/configuration`)}
+                      >
+                        {t("Cấu hình")}
+                      </button>
+                      <button
+                        type="button"
+                        className="button button--primary"
+                        disabled={!canConnect || Boolean(connectingId)}
+                        onClick={() => void connect(robot)}
+                      >
+                        <PlugZap size={17} />
+                        {connectingId === robot.robot_id ? t("Đang kết nối…") : t("Kết nối")}
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className="button button--primary managed-robot-card__guest-connect"
+                      disabled={!canConnect || Boolean(connectingId)}
+                      onClick={() => void connect(robot)}
+                    >
+                      <PlugZap size={17} />
+                      {connectingId === robot.robot_id ? t("Đang kết nối…") : t("Kết nối")}
+                    </button>
+                  )}
                 </div>
               </article>
             );
@@ -214,12 +313,15 @@ export function RobotListPage() {
 
         <footer className="fleet-pagination">
           <span>
-            Hiển thị {robots.length} trong tổng số {robotsQuery.data?.total ?? 0} robot
+            {t("Hiển thị {shown} trong tổng số {total} robot", {
+              shown: robots.length,
+              total: robotsQuery.data?.total ?? 0,
+            })}
           </span>
           <div>
             <button
               type="button"
-              aria-label="Trang trước"
+              aria-label={t("Trang trước")}
               disabled={page <= 1}
               onClick={() => setPage((value) => Math.max(1, value - 1))}
             >
@@ -228,7 +330,7 @@ export function RobotListPage() {
             <strong>{page} / {robotsQuery.data?.total_pages ?? 1}</strong>
             <button
               type="button"
-              aria-label="Trang sau"
+              aria-label={t("Trang sau")}
               disabled={page >= (robotsQuery.data?.total_pages ?? 1)}
               onClick={() => setPage((value) => value + 1)}
             >

@@ -1,7 +1,7 @@
 .PHONY: up down logs test frontend-dev backend-dev simulator-dev
 
 up:
-	docker compose up --build
+	docker compose up -d
 
 down:
 	docker compose down

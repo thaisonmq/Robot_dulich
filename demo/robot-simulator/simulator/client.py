@@ -18,6 +18,7 @@ import websockets
 
 from simulator.config import SimulatorConfig
 from simulator.media_devices import (
+    discover_video_candidates,
     discover_media_sources,
     prepare_audio_source,
     probe_audio_source,
@@ -603,6 +604,22 @@ class RobotConnectionClient:
                     str(message.payload.get("request_id", "")),
                     str(message.payload.get("media_kind", "all")),
                 )
+            elif message.message_type == "media.cameras.get":
+                await self._camera_sources(
+                    socket,
+                    str(message.payload.get("request_id", "")),
+                )
+            elif message.message_type == "media.source.select":
+                request_id = str(message.payload.get("request_id", ""))
+                try:
+                    self._select_live_camera(message.payload)
+                    self.media_restart_requested.set()
+                    self.media_lease_changed.set()
+                    await self._media_source_state(socket, request_id)
+                except (TypeError, ValueError) as exc:
+                    await self._media_source_state(
+                        socket, request_id, str(exc)
+                    )
             elif message.message_type == "media.probe":
                 request_id = str(message.payload.get("request_id", ""))
                 result = await self._probe_media(message.payload)
@@ -780,6 +797,69 @@ class RobotConnectionClient:
                         "ok": True,
                         "media_kind": media_kind,
                         **sources,
+                    },
+                )
+            )
+        )
+
+    async def _camera_sources(self, socket: Any, request_id: str) -> None:
+        sources = await asyncio.to_thread(discover_video_candidates)
+        selected_source = ""
+        if self.config.simulator_media_source_type == "camera":
+            selected_source = (
+                self.config.simulator_media_source
+                or self.config.simulator_camera_device
+            )
+        await socket.send(
+            json.dumps(
+                make_message(
+                    "media.cameras",
+                    self.config.robot_id,
+                    self._next_sequence(),
+                    {
+                        "request_id": request_id,
+                        "ok": True,
+                        "video_sources": sources,
+                        "selected_source": selected_source,
+                    },
+                )
+            )
+        )
+
+    def _select_live_camera(self, payload: dict[str, Any]) -> None:
+        source_type = str(payload.get("source_type", "camera"))
+        source = str(payload.get("source", "")).strip()
+        if source_type != "camera" or not source.startswith("/dev/video"):
+            raise ValueError("Nguồn camera trực tiếp không hợp lệ")
+        available = {
+            item["value"] for item in discover_video_candidates()
+        }
+        if source not in available:
+            raise ValueError("Camera đã bị rút khỏi robot")
+        self.config.simulator_media_source_type = "camera"
+        self.config.simulator_media_source = source
+        self.config.camera_label = (
+            str(payload.get("label", "")).strip() or self.config.camera_label
+        )
+
+    async def _media_source_state(
+        self, socket: Any, request_id: str, error: str | None = None
+    ) -> None:
+        await socket.send(
+            json.dumps(
+                make_message(
+                    "media.source.state",
+                    self.config.robot_id,
+                    self._next_sequence(),
+                    {
+                        "request_id": request_id,
+                        "ok": error is None,
+                        "error": error,
+                        "selected_source": (
+                            self.config.simulator_media_source
+                            if error is None
+                            else ""
+                        ),
                     },
                 )
             )
