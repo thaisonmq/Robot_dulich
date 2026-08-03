@@ -35,14 +35,14 @@ export function MapPanel({
           <h2 id="map-title">{t("Bản đồ hành trình")}</h2>
         </div>
         <div className="map-legend">
-          <span><i className="legend-dot legend-dot--robot" />Robot</span>
+          <span><i className="legend-dot legend-dot--robot" />{t("Robot")}</span>
           <span><i className="legend-dot legend-dot--route" />{t("Tuyến dự kiến")}</span>
-          <button type="button" title={t("Căn bản đồ")}><LocateFixed size={17} /> Fit map</button>
+          <button type="button" title={t("Căn bản đồ")}><LocateFixed size={17} /> {t("Căn bản đồ")}</button>
         </div>
       </div>
       <div className="map-layout">
         <div className="map-canvas">
-          <img src={map.image_url} alt={t("Sơ đồ {name}", { name: map.name })} />
+          <img src={map.image_url} alt={t("Sơ đồ {name}", { name: t(map.name) })} />
           <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
             {route && (
               <polyline
@@ -65,10 +65,10 @@ export function MapPanel({
               }}
               disabled={readOnly}
               onClick={() => onSelect(destination)}
-              aria-label={t("Chọn {name}", { name: destination.name })}
+              aria-label={t("Chọn {name}", { name: t(destination.name) })}
             >
               <Flag size={15} />
-              <span>{destination.name}</span>
+              <span>{t(destination.name)}</span>
             </button>
           ))}
           <div
@@ -89,7 +89,7 @@ export function MapPanel({
         <aside className="destination-panel">
           <div>
             <p className="eyebrow">{t("ĐIỂM ĐẾN")}</p>
-            <h3>{selected ? selected.name : t("Chọn nơi muốn đến")}</h3>
+            <h3>{selected ? t(selected.name) : t("Chọn nơi muốn đến")}</h3>
             <p className="destination-panel__copy">
               {selected
                 ? route
@@ -116,7 +116,7 @@ export function MapPanel({
               <option value="" disabled>{t("Chọn khu vực…")}</option>
               {destinations.map((destination) => (
                 <option key={destination.destination_id} value={destination.destination_id}>
-                  {destination.name}
+                  {t(destination.name)}
                 </option>
               ))}
             </select>

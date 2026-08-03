@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from app.core.config import Settings, get_settings
 from app.core.security import decode_robot_token, decode_token
 from app.models.database import SessionLocal
-from app.models.entities import ControlSession, Robot, RobotConnection, User
+from app.models.entities import Robot, RobotConnection, User
 from app.schemas.messages import RealtimeMessage
 from app.services.hub import hub
 
@@ -16,7 +16,13 @@ MAX_MESSAGE_BYTES = 65_536
 
 
 async def ws_error(socket: WebSocket, code: int, reason: str) -> None:
-    await socket.close(code=code, reason=reason[:120])
+    try:
+        await socket.close(code=code, reason=reason[:120])
+    except (RuntimeError, OSError, WebSocketDisconnect):
+        # Replacing a connection races with the old handler finishing. Starlette
+        # raises RuntimeError if that handler has already sent its close frame;
+        # an obsolete socket must never abort the new authenticated connection.
+        pass
 
 
 @router.websocket("/ws/robot/connect")
@@ -48,38 +54,41 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
             battery_percent=entity.battery_percent,
             last_seen_at=entity.last_seen_at,
         )
-    await socket.accept()
-    old = await hub.register_robot(robot_id, socket)
-    if old and old is not socket:
-        await ws_error(old, 4001, "replaced by a new authenticated connection")
     connection_id = str(uuid4())
-    with SessionLocal.begin() as database:
-        entity = database.query(Robot).filter(Robot.robot_id == robot_id).first()
-        if entity:
-            entity.status = "online"
-            entity.availability = "available"
-            entity.last_seen_at = datetime.now(timezone.utc)
-        database.add(
-            RobotConnection(
-                id=connection_id,
-                robot_id=robot_id,
-                remote_address=socket.client.host if socket.client else None,
-            )
-        )
-    await socket.send_json(
-        {
-            "message_id": str(uuid4()),
-            "schema_version": "1.0",
-            "message_type": "gateway.welcome",
-            "robot_id": robot_id,
-            "session_id": "",
-            "sequence": 0,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "ttl_ms": 0,
-            "payload": {"heartbeat_interval_seconds": 2, "protocol": "1.0"},
-        }
-    )
+    registered = False
+    await socket.accept()
     try:
+        old = await hub.register_robot(robot_id, socket)
+        registered = True
+        if old and old is not socket:
+            await ws_error(old, 4001, "replaced by a new authenticated connection")
+        with SessionLocal.begin() as database:
+            entity = database.query(Robot).filter(Robot.robot_id == robot_id).first()
+            if entity:
+                runtime = hub.robots[robot_id]
+                entity.status = runtime.status
+                entity.availability = runtime.availability
+                entity.last_seen_at = runtime.last_seen_at
+            database.add(
+                RobotConnection(
+                    id=connection_id,
+                    robot_id=robot_id,
+                    remote_address=socket.client.host if socket.client else None,
+                )
+            )
+        await socket.send_json(
+            {
+                "message_id": str(uuid4()),
+                "schema_version": "1.0",
+                "message_type": "gateway.welcome",
+                "robot_id": robot_id,
+                "session_id": "",
+                "sequence": 0,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "ttl_ms": 0,
+                "payload": {"heartbeat_interval_seconds": 2, "protocol": "1.0"},
+            }
+        )
         while True:
             raw = await socket.receive_text()
             if len(raw.encode()) > MAX_MESSAGE_BYTES:
@@ -107,10 +116,11 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
                     continue
             if message.message_type != "robot.heartbeat":
                 await hub.broadcast_telemetry(robot_id, data)
-    except (WebSocketDisconnect, ValueError, json.JSONDecodeError):
+    except (WebSocketDisconnect, ValueError, json.JSONDecodeError, OSError):
         pass
     finally:
-        closed_session = await hub.unregister_robot(robot_id, socket)
+        if registered:
+            await hub.unregister_robot(robot_id, socket)
         with SessionLocal.begin() as database:
             entity = database.query(Robot).filter(Robot.robot_id == robot_id).first()
             if entity:
@@ -118,12 +128,6 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
                 entity.status = runtime.status
                 entity.availability = runtime.availability
                 entity.last_seen_at = runtime.last_seen_at
-            if closed_session is not None:
-                record = database.get(ControlSession, closed_session.session_id)
-                if record:
-                    record.status = "ended"
-                    record.ended_at = closed_session.ended_at
-                    record.end_reason = closed_session.end_reason
             connection = database.get(RobotConnection, connection_id)
             if connection:
                 connection.disconnected_at = datetime.now(timezone.utc)
@@ -162,14 +166,45 @@ async def user_control(
     user = ws_user(socket, settings)
     user_id = user[0] if user else None
     session_id = socket.query_params.get("session_id", "")
+    # This identifier only lives in the page process, so duplicating a tab gets
+    # a different controller identity even though sessionStorage is cloned.
+    client_id = socket.query_params.get("client_id", "").strip()[:128]
+    if not client_id:
+        client_id = f"legacy-{uuid4()}"
     session = hub.get_session(session_id, user_id) if user_id else None
     await socket.accept()
     if not session or session.robot_id != robot_id:
         await ws_error(socket, status.WS_1008_POLICY_VIOLATION, "invalid session")
         return
+    claimed, old_control_socket = await hub.claim_control(
+        session_id, client_id, socket
+    )
+    if not claimed:
+        await ws_error(socket, 4009, "session is controlled by another tab")
+        return
     session.control_connected = True
-    hub.control_sockets[session_id] = socket
+    session.control_ever_connected = True
+    session.control_last_seen_at = datetime.now(timezone.utc)
+    session.control_disconnected_at = None
     hub.session_sockets.setdefault(session_id, set()).add(socket)
+    if old_control_socket is not None and old_control_socket is not socket:
+        await ws_error(old_control_socket, 4001, "replaced by reconnected controller")
+    # A restored browser tab starts its local sequence at zero. The new socket
+    # replaces the old controller, so it also starts a fresh command sequence.
+    session.last_sequence = -1
+    await socket.send_json(
+        {
+            "message_id": str(uuid4()),
+            "schema_version": "1.0",
+            "message_type": "control.ready",
+            "robot_id": robot_id,
+            "session_id": session_id,
+            "sequence": 0,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ttl_ms": 0,
+            "payload": {"client_id": client_id},
+        }
+    )
     try:
         while True:
             raw = await socket.receive_text()
@@ -177,6 +212,7 @@ async def user_control(
                 await ws_error(socket, status.WS_1009_MESSAGE_TOO_BIG, "message too large")
                 return
             message = RealtimeMessage.model_validate_json(raw)
+            session.control_last_seen_at = datetime.now(timezone.utc)
             ack_status = "accepted"
             if session.status != "active":
                 ack_status = "invalid_session"
@@ -186,11 +222,18 @@ async def user_control(
                 ack_status = "expired"
             elif message.sequence <= session.last_sequence:
                 ack_status = "rejected"
-            elif message.message_type not in {"control.velocity", "control.stop"}:
+            elif message.message_type not in {
+                "control.velocity", "control.stop", "session.heartbeat"
+            }:
                 ack_status = "rejected"
             else:
                 session.last_sequence = message.sequence
-                if not await hub.forward_to_robot(robot_id, message.model_dump(mode="json")):
+                if (
+                    message.message_type != "session.heartbeat"
+                    and not await hub.forward_to_robot(
+                        robot_id, message.model_dump(mode="json")
+                    )
+                ):
                     ack_status = "robot_offline"
             await socket.send_json(
                 {
@@ -211,11 +254,11 @@ async def user_control(
     except (WebSocketDisconnect, ValueError, json.JSONDecodeError):
         pass
     finally:
-        session.control_connected = False
         hub.session_sockets.get(session_id, set()).discard(socket)
-        if hub.control_sockets.get(session_id) is socket:
-            hub.control_sockets.pop(session_id, None)
-        if session.status == "active":
+        if await hub.release_control(session_id, socket):
+            session.control_connected = False
+            session.control_disconnected_at = datetime.now(timezone.utc)
+        if session.status == "active" and not session.control_connected:
             await hub.forward_to_robot(
                 robot_id,
                 {
@@ -230,17 +273,6 @@ async def user_control(
                     "payload": {"reason": "user_control_disconnected"},
                 },
             )
-            closed = await hub.close_session(
-                session_id, user_id, reason="user_control_disconnected"
-            )
-            if closed:
-                with SessionLocal.begin() as database:
-                    record = database.get(ControlSession, session_id)
-                    if record:
-                        record.status = "ended"
-                        record.ended_at = datetime.now(timezone.utc)
-                        record.ended_by_user_id = user_id
-                        record.end_reason = "user_control_disconnected"
 
 
 @router.websocket("/ws/user/telemetry/{robot_id}")

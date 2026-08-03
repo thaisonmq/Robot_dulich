@@ -75,6 +75,10 @@ export function DashboardPage() {
       manager.clear("telemetry_disconnected", false);
       setConnectionState("reconnecting");
     },
+    onReconnect: () => {
+      if (sessionEndedRef.current) return;
+      setConnectionState("connected");
+    },
     onSessionEnded: (reason) => {
       sessionEndedRef.current = true;
       manager.clear("session_ended", false);
@@ -157,6 +161,10 @@ export function DashboardPage() {
             audioRef.current,
             (state) => setMediaState(state as MediaState),
             videoSnapshotRef.current ?? undefined,
+            async () => {
+              const refreshed = await api.session(session!.session_id);
+              return refreshed.media;
+            },
           );
           mediaRef.current = media;
           try {
@@ -171,8 +179,9 @@ export function DashboardPage() {
         setConnectionState("error");
         setControlState("disabled");
         telemetry.disconnect();
+        const ownsSession = control.isSessionController();
         await control.disconnect();
-        if (session!.mode !== "spectator") {
+        if (session!.mode !== "spectator" && ownsSession) {
           await api.deleteSession(session!.session_id).catch(() => undefined);
         }
       }
@@ -189,11 +198,37 @@ export function DashboardPage() {
         !disconnectingRef.current
         && session.mode !== "spectator"
         && !sessionEndedRef.current
+        && control.isSessionController()
       ) {
         void api.deleteSession(session.session_id).catch(() => undefined);
       }
+      resetSession();
     };
-  }, [control, manager, navigate, robotId, selectedRobot, session, setConnectionState, setControlState, setMediaState, telemetry]);
+  }, [control, manager, navigate, resetSession, robotId, selectedRobot, session, setConnectionState, setControlState, setMediaState, telemetry]);
+
+  useEffect(() => {
+    if (!session || session.mode === "spectator") return undefined;
+
+    const endSessionOnPageExit = () => {
+      if (
+        disconnectingRef.current
+        || sessionEndedRef.current
+        || !control.isSessionController()
+      ) return;
+      disconnectingRef.current = true;
+      manager.clear("page_closed", true);
+      void control.disconnect();
+
+      // React cleanup is not guaranteed when the browser closes a tab. A
+      // keepalive request started from pagehide can finish after the document
+      // has been discarded, so an intentional tab close releases immediately.
+      void api.deleteSession(session.session_id).catch(() => undefined);
+      resetSession();
+    };
+
+    window.addEventListener("pagehide", endSessionOnPageExit);
+    return () => window.removeEventListener("pagehide", endSessionOnPageExit);
+  }, [control, manager, resetSession, session]);
 
   async function toggleMic() {
     if (isSpectator) return;
@@ -222,6 +257,7 @@ export function DashboardPage() {
       control.disconnect(),
       mediaRef.current?.disconnect() ?? Promise.resolve(),
       session && session.mode !== "spectator" && !sessionEndedRef.current
+        && control.isSessionController()
         ? api.deleteSession(session.session_id)
         : Promise.resolve(),
     ]);
@@ -395,7 +431,7 @@ export function DashboardPage() {
                   </span>
                   <div className="robot-language" aria-label={t("Ngôn ngữ phía robot: Vietnamese")}>
                     <span className="robot-language__mark">VI</span>
-                    <span><strong>Vietnamese</strong><small>VI</small></span>
+                    <span><strong>{t("Tiếng Việt")}</strong><small>VI</small></span>
                     <LockKeyhole size={15} />
                   </div>
                 </div>

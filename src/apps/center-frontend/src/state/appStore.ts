@@ -32,6 +32,26 @@ interface AppState {
   resetSession: () => void;
 }
 
+const ACTIVE_SESSION_KEY = "rovera_active_control_session";
+
+function readActiveSession(): { selectedRobot: Robot; session: Session } | null {
+  try {
+    const raw = sessionStorage.getItem(ACTIVE_SESSION_KEY);
+    return raw ? JSON.parse(raw) as { selectedRobot: Robot; session: Session } : null;
+  } catch {
+    sessionStorage.removeItem(ACTIVE_SESSION_KEY);
+    return null;
+  }
+}
+
+function persistActiveSession(selectedRobot: Robot | null, session: Session | null): void {
+  if (selectedRobot && session) {
+    sessionStorage.setItem(ACTIVE_SESSION_KEY, JSON.stringify({ selectedRobot, session }));
+  } else {
+    sessionStorage.removeItem(ACTIVE_SESSION_KEY);
+  }
+}
+
 const defaultPose: Pose = {
   map_id: "MAP-001", x: 5.5, y: 6, yaw: 0,
   linear_velocity: 0, angular_velocity: 0,
@@ -41,11 +61,13 @@ const defaultHealth: Health = {
   camera: "offline", audio: "offline", navigation: "idle",
 };
 
-export const useAppStore = create<AppState>((set) => ({
+const restoredSession = readActiveSession();
+
+export const useAppStore = create<AppState>((set, get) => ({
   user: null,
   robots: [],
-  selectedRobot: null,
-  session: null,
+  selectedRobot: restoredSession?.selectedRobot ?? null,
+  session: restoredSession?.session ?? null,
   pose: defaultPose,
   health: defaultHealth,
   connectionState: "idle",
@@ -56,8 +78,14 @@ export const useAppStore = create<AppState>((set) => ({
   commandStatus: "Sẵn sàng",
   setUser: (user) => set({ user }),
   setRobots: (robots) => set({ robots }),
-  selectRobot: (selectedRobot) => set({ selectedRobot, connectionState: "selecting" }),
-  setSession: (session) => set({ session }),
+  selectRobot: (selectedRobot) => {
+    persistActiveSession(selectedRobot, get().session);
+    set({ selectedRobot, connectionState: "selecting" });
+  },
+  setSession: (session) => {
+    persistActiveSession(get().selectedRobot, session);
+    set({ session });
+  },
   setPose: (pose) => set({ pose }),
   setHealth: (health) => set({ health }),
   setConnectionState: (connectionState) => set({ connectionState }),
@@ -66,10 +94,12 @@ export const useAppStore = create<AppState>((set) => ({
   setNavigationState: (navigationState) => set({ navigationState }),
   setRoute: (route) => set({ route }),
   setCommandStatus: (commandStatus) => set({ commandStatus }),
-  resetSession: () => set({
-    session: null, selectedRobot: null, connectionState: "idle",
-    mediaState: "idle", controlState: "disabled", navigationState: "idle",
-    route: null, commandStatus: "Sẵn sàng", pose: defaultPose, health: defaultHealth,
-  }),
+  resetSession: () => {
+    persistActiveSession(null, null);
+    set({
+      session: null, selectedRobot: null, connectionState: "idle",
+      mediaState: "idle", controlState: "disabled", navigationState: "idle",
+      route: null, commandStatus: "Sẵn sàng", pose: defaultPose, health: defaultHealth,
+    });
+  },
 }));
-

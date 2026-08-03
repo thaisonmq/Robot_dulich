@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -26,6 +28,12 @@ class SimulatorConfig(BaseSettings):
     max_forward_speed: float = 0.4
     max_reverse_speed: float = 0.25
     max_angular_speed: float = 0.8
+    motion_backend: Literal["simulator", "ros2"] = "simulator"
+    motion_socket_path: str = "/var/lib/rovera/control/motion.sock"
+    motion_watchdog_ms: int = Field(default=250, ge=150, le=500)
+    ros_max_forward_speed: float = Field(default=0.33, gt=0, le=1.0)
+    ros_max_reverse_speed: float = Field(default=0.25, gt=0, le=1.0)
+    ros_max_angular_speed: float = Field(default=0.8, gt=0, le=3.0)
     heartbeat_seconds: float = 2.0
     livekit_url: str = "ws://localhost:7880"
     simulator_media_source_type: str = "test"
@@ -52,7 +60,7 @@ class SimulatorConfig(BaseSettings):
     video_width: int = Field(default=1920, ge=640, le=1920)
     video_height: int = Field(default=1080, ge=360, le=1080)
     video_fps: int = Field(default=25, ge=10, le=30)
-    video_bitrate: int = Field(default=8_000_000, ge=500_000, le=12_000_000)
+    video_bitrate: int = Field(default=6_000_000, ge=500_000, le=12_000_000)
     video_encoder: str = "auto"
     video_pipeline: str = "auto"
     video_passthrough: bool = True

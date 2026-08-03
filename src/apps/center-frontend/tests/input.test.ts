@@ -38,6 +38,23 @@ describe("KeyboardInputAdapter", () => {
     expect(stop).toHaveBeenCalledWith("input_released");
   });
 
+  it.each([
+    ["a", "KeyA", "left"],
+    ["s", "KeyS", "backward"],
+    ["w", "KeyW", "forward"],
+    ["d", "KeyD", "right"],
+  ] as const)("maps %s to %s movement", (key, code, action) => {
+    const manager = new InputManager(vi.fn(), vi.fn());
+    const detach = new KeyboardInputAdapter(manager).attach();
+    cleanups.push(detach, () => manager.destroy());
+
+    fireEvent.keyDown(window, { key, code });
+    expect(manager.state()[action]).toBe(true);
+
+    fireEvent.keyUp(window, { key, code });
+    expect(manager.state()[action]).toBe(false);
+  });
+
   it("stops and clears input on blur", () => {
     const stop = vi.fn();
     const manager = new InputManager(vi.fn(), stop);

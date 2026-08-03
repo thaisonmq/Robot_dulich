@@ -20,6 +20,14 @@ export function useTeleoperation() {
       () => {
         setControlState("robot_offline");
       },
+      () => {
+        setControlState("ready");
+        setCommandStatus("Đã kết nối lại");
+      },
+      () => {
+        setControlState("expired");
+        setCommandStatus("Mất kết nối quá 5 phút");
+      },
     ),
     [setCommandStatus, setControlState],
   );

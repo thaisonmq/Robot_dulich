@@ -56,10 +56,14 @@ class SessionRuntime:
     user_id: str
     status: str
     started_at: datetime
-    expires_at: datetime
+    expires_at: datetime | None
     last_sequence: int = -1
     media_renewed_at: datetime | None = None
     control_connected: bool = False
+    control_ever_connected: bool = False
+    control_last_seen_at: datetime | None = None
+    control_disconnected_at: datetime | None = None
+    robot_disconnected_at: datetime | None = None
     ended_at: datetime | None = None
     end_reason: str | None = None
 
@@ -92,6 +96,7 @@ class ConnectionHub:
         self.telemetry_sockets: dict[str, set[WebSocket]] = {}
         self.session_sockets: dict[str, set[WebSocket]] = {}
         self.control_sockets: dict[str, WebSocket] = {}
+        self.control_clients: dict[str, str] = {}
         self.sessions: dict[str, SessionRuntime] = {}
         self.robot_session: dict[str, str] = {}
         self.camera_sources: dict[str, dict[str, CameraSourceRuntime]] = {}
@@ -136,12 +141,15 @@ class ConnectionHub:
             robot.status = "online"
             robot.availability = "busy" if robot_id in self.robot_session else "available"
             robot.last_seen_at = datetime.now(timezone.utc)
+            session_id = self.robot_session.get(robot_id)
+            session = self.sessions.get(session_id) if session_id else None
+            if session is not None and session.status == "active":
+                session.robot_disconnected_at = None
             return old
 
     async def unregister_robot(
         self, robot_id: str, socket: WebSocket
-    ) -> SessionRuntime | None:
-        closed_session: SessionRuntime | None = None
+    ) -> None:
         async with self.lock:
             if self.robot_sockets.get(robot_id) is socket:
                 self.robot_sockets.pop(robot_id, None)
@@ -155,10 +163,10 @@ class ConnectionHub:
                         if not future.done():
                             future.set_exception(ConnectionError("robot_offline"))
                         self.pending_robot_requests.pop(request_id, None)
-                closed_session = self._close_session_for_robot(robot_id)
-        if closed_session is not None:
-            await self.notify_session_ended(closed_session)
-        return closed_session
+                session_id = self.robot_session.get(robot_id)
+                session = self.sessions.get(session_id) if session_id else None
+                if session is not None and session.status == "active":
+                    session.robot_disconnected_at = datetime.now(timezone.utc)
 
     async def create_session(self, robot_id: str, user_id: str, timeout_seconds: int) -> SessionRuntime:
         async with self.lock:
@@ -174,13 +182,18 @@ class ConnectionHub:
                 if existing_session is not None and existing_session.status == "active":
                     raise RuntimeError("robot_busy")
                 self.robot_session.pop(robot_id, None)
+            now = datetime.now(timezone.utc)
             session = SessionRuntime(
                 session_id=str(uuid4()),
                 robot_id=robot_id,
                 user_id=user_id,
                 status="active",
-                started_at=datetime.now(timezone.utc),
-                expires_at=datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds),
+                started_at=now,
+                expires_at=(
+                    now + timedelta(seconds=timeout_seconds)
+                    if timeout_seconds > 0
+                    else None
+                ),
             )
             self.sessions[session.session_id] = session
             self.robot_session[robot_id] = session.session_id
@@ -193,6 +206,32 @@ class ConnectionHub:
         if session and user_id and session.user_id != user_id:
             return None
         return session if session and session.status == "active" else None
+
+    async def claim_control(
+        self, session_id: str, client_id: str, socket: WebSocket
+    ) -> tuple[bool, WebSocket | None]:
+        """Keep the first browser tab in control while allowing its reconnects."""
+        async with self.lock:
+            old_socket = self.control_sockets.get(session_id)
+            old_client_id = self.control_clients.get(session_id)
+            if (
+                old_socket is not None
+                and old_socket is not socket
+                and old_client_id != client_id
+            ):
+                return False, None
+            self.control_sockets[session_id] = socket
+            self.control_clients[session_id] = client_id
+            return True, old_socket
+
+    async def release_control(self, session_id: str, socket: WebSocket) -> bool:
+        """Release ownership only when this is still the registered socket."""
+        async with self.lock:
+            if self.control_sockets.get(session_id) is not socket:
+                return False
+            self.control_sockets.pop(session_id, None)
+            self.control_clients.pop(session_id, None)
+            return True
 
     async def close_session(
         self,
@@ -224,16 +263,6 @@ class ConnectionHub:
         await self.notify_session_ended(closed_session)
         return True
 
-    def _close_session_for_robot(self, robot_id: str) -> SessionRuntime | None:
-        session_id = self.robot_session.pop(robot_id, None)
-        if session_id and session_id in self.sessions:
-            session = self.sessions[session_id]
-            session.status = "ended"
-            session.ended_at = datetime.now(timezone.utc)
-            session.end_reason = "robot_disconnected"
-            return session
-        return None
-
     async def expire_unconnected_sessions(
         self, connect_timeout_seconds: int
     ) -> list[SessionRuntime]:
@@ -245,6 +274,7 @@ class ConnectionHub:
                 if (
                     session.status != "active"
                     or session.control_connected
+                    or session.control_ever_connected
                     or (now - session.started_at).total_seconds()
                     < connect_timeout_seconds
                 ):
@@ -270,10 +300,73 @@ class ConnectionHub:
             await self.notify_session_ended(session)
         return closed_sessions
 
+    async def expire_disconnected_sessions(
+        self, reconnect_timeout_seconds: int
+    ) -> list[SessionRuntime]:
+        """End sessions only after a controller or robot misses its reconnect grace."""
+        now = datetime.now(timezone.utc)
+        closed_sessions: list[SessionRuntime] = []
+        async with self.lock:
+            for session in self.sessions.values():
+                if session.status != "active":
+                    continue
+                control_timed_out = (
+                    session.control_ever_connected
+                    and (
+                        (
+                            not session.control_connected
+                            and session.control_disconnected_at is not None
+                            and (now - session.control_disconnected_at).total_seconds()
+                            >= reconnect_timeout_seconds
+                        )
+                        or (
+                            session.control_connected
+                            and session.control_last_seen_at is not None
+                            and (now - session.control_last_seen_at).total_seconds()
+                            >= reconnect_timeout_seconds
+                        )
+                    )
+                )
+                robot_timed_out = (
+                    session.robot_disconnected_at is not None
+                    and (now - session.robot_disconnected_at).total_seconds()
+                    >= reconnect_timeout_seconds
+                )
+                if not control_timed_out and not robot_timed_out:
+                    continue
+                session.status = "ended"
+                session.ended_at = now
+                session.end_reason = (
+                    "robot_reconnect_timeout"
+                    if robot_timed_out
+                    else "control_reconnect_timeout"
+                )
+                if self.robot_session.get(session.robot_id) == session.session_id:
+                    self.robot_session.pop(session.robot_id, None)
+                robot = self.robots.get(session.robot_id)
+                if robot:
+                    robot.availability = (
+                        "available" if robot.status == "online" else "offline"
+                    )
+                closed_sessions.append(session)
+
+        for session in closed_sessions:
+            await self.set_media_lease(
+                session.robot_id,
+                f"session:{session.session_id}",
+                active=False,
+            )
+            await self.notify_session_ended(session)
+        return closed_sessions
+
     def _expire_sessions(self) -> None:
         now = datetime.now(timezone.utc)
         for session in self.sessions.values():
-            if session.status == "active" and session.expires_at <= now:
+            if (
+                session.status == "active"
+                and session.expires_at is not None
+                and session.expires_at <= now
+            ):
                 session.status = "expired"
                 session.ended_at = now
                 session.end_reason = "session_expired"
@@ -308,6 +401,7 @@ class ConnectionHub:
                 pass
         self.session_sockets.pop(session.session_id, None)
         self.control_sockets.pop(session.session_id, None)
+        self.control_clients.pop(session.session_id, None)
 
     def remember_camera_sources(
         self,
@@ -417,7 +511,6 @@ class ConnectionHub:
             session
             for session in self.sessions.values()
             if session.status == "active"
-            and session.control_connected
             and (
                 session.media_renewed_at is None
                 or (now - session.media_renewed_at).total_seconds()

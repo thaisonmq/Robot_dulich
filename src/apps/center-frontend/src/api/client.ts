@@ -222,6 +222,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ robot_id: robotId }),
     }),
+  session: (sessionId: string) => request<Session>(`/api/sessions/${sessionId}`),
+  myActiveSessions: () =>
+    request<ActiveControlSession[]>("/api/sessions/mine"),
   activeGuestSessions: () =>
     request<ActiveControlSession[]>("/api/sessions/active"),
   spectateSession: (sessionId: string) =>

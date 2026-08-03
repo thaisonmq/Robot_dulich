@@ -83,7 +83,7 @@ export function AccountPage() {
       <div className="account-page__content">
         <section className="account-hero">
           <div>
-            <p className="eyebrow">IDENTITY · ACCESS</p>
+            <p className="eyebrow">{t("DANH TÍNH · QUYỀN TRUY CẬP")}</p>
             <h1>{t("Tài khoản của tôi")}</h1>
             <p>{t("Cập nhật thông tin cá nhân và kiểm soát phương thức đăng nhập.")}</p>
           </div>
@@ -109,8 +109,8 @@ export function AccountPage() {
             <form onSubmit={saveProfile}>
               <label className="form-field"><span>{t("Họ và tên")}</span><input value={fullName} onChange={(event) => setFullName(event.target.value)} required minLength={2} /></label>
               <div className="account-readonly-field"><AtSign size={16} /><span><small>{t("Tên đăng nhập")}</small><strong>@{user.username}</strong></span></div>
-              <div className="account-readonly-field"><span className="account-readonly-field__mark">E</span><span><small>Email</small><strong>{user.email}</strong></span></div>
-              {profileMessage && <p className="account-form-message">{profileMessage}</p>}
+              <div className="account-readonly-field"><span className="account-readonly-field__mark">E</span><span><small>{t("Email")}</small><strong>{user.email}</strong></span></div>
+              {profileMessage && <p className="account-form-message">{t(profileMessage)}</p>}
               <button className="button button--primary" disabled={savingProfile}>{savingProfile ? t("Đang lưu…") : t("Lưu hồ sơ")}</button>
             </form>
           </section>
@@ -124,12 +124,12 @@ export function AccountPage() {
               {user.password_enabled && <label className="form-field"><span>{t("Mật khẩu hiện tại")}</span><input type="password" value={currentPassword} autoComplete="current-password" onChange={(event) => setCurrentPassword(event.target.value)} required /></label>}
               <label className="form-field"><span>{t("Mật khẩu mới")}</span><input type="password" value={newPassword} minLength={8} autoComplete="new-password" onChange={(event) => setNewPassword(event.target.value)} required /></label>
               <label className="form-field"><span>{t("Xác nhận mật khẩu")}</span><input type="password" value={confirmation} minLength={8} autoComplete="new-password" onChange={(event) => setConfirmation(event.target.value)} required /></label>
-              {passwordMessage && <p className="account-form-message">{passwordMessage}</p>}
+              {passwordMessage && <p className="account-form-message">{t(passwordMessage)}</p>}
               <button className="button button--outline" disabled={savingPassword}>{savingPassword ? t("Đang cập nhật…") : user.password_enabled ? t("Đổi mật khẩu") : t("Tạo mật khẩu")}</button>
             </form>
             <div className="linked-identities">
               <small>{t("Phương thức đã liên kết")}</small>
-              <span className={user.password_enabled ? "is-linked" : ""}>Password</span>
+              <span className={user.password_enabled ? "is-linked" : ""}>{t("Mật khẩu")}</span>
               <span className={user.auth_providers.includes("google") ? "is-linked" : ""}>Google</span>
             </div>
           </section>

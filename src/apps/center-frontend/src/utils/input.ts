@@ -145,6 +145,10 @@ const KEY_ACTIONS: Record<string, InputAction> = {
   ArrowDown: "backward",
   ArrowLeft: "left",
   ArrowRight: "right",
+  KeyW: "forward",
+  KeyS: "backward",
+  KeyA: "left",
+  KeyD: "right",
   Space: "emergencyStop",
   " ": "emergencyStop",
 };

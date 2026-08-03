@@ -46,7 +46,7 @@ def session_payload(
         "status": session.status if mode == "control" else "spectating",
         "mode": mode,
         "started_at": session.started_at.isoformat(),
-        "expires_at": session.expires_at.isoformat(),
+        "expires_at": session.expires_at.isoformat() if session.expires_at else None,
         "controller": (
             {
                 "id": controller.id,
@@ -75,6 +75,31 @@ def session_payload(
 
 def session_owner(database: Session, session: SessionRuntime) -> User | None:
     return database.get(User, session.user_id)
+
+
+def active_session_payload(
+    session: SessionRuntime,
+    owner: User,
+    now: datetime,
+) -> dict:
+    robot = hub.robots.get(session.robot_id)
+    return {
+        "session_id": session.session_id,
+        "robot_id": session.robot_id,
+        "robot_name": robot.name if robot else session.robot_id,
+        "status": session.status,
+        "started_at": session.started_at.isoformat(),
+        "expires_at": session.expires_at.isoformat() if session.expires_at else None,
+        "duration_seconds": max(
+            0, round((now - session.started_at).total_seconds())
+        ),
+        "controller": {
+            "id": owner.id,
+            "name": owner.full_name,
+            "username": owner.username,
+            "role": owner.role,
+        },
+    }
 
 
 def can_view_session(actor: User, owner: User | None, session: SessionRuntime) -> bool:
@@ -261,26 +286,21 @@ async def active_guest_sessions(
         owner = session_owner(database, session)
         if owner is None or owner.role != "guest":
             continue
-        robot = hub.robots.get(session.robot_id)
-        sessions.append(
-            {
-                "session_id": session.session_id,
-                "robot_id": session.robot_id,
-                "robot_name": robot.name if robot else session.robot_id,
-                "status": session.status,
-                "started_at": session.started_at.isoformat(),
-                "expires_at": session.expires_at.isoformat(),
-                "duration_seconds": max(
-                    0, round((now - session.started_at).total_seconds())
-                ),
-                "controller": {
-                    "id": owner.id,
-                    "name": owner.full_name,
-                    "username": owner.username,
-                    "role": owner.role,
-                },
-            }
-        )
+        sessions.append(active_session_payload(session, owner, now))
+    return sorted(sessions, key=lambda item: item["started_at"])
+
+
+@router.get("/mine")
+async def my_active_sessions(
+    actor: User = Depends(authenticated_user),
+) -> list[dict]:
+    """Expose sessions owned by this account so another tab can end them."""
+    now = datetime.now(timezone.utc)
+    sessions = [
+        active_session_payload(session, actor, now)
+        for session in hub.sessions.values()
+        if session.status == "active" and session.user_id == actor.id
+    ]
     return sorted(sessions, key=lambda item: item["started_at"])
 
 
@@ -437,6 +457,8 @@ async def select_session_camera(
 @router.get("/{session_id}")
 async def get_session(
     session_id: str,
+    request: Request,
+    settings: Settings = Depends(get_settings),
     actor: User = Depends(authenticated_user),
     database: Session = Depends(get_db),
 ) -> dict:
@@ -446,13 +468,15 @@ async def get_session(
         raise HTTPException(
             status_code=404, detail="Phiên không tồn tại hoặc đã kết thúc"
         )
-    return {
-        "session_id": session.session_id,
-        "robot_id": session.robot_id,
-        "status": session.status,
-        "started_at": session.started_at.isoformat(),
-        "expires_at": session.expires_at.isoformat(),
-    }
+    mode = "control" if actor.id == session.user_id else "spectator"
+    return session_payload(
+        session,
+        request,
+        settings,
+        user_id=actor.id,
+        mode=mode,
+        controller=owner,
+    )
 
 
 @router.delete("/{session_id}")

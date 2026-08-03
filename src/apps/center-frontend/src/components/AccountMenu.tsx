@@ -63,13 +63,13 @@ export function AccountMenu() {
       >
         <span className="account-avatar">
           {user.avatar_url ? (
-            <img src={user.avatar_url} alt={user.full_name} referrerPolicy="no-referrer" />
+            <img src={user.avatar_url} alt={t(user.full_name)} referrerPolicy="no-referrer" />
           ) : (
-            user.full_name.slice(0, 1).toLocaleUpperCase()
+            t(user.full_name).slice(0, 1).toLocaleUpperCase()
           )}
         </span>
         <span className="account-menu__identity">
-          <strong>{user.full_name}</strong>
+          <strong>{t(user.full_name)}</strong>
           <small>{t(ROLE_LABELS[user.role])}</small>
         </span>
         <ChevronDown size={16} className={open ? "is-open" : ""} />

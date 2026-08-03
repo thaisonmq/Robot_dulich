@@ -29,6 +29,7 @@ function account(role: User["role"]): User {
 describe("AccountMenu", () => {
   afterEach(() => {
     act(() => useAppStore.getState().setUser(null));
+    localStorage.clear();
     sessionStorage.clear();
   });
 
@@ -36,7 +37,7 @@ describe("AccountMenu", () => {
     act(() => useAppStore.getState().setUser(account("admin")));
     render(<I18nProvider><AccountMenu /></I18nProvider>);
 
-    fireEvent.click(screen.getByRole("button", { name: /Quản trị hệ thống/ }));
+    fireEvent.click(screen.getByRole("button", { name: /System administrator/ }));
 
     expect(screen.getByText("Account management")).toBeInTheDocument();
     expect(screen.getByText("My account")).toBeInTheDocument();
@@ -46,7 +47,7 @@ describe("AccountMenu", () => {
     act(() => useAppStore.getState().setUser(account("operator")));
     render(<I18nProvider><AccountMenu /></I18nProvider>);
 
-    fireEvent.click(screen.getByRole("button", { name: /Khách tham quan/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Visitor/ }));
 
     expect(screen.getByText("Account management")).toBeInTheDocument();
     expect(screen.getByText("Manage guest accounts")).toBeInTheDocument();
@@ -56,9 +57,19 @@ describe("AccountMenu", () => {
     act(() => useAppStore.getState().setUser(account("guest")));
     render(<I18nProvider><AccountMenu /></I18nProvider>);
 
-    fireEvent.click(screen.getByRole("button", { name: /Khách tham quan/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Visitor/ }));
 
     expect(screen.queryByText("Account management")).not.toBeInTheDocument();
     expect(screen.getByText("My account")).toBeInTheDocument();
+  });
+
+  it("localizes a known server-provided display name", () => {
+    const admin = account("admin");
+    localStorage.setItem(`rovera:interface-language:${admin.id}`, "zh");
+    act(() => useAppStore.getState().setUser(admin));
+
+    render(<I18nProvider><AccountMenu /></I18nProvider>);
+
+    expect(screen.getByText("系统管理员")).toBeInTheDocument();
   });
 });

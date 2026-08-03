@@ -9,10 +9,12 @@ import { RobotConfigurationPage } from "./pages/RobotConfigurationPage";
 import { RobotEditorPage } from "./pages/RobotEditorPage";
 import { RobotListPage } from "./pages/RobotListPage";
 import { UserManagementPage } from "./pages/UserManagementPage";
+import { useI18n } from "./i18n/I18nProvider";
 import { navigate, usePathname } from "./router";
 import { useAppStore } from "./state/appStore";
 
 export function App() {
+  const { t } = useI18n();
   const pathname = usePathname();
   const setUser = useAppStore((state) => state.setUser);
   const user = useAppStore((state) => state.user);
@@ -57,7 +59,7 @@ export function App() {
     return null;
   }
   if (checkingSession || !user) {
-    return <main className="app-auth-loading"><span /><p>Đang tải phiên đăng nhập…</p></main>;
+    return <main className="app-auth-loading"><span /><p>{t("Đang tải phiên đăng nhập…")}</p></main>;
   }
   if (pathname === "/account") return <AccountPage />;
   if (pathname === "/admin/users") {

@@ -1,3 +1,12 @@
+import german from "./locales/de.json";
+import spanish from "./locales/es.json";
+import french from "./locales/fr.json";
+import generatedJapanese from "./locales/ja.json";
+import korean from "./locales/ko.json";
+import russian from "./locales/ru.json";
+import thai from "./locales/th.json";
+import chinese from "./locales/zh.json";
+
 export type TranslationVariables = Record<string, string | number>;
 
 const ENGLISH: Record<string, string> = {
@@ -286,6 +295,9 @@ const ENGLISH: Record<string, string> = {
   "Ảnh kiểm thử tự động": "Generated test pattern",
   "Robot telepresence": "Telepresence robot",
   "Robot telepresence trong bảo tàng": "Telepresence robot in a museum",
+  "Không gian du lịch được số hoá": "Digitized tourism space",
+  "Không gian số với các màn hình bản đồ và khu du lịch": "Digital space with map and tourism displays",
+  "Đang trở về danh sách robot…": "Returning to the robot list…",
   "Dùng tên đăng nhập hoặc email của bạn.": "Use your username or email.",
   "Tên đăng nhập hoặc email": "Username or email",
   "Ghi nhớ tài khoản": "Remember account",
@@ -368,11 +380,14 @@ const ENGLISH: Record<string, string> = {
   "Quyền điều khiển tiêu chuẩn": "Standard control access",
   "Tài khoản khách được kết nối và điều khiển robot; cấu hình kỹ thuật được bảo vệ ở cấp vận hành.": "Guest accounts can connect to and control robots; technical configuration remains protected at the operations level.",
   "Phiên khách đang điều khiển": "Active guest sessions",
+  "Phiên đang hoạt động": "Active sessions",
+  "Phiên điều khiển của bạn": "Your control session",
   "phiên hoạt động": "active sessions",
   "phút": "min",
   "Đang mở…": "Opening…",
   "Xem cùng": "Watch live",
   "Kết thúc": "End",
+  "Ngắt phiên": "Disconnect session",
   "Không thể kết thúc phiên": "Could not end the session",
   "Không thể xem phiên điều khiển": "Could not watch the control session",
   "Nguồn camera": "Camera source",
@@ -414,6 +429,39 @@ const ENGLISH: Record<string, string> = {
   "Không thể đặt lại mật khẩu": "Could not reset the password",
   "Không tìm thấy tài khoản": "No accounts found",
   "{total} tài khoản": "{total} accounts",
+  "Đang tải phiên đăng nhập…": "Loading your session…",
+  "ĐĂNG KÝ THIẾT BỊ · TRẠNG THÁI TRỰC TIẾP": "DEVICE REGISTRY · LIVE STATUS",
+  "Quản trị hệ thống": "System administrator",
+  "Khách tham quan": "Visitor",
+  "Chưa phân khu": "Unassigned site",
+  "KHÔNG GIAN DU LỊCH SỐ": "DIGITAL TOURISM SPACE",
+  "TẦM NHÌN · AR · TRỰC TIẾP · BẢN ĐỒ": "VISION · AR · LIVE · MAP",
+  "LỘ TRÌNH DI CHUYỂN": "MOVEMENT ROUTE",
+  "Bản đồ trực quan": "Visual map",
+  "MÀN HÌNH TRỰC TIẾP": "LIVE DISPLAY",
+  "Khu du lịch": "Tourist attraction",
+  "HƯỚNG DẪN THAM QUAN AR": "AR TOUR GUIDE",
+  "Điều hướng tại điểm đến": "On-site navigation",
+  "BẢN ĐỒ ĐIỂM ĐẾN": "DESTINATION MAP",
+  "Khám phá khu du lịch": "Explore the attraction",
+  "KHU DU LỊCH": "TOURIST ATTRACTION",
+  "Không gian nổi bật": "Featured space",
+  "Robot": "Robot",
+  "DANH TÍNH · QUYỀN TRUY CẬP": "IDENTITY · ACCESS",
+  "Email": "Email",
+  "Truy cập bảo mật": "Secure access",
+  "Đăng ký khách": "Guest registration",
+  "CON NGƯỜI · VAI TRÒ · QUYỀN TRUY CẬP": "PEOPLE · ROLES · ACCESS",
+  "KẾT NỐI ROBOT": "ROBOT CONNECTION",
+  "Hồ sơ": "Profile",
+  "Khu tham quan demo": "Demo visitor area",
+  "Khu vực kỹ thuật": "Technical area",
+  "Khu trưng bày A": "Exhibition area A",
+  "Khu trưng bày B": "Exhibition area B",
+  "Sảnh chính": "Main lobby",
+  "Thang máy": "Elevator",
+  "Tiếng Việt": "Vietnamese",
+  "Không thể kết nối trung tâm": "Could not connect to the center",
 };
 
 const JAPANESE: Record<string, string> = {
@@ -702,23 +750,31 @@ const JAPANESE: Record<string, string> = {
   "Ảnh kiểm thử tự động": "自動テストパターン",
 };
 
+const CATALOGUES: Record<string, Record<string, string>> = {
+  de: german,
+  en: ENGLISH,
+  es: spanish,
+  fr: french,
+  ja: { ...generatedJapanese, ...JAPANESE },
+  ko: korean,
+  ru: russian,
+  th: thai,
+  zh: chinese,
+};
+
 export function translate(
   language: string,
   source: string,
   variables: TranslationVariables = {},
 ): string {
-  const catalogue = language === "vi"
-    ? null
-    : language === "ja"
-      ? JAPANESE
-      : ENGLISH;
   if (source.startsWith("Lệnh: ")) {
     return translate(language, "Lệnh: {status}", { status: source.slice("Lệnh: ".length) });
   }
   if (source.includes(" + ")) {
     return source.split(" + ").map((part) => translate(language, part)).join(" + ");
   }
-  const template = catalogue?.[source] ?? (language === "ja" ? ENGLISH[source] : undefined) ?? source;
+  const catalogue = CATALOGUES[language] ?? ENGLISH;
+  const template = language === "vi" ? source : catalogue[source] ?? ENGLISH[source] ?? source;
   return Object.entries(variables).reduce(
     (result, [key, value]) => result.replaceAll(`{${key}}`, String(value)),
     template,

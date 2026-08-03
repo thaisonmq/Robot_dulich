@@ -31,11 +31,14 @@ class MotionSimulator:
         self.angular_z = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, angular_z))
         self.last_command_monotonic = time.monotonic()
 
-    def stop(self) -> None:
+    def stop(self, _reason: str = "") -> None:
         self.linear_x = 0.0
         self.angular_z = 0.0
         self.pose.linear_velocity = 0.0
         self.pose.angular_velocity = 0.0
+
+    def close(self) -> None:
+        self.stop("simulator_shutdown")
 
     def watchdog(self, now: float | None = None) -> bool:
         now = now if now is not None else time.monotonic()
@@ -74,4 +77,3 @@ class MotionSimulator:
             "linear_velocity": round(self.pose.linear_velocity, 3),
             "angular_velocity": round(self.pose.angular_velocity, 3),
         }
-

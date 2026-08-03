@@ -40,7 +40,7 @@ export function LoginPage() {
 
   return (
     <AuthShell>
-      <div className="login-security"><LockKeyhole size={18} /><span>Secure access</span></div>
+      <div className="login-security"><LockKeyhole size={18} /><span>{t("Truy cập bảo mật")}</span></div>
       <div className="login-copy">
         <h1>{t("Đăng nhập")}</h1>
         <p>{t("Dùng tên đăng nhập hoặc email của bạn.")}</p>
@@ -80,7 +80,7 @@ export function LoginPage() {
         <div className="form-row form-row--end">
           <button type="button" className="text-button">{t("Quên mật khẩu?")}</button>
         </div>
-        {error && <p role="alert" className="form-error">{error}</p>}
+        {error && <p role="alert" className="form-error">{t(error)}</p>}
         <button className="button button--primary button--large" disabled={loading}>
           {loading ? t("Đang xác thực…") : t("Đăng nhập")}
         </button>

@@ -47,7 +47,7 @@ export function RegisterPage() {
 
   return (
     <AuthShell wide>
-      <div className="login-security"><UserPlus size={18} /><span>Guest registration</span></div>
+      <div className="login-security"><UserPlus size={18} /><span>{t("Đăng ký khách")}</span></div>
       <div className="login-copy">
         <h1>{t("Tạo tài khoản")}</h1>
         <p>{t("Tài khoản mới bắt đầu với quyền khách: được kết nối robot nhưng không được sửa cấu hình kỹ thuật.")}</p>
@@ -64,7 +64,7 @@ export function RegisterPage() {
           </label>
         </div>
         <label className="form-field">
-          <span>Email</span>
+          <span>{t("Email")}</span>
           <input type="email" value={email} autoComplete="email" onChange={(event) => setEmail(event.target.value)} required />
         </label>
         <div className="auth-form-grid">
@@ -91,7 +91,7 @@ export function RegisterPage() {
           </label>
         </div>
         <small className="form-hint">{t("Dùng ít nhất 8 ký tự. Tên đăng nhập không chứa khoảng trắng.")}</small>
-        {error && <p role="alert" className="form-error">{error}</p>}
+        {error && <p role="alert" className="form-error">{t(error)}</p>}
         <button className="button button--primary button--large" disabled={loading}>
           {loading ? t("Đang tạo tài khoản…") : t("Tạo tài khoản khách")}
         </button>

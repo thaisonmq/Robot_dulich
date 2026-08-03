@@ -5,6 +5,7 @@ from uuid import uuid4
 import pytest
 
 from app.api import robots as robot_api
+from app.api import websockets as websocket_api
 from app.schemas.messages import RealtimeMessage
 from app.services.hub import ConnectionHub
 
@@ -28,6 +29,20 @@ def test_ttl_validation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_closing_an_obsolete_websocket_is_idempotent() -> None:
+    class AlreadyClosedSocket:
+        async def close(self, **_kwargs: object) -> None:
+            raise RuntimeError(
+                "Unexpected ASGI message 'websocket.close', after sending "
+                "'websocket.close'"
+            )
+
+    await websocket_api.ws_error(
+        AlreadyClosedSocket(), 4001, "replaced connection"  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
 async def test_session_lock_allows_only_one_controller() -> None:
     hub = ConnectionHub()
     robot = hub.sync_registry_robot(
@@ -41,6 +56,21 @@ async def test_session_lock_allows_only_one_controller() -> None:
     assert await hub.close_session(first.session_id, "user-a")
     second = await hub.create_session("ROBOT-001", "user-b", 60)
     assert second.user_id == "user-b"
+
+
+@pytest.mark.asyncio
+async def test_session_without_absolute_timeout_stays_active() -> None:
+    hub = ConnectionHub()
+    robot = hub.sync_registry_robot(
+        "ROBOT-001", "Test robot", "Test site", "MAP-001", enrolled=True
+    )
+    robot.status = "online"
+    session = await hub.create_session("ROBOT-001", "user-a", 0)
+    session.started_at = datetime.now(timezone.utc) - timedelta(days=3)
+
+    assert hub.get_session(session.session_id) is session
+    assert session.expires_at is None
+    assert session.status == "active"
 
 
 @pytest.mark.asyncio
@@ -77,7 +107,7 @@ async def test_session_without_control_channel_releases_robot_lock() -> None:
 
 
 @pytest.mark.asyncio
-async def test_robot_disconnect_releases_session_and_notifies_controller() -> None:
+async def test_robot_disconnect_uses_reconnect_grace_before_ending_session() -> None:
     hub = ConnectionHub()
     notifications: list[dict] = []
 
@@ -101,17 +131,75 @@ async def test_robot_disconnect_releases_session_and_notifies_controller() -> No
     session = await hub.create_session("ROBOT-001", "user-a", 60)
     hub.session_sockets[session.session_id] = {UserSocket()}  # type: ignore[arg-type]
 
-    closed = await hub.unregister_robot(
-        "ROBOT-001", robot_socket  # type: ignore[arg-type]
-    )
+    await hub.unregister_robot("ROBOT-001", robot_socket)  # type: ignore[arg-type]
 
-    assert closed is session
-    assert session.status == "ended"
-    assert session.end_reason == "robot_disconnected"
-    assert "ROBOT-001" not in hub.robot_session
+    assert session.status == "active"
+    assert session.robot_disconnected_at is not None
+    assert hub.robot_session["ROBOT-001"] == session.session_id
     assert robot.availability == "offline"
+    assert notifications == []
+
+    replacement_socket = RobotSocket()
+    await hub.register_robot(
+        "ROBOT-001", replacement_socket  # type: ignore[arg-type]
+    )
+    assert session.robot_disconnected_at is None
+    assert session.status == "active"
+
+    await hub.unregister_robot(
+        "ROBOT-001", replacement_socket  # type: ignore[arg-type]
+    )
+    assert session.robot_disconnected_at is not None
+    session.robot_disconnected_at -= timedelta(seconds=301)
+    ended = await hub.expire_disconnected_sessions(300)
+
+    assert ended == [session]
+    assert session.status == "ended"
+    assert session.end_reason == "robot_reconnect_timeout"
+    assert "ROBOT-001" not in hub.robot_session
     assert notifications[0]["message_type"] == "session.ended"
-    assert notifications[0]["payload"]["reason"] == "robot_disconnected"
+    assert notifications[0]["payload"]["reason"] == "robot_reconnect_timeout"
+
+
+@pytest.mark.asyncio
+async def test_control_disconnect_reconnects_within_five_minute_grace() -> None:
+    hub = ConnectionHub()
+    robot = hub.sync_registry_robot(
+        "ROBOT-001", "Test robot", "Test site", "MAP-001", enrolled=True
+    )
+    robot.status = "online"
+    session = await hub.create_session("ROBOT-001", "user-a", 0)
+    session.control_ever_connected = True
+    session.control_last_seen_at = datetime.now(timezone.utc)
+    session.control_disconnected_at = datetime.now(timezone.utc)
+
+    assert await hub.expire_disconnected_sessions(300) == []
+    session.control_connected = True
+    session.control_disconnected_at = None
+    assert hub.get_session(session.session_id) is session
+
+    session.control_connected = False
+    session.control_disconnected_at = datetime.now(timezone.utc) - timedelta(seconds=301)
+    ended = await hub.expire_disconnected_sessions(300)
+    assert ended == [session]
+    assert session.end_reason == "control_reconnect_timeout"
+
+
+@pytest.mark.asyncio
+async def test_missing_control_heartbeat_ends_session_after_five_minutes() -> None:
+    hub = ConnectionHub()
+    robot = hub.sync_registry_robot(
+        "ROBOT-001", "Test robot", "Test site", "MAP-001", enrolled=True
+    )
+    robot.status = "online"
+    session = await hub.create_session("ROBOT-001", "user-a", 0)
+    session.control_ever_connected = True
+    session.control_connected = True
+    session.control_last_seen_at = datetime.now(timezone.utc) - timedelta(seconds=301)
+
+    ended = await hub.expire_disconnected_sessions(300)
+    assert ended == [session]
+    assert session.end_reason == "control_reconnect_timeout"
 
 
 @pytest.mark.asyncio

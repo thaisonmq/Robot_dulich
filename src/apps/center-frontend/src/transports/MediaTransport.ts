@@ -43,6 +43,7 @@ export class LiveKitMediaTransport implements IMediaTransport {
     private readonly audioElement: HTMLAudioElement,
     private readonly onState: (state: string) => void,
     private readonly snapshotCanvas?: HTMLCanvasElement,
+    private readonly refreshConnection?: () => Promise<{ url: string; token: string }>,
   ) {}
 
   async connect(url: string, token: string): Promise<void> {
@@ -140,7 +141,12 @@ export class LiveKitMediaTransport implements IMediaTransport {
       this.showRecoveryFrame();
       this.scheduleRoomReconnect();
     });
-    await room.connect(url, token);
+    try {
+      await room.connect(url, token);
+    } catch (reason) {
+      if (!this.manualDisconnect) this.scheduleRoomReconnect();
+      throw reason;
+    }
     if (this.microphoneEnabled) {
       await room.localParticipant.setMicrophoneEnabled(true);
     }
@@ -443,7 +449,10 @@ export class LiveKitMediaTransport implements IMediaTransport {
         const room = this.room;
         this.room = null;
         if (room) await room.disconnect().catch(() => undefined);
-        await this.connect(connection.url, connection.token);
+        const refreshed = this.refreshConnection
+          ? await this.refreshConnection()
+          : connection;
+        await this.connect(refreshed.url, refreshed.token);
       } catch {
         this.connection = connection;
         this.manualDisconnect = false;

@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import jwt
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app.main import app
 from app.models.database import SessionLocal
@@ -30,6 +31,8 @@ def test_gateway_session_command_and_telemetry_flow() -> None:
     hub.robot_sockets.clear()
     hub.sessions.clear()
     hub.robot_session.clear()
+    hub.control_sockets.clear()
+    hub.control_clients.clear()
     client = TestClient(app)
     with client:
         hub.robots["ROBOT-001"].status = "offline"
@@ -60,13 +63,18 @@ def test_gateway_session_command_and_telemetry_flow() -> None:
                 "/api/sessions", headers=headers, json={"robot_id": "ROBOT-001"}
             ).json()
             session_id = session["session_id"]
+            assert session["expires_at"] is None
             media_start = robot_ws.receive_json()
             assert media_start["message_type"] == "media.start"
             assert media_start["payload"]["lease_id"] == f"session:{session_id}"
-            query = f"?session_id={session_id}&token={token}"
+            query = (
+                f"?session_id={session_id}&token={token}"
+                "&client_id=primary-tab"
+            )
             with client.websocket_connect(
                 f"/ws/user/control/ROBOT-001{query}"
             ) as control_ws:
+                assert control_ws.receive_json()["message_type"] == "control.ready"
                 command = envelope(
                     "control.velocity", session_id, 1,
                     {"linear_x": 0.4, "angular_z": 0.0},
@@ -74,6 +82,19 @@ def test_gateway_session_command_and_telemetry_flow() -> None:
                 control_ws.send_json(command)
                 assert robot_ws.receive_json()["message_id"] == command["message_id"]
                 assert control_ws.receive_json()["payload"]["status"] == "accepted"
+                duplicate_query = (
+                    f"?session_id={session_id}&token={token}"
+                    "&client_id=duplicated-tab"
+                )
+                with client.websocket_connect(
+                    f"/ws/user/control/ROBOT-001{duplicate_query}"
+                ) as duplicate_ws:
+                    try:
+                        duplicate_ws.receive_json()
+                    except WebSocketDisconnect as exc:
+                        assert exc.code == 4009
+                    else:
+                        raise AssertionError("duplicated tab unexpectedly took control")
                 with client.websocket_connect(
                     f"/ws/user/telemetry/ROBOT-001{query}"
                 ) as telemetry_ws:
@@ -88,6 +109,30 @@ def test_gateway_session_command_and_telemetry_flow() -> None:
                     robot_ws.send_json(pose)
                     received = telemetry_ws.receive_json()
                     assert received["payload"]["x"] == 6.0
+                heartbeat = envelope("session.heartbeat", session_id, 2, {})
+                control_ws.send_json(heartbeat)
+                assert control_ws.receive_json()["payload"]["status"] == "accepted"
+            with client.websocket_connect(
+                f"/ws/user/control/ROBOT-001{query}"
+            ) as reconnected_control_ws:
+                assert (
+                    reconnected_control_ws.receive_json()["message_type"]
+                    == "control.ready"
+                )
+                heartbeat = envelope("session.heartbeat", session_id, 1, {})
+                reconnected_control_ws.send_json(heartbeat)
+                assert (
+                    reconnected_control_ws.receive_json()["payload"]["status"]
+                    == "accepted"
+                )
+                refreshed = client.get(
+                    f"/api/sessions/{session_id}", headers=headers
+                )
+                assert refreshed.status_code == 200
+                assert refreshed.json()["media"]["token"]
+            assert client.delete(
+                f"/api/sessions/{session_id}", headers=headers
+            ).status_code == 200
 
 
 def test_robot_auth_rejects_wrong_secret_and_scopes_media_token() -> None:
@@ -455,6 +500,14 @@ def test_guest_control_camera_privacy_and_supervisor_force_end() -> None:
             )
             assert active.status_code == 200
             assert active.json()[0]["controller"]["username"] == "camera.guest"
+            mine = client.get("/api/sessions/mine", headers=guest_headers)
+            assert mine.status_code == 200
+            assert [item["session_id"] for item in mine.json()] == [
+                session["session_id"]
+            ]
+            assert client.get(
+                "/api/sessions/mine", headers=operator_headers
+            ).json() == []
 
             spectator = client.post(
                 f"/api/sessions/{session['session_id']}/spectate",

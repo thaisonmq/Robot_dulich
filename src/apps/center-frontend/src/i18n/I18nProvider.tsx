@@ -74,11 +74,7 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     document.documentElement.lang = language;
     document.documentElement.dir = RTL_LANGUAGES.has(language) ? "rtl" : "ltr";
-    document.title = language === "ja"
-      ? "Rovera・ロボット運用センター"
-      : language === "vi"
-        ? "Rovera · Trung tâm vận hành robot"
-        : "Rovera · Robot operations center";
+    document.title = `Rovera · ${translate(language, "Trung tâm vận hành robot")}`;
   }, [language]);
 
   const value = useMemo(() => ({ language, setLanguage, t }), [language, setLanguage, t]);

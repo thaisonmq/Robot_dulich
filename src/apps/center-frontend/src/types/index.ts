@@ -177,7 +177,7 @@ export interface Session {
   status: string;
   mode: "control" | "spectator";
   started_at: string;
-  expires_at: string;
+  expires_at: string | null;
   controller: SessionController | null;
   media: { url: string; room_name: string; token: string };
   control_websocket_url: string;
@@ -197,7 +197,7 @@ export interface ActiveControlSession {
   robot_name: string;
   status: string;
   started_at: string;
-  expires_at: string;
+  expires_at: string | null;
   duration_seconds: number;
   controller: SessionController;
 }

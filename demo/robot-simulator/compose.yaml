@@ -8,10 +8,10 @@ services:
         ROVERA_EDGE_VERSION: "1.1.0"
     hostname: ${ROBOT_CONTAINER_HOSTNAME:-rovera-robot-edge}
     network_mode: host
-    # The container is started by the per-user systemd unit after the host
-    # PipeWire/Pulse socket exists.  Letting Docker restore it during boot
-    # would make Docker create /run/user/1000/pulse as root before login.
-    restart: "no"
+    # Keep the edge agent running across Docker/host restarts. The Pulse mount
+    # below uses the stable /run/user parent, so Docker never creates a user's
+    # /run/user/<uid>/pulse directory before that user logs in.
+    restart: unless-stopped
     stop_grace_period: 10s
 
     env_file:
@@ -20,9 +20,14 @@ services:
       # Đường dẫn ổn định bên trong container. Thư mục host được cấu hình
       # riêng bằng ROBOT_STATE_DIR và không mất khi compose down/up.
       ROBOT_STATE_FILE: /var/lib/rovera/device.json
+      # Hardware motion remains opt-in. Enabling the ros2-control profile alone
+      # cannot move the car while MOTION_BACKEND keeps its safe default.
+      MOTION_BACKEND: ${MOTION_BACKEND:-simulator}
+      MOTION_SOCKET_PATH: /var/lib/rovera/control/motion.sock
+      MOTION_WATCHDOG_MS: ${MOTION_WATCHDOG_MS:-250}
       # Cho phép FFmpeg/pactl trong container thấy nguồn thu PipeWire/PulseAudio
       # của user trên host (đặc biệt là microphone Bluetooth HSP/HFP).
-      PULSE_SERVER: unix:/run/rovera-pulse/native
+      PULSE_SERVER: unix:/run/rovera-user/${PULSE_UID:-1000}/pulse/native
 
     user: "${ROBOT_UID:-1000}:${ROBOT_GID:-1000}"
     group_add:
@@ -45,11 +50,14 @@ services:
         source: /dev
         target: /dev
       - type: bind
-        source: ${PULSE_SOCKET_DIR:-/run/user/1000/pulse}
-        target: /run/rovera-pulse
+        # /run/user exists from boot. The per-user runtime and Pulse socket can
+        # appear later without requiring the container to be recreated.
+        source: /run/user
+        target: /run/rovera-user
         read_only: true
         bind:
-          # Never let Docker create the host's per-user runtime directory.
+          # Propagate the user's runtime tmpfs when login happens after Docker.
+          propagation: rslave
           create_host_path: false
 
     device_cgroup_rules:
@@ -61,6 +69,93 @@ services:
       - "c 10:* rmw"
       - "c 254:* rmw"
 
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  ros-control-bridge:
+    profiles: ["ros2-control"]
+    build:
+      context: .
+      dockerfile: ros_bridge/Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 5s
+    user: "${ROBOT_UID:-1000}:${ROBOT_GID:-1000}"
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
+      MOTION_SOCKET_PATH: /var/lib/rovera/control/motion.sock
+      MOTION_WATCHDOG_MS: ${MOTION_WATCHDOG_MS:-250}
+      ROS_COMMAND_RATE_HZ: ${ROS_COMMAND_RATE_HZ:-30}
+      ROS_MAX_FORWARD_SPEED: ${ROS_MAX_FORWARD_SPEED:-0.33}
+      ROS_MAX_REVERSE_SPEED: ${ROS_MAX_REVERSE_SPEED:-0.25}
+      ROS_MAX_ANGULAR_SPEED: ${ROS_MAX_ANGULAR_SPEED:-0.8}
+      # Parallel mode leaves the existing Yahboom and micro-ROS containers
+      # untouched. The bridge publishes /cmd_vel only while /joy is inactive.
+      ROS_USE_TWIST_MUX: ${ROS_USE_TWIST_MUX:-false}
+      ROS_WEB_CMD_VEL_TOPIC: ${ROS_WEB_CMD_VEL_TOPIC:-/cmd_vel}
+      ROS_LEGACY_JOY_TOPIC: ${ROS_LEGACY_JOY_TOPIC:-/joy}
+      ROS_LEGACY_JOY_STATE_TOPIC: ${ROS_LEGACY_JOY_STATE_TOPIC:-/JoyState}
+      ROS_LEGACY_JOY_DEADZONE: ${ROS_LEGACY_JOY_DEADZONE:-0.12}
+      ROS_LEGACY_JOY_AXES: ${ROS_LEGACY_JOY_AXES:-1,2}
+      ROS_LEGACY_OVERRIDE_MS: ${ROS_LEGACY_OVERRIDE_MS:-350}
+      ROS_ESTOP_TOPIC: /rovera/emergency_stop
+    volumes:
+      - type: bind
+        source: ${ROBOT_STATE_DIR:-./state}
+        target: /var/lib/rovera
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /var/lib/rovera/control/motion.sock"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  micro-ros-agent:
+    # Optional managed replacement. It is deliberately not part of the
+    # ros2-control profile used beside an existing legacy stack.
+    profiles: ["ros2-managed-stack"]
+    image: microros/micro-ros-agent:humble
+    network_mode: host
+    restart: unless-stopped
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+    volumes:
+      - /dev/shm:/dev/shm
+    command: ["serial", "--dev", "/dev/ttyUSB0", "-b", "921600", "-v4"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  yahboom-joystick:
+    profiles: ["ros2-managed-stack"]
+    image: yahboomtechnology/ros-humble:4.1.2
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
+    volumes:
+      - /dev/input:/dev/input
+      - type: bind
+        source: ./ros_bridge/yahboomcar_joy_web_compatible.launch.py
+        target: /opt/rovera/yahboomcar_joy_web_compatible.launch.py
+        read_only: true
+    command:
+      - /bin/bash
+      - -lc
+      - >-
+        source /opt/ros/humble/setup.bash &&
+        source /root/yahboomcar_ws/install/setup.bash &&
+        exec ros2 launch /opt/rovera/yahboomcar_joy_web_compatible.launch.py
     logging:
       driver: json-file
       options:

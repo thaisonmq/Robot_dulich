@@ -12,7 +12,7 @@ from app.core.config import get_settings
 from app.models.database import Base, engine
 from app.models.database import SessionLocal
 from app.models.entities import ControlSession, Robot
-from app.services.hub import hub
+from app.services.hub import SessionRuntime, hub
 from app.services.seed import seed_database
 
 settings = get_settings()
@@ -28,9 +28,13 @@ async def presence_monitor() -> None:
         abandoned_sessions = await hub.expire_unconnected_sessions(
             settings.session_connect_timeout_seconds
         )
-        if abandoned_sessions:
+        disconnected_sessions = await hub.expire_disconnected_sessions(
+            settings.session_reconnect_timeout_seconds
+        )
+        ended_sessions = [*abandoned_sessions, *disconnected_sessions]
+        if ended_sessions:
             with SessionLocal.begin() as database:
-                for session in abandoned_sessions:
+                for session in ended_sessions:
                     record = database.get(ControlSession, session.session_id)
                     if record:
                         record.status = "ended"
@@ -46,7 +50,9 @@ async def presence_monitor() -> None:
             ):
                 socket = hub.robot_sockets.get(robot_id)
                 if socket:
-                    await socket.close(code=4002, reason="heartbeat timeout")
+                    await websockets.ws_error(
+                        socket, 4002, "heartbeat timeout"
+                    )
 
 
 @asynccontextmanager
@@ -55,14 +61,30 @@ async def lifespan(_: FastAPI):
     seed_database()
     with SessionLocal.begin() as database:
         now = datetime.now(timezone.utc)
-        for stale in (
+        for active in (
             database.query(ControlSession)
             .filter(ControlSession.status == "active")
             .all()
         ):
-            stale.status = "ended"
-            stale.ended_at = now
-            stale.end_reason = "center_restarted"
+            session = hub.sessions.get(active.session_id)
+            if session is None:
+                session = SessionRuntime(
+                    session_id=active.session_id,
+                    robot_id=active.robot_id,
+                    user_id=active.user_id,
+                    status="active",
+                    started_at=(
+                        active.started_at.replace(tzinfo=timezone.utc)
+                        if active.started_at.tzinfo is None
+                        else active.started_at
+                    ),
+                    expires_at=None,
+                    control_ever_connected=True,
+                    control_disconnected_at=now,
+                    robot_disconnected_at=now,
+                )
+                hub.sessions[session.session_id] = session
+                hub.robot_session[session.robot_id] = session.session_id
         for robot in database.query(Robot).all():
             hub.sync_registry_robot(
                 robot.robot_id,

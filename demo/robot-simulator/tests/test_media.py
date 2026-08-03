@@ -19,6 +19,82 @@ from simulator.media import (
 )
 
 
+@pytest.mark.asyncio
+async def test_main_room_subscribes_only_to_user_audio(monkeypatch) -> None:
+    class Publication:
+        def __init__(self, kind) -> None:
+            self.kind = kind
+            self.subscriptions: list[bool] = []
+
+        def set_subscribed(self, subscribed: bool) -> None:
+            self.subscriptions.append(subscribed)
+
+    class Participant:
+        def __init__(self, identity: str, publications: list[Publication]) -> None:
+            self.identity = identity
+            self.track_publications = {
+                str(index): publication
+                for index, publication in enumerate(publications)
+            }
+
+    user_audio = Publication(rtc.TrackKind.KIND_AUDIO)
+    camera_video = Publication(rtc.TrackKind.KIND_VIDEO)
+    robot_audio = Publication(rtc.TrackKind.KIND_AUDIO)
+    user = Participant("user:operator", [user_audio, camera_video])
+    camera = Participant("robot:camera", [robot_audio])
+
+    class Room:
+        def __init__(self) -> None:
+            self.events = {}
+            self.remote_participants = {"user": user, "camera": camera}
+            self.options = None
+
+        def on(self, event: str):
+            def register(callback):
+                self.events[event] = callback
+                return callback
+
+            return register
+
+        async def connect(self, _url: str, _token: str, options) -> None:
+            self.options = options
+
+        async def disconnect(self) -> None:
+            return None
+
+    room = Room()
+    monkeypatch.setattr("simulator.media.rtc.Room", lambda: room)
+
+    async def token_provider(_purpose: str) -> str:
+        return "token"
+
+    async def no_media() -> None:
+        return None
+
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="test",
+            video_pipeline="raw",
+        ),
+        token_provider,
+    )
+    monkeypatch.setattr(publisher, "_publish_video", no_media)
+    monkeypatch.setattr(publisher, "_publish_audio", no_media)
+
+    await publisher.connect()
+
+    assert room.options.auto_subscribe is False
+    assert user_audio.subscriptions == [True]
+    assert camera_video.subscriptions == []
+    assert robot_audio.subscriptions == []
+
+    later_audio = Publication(rtc.TrackKind.KIND_AUDIO)
+    room.events["track_published"](later_audio, user)
+    assert later_audio.subscriptions == [True]
+
+    await publisher.disconnect()
+
+
 def test_rtsp_defaults_to_low_jitter_udp_input() -> None:
     publisher = MediaPublisher(
         SimulatorConfig(
@@ -471,12 +547,12 @@ def test_latest_video_frame_discards_queued_latency() -> None:
     assert frames.empty()
 
 
-def test_full_hd_defaults_leave_headroom_for_rtsp_reencoding() -> None:
-    config = SimulatorConfig()
+def test_full_hd_defaults_leave_headroom_for_control_traffic() -> None:
+    config = SimulatorConfig(_env_file=None)
 
     assert config.video_width == 1920
     assert config.video_height == 1080
-    assert config.video_bitrate == 8_000_000
+    assert config.video_bitrate == 6_000_000
 
 
 def test_video_pipe_can_buffer_multiple_full_hd_frames() -> None:

@@ -50,9 +50,17 @@ export function RobotListPage() {
     enabled: canOperate,
     refetchInterval: 2000,
   });
+  const mySessionsQuery = useQuery({
+    queryKey: ["my-active-sessions"],
+    queryFn: api.myActiveSessions,
+    refetchInterval: 2000,
+  });
   const forceEndMutation = useMutation({
-    mutationFn: api.forceEndSession,
+    mutationFn: ({ sessionId, owned }: { sessionId: string; owned: boolean }) => (
+      owned ? api.deleteSession(sessionId) : api.forceEndSession(sessionId)
+    ),
     onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["my-active-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ["active-guest-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ["robots"] });
     },
@@ -61,6 +69,15 @@ export function RobotListPage() {
     },
   });
   const robots = robotsQuery.data?.items ?? [];
+  const mySessionIds = new Set(
+    (mySessionsQuery.data ?? []).map((activeSession) => activeSession.session_id),
+  );
+  const visibleSessions = [
+    ...(mySessionsQuery.data ?? []),
+    ...(activeSessionsQuery.data ?? []).filter(
+      (activeSession) => !mySessionIds.has(activeSession.session_id),
+    ),
+  ];
   const summary = robotsQuery.data?.summary ?? {
     total: 0, online: 0, available: 0, pending: 0,
   };
@@ -122,7 +139,7 @@ export function RobotListPage() {
       <div className="fleet-manager__content">
         <section className="fleet-manager__heading">
           <div>
-            <p className="eyebrow">DEVICE REGISTRY · LIVE STATUS</p>
+            <p className="eyebrow">{t("ĐĂNG KÝ THIẾT BỊ · TRẠNG THÁI TRỰC TIẾP")}</p>
             <h2>{t("Danh sách robot")}</h2>
             <p>{t("Đăng ký thiết bị, theo dõi kết nối và mở phiên điều khiển.")}</p>
           </div>
@@ -143,40 +160,46 @@ export function RobotListPage() {
           </div>
         )}
 
-        {canOperate && Boolean(activeSessionsQuery.data?.length) && (
-          <section className="active-session-strip" aria-label={t("Phiên khách đang điều khiển")}>
+        {Boolean(visibleSessions.length) && (
+          <section className="active-session-strip" aria-label={t("Phiên đang hoạt động")}>
             <header>
-              <span><i className="status-dot online" /> {t("Phiên khách đang điều khiển")}</span>
-              <small>{activeSessionsQuery.data?.length} {t("phiên hoạt động")}</small>
+              <span><i className="status-dot online" /> {t("Phiên đang hoạt động")}</span>
+              <small>{visibleSessions.length} {t("phiên hoạt động")}</small>
             </header>
             <div>
-              {activeSessionsQuery.data?.map((activeSession) => (
-                <article key={activeSession.session_id}>
+              {visibleSessions.map((activeSession) => {
+                const owned = activeSession.controller.id === user?.id;
+                return <article key={activeSession.session_id}>
                   <span className="active-session-strip__user"><UserRound size={17} /></span>
                   <span>
-                    <strong>{activeSession.controller.name}</strong>
+                    <strong>{owned ? t("Phiên điều khiển của bạn") : t(activeSession.controller.name)}</strong>
                     <small>@{activeSession.controller.username} · {activeSession.robot_name}</small>
                   </span>
                   <time>{Math.max(1, Math.ceil(activeSession.duration_seconds / 60))} {t("phút")}</time>
-                  <button
-                    type="button"
-                    className="button button--outline"
-                    disabled={Boolean(watchingId)}
-                    onClick={() => void watchSession(activeSession.session_id, activeSession.robot_id)}
-                  >
-                    <MonitorPlay size={16} />
-                    {watchingId === activeSession.session_id ? t("Đang mở…") : t("Xem cùng")}
-                  </button>
+                  {!owned && (
+                    <button
+                      type="button"
+                      className="button button--outline"
+                      disabled={Boolean(watchingId)}
+                      onClick={() => void watchSession(activeSession.session_id, activeSession.robot_id)}
+                    >
+                      <MonitorPlay size={16} />
+                      {watchingId === activeSession.session_id ? t("Đang mở…") : t("Xem cùng")}
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="button button--danger-outline"
                     disabled={forceEndMutation.isPending}
-                    onClick={() => forceEndMutation.mutate(activeSession.session_id)}
+                    onClick={() => forceEndMutation.mutate({
+                      sessionId: activeSession.session_id,
+                      owned,
+                    })}
                   >
-                    <OctagonX size={16} /> {t("Kết thúc")}
+                    <OctagonX size={16} /> {owned ? t("Ngắt phiên") : t("Kết thúc")}
                   </button>
-                </article>
-              ))}
+                </article>;
+              })}
             </div>
           </section>
         )}
@@ -214,7 +237,7 @@ export function RobotListPage() {
           </div>
         </section>
 
-        {error && <div role="alert" className="notice notice--error">{error}</div>}
+        {error && <div role="alert" className="notice notice--error">{t(error)}</div>}
 
         <section className="managed-robot-grid" aria-label={t("Danh sách robot")}>
           {robotsQuery.isLoading ? (
@@ -262,7 +285,7 @@ export function RobotListPage() {
                   <span>
                     <small>{robot.robot_id}</small>
                     <strong>{robot.name}</strong>
-                    <em><MapPin size={13} /> {robot.site_id}</em>
+                    <em><MapPin size={13} /> {t(robot.site_id)}</em>
                   </span>
                 </div>
 

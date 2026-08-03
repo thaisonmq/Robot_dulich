@@ -29,7 +29,7 @@ const EMPTY_FORM: AdminUserCreateInput = {
 };
 
 export function UserManagementPage() {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const currentUser = useAppStore((state) => state.user);
@@ -129,7 +129,7 @@ export function UserManagementPage() {
       <div className="user-admin-page__content">
         <section className="user-admin-heading">
           <div>
-            <p className="eyebrow">PEOPLE · ROLES · ACCESS</p>
+            <p className="eyebrow">{t("CON NGƯỜI · VAI TRÒ · QUYỀN TRUY CẬP")}</p>
             <h1>{t("Quản lý tài khoản")}</h1>
             <p>{t(isAdmin
               ? "Tạo tài khoản vận hành, phân quyền và kiểm soát trạng thái truy cập."
@@ -180,7 +180,7 @@ export function UserManagementPage() {
             <form onSubmit={submitCreate}>
               <label className="form-field"><span>{t("Họ và tên")}</span><input value={form.full_name} onChange={(event) => setForm({ ...form, full_name: event.target.value })} required /></label>
               <label className="form-field"><span>{t("Tên đăng nhập")}</span><input value={form.username} pattern="[a-z0-9][a-z0-9._-]{2,31}" onChange={(event) => setForm({ ...form, username: event.target.value.toLocaleLowerCase() })} required /></label>
-              <label className="form-field"><span>Email</span><input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} required /></label>
+              <label className="form-field"><span>{t("Email")}</span><input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} required /></label>
               <label className="form-field"><span>{t("Mật khẩu tạm thời")}</span><input type="password" minLength={8} value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} required /></label>
               <label className="form-field">
                 <span>{t("Loại tài khoản")}</span>
@@ -197,7 +197,7 @@ export function UserManagementPage() {
                 <input type="checkbox" checked={form.must_change_password} onChange={(event) => setForm({ ...form, must_change_password: event.target.checked })} />
                 <span>{t("Yêu cầu đổi mật khẩu khi bàn giao")}</span>
               </label>
-              {formError && <p role="alert" className="form-error">{formError}</p>}
+              {formError && <p role="alert" className="form-error">{t(formError)}</p>}
               <button className="button button--primary" disabled={createMutation.isPending}>{createMutation.isPending ? t("Đang tạo…") : t("Tạo tài khoản")}</button>
             </form>
           </section>
@@ -224,7 +224,7 @@ export function UserManagementPage() {
             <span className="user-directory__inactive"><Ban size={15} /> {summary.inactive} {t("đã khoá")}</span>
           </div>
 
-          {actionMessage && <div className="notice notice--warning user-action-message">{actionMessage}</div>}
+          {actionMessage && <div className="notice notice--warning user-action-message">{t(actionMessage)}</div>}
 
           <div className="user-table" role="table" aria-label={t("Danh sách tài khoản")}>
             <div className="user-table__head" role="row">
@@ -242,9 +242,9 @@ export function UserManagementPage() {
               <div className={`user-row${!account.active ? " is-inactive" : ""}`} role="row" key={account.id}>
                 <div className="user-row__identity">
                   <span className="account-avatar">
-                    {account.avatar_url ? <img src={account.avatar_url} alt={account.full_name} referrerPolicy="no-referrer" /> : account.full_name.slice(0, 1).toLocaleUpperCase()}
+                    {account.avatar_url ? <img src={account.avatar_url} alt={t(account.full_name)} referrerPolicy="no-referrer" /> : t(account.full_name).slice(0, 1).toLocaleUpperCase()}
                   </span>
-                  <span><strong>{account.full_name}</strong><small>@{account.username} · {account.email}</small></span>
+                  <span><strong>{t(account.full_name)}</strong><small>@{account.username} · {account.email}</small></span>
                 </div>
                 <div>
                   {account.role === "admin" ? (
@@ -255,7 +255,7 @@ export function UserManagementPage() {
                     <select
                       className={`role-select role-select--${account.role}`}
                       value={account.role}
-                      aria-label={t("Vai trò của {name}", { name: account.full_name })}
+                      aria-label={t("Vai trò của {name}", { name: t(account.full_name) })}
                       disabled={updateMutation.isPending}
                       onChange={(event) => updateMutation.mutate({
                         userId: account.id,
@@ -267,7 +267,7 @@ export function UserManagementPage() {
                     </select>
                   )}
                 </div>
-                <span className="user-row__time">{account.last_login_at ? new Date(account.last_login_at).toLocaleString("vi-VN", { dateStyle: "short", timeStyle: "short" }) : t("Chưa đăng nhập")}</span>
+                <span className="user-row__time">{account.last_login_at ? new Date(account.last_login_at).toLocaleString(language, { dateStyle: "short", timeStyle: "short" }) : t("Chưa đăng nhập")}</span>
                 <span className={account.active ? "account-status is-active" : "account-status"}>
                   <i /> {account.active ? t("Đang hoạt động") : t("Đã vô hiệu hoá")}
                 </span>
@@ -301,7 +301,7 @@ export function UserManagementPage() {
                 resetMutation.mutate({ userId: resetTarget.id, password: resetPassword });
               }}
             >
-              <span><KeyRound size={18} /><strong>{t("Đặt mật khẩu tạm cho {name}", { name: resetTarget.full_name })}</strong></span>
+              <span><KeyRound size={18} /><strong>{t("Đặt mật khẩu tạm cho {name}", { name: t(resetTarget.full_name) })}</strong></span>
               <input type="password" minLength={8} value={resetPassword} placeholder={t("Ít nhất 8 ký tự")} onChange={(event) => setResetPassword(event.target.value)} required autoFocus />
               <button type="submit" className="button button--primary" disabled={resetMutation.isPending}>{t("Xác nhận")}</button>
               <button type="button" className="button" onClick={() => setResetTarget(null)}>{t("Huỷ")}</button>

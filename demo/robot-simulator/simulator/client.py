@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import platform
 import random
@@ -28,6 +29,7 @@ from simulator.media_devices import (
 from simulator.media import MediaPublisher, rtsp_input_args
 from simulator.messages import Message, make_message
 from simulator.motion import MotionSimulator
+from simulator.motion_driver import MotionDriver, build_motion_driver
 from simulator.navigation import NavigationSimulator
 
 logger = logging.getLogger("simulator.gateway")
@@ -37,6 +39,7 @@ class RobotConnectionClient:
     def __init__(self, config: SimulatorConfig) -> None:
         self.config = config
         self.motion = MotionSimulator(config)
+        self.motion_driver: MotionDriver = build_motion_driver(config, self.motion)
         self.navigation = NavigationSimulator(self.motion)
         self.media = MediaPublisher(config, self._media_token)
         self.sequence = 0
@@ -409,7 +412,7 @@ class RobotConnectionClient:
             except Exception as exc:
                 logger.warning("gateway reconnect robot_id=%s error=%s", self.config.robot_id, exc)
             finally:
-                self.motion.stop()
+                self._stop_motion("gateway_disconnected")
                 self.socket = None
                 self.media_leases.clear()
                 self.media_lease_changed.set()
@@ -546,14 +549,22 @@ class RobotConnectionClient:
                 await self._ack(socket, message, "expired")
                 continue
             if message.message_type == "control.velocity":
+                try:
+                    linear_x = float(message.payload.get("linear_x", 0))
+                    angular_z = float(message.payload.get("angular_z", 0))
+                except (TypeError, ValueError):
+                    self._stop_motion("invalid_velocity")
+                    await self._ack(socket, message, "rejected")
+                    continue
+                if not math.isfinite(linear_x) or not math.isfinite(angular_z):
+                    self._stop_motion("invalid_velocity")
+                    await self._ack(socket, message, "rejected")
+                    continue
                 self.navigation.cancel() if self.navigation.status == "moving" else None
-                self.motion.set_velocity(
-                    float(message.payload.get("linear_x", 0)),
-                    float(message.payload.get("angular_z", 0)),
-                )
+                self.motion_driver.set_velocity(linear_x, angular_z)
                 await self._ack(socket, message, "accepted")
             elif message.message_type == "control.stop":
-                self.motion.stop()
+                self._stop_motion(str(message.payload.get("reason", "control_stop")))
                 await self._ack(socket, message, "completed")
             elif message.message_type == "media.start":
                 try:
@@ -568,13 +579,21 @@ class RobotConnectionClient:
                 except ValueError:
                     await self._ack(socket, message, "rejected")
             elif message.message_type == "navigation.goal":
-                self.navigation.start(
-                    str(message.payload["route_id"]), list(message.payload["points"])
-                )
-                await self._ack(socket, message, "accepted")
+                if self.config.motion_backend == "ros2":
+                    self.navigation.status = "failed"
+                    self.navigation.route_id = str(message.payload.get("route_id", ""))
+                    self._stop_motion("navigation_unsupported")
+                    await self._ack(socket, message, "rejected")
+                else:
+                    self.navigation.start(
+                        str(message.payload["route_id"]),
+                        list(message.payload["points"]),
+                    )
+                    await self._ack(socket, message, "accepted")
                 await self._navigation_status(socket)
             elif message.message_type == "navigation.cancel":
                 self.navigation.cancel()
+                self._stop_motion("navigation_cancelled")
                 await self._ack(socket, message, "completed")
                 await self._navigation_status(socket)
             elif message.message_type == "configuration.get":
@@ -702,7 +721,9 @@ class RobotConnectionClient:
     def _apply_configuration(self, payload: dict[str, Any]) -> None:
         profile = str(payload.get("video_profile", ""))
         profiles = {
-            "full_hd": (1920, 1080, 8_000_000),
+            # Leave Wi-Fi airtime for low-latency control while preserving
+            # good 1080p25 quality on the robot's MJPEG camera.
+            "full_hd": (1920, 1080, 6_000_000),
             "balanced": (1280, 720, 2_500_000),
             "low_bandwidth": (854, 480, 1_200_000),
         }
@@ -1060,9 +1081,10 @@ class RobotConnectionClient:
             started = time.monotonic()
             dt = min(0.1, started - previous)
             previous = started
-            self.navigation.update()
-            self.motion.watchdog(started)
-            self.motion.step(dt)
+            if self.config.motion_backend == "simulator":
+                self.navigation.update()
+                self.motion.step(dt)
+            self.motion_driver.watchdog(started)
             await asyncio.sleep(max(0, period - (time.monotonic() - started)))
 
     async def _telemetry_loop(self, socket: Any) -> None:
@@ -1092,6 +1114,7 @@ class RobotConnectionClient:
                             "audio": "online" if self.media.connected else "offline",
                             "navigation": self.navigation.status,
                             "simulator": "running",
+                            "motion_backend": self.config.motion_backend,
                         },
                     )
                 )
@@ -1137,8 +1160,14 @@ class RobotConnectionClient:
         self.sequence += 1
         return self.sequence
 
+    def _stop_motion(self, reason: str) -> None:
+        self.motion_driver.stop(reason)
+        if self.motion_driver is not self.motion:
+            self.motion.stop(reason)
+
     async def stop(self) -> None:
         self.running = False
-        self.motion.stop()
+        self._stop_motion("edge_shutdown")
         if self.socket:
             await self.socket.close()
+        self.motion_driver.close()

@@ -24,11 +24,17 @@ Robot sends `robot.heartbeat`, `robot.pose`, `robot.health`,
 
 ## User control
 
-`/ws/user/control/{robot_id}?session_id=...&token=...`
+`/ws/user/control/{robot_id}?session_id=...&token=...&client_id=...`
 
 The backend validates the JWT, session ownership, monotonic sequence, timestamp,
 TTL and live robot connection before forwarding. Joystick messages are never
 queued or retried. `control.stop` is forwarded immediately.
+
+`client_id` is generated once per page process and is not persisted. The first
+tab to claim a session remains its controller; another tab is closed with code
+`4009`. A reconnect from the same tab may replace its stale socket. After a
+successful claim, the backend sends `control.ready` with the accepted
+`client_id`; clients wait for this message before enabling controls.
 
 ## User telemetry
 

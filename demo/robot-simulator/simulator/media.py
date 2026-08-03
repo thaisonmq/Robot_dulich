@@ -224,13 +224,27 @@ class MediaPublisher:
                 logger.info("receiving user audio identity=%s", participant.identity)
                 self.tasks.append(asyncio.create_task(self._consume_audio(track)))
 
+        @self.room.on("track_published")
+        def on_track_published(publication, participant) -> None:
+            self._subscribe_user_audio(publication, participant)
+
         @self.room.on("disconnected")
         def on_disconnected(*_args) -> None:
             self.connected = False
             logger.warning("LiveKit disconnected; media publisher will reconnect")
 
         token = await self.token_provider("main")
-        await self.room.connect(self.config.livekit_url, token)
+        # The encoded camera publisher uses a second LiveKit identity. The main
+        # robot room must not auto-subscribe to that video or the Pi downloads
+        # its own 8 Mbps stream and competes with control traffic on Wi-Fi.
+        await self.room.connect(
+            self.config.livekit_url,
+            token,
+            rtc.RoomOptions(auto_subscribe=False),
+        )
+        for participant in self.room.remote_participants.values():
+            for publication in participant.track_publications.values():
+                self._subscribe_user_audio(publication, participant)
         pipeline = self._video_pipeline()
         if pipeline == "encoded":
             plan = await asyncio.to_thread(self._prepare_encoded_video)
@@ -244,6 +258,17 @@ class MediaPublisher:
             self.config.robot_id,
             pipeline,
         )
+
+    @staticmethod
+    def _is_user_audio_publication(publication, participant) -> bool:
+        return (
+            publication.kind == rtc.TrackKind.KIND_AUDIO
+            and participant.identity.startswith("user:")
+        )
+
+    def _subscribe_user_audio(self, publication, participant) -> None:
+        if self._is_user_audio_publication(publication, participant):
+            publication.set_subscribed(True)
 
     def _video_pipeline(self) -> str:
         pipeline = self.config.video_pipeline.strip().lower()

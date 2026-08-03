@@ -7,9 +7,16 @@ describe("interface translations", () => {
     expect(translate("ja", "Loa phát đàm thoại")).toBe("通話用スピーカー");
   });
 
-  it("uses English as the safe fallback for languages without a UI catalogue", () => {
-    expect(translate("fr", "Đăng nhập")).toBe("Sign in");
-    expect(translate("fr", "Phát âm kiểm tra loa")).toBe("Play speaker test tone");
+  it("renders the additional interface catalogues", () => {
+    expect(translate("fr", "Đăng nhập")).toBe("Se connecter");
+    expect(translate("de", "Ngôn ngữ")).toBe("Sprache");
+    expect(translate("es", "Đăng xuất")).toBe("Cerrar sesión");
+    expect(translate("ru", "Mật khẩu")).toBe("Пароль");
+    expect(translate("zh", "Điều khiển robot")).not.toBe("Robot controls");
+    expect(translate("ko", "Điều khiển robot")).not.toBe("Robot controls");
+    expect(translate("th", "Điều khiển robot")).not.toBe("Robot controls");
+    expect(translate("zh", "Quản trị hệ thống")).toBe("系统管理员");
+    expect(translate("zh", "Chưa phân khu")).toBe("未分区");
   });
 
   it("interpolates translated values", () => {

@@ -80,21 +80,21 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 
 /* Login */
 .login-page {
+  position: relative;
   height: 100dvh;
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1.92fr) minmax(420px, 1fr);
   overflow: hidden;
-  background: #02172b;
+  background: #000118;
 }
 .login-image {
   position: relative;
+  z-index: 0;
   min-height: 0;
-  overflow: hidden;
+  overflow: visible;
   isolation: isolate;
-  background:
-    radial-gradient(circle at 58% 45%, #06386b, transparent 52%),
-    #02172b;
+  background: transparent;
 }
 .login-image::after {
   content: "";
@@ -122,14 +122,16 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .login-image img {
   position: absolute;
   z-index: 0;
-  inset: 0;
-  width: 100%;
+  top: 0;
+  bottom: 0;
+  left: 45%;
+  width: auto;
+  max-width: none;
   height: 100%;
-  object-fit: cover;
-  object-position: 45% center;
   filter: saturate(1.1) contrast(1.03) brightness(.97);
-  transform: scale(1.01);
+  transform: translateX(-45%) scale(1.01);
   animation: login-scene-arrival 1.15s cubic-bezier(.2,.8,.2,1) both;
+  pointer-events: none;
 }
 .login-image__veil {
   position: absolute;
@@ -141,8 +143,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   pointer-events: none;
 }
 @keyframes login-scene-arrival {
-  from { opacity: 0; transform: scale(1.025); }
-  to { opacity: 1; transform: scale(1.01); }
+  from { opacity: 0; transform: translateX(-45%) scale(1.025); }
+  to { opacity: 1; transform: translateX(-45%) scale(1.01); }
 }
 .login-vision {
   position: absolute;
@@ -489,11 +491,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 
 .login-panel {
   position: relative;
+  z-index: 1;
   min-height: 0;
   padding: clamp(16px, 2.1vw, 32px) clamp(16px, 1.8vw, 28px) clamp(16px, 2.1vw, 32px) 0;
   display: grid;
   place-items: stretch;
-  background: #02172b;
+  background: transparent;
 }
 .login-panel__inner {
   width: 100%;
@@ -2414,12 +2417,25 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 
 @media (max-width: 720px) {
   .login-page { grid-template-columns: 1fr; }
-  .login-image { display: none; }
+  .login-image {
+    position: absolute;
+    inset: 0;
+    display: block;
+    overflow: hidden;
+  }
+  .login-image::before,
+  .login-image::after,
+  .login-vision { display: none; }
+  .login-image img {
+    left: 50%;
+    transform: translateX(-50%) scale(1.01);
+    animation: none;
+  }
   .login-panel {
     padding: 12px;
     background:
-      radial-gradient(circle at 10% 10%, rgba(17,100,205,.2), transparent 36%),
-      #02172b;
+      radial-gradient(circle at 10% 10%, rgba(17,100,205,.18), transparent 36%),
+      rgba(1,15,31,.36);
   }
   .login-panel__inner {
     width: min(480px, 100%);

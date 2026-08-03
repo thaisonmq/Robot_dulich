@@ -236,7 +236,7 @@ export function RobotConfigurationPage() {
           <div className="configuration-health">
             <span><CircleDot size={17} /><small>{t("Kết nối")}</small><strong>{robot?.status === "online" ? t("Trực tuyến") : t("Ngoại tuyến")}</strong></span>
             <span><Cpu size={17} /><small>{t("Phiên bản")}</small><strong>{configuration?.software_version ?? "—"}</strong></span>
-            <span><Video size={17} /><small>Profile</small><strong>{form.video_profile === "full_hd" ? "Full HD" : form.video_profile === "balanced" ? t("Cân bằng") : t("Băng thông thấp")}</strong></span>
+            <span><Video size={17} /><small>{t("Hồ sơ")}</small><strong>{form.video_profile === "full_hd" ? "Full HD" : form.video_profile === "balanced" ? t("Cân bằng") : t("Băng thông thấp")}</strong></span>
           </div>
           <div className={`config-preview ${previewState === "connected" ? "is-live" : ""}`}>
             <video ref={videoRef} autoPlay playsInline aria-label={t("Xem trước camera robot")} />
@@ -303,7 +303,7 @@ export function RobotConfigurationPage() {
               <h3>{t("Không kết nối được simulator")}</h3>
               <p>
                 {configurationQuery.error instanceof Error
-                  ? configurationQuery.error.message
+                  ? t(configurationQuery.error.message)
                   : t("Simulator không phản hồi yêu cầu cấu hình")}
               </p>
               <button
@@ -348,7 +348,7 @@ export function RobotConfigurationPage() {
                       <p className={connectionTest.data.ok ? "diagnostic-result is-ok" : "diagnostic-result"}>
                         {connectionTest.data.ok
                           ? `Gateway ${connectionTest.data.gateway} · Media ${connectionTest.data.media}`
-                          : connectionTest.data.detail}
+                          : t(connectionTest.data.detail ?? "Không thể kết nối trung tâm")}
                       </p>
                     )}
                   </section>
@@ -449,13 +449,13 @@ export function RobotConfigurationPage() {
                         ? t("Robot đang dò thiết bị camera trên máy đang chạy…")
                         : mediaSourceScan.isError && mediaSourceScan.variables === "video"
                           ? mediaSourceScan.error instanceof Error
-                            ? mediaSourceScan.error.message
+                            ? t(mediaSourceScan.error.message)
                             : t("Không quét được camera trên robot")
                           : sourcesScanned.video
                             ? videoSources.length
                               ? `${t("Đã xác minh {count} camera trả về hình ảnh.", { count: videoSources.length })}${rejectedVideoSources.length ? ` ${t("Loại {count} nguồn không hoạt động.", { count: rejectedVideoSources.length })}` : ""}`
                               : rejectedVideoSources.length
-                                ? `${t("Không có camera hoạt động.")} ${rejectedVideoSources[0].reason}`
+                                ? `${t("Không có camera hoạt động.")} ${t(rejectedVideoSources[0].reason)}`
                                 : t("Robot không phát hiện camera nào. Kiểm tra kết nối USB và quyền truy cập thiết bị.")
                             : form.video_source_type === "camera"
                               ? t("Bấm Quét để chỉ giữ camera thực sự trả về được frame hình ảnh.")
@@ -500,9 +500,9 @@ export function RobotConfigurationPage() {
                     </button>
                     {mediaTest.data?.diagnostic === "video" && (
                       <span className={mediaTest.data.ok ? "is-ok" : ""}>
-                        {mediaTest.data.detail ?? (
-                          mediaTest.data.ok ? t("Nguồn video hoạt động") : t("Nguồn video không hoạt động")
-                        )}
+                        {mediaTest.data.detail
+                          ? t(mediaTest.data.detail)
+                          : mediaTest.data.ok ? t("Nguồn video hoạt động") : t("Nguồn video không hoạt động")}
                       </span>
                     )}
                   </div>
@@ -589,13 +589,13 @@ export function RobotConfigurationPage() {
                         ? t("Robot đang dò đầu ra ALSA và PipeWire/PulseAudio…")
                         : mediaSourceScan.isError && mediaSourceScan.variables === "speaker"
                           ? mediaSourceScan.error instanceof Error
-                            ? mediaSourceScan.error.message
+                            ? t(mediaSourceScan.error.message)
                             : t("Không quét được loa trên robot")
                           : sourcesScanned.speaker
                             ? speakerSources.length
                               ? `${t("Đã xác minh {count} đầu ra loa.", { count: speakerSources.length })}${rejectedSpeakerSources.length ? ` ${t("Loại {count} đầu ra không hoạt động.", { count: rejectedSpeakerSources.length })}` : ""} ${t("Chọn loa, kiểm tra âm báo rồi lưu cấu hình.")}`
                               : rejectedSpeakerSources.length
-                                ? `${t("Không có loa hoạt động.")} ${rejectedSpeakerSources[0].label}: ${rejectedSpeakerSources[0].reason}`
+                                ? `${t("Không có loa hoạt động.")} ${rejectedSpeakerSources[0].label}: ${t(rejectedSpeakerSources[0].reason)}`
                                 : t("Robot không phát hiện loa nào. Kiểm tra USB, Bluetooth hoặc dịch vụ PipeWire/PulseAudio.")
                             : form.audio_output_type === "device"
                               ? t("Bấm Quét để tìm loa; quá trình quét không phát âm thanh.")
@@ -613,9 +613,9 @@ export function RobotConfigurationPage() {
                     </button>
                     {mediaTest.data?.diagnostic === "speaker" && (
                       <span className={mediaTest.data.ok ? "is-ok" : ""}>
-                        {mediaTest.data.detail ?? (
-                          mediaTest.data.ok ? t("Loa phát âm thanh thành công") : t("Loa không hoạt động")
-                        )}
+                        {mediaTest.data.detail
+                          ? t(mediaTest.data.detail)
+                          : mediaTest.data.ok ? t("Loa phát âm thanh thành công") : t("Loa không hoạt động")}
                       </span>
                     )}
                   </div>
@@ -709,7 +709,7 @@ export function RobotConfigurationPage() {
                         ? t("Robot đang dò ALSA, PipeWire và Bluetooth; hãy nói vào microphone…")
                         : mediaSourceScan.isError && mediaSourceScan.variables === "audio"
                           ? mediaSourceScan.error instanceof Error
-                            ? mediaSourceScan.error.message
+                            ? t(mediaSourceScan.error.message)
                             : t("Không quét được microphone trên robot")
                           : sourcesScanned.audio
                             ? audioSources.length
@@ -718,7 +718,7 @@ export function RobotConfigurationPage() {
                                 ? (() => {
                                     const rejectedSource = rejectedAudioSources.find((source) => source.type === "pulse")
                                       ?? rejectedAudioSources[0];
-                                    return `${t("Không có microphone hoạt động.")} ${rejectedSource.label}: ${rejectedSource.reason}`;
+                                    return `${t("Không có microphone hoạt động.")} ${rejectedSource.label}: ${t(rejectedSource.reason)}`;
                                   })()
                                 : t("Robot không phát hiện microphone nào. Với Bluetooth, chọn HSP/HFP, bật tiếng rồi quét khi đang nói.")
                             : form.audio_source_type === "device"
@@ -732,9 +732,9 @@ export function RobotConfigurationPage() {
                     </button>
                     {mediaTest.data?.diagnostic === "audio" && (
                       <span className={mediaTest.data.ok ? "is-ok" : ""}>
-                        {mediaTest.data.detail ?? (
-                          mediaTest.data.ok ? t("Microphone có tín hiệu") : t("Microphone không hoạt động")
-                        )}
+                        {mediaTest.data.detail
+                          ? t(mediaTest.data.detail)
+                          : mediaTest.data.ok ? t("Microphone có tín hiệu") : t("Microphone không hoạt động")}
                       </span>
                     )}
                   </div>
@@ -745,7 +745,7 @@ export function RobotConfigurationPage() {
 
           {save.isError && (
             <p role="alert" className="form-error">
-              {save.error instanceof Error ? save.error.message : t("Không lưu được cấu hình")}
+              {save.error instanceof Error ? t(save.error.message) : t("Không lưu được cấu hình")}
             </p>
           )}
           <div className="configuration-actions">

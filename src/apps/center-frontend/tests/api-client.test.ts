@@ -44,6 +44,27 @@ describe("API authentication", () => {
     expect(authStorage.get()).toBe("existing-token");
     expect(expired).not.toHaveBeenCalled();
   });
+
+  it("ends a session with a keepalive request when a page is closing", async () => {
+    authStorage.set("active-token");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ status: "ended" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.deleteSession("SESSION-1");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/SESSION-1",
+      expect.objectContaining({
+        method: "DELETE",
+        keepalive: true,
+        headers: expect.objectContaining({ Authorization: "Bearer active-token" }),
+      }),
+    );
+  });
 });
 
 describe("Robot media source scan", () => {

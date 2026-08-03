@@ -117,7 +117,7 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
       <section className="robot-editor-shell">
         <aside className="robot-editor-guide">
           <span className="editor-device-icon"><Bot size={38} /></span>
-          <p className="eyebrow">ROBOT CONNECTION</p>
+          <p className="eyebrow">{t("KẾT NỐI ROBOT")}</p>
           <h1>{mode === "create" ? t("Thêm robot trong vài giây") : t("Thông tin quản lý")}</h1>
           <p>
             {mode === "create"
@@ -237,7 +237,7 @@ export function RobotEditorPage({ mode }: { mode: "create" | "edit" }) {
               ) : robotQuery.isError ? (
                 <div className="configuration-error" role="alert">
                   <h3>{t("Không tải được robot")}</h3>
-                  <p>{robotQuery.error instanceof Error ? robotQuery.error.message : t("Robot không tồn tại")}</p>
+                  <p>{robotQuery.error instanceof Error ? t(robotQuery.error.message) : t("Robot không tồn tại")}</p>
                 </div>
               ) : (
                 <div className="editor-fields">
