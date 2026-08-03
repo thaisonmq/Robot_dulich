@@ -836,11 +836,23 @@ def _active_sources(
     return active, rejected
 
 
-def discover_video_sources() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+def discover_video_sources(
+    known_active_sources: set[str] | None = None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     # Probe sequentially. Multiple /dev/videoN nodes can belong to one physical
     # UVC camera and opening them concurrently can make a valid node look busy.
+    # A camera already reserved by the live media lease must not be opened by a
+    # second FFmpeg probe: many UVC drivers allow only one capture owner and the
+    # competing probe otherwise makes the real publisher fail its first start.
+    known_active = known_active_sources or set()
+
+    def probe(source: str) -> tuple[bool, str]:
+        if source in known_active:
+            return True, "Camera đang được phiên trực tiếp sử dụng"
+        return probe_video_source(source)
+
     return _active_sources(
-        discover_video_candidates(), probe_video_source, max_workers=1
+        discover_video_candidates(), probe, max_workers=1
     )
 
 

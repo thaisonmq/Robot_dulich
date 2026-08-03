@@ -193,6 +193,34 @@ def test_video_probe_keeps_camera_already_used_by_live_stream(monkeypatch) -> No
     assert "luồng trực tiếp" in detail
 
 
+def test_video_scan_does_not_reopen_camera_reserved_by_live_view(
+    monkeypatch,
+) -> None:
+    candidates = [
+        {"type": "camera", "value": "/dev/video0", "label": "Camera live"},
+        {"type": "camera", "value": "/dev/video2", "label": "Camera phụ"},
+    ]
+    probed: list[str] = []
+    monkeypatch.setattr(
+        media_devices, "discover_video_candidates", lambda: candidates
+    )
+
+    def probe(source: str) -> tuple[bool, str]:
+        probed.append(source)
+        return source == "/dev/video2", "Đã có frame"
+
+    monkeypatch.setattr(media_devices, "probe_video_source", probe)
+
+    active, rejected = media_devices.discover_video_sources({"/dev/video0"})
+
+    assert [source["value"] for source in active] == [
+        "/dev/video0",
+        "/dev/video2",
+    ]
+    assert rejected == []
+    assert probed == ["/dev/video2"]
+
+
 def test_video_scan_payload_exposes_only_working_cameras(monkeypatch) -> None:
     active = [
         {"type": "camera", "value": "/dev/video0", "label": "USB Camera"}

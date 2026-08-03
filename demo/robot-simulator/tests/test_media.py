@@ -741,6 +741,22 @@ def test_camera_bridge_drops_surplus_frames_without_upsampling(
     )
     assert command[command.index("-fps_mode") + 1] == "passthrough"
     assert command[command.index("-g") + 1] == str(round(float(expected_fps)))
+    assert video_filter.endswith("format=yuv420p")
+
+
+def test_v4l2m2m_camera_bridge_uses_standard_nv12_input() -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="camera",
+            simulator_media_source="/dev/video0",
+            simulator_camera_format="mjpeg",
+        )
+    )
+    plan = EncodedVideoPlan("bridge", "mjpeg", "h264_v4l2m2m")
+
+    command = publisher._encoded_ffmpeg_command(plan)
+
+    assert command[command.index("-vf") + 1].endswith("format=nv12")
 
 
 @pytest.mark.parametrize(

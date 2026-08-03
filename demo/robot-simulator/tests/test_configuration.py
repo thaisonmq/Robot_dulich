@@ -85,6 +85,41 @@ async def test_live_camera_picker_returns_only_probed_working_sources(
     assert message["payload"]["selected_source"] == "/dev/video0"
 
 
+@pytest.mark.asyncio
+async def test_live_camera_picker_does_not_probe_selected_leased_camera(
+    monkeypatch,
+) -> None:
+    active = [
+        {"type": "camera", "value": "/dev/video0", "label": "USB Camera"}
+    ]
+    calls: list[set[str] | None] = []
+
+    def discover(
+        known_active_sources: set[str] | None = None,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        calls.append(known_active_sources)
+        return active, []
+
+    monkeypatch.setattr("simulator.client.discover_video_sources", discover)
+    client = RobotConnectionClient(
+        SimulatorConfig(
+            simulator_media_source_type="camera",
+            simulator_media_source="/dev/video0",
+        )
+    )
+    client._start_media_lease({"lease_id": "session:test", "ttl_seconds": 30})
+
+    class Socket:
+        sent: list[str] = []
+
+        async def send(self, message: str) -> None:
+            self.sent.append(message)
+
+    await client._camera_sources(Socket(), "request-camera-list")
+
+    assert calls == [{"/dev/video0"}]
+
+
 def test_configuration_is_owned_and_applied_by_simulator() -> None:
     client = RobotConnectionClient(
         SimulatorConfig(

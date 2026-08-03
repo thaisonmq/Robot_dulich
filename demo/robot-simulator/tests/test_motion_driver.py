@@ -263,6 +263,42 @@ async def test_ros2_backend_routes_velocity_and_stop_without_navigation(
 
 
 @pytest.mark.asyncio
+async def test_ros2_backend_samples_control_dispatch_latency(
+    monkeypatch,
+    tmp_path,
+    caplog,
+) -> None:
+    driver = FakeMotionDriver()
+    monkeypatch.setattr(
+        "simulator.client.build_motion_driver", lambda _config, _simulator: driver
+    )
+    client = RobotConnectionClient(
+        SimulatorConfig(
+            motion_backend="ros2",
+            robot_state_file=str(tmp_path / "missing-device.json"),
+        )
+    )
+    socket = FakeGatewaySocket(
+        [
+            make_message(
+                "control.velocity",
+                "ROBOT-001",
+                1,
+                {"linear_x": 0.2, "angular_z": 0.0},
+                "session-1",
+                300,
+            )
+        ]
+    )
+
+    with caplog.at_level("INFO", logger="simulator.gateway"):
+        await client._receive_loop(socket)
+
+    assert "control latency browser_to_edge_ms=" in caplog.text
+    assert "edge_dispatch_ms=" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_ros2_backend_rejects_non_finite_velocity(
     monkeypatch,
     tmp_path,

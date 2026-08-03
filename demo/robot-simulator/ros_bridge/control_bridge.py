@@ -117,6 +117,7 @@ class RosControlBridge(Node):
         self._last_receive_monotonic = 0.0
         self._last_publish_monotonic = 0.0
         self._last_estop_publish_monotonic = 0.0
+        self._last_latency_log_monotonic = 0.0
         self._legacy_override_until = 0.0
         self._legacy_mode_active = False
         self._legacy_override_logged = False
@@ -246,6 +247,16 @@ class RosControlBridge(Node):
         self._stop_burst_remaining = 0
         self._publish_velocity(command)
         self._last_publish_monotonic = now
+        if now - self._last_latency_log_monotonic >= 1.0:
+            ipc_age_ms = max(
+                0.0,
+                (time.monotonic_ns() - command.sent_monotonic_ns) / 1_000_000,
+            )
+            self.get_logger().info(
+                "control latency edge_to_ros_ms="
+                f"{ipc_age_ms:.3f} sequence={command.sequence}"
+            )
+            self._last_latency_log_monotonic = now
 
     def _tick(self) -> None:
         now = time.monotonic()

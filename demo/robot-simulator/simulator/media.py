@@ -1018,8 +1018,19 @@ class MediaPublisher:
                 "force_original_aspect_ratio=increase,"
                 f"crop={self.config.video_width}:{self.config.video_height}"
             )
-            if plan.encoder in {"h264_vaapi", "h264_rkmpp"}:
+            # USB MJPEG cameras commonly decode to YUV 4:2:2. WebRTC H.264
+            # decoders are most reliable on 4:2:0, and leaving x264 on the
+            # High 4:2:2 profile can force software decode in the browser and
+            # make live-view latency vary by client. Normalize every encoder
+            # to a standard 4:2:0 input before publishing.
+            if plan.encoder in {
+                "h264_vaapi",
+                "h264_rkmpp",
+                "h264_v4l2m2m",
+            }:
                 filters += ",format=nv12"
+            else:
+                filters += ",format=yuv420p"
             if plan.encoder == "h264_vaapi":
                 filters += ",hwupload"
             command.extend(["-vf", filters, "-c:v", plan.encoder])

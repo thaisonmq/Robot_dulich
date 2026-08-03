@@ -10,6 +10,7 @@ import random
 import ssl
 import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
@@ -57,6 +58,7 @@ class RobotConnectionClient:
         self._configured_enrollment_token = config.robot_enrollment_token
         self._configured_configuration = self._configuration_snapshot()
         self._state_loaded = False
+        self._last_control_latency_log_monotonic = 0.0
         self._load_device_state()
 
     @property
@@ -561,7 +563,24 @@ class RobotConnectionClient:
                     await self._ack(socket, message, "rejected")
                     continue
                 self.navigation.cancel() if self.navigation.status == "moving" else None
+                dispatch_started = time.monotonic()
                 self.motion_driver.set_velocity(linear_x, angular_z)
+                dispatch_finished = time.monotonic()
+                if (
+                    dispatch_finished - self._last_control_latency_log_monotonic
+                    >= 1.0
+                ):
+                    command_age_ms = (
+                        datetime.now(timezone.utc) - message.timestamp
+                    ).total_seconds() * 1000
+                    logger.info(
+                        "control latency browser_to_edge_ms=%.1f "
+                        "edge_dispatch_ms=%.3f sequence=%d",
+                        command_age_ms,
+                        (dispatch_finished - dispatch_started) * 1000,
+                        message.sequence,
+                    )
+                    self._last_control_latency_log_monotonic = dispatch_finished
                 await self._ack(socket, message, "accepted")
             elif message.message_type == "control.stop":
                 self._stop_motion(str(message.payload.get("reason", "control_stop")))
@@ -849,13 +868,23 @@ class RobotConnectionClient:
         )
 
     async def _camera_sources(self, socket: Any, request_id: str) -> None:
-        sources, _rejected = await asyncio.to_thread(discover_video_sources)
         selected_source = ""
         if self.config.simulator_media_source_type == "camera":
             selected_source = (
                 self.config.simulator_media_source
                 or self.config.simulator_camera_device
             )
+        # The live-view request and camera-list request arrive together when a
+        # dashboard opens. Do not race the publisher by probing its exclusive
+        # V4L2 device in another FFmpeg process. Other candidates are still
+        # opened and must return a real frame before they are shown.
+        if selected_source and self.media_leases:
+            sources, _rejected = await asyncio.to_thread(
+                discover_video_sources,
+                {selected_source},
+            )
+        else:
+            sources, _rejected = await asyncio.to_thread(discover_video_sources)
         await socket.send(
             json.dumps(
                 make_message(
