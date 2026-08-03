@@ -95,7 +95,7 @@ services:
       LIVEKIT_ROBOT_URL: ${LIVEKIT_ROBOT_URL:-ws://livekit:7880}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-dev-secret-at-least-32-characters-long}
-      CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8080}
       SAMPLE_DATA_DIR: /sample-data
     volumes:
       - ../../sample-data:/sample-data:ro

@@ -1,6 +1,7 @@
 import { CONTROL_CONFIG } from "../config/control";
 import { authStorage } from "../api/client";
 import type { MessageEnvelope } from "../types";
+import { createUuid } from "../utils/uuid";
 
 export interface VelocityCommand { linear_x: number; angular_z: number }
 export interface IControlTransport {
@@ -37,7 +38,7 @@ export class WebSocketControlTransport implements IControlTransport {
   private reconnectAttempts = 0;
   private manualDisconnect = false;
   private sessionController = false;
-  private readonly clientId = crypto.randomUUID();
+  private readonly clientId = createUuid();
   private connection: { robotId: string; sessionId: string; url: string } | null = null;
 
   constructor(
@@ -171,7 +172,7 @@ export class WebSocketControlTransport implements IControlTransport {
   private envelope(messageType: string, payload: Record<string, unknown>): MessageEnvelope {
     this.sequence += 1;
     return {
-      message_id: crypto.randomUUID(),
+      message_id: createUuid(),
       schema_version: "1.0",
       message_type: messageType,
       robot_id: this.robotId,
