@@ -22,6 +22,7 @@
       "enum": [
         "control.velocity",
         "control.stop",
+        "camera.ptz",
         "command.ack",
         "robot.heartbeat",
         "robot.pose",
@@ -36,6 +37,12 @@
         "diagnostics.result",
         "media.sources.get",
         "media.sources",
+        "media.onvif.scan",
+        "media.onvif.devices",
+        "media.cameras.get",
+        "media.cameras",
+        "media.source.select",
+        "media.source.state",
         "media.probe",
         "gateway.welcome"
       ]

@@ -1,8 +1,8 @@
 diff --git a/main.go b/main.go
-index b2ab7a4..7790f9f 100644
+index b2ab7a4..5b992fb 100644
 --- a/main.go
 +++ b/main.go
-@@ -49,15 +49,27 @@ func main() {
+@@ -49,15 +49,33 @@ func main() {
  				Usage:    "access token for authentication. canPublish permission is required",
  				Required: true,
  			},
@@ -15,6 +15,11 @@ index b2ab7a4..7790f9f 100644
 +				Name:  "pacer-max-latency-ms",
 +				Usage: "maximum RTP pacer queue latency in milliseconds",
 +				Value: 60,
++			},
++			&cli.IntFlag{
++				Name:  "video-fps",
++				Usage: "fixed video frame rate used for monotonic RTP timestamps",
++				Value: 25,
 +			},
  			&cli.BoolFlag{
  				Name: "verbose",
@@ -30,11 +35,12 @@ index b2ab7a4..7790f9f 100644
 +				PipelineString:  strings.Join(c.Args().Slice(), " "),
 +				PacerBitrate:    c.Int("pacer-bitrate"),
 +				PacerMaxLatency: time.Duration(c.Int("pacer-max-latency-ms")) * time.Millisecond,
++				VideoFPS:        c.Int("video-fps"),
  			})
  			if delay := c.Int("delay"); delay != 0 {
  				time.Sleep(time.Duration(delay) * time.Second)
 diff --git a/publish.go b/publish.go
-index d5ec92f..946f5bc 100644
+index d5ec92f..4e28f37 100644
 --- a/publish.go
 +++ b/publish.go
 @@ -20,10 +20,12 @@ import (
@@ -50,7 +56,7 @@ index d5ec92f..946f5bc 100644
  	"github.com/livekit/protocol/livekit"
  	"github.com/livekit/protocol/logger"
  	lksdk "github.com/livekit/server-sdk-go/v2"
-@@ -42,9 +44,11 @@ var (
+@@ -42,9 +44,12 @@ var (
  )
  
  type PublisherParams struct {
@@ -62,10 +68,11 @@ index d5ec92f..946f5bc 100644
 +	PipelineString  string
 +	PacerBitrate    int
 +	PacerMaxLatency time.Duration
++	VideoFPS        int
  }
  
  type Publisher struct {
-@@ -80,9 +84,18 @@ func (p *Publisher) Start() error {
+@@ -80,9 +85,18 @@ func (p *Publisher) Start() error {
  		// TODO: stop publishing and exit
  	}
  	p.room = lksdk.NewRoom(cb)
@@ -86,38 +93,80 @@ index d5ec92f..946f5bc 100644
  	if err != nil {
  		return err
  	}
+@@ -197,7 +211,7 @@ func (p *Publisher) initialize() error {
+ 		} else if p.audioTrack != nil && target.isAudio {
+ 			return errors.New("pipeline has more than one audio source")
+ 		}
+-		pt, err := createPublisherTrack(target.mimeType)
++		pt, err := createPublisherTrack(target.mimeType, p.params.VideoFPS)
+ 		if err != nil {
+ 			return err
+ 		}
 diff --git a/track.go b/track.go
-index f6494a6..cdf1e40 100644
+index f6494a6..f1d490c 100644
 --- a/track.go
 +++ b/track.go
-@@ -37,6 +37,7 @@ type publisherTrack struct {
+@@ -37,9 +37,12 @@ type publisherTrack struct {
  	publication *lksdk.LocalTrackPublication
  	isEnded     atomic.Bool
  	onEOS       func()
 +	lastTimestamp gst.ClockTime
++	frameDuration time.Duration
++	nextWriteAt   time.Time
  }
  
- func createPublisherTrack(mimeType string) (*publisherTrack, error) {
-@@ -61,8 +62,9 @@ func createPublisherTrack(mimeType string) (*publisherTrack, error) {
+-func createPublisherTrack(mimeType string) (*publisherTrack, error) {
++func createPublisherTrack(mimeType string, videoFPS int) (*publisherTrack, error) {
+ 	webrtcMime := ""
+ 	if mimeType == "audio/x-opus" {
+ 		webrtcMime = webrtc.MimeTypeOpus
+@@ -60,17 +63,33 @@ func createPublisherTrack(mimeType string) (*publisherTrack, error) {
+ 		return nil, err
  	}
  
++	frameDuration := time.Duration(0)
++	if mimeType != "audio/x-opus" && videoFPS > 0 {
++		frameDuration = time.Second / time.Duration(videoFPS)
++	}
++
  	pt := &publisherTrack{
 -		mimeType: webrtcMime,
 -		sink:     sink,
 +		mimeType:      webrtcMime,
 +		sink:          sink,
 +		lastTimestamp: gst.ClockTimeNone,
++		frameDuration:  frameDuration,
  	}
  	sink.SetCallbacks(&app.SinkCallbacks{
  		EOSFunc:       pt.handleEOS,
-@@ -112,13 +114,9 @@ func (t *publisherTrack) handleSample(sink *app.Sink) gst.FlowReturn {
- 		return gst.FlowError
+ 		NewSampleFunc: pt.handleSample,
+ 	})
++	if frameDuration > 0 {
++		sink.SetSync(false)
++		// The callback already paces each access unit. Keep only enough room to
++		// decouple GStreamer scheduling; a one-second appsink queue turns a brief
++		// RTSP burst into permanent live-view delay.
++		sink.SetMaxBuffers(2)
++	}
+ 
+ 	if mimeType == "video/x-h264" {
+-		sink.SetCaps(gst.NewCapsFromString("video/x-h264,stream-format=byte-stream"))
++		sink.SetCaps(gst.NewCapsFromString(
++			"video/x-h264,stream-format=byte-stream,alignment=au",
++		))
  	}
  
+ 	pt.track, err = lksdk.NewLocalTrack(
+@@ -111,14 +126,11 @@ func (t *publisherTrack) handleSample(sink *app.Sink) gst.FlowReturn {
+ 	if segment == nil {
+ 		return gst.FlowError
+ 	}
+-
 -	duration := buffer.Duration()
 -	// pts := buffer.PresentationTimestamp()
 -	// ts := time.Duration(segment.ToRunningTime(gst.FormatTime, uint64(pts)))
--
++	t.paceVideo()
+ 
  	err := t.track.WriteSample(media.Sample{
  		Data:     buffer.Bytes(),
 -		Duration: time.Duration(duration),
@@ -125,11 +174,30 @@ index f6494a6..cdf1e40 100644
  	}, nil)
  
  	switch {
-@@ -131,6 +129,52 @@ func (t *publisherTrack) handleSample(sink *app.Sink) gst.FlowReturn {
+@@ -131,6 +143,68 @@ func (t *publisherTrack) handleSample(sink *app.Sink) gst.FlowReturn {
  	}
  }
  
++func (t *publisherTrack) paceVideo() {
++	if t.frameDuration <= 0 {
++		return
++	}
++	now := time.Now()
++	if t.nextWriteAt.IsZero() || now.Sub(t.nextWriteAt) > 3*t.frameDuration {
++		t.nextWriteAt = now
++	}
++	if wait := time.Until(t.nextWriteAt); wait > 0 {
++		time.Sleep(wait)
++	}
++	t.nextWriteAt = t.nextWriteAt.Add(t.frameDuration)
++}
++
 +func (t *publisherTrack) sampleDuration(s *gst.Sample, buffer *gst.Buffer) time.Duration {
++	if t.frameDuration > 0 {
++		t.rememberTimestamp(buffer)
++		return t.frameDuration
++	}
++
 +	if duration := buffer.Duration().AsDuration(); duration != nil && *duration > 0 {
 +		t.rememberTimestamp(buffer)
 +		return *duration
@@ -162,9 +230,6 @@ index f6494a6..cdf1e40 100644
 +		}
 +	}
 +
-+	// A missing GStreamer duration becomes -1 ns when cast directly to
-+	// time.Duration. That makes the outgoing RTP timestamp jump backwards and
-+	// Chromium renders the stream in bursts. Keep a safe live-video fallback.
 +	return time.Second / 30
 +}
 +

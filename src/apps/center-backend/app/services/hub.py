@@ -75,6 +75,7 @@ class CameraSourceRuntime:
     source: str
     label: str
     selected: bool = False
+    ptz: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -427,6 +428,7 @@ class ConnectionHub:
                 source=value,
                 label=str(source.get("label") or f"Camera {index + 1}"),
                 selected=value == selected_source,
+                ptz=dict(source.get("ptz") or {}),
             )
             remembered[camera.camera_id] = camera
         self.camera_sources[robot_id] = remembered

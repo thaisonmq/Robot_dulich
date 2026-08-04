@@ -135,6 +135,7 @@ def camera_payload(
         "id": source.camera_id,
         "label": source.label if detailed else f"Camera {index + 1}",
         "selected": source.selected,
+        "ptz": source.ptz,
     }
     if detailed:
         public.update(
@@ -149,7 +150,7 @@ def camera_payload(
 async def load_camera_inventory(robot_id: str) -> dict:
     try:
         return await hub.request_robot(
-            robot_id, "media.cameras.get", {}, timeout_seconds=2
+            robot_id, "media.cameras.get", {}, timeout_seconds=4
         )
     except asyncio.TimeoutError:
         # Compatibility with edge agents released before the lightweight

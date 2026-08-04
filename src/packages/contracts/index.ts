@@ -1,6 +1,7 @@
 export type MessageType =
   | "control.velocity"
   | "control.stop"
+  | "camera.ptz"
   | "command.ack"
   | "robot.heartbeat"
   | "robot.pose"
@@ -15,6 +16,8 @@ export type MessageType =
   | "diagnostics.result"
   | "media.sources.get"
   | "media.sources"
+  | "media.onvif.scan"
+  | "media.onvif.devices"
   | "media.cameras.get"
   | "media.cameras"
   | "media.source.select"

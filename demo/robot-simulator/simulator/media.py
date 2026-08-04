@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import math
 import os
@@ -29,9 +30,11 @@ VIDEO_FRAME_TIMEOUT_SECONDS = 10
 VIDEO_JITTER_BUFFER_FRAMES = 2
 VIDEO_PIPE_BUFFER_FRAMES = 4
 VIDEO_PACER_BASE_BITRATE = 8_000_000
+VIDEO_PACER_MAX_BITRATE = 20_000_000
 VIDEO_PACER_FRAME_FRACTION_MS = 750
 VIDEO_PACER_MIN_LATENCY_MS = 12
 VIDEO_PACER_MAX_LATENCY_MS = 35
+UNRELIABLE_RTSP_FPS = 20
 AUDIO_PLAYBACK_BUFFER_FRAMES = 4
 AUDIO_DEVICE_BUFFER_MS = 60
 AUDIO_DEVICE_PERIOD_MS = 20
@@ -76,6 +79,27 @@ class EncodedVideoPlan:
     source_codec: str
     encoder: str
     ffmpeg_binary: str = "ffmpeg"
+    source_fps: Fraction | None = None
+    output_fps: Fraction | None = None
+    source_bitrate: int = 0
+    output_width: int = 0
+    output_height: int = 0
+
+
+@dataclass(frozen=True)
+class SourceVideoProbe:
+    """Media properties used to choose the lowest-latency safe route."""
+
+    codec: str
+    width: int = 0
+    height: int = 0
+    fps: Fraction | None = None
+    bitrate: int = 0
+    pixel_format: str = ""
+    profile: str = ""
+    has_b_frames: bool = False
+    timing_reliable: bool = True
+    timing_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -102,6 +126,36 @@ def fps_text(fps: Fraction) -> str:
     if fps.denominator == 1:
         return str(fps.numerator)
     return f"{fps.numerator}/{fps.denominator}"
+
+
+def parse_ffprobe_fraction(value: object) -> Fraction | None:
+    text = str(value or "").strip()
+    if not text or text in {"0", "0/0", "N/A"}:
+        return None
+    try:
+        parsed = Fraction(text).limit_denominator(1001)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def bounded_video_dimensions(
+    source_width: int,
+    source_height: int,
+    maximum_width: int,
+    maximum_height: int,
+) -> tuple[int, int]:
+    """Fit inside the selected profile without wasting CPU on upscaling."""
+    if source_width <= 0 or source_height <= 0:
+        return maximum_width, maximum_height
+    scale = min(
+        1.0,
+        maximum_width / source_width,
+        maximum_height / source_height,
+    )
+    width = max(2, round(source_width * scale / 2) * 2)
+    height = max(2, round(source_height * scale / 2) * 2)
+    return width, height
 
 
 def parse_v4l2_capture_profile(
@@ -379,6 +433,8 @@ class MediaPublisher:
             self.config.simulator_camera_height,
             self.config.simulator_camera_fps,
             self.config.rtsp_transport,
+            self.config.rtsp_normalize,
+            self.config.rtsp_auto_normalize,
             self.config.video_width,
             self.config.video_height,
             self.config.video_fps,
@@ -405,38 +461,73 @@ class MediaPublisher:
         if parser.returncode != 0:
             raise RuntimeError("GStreamer h264parse plugin is unavailable")
 
-        source_codec = self._probe_source_codec()
-        if source_codec == "h264" and self.config.video_passthrough:
-            camera_needs_frame_drop = (
-                self.config.simulator_media_source_type == "camera"
-                and self._camera_capture_profile_for_source().fps
-                > Fraction(self.config.video_fps, 1)
+        probe = self._probe_video_source()
+        reasons = self._video_transcode_reasons(probe)
+        output_width, output_height = bounded_video_dimensions(
+            probe.width,
+            probe.height,
+            self.config.video_width,
+            self.config.video_height,
+        )
+        target_fps = Fraction(self.config.video_fps, 1)
+        if not reasons:
+            # USB H.264 goes straight from V4L2 to LiveKit. RTSP/file H.264
+            # crosses a zero-copy FFmpeg MPEG-TS bridge: this repairs access-unit
+            # boundaries without decoding while keeping vendor compatibility.
+            mode = (
+                "direct"
+                if self.config.simulator_media_source_type == "camera"
+                else "bridge"
             )
-            if not camera_needs_frame_drop:
-                mode = (
-                    "direct"
-                    if self.config.simulator_media_source_type in {"rtsp", "camera"}
-                    else "bridge"
-                )
-                logger.info(
-                    "video optimization selected mode=%s source_codec=h264 "
-                    "decode=false encode=false",
-                    mode,
-                )
-                return EncodedVideoPlan(mode, source_codec, "copy")
+            passthrough_fps = probe.fps or target_fps
             logger.info(
-                "camera H.264 passthrough disabled capture_fps=%s output_fps=%d; "
-                "transcoding so surplus frames can be dropped safely",
-                fps_text(self._camera_capture_profile_for_source().fps),
-                self.config.video_fps,
+                "video route mode=%s codec=h264 copy=true fps=%s size=%dx%d "
+                "bitrate=%d",
+                mode,
+                fps_text(passthrough_fps),
+                probe.width,
+                probe.height,
+                probe.bitrate,
             )
+            return EncodedVideoPlan(
+                mode,
+                probe.codec,
+                "copy",
+                source_fps=passthrough_fps,
+                output_fps=passthrough_fps,
+                source_bitrate=probe.bitrate,
+                output_width=probe.width,
+                output_height=probe.height,
+            )
+
+        if probe.fps is not None and probe.timing_reliable:
+            output_fps = min(probe.fps, target_fps)
+        elif (
+            self.config.simulator_media_source_type == "rtsp"
+            and not probe.timing_reliable
+        ):
+            # Leave headroom below common 25 FPS RTSP sources. A camera with
+            # corrupt timestamps cannot safely be paced faster than the frames
+            # it really delivers; doing so makes the browser jitter buffer grow
+            # until it starts dropping frames and live control looks delayed.
+            output_fps = min(target_fps, Fraction(UNRELIABLE_RTSP_FPS, 1))
+        else:
+            output_fps = target_fps
+        logger.info(
+            "video route transcode=true codec=%s reason=%s output=%dx%d@%s",
+            probe.codec,
+            ",".join(reasons),
+            output_width,
+            output_height,
+            fps_text(output_fps),
+        )
 
         encoder, binary = self._select_video_encoder()
         if encoder == "h264_vaapi":
             logger.info(
                 "video optimization selected mode=bridge source_codec=%s "
                 "encoder=%s rate_control=%s low_power=%s",
-                source_codec,
+                probe.codec,
                 encoder,
                 self._vaapi_rate_control,
                 self._vaapi_low_power,
@@ -444,19 +535,67 @@ class MediaPublisher:
         else:
             logger.info(
                 "video optimization selected mode=bridge source_codec=%s encoder=%s",
-                source_codec,
+                probe.codec,
                 encoder,
             )
-        return EncodedVideoPlan("bridge", source_codec, encoder, binary)
+        return EncodedVideoPlan(
+            "bridge",
+            probe.codec,
+            encoder,
+            binary,
+            source_fps=probe.fps,
+            output_fps=output_fps,
+            source_bitrate=probe.bitrate,
+            output_width=output_width,
+            output_height=output_height,
+        )
+
+    def _video_transcode_reasons(self, probe: SourceVideoProbe) -> list[str]:
+        reasons: list[str] = []
+        if probe.codec != "h264":
+            reasons.append(f"codec-{probe.codec}")
+        if not self.config.video_passthrough:
+            reasons.append("passthrough-disabled")
+        if self.config.simulator_media_source_type == "rtsp":
+            if self.config.rtsp_normalize:
+                reasons.append("normalize-forced")
+            elif self.config.rtsp_auto_normalize and not probe.timing_reliable:
+                reasons.append(probe.timing_reason or "timing-unreliable")
+        if probe.width > self.config.video_width or probe.height > self.config.video_height:
+            reasons.append("profile-resolution")
+        if probe.fps is not None and probe.fps > 30:
+            reasons.append("profile-fps")
+        maximum_passthrough_bitrate = max(
+            self.config.video_bitrate * 3 // 2,
+            self.config.video_bitrate + 1_000_000,
+        )
+        if probe.bitrate > maximum_passthrough_bitrate:
+            reasons.append("profile-bitrate")
+        compatible_pixel_formats = {"", "nv12", "yuv420p", "yuvj420p"}
+        if probe.pixel_format not in compatible_pixel_formats:
+            reasons.append("pixel-format")
+        compatible_profiles = {"", "baseline", "constrained baseline", "main", "high"}
+        if probe.profile.casefold() not in compatible_profiles:
+            reasons.append("h264-profile")
+        return reasons
 
     def _probe_source_codec(self) -> str:
+        """Compatibility helper retained for diagnostics and older callers."""
+        return self._probe_video_source().codec
+
+    def _probe_video_source(self) -> SourceVideoProbe:
         kind = self.config.simulator_media_source_type
         if kind == "camera":
             profile = self._camera_capture_profile_for_source()
-            return profile.source_codec
+            return SourceVideoProbe(
+                codec=profile.source_codec,
+                width=profile.width,
+                height=profile.height,
+                fps=profile.fps,
+            )
 
         if kind not in {"rtsp", "file"}:
-            return "rawvideo"
+            return SourceVideoProbe(codec="rawvideo")
         if shutil.which("ffprobe") is None:
             raise RuntimeError("ffprobe is required to inspect the video source")
         if kind == "rtsp":
@@ -478,9 +617,12 @@ class MediaPublisher:
                     "-select_streams",
                     "v:0",
                     "-show_entries",
-                    "stream=codec_name",
+                    (
+                        "stream=codec_name,width,height,pix_fmt,profile,"
+                        "avg_frame_rate,r_frame_rate,bit_rate,has_b_frames"
+                    ),
                     "-of",
-                    "default=nokey=1:noprint_wrappers=1",
+                    "json",
                 ],
                 capture_output=True,
                 check=False,
@@ -489,15 +631,68 @@ class MediaPublisher:
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("video source codec probe timed out") from exc
-        codec = result.stdout.strip().splitlines()
-        if result.returncode != 0 or not codec:
+        try:
+            payload = json.loads(result.stdout or "{}")
+            stream = payload.get("streams", [])[0]
+        except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+            stream = None
+        if result.returncode != 0 or not isinstance(stream, dict):
             detail = result.stderr.strip().replace(
                 self.config.simulator_media_source, "<media-source>"
             )
             raise RuntimeError(
                 f"cannot detect video source codec: {detail[-300:] or 'no video stream'}"
             )
-        return codec[0].strip().lower()
+        codec = str(stream.get("codec_name") or "").strip().lower()
+        if not codec:
+            raise RuntimeError("cannot detect video source codec: no video codec")
+
+        average_fps = parse_ffprobe_fraction(stream.get("avg_frame_rate"))
+        advertised_fps = parse_ffprobe_fraction(stream.get("r_frame_rate"))
+        fps = average_fps or advertised_fps
+        timing_reliable = True
+        timing_reason = ""
+        if kind == "rtsp" and (fps is None or fps > 60):
+            timing_reliable = False
+            timing_reason = (
+                "timing-missing" if fps is None else "timing-out-of-range"
+            )
+            fps = None
+
+        def positive_int(value: object) -> int:
+            try:
+                parsed = int(str(value or "0"))
+            except ValueError:
+                return 0
+            return max(0, parsed)
+
+        probe = SourceVideoProbe(
+            codec=codec,
+            width=positive_int(stream.get("width")),
+            height=positive_int(stream.get("height")),
+            fps=fps,
+            bitrate=positive_int(stream.get("bit_rate")),
+            pixel_format=str(stream.get("pix_fmt") or "").strip().lower(),
+            profile=str(stream.get("profile") or "").strip(),
+            has_b_frames=positive_int(stream.get("has_b_frames")) > 0,
+            timing_reliable=timing_reliable,
+            timing_reason=timing_reason,
+        )
+        logger.info(
+            "video source probe kind=%s codec=%s size=%dx%d fps=%s bitrate=%d "
+            "pix_fmt=%s profile=%s b_frames=%s timing=%s",
+            kind,
+            probe.codec,
+            probe.width,
+            probe.height,
+            fps_text(probe.fps) if probe.fps else "unknown",
+            probe.bitrate,
+            probe.pixel_format or "unknown",
+            probe.profile or "unknown",
+            probe.has_b_frames,
+            "ok" if probe.timing_reliable else probe.timing_reason,
+        )
+        return probe
 
     def _camera_device(self) -> str:
         return (
@@ -808,6 +1003,10 @@ class MediaPublisher:
                 # delta frame corrupts the rest of its GOP, which appears as
                 # scratches until the next keyframe.
                 "latency=80",
+                # Do not slave the local pipeline clock to unstable sender
+                # reports. The publisher assigns a fixed RTP frame duration.
+                "buffer-mode=none",
+                "max-ts-offset=0",
                 "drop-on-latency=false",
                 "!",
                 "rtph264depay",
@@ -838,7 +1037,16 @@ class MediaPublisher:
             ]
         raise ValueError(f"direct H.264 is unsupported for source type: {kind}")
 
-    def _bridge_h264_pipeline(self) -> list[str]:
+    def _bridge_h264_pipeline(
+        self, plan: EncodedVideoPlan | None = None
+    ) -> list[str]:
+        # Decouple the two native processes without preserving a full second of
+        # stale pictures. Four to five access units cover normal 25/30 fps TCP
+        # bursts while back-pressure keeps encoded GOPs intact.
+        queue_frames = max(
+            2,
+            min(6, math.ceil(float(self._publisher_video_fps(plan)) * 0.16)),
+        )
         return [
             "fdsrc",
             "fd=0",
@@ -849,11 +1057,10 @@ class MediaPublisher:
             "latency=0",
             "!",
             "queue",
-            # Apply back-pressure to FFmpeg instead of dropping encoded
-            # delta frames and leaving the browser with an undecodable GOP.
-            # One frame is enough to decouple the processes without letting
-            # the clock-synchronised sink sit several frames behind live.
-            "max-size-buffers=1",
+            # Back-pressure is intentional: dropping an H.264 delta frame
+            # corrupts the remainder of its GOP. The upstream RTSP queue and
+            # publisher watchdog reconnect instead of growing local latency.
+            f"max-size-buffers={queue_frames}",
             "max-size-bytes=0",
             "max-size-time=0",
             "!",
@@ -869,6 +1076,7 @@ class MediaPublisher:
         plan: EncodedVideoPlan | None = None,
     ) -> list[str]:
         fps = self._publisher_video_fps(plan)
+        pacer_bitrate = self._publisher_pacer_bitrate(plan)
         return [
             "gstreamer-publisher",
             "--url",
@@ -876,9 +1084,11 @@ class MediaPublisher:
             "--token",
             token,
             "--pacer-bitrate",
-            str(max(self.config.video_bitrate, VIDEO_PACER_BASE_BITRATE)),
+            str(pacer_bitrate),
             "--pacer-max-latency-ms",
             str(video_pacer_max_latency_ms(fps)),
+            "--video-fps",
+            str(max(1, round(float(fps)))),
             "--",
             *pipeline,
         ]
@@ -886,6 +1096,8 @@ class MediaPublisher:
     def _publisher_video_fps(
         self, plan: EncodedVideoPlan | None = None
     ) -> Fraction:
+        if plan is not None and plan.output_fps is not None:
+            return plan.output_fps
         # Direct H.264 keeps the negotiated capture cadence. Transcoded camera
         # paths cap it at VIDEO_FPS and drop surplus raw frames before encode.
         if self.config.simulator_media_source_type == "camera":
@@ -894,6 +1106,26 @@ class MediaPublisher:
                 return capture_fps
             return min(capture_fps, Fraction(self.config.video_fps, 1))
         return Fraction(self.config.video_fps, 1)
+
+    def _publisher_pacer_bitrate(
+        self, plan: EncodedVideoPlan | None = None
+    ) -> int:
+        bitrate = self.config.video_bitrate
+        if plan is not None and plan.encoder == "copy":
+            if plan.source_bitrate > 0:
+                # Camera IDR frames arrive in a short burst. Pacing 35% above
+                # the average clears them before the next frame without
+                # changing the number of bytes sent over the network.
+                bitrate = max(bitrate, math.ceil(plan.source_bitrate * 1.35))
+            else:
+                # RTSP commonly omits bit_rate. Reserve enough pacing headroom
+                # for a normal 1080p H.264 main stream; actual bandwidth remains
+                # the camera's encoded bitrate.
+                bitrate = max(bitrate, self.config.video_bitrate * 2)
+        return min(
+            VIDEO_PACER_MAX_BITRATE,
+            max(VIDEO_PACER_BASE_BITRATE, bitrate),
+        )
 
     def _video_encoder_args(
         self,
@@ -904,6 +1136,10 @@ class MediaPublisher:
         output_fps: Fraction | None = None,
     ) -> list[str]:
         selected_fps = output_fps or Fraction(self.config.video_fps, 1)
+        # A one-second VBV can preserve a full second of stale video after a
+        # motion burst. A 250 ms window still covers normal IDRs while bounding
+        # the encoder/pacer latency for live control.
+        vbv_buffer = max(250_000, self.config.video_bitrate // 4)
         common = [
             "-g",
             str(max(1, round(float(selected_fps)))),
@@ -924,7 +1160,7 @@ class MediaPublisher:
                     # VAAPI defines larger values as faster. The webcam path is
                     # latency-sensitive and CQP already controls visual quality.
                     "-quality",
-                    "8",
+                    "7",
                 ]
                 if selected_low_power
                 else []
@@ -957,7 +1193,7 @@ class MediaPublisher:
                 "-maxrate",
                 str(self.config.video_bitrate),
                 "-bufsize",
-                str(self.config.video_bitrate),
+                str(vbv_buffer),
                 "-async_depth",
                 "1",
                 *low_latency,
@@ -969,7 +1205,7 @@ class MediaPublisher:
             "-maxrate",
             str(self.config.video_bitrate),
             "-bufsize",
-            str(self.config.video_bitrate),
+            str(vbv_buffer),
         ]
         if encoder == "libx264":
             return [
@@ -1006,17 +1242,44 @@ class MediaPublisher:
             )
         else:
             output_fps = self._publisher_video_fps(plan)
-            cadence_filter = (
-                "setpts=PTS-STARTPTS,"
-                f"fps=fps={fps_text(output_fps)}:round=down:eof_action=pass"
-                if self.config.simulator_media_source_type == "camera"
-                else f"fps={self.config.video_fps}"
-            )
+            if self.config.simulator_media_source_type == "camera":
+                cadence_filter = (
+                    "setpts=PTS-STARTPTS,"
+                    f"fps=fps={fps_text(output_fps)}:round=down:eof_action=pass"
+                )
+            elif self.config.simulator_media_source_type == "rtsp":
+                if plan.source_fps is None:
+                    # Some ONVIF cameras advertise values such as 100 FPS while
+                    # actually producing about 20-25 FPS. Rebase those frames
+                    # from their arrival clock before fps normalization; using
+                    # the corrupt camera PTS creates long bursts and freezes.
+                    cadence_filter = (
+                        "setpts=(RTCTIME-RTCSTART)/(TB*1000000),"
+                        f"fps=fps={fps_text(output_fps)}:"
+                        "round=near:eof_action=pass,"
+                        f"setpts=N/({fps_text(output_fps)}*TB)"
+                    )
+                else:
+                    # Rebuild bursty arrival timestamps at the configured output
+                    # cadence. The second setpts gives the publisher a clean
+                    # monotonic RTP clock after duplicate/drop normalization.
+                    cadence_filter = (
+                        "setpts=PTS-STARTPTS,"
+                        f"fps=fps={fps_text(output_fps)}:"
+                        "round=near:eof_action=pass,"
+                        f"setpts=N/({fps_text(output_fps)}*TB)"
+                    )
+            else:
+                cadence_filter = (
+                    "setpts=PTS-STARTPTS,"
+                    f"fps=fps={self.config.video_fps}:round=near:eof_action=pass,"
+                    f"setpts=N/({self.config.video_fps}*TB)"
+                )
+            output_width = plan.output_width or self.config.video_width
+            output_height = plan.output_height or self.config.video_height
             filters = (
                 f"{cadence_filter},"
-                f"scale={self.config.video_width}:{self.config.video_height}:"
-                "force_original_aspect_ratio=increase,"
-                f"crop={self.config.video_width}:{self.config.video_height}"
+                f"scale={output_width}:{output_height}:flags=fast_bilinear"
             )
             # USB MJPEG cameras commonly decode to YUV 4:2:2. WebRTC H.264
             # decoders are most reliable on 4:2:0, and leaving x264 on the
@@ -1050,6 +1313,8 @@ class MediaPublisher:
                 # of waiting for FFmpeg's AVIO buffer to fill on quiet scenes.
                 "-flush_packets",
                 "1",
+                "-mpegts_flags",
+                "+resend_headers+initial_discontinuity",
                 "-f",
                 "mpegts",
                 "pipe:1",
@@ -1091,7 +1356,7 @@ class MediaPublisher:
                     plan.mode,
                     plan.encoder,
                     fps_text(self._publisher_video_fps(plan)),
-                    max(self.config.video_bitrate, VIDEO_PACER_BASE_BITRATE),
+                    self._publisher_pacer_bitrate(plan),
                     video_pacer_max_latency_ms(self._publisher_video_fps(plan)),
                 )
                 waiters = [asyncio.create_task(process.wait()) for process in processes]
@@ -1156,7 +1421,7 @@ class MediaPublisher:
             publisher = await asyncio.create_subprocess_exec(
                 *self._publisher_command(
                     token,
-                    self._bridge_h264_pipeline(),
+                    self._bridge_h264_pipeline(plan),
                     plan,
                 ),
                 stdin=read_fd,
@@ -1272,7 +1537,10 @@ class MediaPublisher:
             low_latency = [
                 "-fflags", "+genpts+discardcorrupt+nobuffer",
                 "-flags", "low_delay",
-                "-thread_queue_size", "64",
+                # Cap input backlog below half a second for common 25/30 fps
+                # cameras. Preserving a larger queue only preserves stale video.
+                "-thread_queue_size", "8",
+                "-use_wallclock_as_timestamps", "1",
                 "-rtsp_transport", self.config.rtsp_transport,
                 "-buffer_size", "262144",
             ]

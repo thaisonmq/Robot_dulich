@@ -132,4 +132,28 @@ describe("WebSocketControlTransport", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(FakeWebSocket.instances).toHaveLength(2);
   });
+
+  it("sends PTZ motion and stop commands through the active control channel", async () => {
+    const transport = new WebSocketControlTransport(vi.fn(), vi.fn());
+    const connecting = transport.connect("ROBOT-001", "session-1", "/ws/control");
+    FakeWebSocket.instances[0].open();
+    FakeWebSocket.instances[0].acceptControl();
+    await connecting;
+
+    transport.sendPtz({ operation: "move", pan: -1, tilt: 0, speed: "slow" });
+    transport.sendPtz({ operation: "stop" });
+
+    const messages = FakeWebSocket.instances[0].sent.map((raw) => JSON.parse(raw));
+    expect(messages.map((message) => message.message_type)).toEqual([
+      "camera.ptz",
+      "camera.ptz",
+    ]);
+    expect(messages[0].payload).toEqual({
+      operation: "move",
+      pan: -1,
+      tilt: 0,
+      speed: "slow",
+    });
+    expect(messages[1].payload).toEqual({ operation: "stop" });
+  });
 });

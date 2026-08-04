@@ -12,7 +12,10 @@ from simulator.media import (
     CameraCaptureProfile,
     EncodedVideoPlan,
     MediaPublisher,
+    SourceVideoProbe,
     VIDEO_JITTER_BUFFER_FRAMES,
+    bounded_video_dimensions,
+    parse_ffprobe_fraction,
     parse_v4l2_capture_profile,
     video_pacer_max_latency_ms,
     video_pipe_buffer_limit,
@@ -95,7 +98,7 @@ async def test_main_room_subscribes_only_to_user_audio(monkeypatch) -> None:
     await publisher.disconnect()
 
 
-def test_rtsp_defaults_to_low_jitter_udp_input() -> None:
+def test_rtsp_defaults_to_bounded_reliable_tcp_input() -> None:
     publisher = MediaPublisher(
         SimulatorConfig(
             simulator_media_source_type="rtsp",
@@ -105,15 +108,16 @@ def test_rtsp_defaults_to_low_jitter_udp_input() -> None:
 
     arguments = publisher._video_input_args()
 
-    assert arguments[:8] == [
+    assert arguments[:10] == [
         "-fflags", "+genpts+discardcorrupt+nobuffer",
         "-flags", "low_delay",
-        "-thread_queue_size", "64",
-        "-rtsp_transport", "udp",
+        "-thread_queue_size", "8",
+        "-use_wallclock_as_timestamps", "1",
+        "-rtsp_transport", "tcp",
     ]
     assert arguments[arguments.index("-buffer_size") + 1] == "262144"
-    assert arguments[arguments.index("-max_delay") + 1] == "100000"
-    assert arguments[arguments.index("-reorder_queue_size") + 1] == "32"
+    assert arguments[arguments.index("-max_delay") + 1] == "0"
+    assert arguments[arguments.index("-reorder_queue_size") + 1] == "0"
     assert "-stimeout" not in arguments
     assert "-rw_timeout" not in arguments
     assert arguments[-2:] == ["-i", "rtsp://camera.local/live"]
@@ -139,6 +143,7 @@ def test_rtsp_tcp_transport_remains_configurable() -> None:
             simulator_media_source_type="rtsp",
             simulator_media_source="rtsp://camera.local/live",
             rtsp_transport="tcp",
+            rtsp_normalize=False,
         )
     )
 
@@ -165,6 +170,7 @@ def test_encoded_publisher_paces_large_frames_without_reencoding(
 
     assert command[command.index("--pacer-bitrate") + 1] == pacer_bitrate
     assert command[command.index("--pacer-max-latency-ms") + 1] == "30"
+    assert command[command.index("--video-fps") + 1] == "25"
     assert command[-2:] == ["--", "h264parse"]
 
 
@@ -192,6 +198,7 @@ def test_direct_usb_camera_pacer_uses_capture_fps() -> None:
     command = publisher._publisher_command("secret", ["h264parse"])
 
     assert command[command.index("--pacer-max-latency-ms") + 1] == "12"
+    assert command[command.index("--video-fps") + 1] == "60"
 
 
 def test_usb_camera_uses_v4l2_device_settings() -> None:
@@ -553,12 +560,102 @@ def test_full_hd_defaults_leave_headroom_for_control_traffic() -> None:
     assert config.video_width == 1920
     assert config.video_height == 1080
     assert config.video_bitrate == 6_000_000
+    assert config.rtsp_normalize is False
+    assert config.rtsp_auto_normalize is True
 
 
 def test_video_pipe_can_buffer_multiple_full_hd_frames() -> None:
     frame_size = 1920 * 1080 * 3 // 2
 
     assert video_pipe_buffer_limit(frame_size) == frame_size * 4
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("25/1", Fraction(25, 1)),
+        ("30000/1001", Fraction(30000, 1001)),
+        ("0/0", None),
+        ("N/A", None),
+        (None, None),
+    ],
+)
+def test_ffprobe_frame_rate_parser_is_bounded_and_exact(
+    value: object,
+    expected: Fraction | None,
+) -> None:
+    assert parse_ffprobe_fraction(value) == expected
+
+
+def test_video_dimensions_never_upscale_small_sources() -> None:
+    assert bounded_video_dimensions(1280, 720, 1920, 1080) == (1280, 720)
+    assert bounded_video_dimensions(3840, 2160, 1920, 1080) == (1920, 1080)
+    assert bounded_video_dimensions(1280, 960, 1280, 720) == (960, 720)
+
+
+def test_rtsp_probe_prefers_average_rate_over_codec_tick_rate(monkeypatch) -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="rtsp",
+            simulator_media_source="rtsp://camera.local/live",
+        )
+    )
+    monkeypatch.setattr("simulator.media.shutil.which", lambda _binary: "/usr/bin/tool")
+    payload = """{
+      "streams": [{
+        "codec_name": "h264",
+        "profile": "Main",
+        "width": 1920,
+        "height": 1080,
+        "pix_fmt": "yuv420p",
+        "r_frame_rate": "50/1",
+        "avg_frame_rate": "25/1",
+        "bit_rate": "8000000",
+        "has_b_frames": 0
+      }]
+    }"""
+    monkeypatch.setattr(
+        "simulator.media.subprocess.run",
+        lambda command, **_kwargs: CompletedProcess(command, 0, payload, ""),
+    )
+
+    probe = publisher._probe_video_source()
+
+    assert probe.fps == Fraction(25, 1)
+    assert probe.timing_reliable is True
+    assert probe.bitrate == 8_000_000
+
+
+def test_rtsp_probe_marks_camera_128_style_timing_unreliable(monkeypatch) -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="rtsp",
+            simulator_media_source="rtsp://camera.local/live",
+        )
+    )
+    monkeypatch.setattr("simulator.media.shutil.which", lambda _binary: "/usr/bin/tool")
+    payload = """{
+      "streams": [{
+        "codec_name": "h264",
+        "profile": "Main",
+        "width": 1920,
+        "height": 1080,
+        "pix_fmt": "yuv420p",
+        "r_frame_rate": "100/1",
+        "avg_frame_rate": "0/0",
+        "has_b_frames": 0
+      }]
+    }"""
+    monkeypatch.setattr(
+        "simulator.media.subprocess.run",
+        lambda command, **_kwargs: CompletedProcess(command, 0, payload, ""),
+    )
+
+    probe = publisher._probe_video_source()
+
+    assert probe.fps is None
+    assert probe.timing_reliable is False
+    assert probe.timing_reason == "timing-out-of-range"
 
 
 def test_video_publish_options_prioritize_smooth_motion() -> None:
@@ -653,12 +750,244 @@ def test_rtsp_h264_direct_pipeline_never_decodes_or_encodes() -> None:
         "config-interval=1",
     ]
     assert "latency=80" in pipeline
+    assert "buffer-mode=none" in pipeline
+    assert "max-ts-offset=0" in pipeline
     assert "drop-on-latency=false" in pipeline
     assert "decode" not in command
     assert all(
         encoder not in command
         for encoder in ("x264enc", "mpph264enc", "h264_vaapi", "h264_nvenc")
     )
+
+
+def test_rtsp_h264_passthrough_repairs_frame_boundaries_in_copy_bridge(
+    monkeypatch,
+) -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="rtsp",
+            simulator_media_source="rtsp://camera.local/live",
+            rtsp_normalize=False,
+        )
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_probe_video_source",
+        lambda: SourceVideoProbe(
+            codec="h264",
+            width=1920,
+            height=1080,
+            fps=Fraction(25, 1),
+            pixel_format="yuv420p",
+            profile="Main",
+        ),
+    )
+    monkeypatch.setattr("simulator.media.shutil.which", lambda _binary: "/usr/bin/tool")
+    monkeypatch.setattr(
+        "simulator.media.subprocess.run",
+        lambda command, **_kwargs: CompletedProcess(command, 0, "", ""),
+    )
+
+    plan = publisher._build_encoded_video_plan()
+    command = publisher._encoded_ffmpeg_command(plan)
+
+    assert plan.mode == "bridge"
+    assert plan.encoder == "copy"
+    assert plan.output_fps == Fraction(25, 1)
+    assert command[command.index("-c:v") + 1] == "copy"
+    assert "h264_mp4toannexb" in command
+    assert "-vf" not in command
+
+
+def test_rtsp_h264_normalization_remains_available_as_opt_in(monkeypatch) -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="rtsp",
+            simulator_media_source="rtsp://camera.local/live",
+            rtsp_normalize=True,
+        )
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_probe_video_source",
+        lambda: SourceVideoProbe(
+            codec="h264",
+            width=1920,
+            height=1080,
+            fps=Fraction(25, 1),
+            pixel_format="yuv420p",
+            profile="Main",
+        ),
+    )
+    monkeypatch.setattr(
+        publisher, "_select_video_encoder", lambda: ("libx264", "ffmpeg")
+    )
+    monkeypatch.setattr("simulator.media.shutil.which", lambda _binary: "/usr/bin/tool")
+    monkeypatch.setattr(
+        "simulator.media.subprocess.run",
+        lambda command, **_kwargs: CompletedProcess(command, 0, "", ""),
+    )
+
+    plan = publisher._build_encoded_video_plan()
+    command = publisher._encoded_ffmpeg_command(plan)
+    video_filter = command[command.index("-vf") + 1]
+
+    assert plan.mode == "bridge"
+    assert plan.encoder == "libx264"
+    assert "fps=fps=25:round=near:eof_action=pass" in video_filter
+    assert "setpts=N/(25*TB)" in video_filter
+
+
+def test_clean_rtsp_h264_keeps_real_30fps_and_avoids_reencoding(
+    monkeypatch,
+) -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="rtsp",
+            simulator_media_source="rtsp://camera.local/live",
+            video_fps=25,
+            video_bitrate=6_000_000,
+        )
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_probe_video_source",
+        lambda: SourceVideoProbe(
+            codec="h264",
+            width=1920,
+            height=1080,
+            fps=Fraction(30, 1),
+            bitrate=8_000_000,
+            pixel_format="yuv420p",
+            profile="High",
+        ),
+    )
+    monkeypatch.setattr("simulator.media.shutil.which", lambda _binary: "/usr/bin/tool")
+    monkeypatch.setattr(
+        "simulator.media.subprocess.run",
+        lambda command, **_kwargs: CompletedProcess(command, 0, "", ""),
+    )
+
+    plan = publisher._build_encoded_video_plan()
+    command = publisher._publisher_command("secret", ["h264parse"], plan)
+
+    assert plan.encoder == "copy"
+    assert plan.output_fps == Fraction(30, 1)
+    assert command[command.index("--video-fps") + 1] == "30"
+    assert command[command.index("--pacer-bitrate") + 1] == "10800000"
+
+
+def test_auto_normalize_transcodes_only_unreliable_h264_timing(
+    monkeypatch,
+) -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="rtsp",
+            simulator_media_source="rtsp://camera.local/live",
+            video_fps=25,
+        )
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_probe_video_source",
+        lambda: SourceVideoProbe(
+            codec="h264",
+            width=1920,
+            height=1080,
+            pixel_format="yuv420p",
+            profile="Main",
+            timing_reliable=False,
+            timing_reason="timing-out-of-range",
+        ),
+    )
+    monkeypatch.setattr(
+        publisher, "_select_video_encoder", lambda: ("libx264", "ffmpeg")
+    )
+    monkeypatch.setattr("simulator.media.shutil.which", lambda _binary: "/usr/bin/tool")
+    monkeypatch.setattr(
+        "simulator.media.subprocess.run",
+        lambda command, **_kwargs: CompletedProcess(command, 0, "", ""),
+    )
+
+    plan = publisher._build_encoded_video_plan()
+    command = publisher._encoded_ffmpeg_command(plan)
+
+    assert plan.encoder == "libx264"
+    assert plan.output_fps == Fraction(20, 1)
+    video_filter = command[command.index("-vf") + 1]
+    assert "setpts=(RTCTIME-RTCSTART)/(TB*1000000)" in video_filter
+    assert "fps=fps=20:round=near:eof_action=pass" in video_filter
+    assert "setpts=N/(20*TB)" in video_filter
+
+
+@pytest.mark.parametrize("codec", ["hevc", "mjpeg", "vp8"])
+def test_non_h264_rtsp_is_converted_to_browser_h264(
+    monkeypatch,
+    codec: str,
+) -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="rtsp",
+            simulator_media_source="rtsp://camera.local/live",
+        )
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_probe_video_source",
+        lambda: SourceVideoProbe(
+            codec=codec,
+            width=1280,
+            height=720,
+            fps=Fraction(25, 1),
+        ),
+    )
+    monkeypatch.setattr(
+        publisher, "_select_video_encoder", lambda: ("libx264", "ffmpeg")
+    )
+    monkeypatch.setattr("simulator.media.shutil.which", lambda _binary: "/usr/bin/tool")
+    monkeypatch.setattr(
+        "simulator.media.subprocess.run",
+        lambda command, **_kwargs: CompletedProcess(command, 0, "", ""),
+    )
+
+    plan = publisher._build_encoded_video_plan()
+    command = publisher._encoded_ffmpeg_command(plan)
+
+    assert plan.encoder == "libx264"
+    assert plan.output_width == 1280
+    assert plan.output_height == 720
+    assert "scale=1280:720:flags=fast_bilinear" in command[
+        command.index("-vf") + 1
+    ]
+
+
+def test_h264_over_profile_limits_is_transcoded_to_selected_profile(
+    monkeypatch,
+) -> None:
+    publisher = MediaPublisher(
+        SimulatorConfig(
+            simulator_media_source_type="rtsp",
+            simulator_media_source="rtsp://camera.local/live",
+            video_width=1280,
+            video_height=720,
+            video_bitrate=2_500_000,
+        )
+    )
+    probe = SourceVideoProbe(
+        codec="h264",
+        width=3840,
+        height=2160,
+        fps=Fraction(30, 1),
+        bitrate=12_000_000,
+        pixel_format="yuv420p",
+        profile="High",
+    )
+
+    reasons = publisher._video_transcode_reasons(probe)
+
+    assert "profile-resolution" in reasons
+    assert "profile-bitrate" in reasons
+    assert bounded_video_dimensions(3840, 2160, 1280, 720) == (1280, 720)
 
 
 def test_usb_h264_direct_pipeline_keeps_requested_capture_profile() -> None:
@@ -873,7 +1202,7 @@ def test_vaapi_bridge_uses_cqp_for_older_intel_drivers() -> None:
     assert command[command.index("-qp") + 1] == "27"
     assert command[command.index("-async_depth") + 1] == "1"
     assert command[command.index("-low_power") + 1] == "1"
-    assert command[command.index("-quality") + 1] == "8"
+    assert command[command.index("-quality") + 1] == "7"
     assert "setpts=PTS-STARTPTS" in command[command.index("-vf") + 1]
     assert "fps=fps=25:round=down:eof_action=pass" in command[
         command.index("-vf") + 1
@@ -892,6 +1221,7 @@ def test_vaapi_cbr_bridge_also_keeps_one_frame_in_flight() -> None:
 
     assert arguments[arguments.index("-rc_mode") + 1] == "CBR"
     assert arguments[arguments.index("-async_depth") + 1] == "1"
+    assert arguments[arguments.index("-bufsize") + 1] == "1000000"
 
 
 def test_vaapi_regular_entrypoint_remains_available() -> None:
@@ -913,7 +1243,7 @@ def test_bridge_pipeline_uses_an_os_pipe_instead_of_tcp() -> None:
     assert "h264parse" in pipeline
     assert "leaky=downstream" not in pipeline
     assert "latency=0" in pipeline
-    assert "max-size-buffers=1" in pipeline
+    assert "max-size-buffers=4" in pipeline
     assert pipeline[-3:] == [
         "h264parse",
         "disable-passthrough=true",

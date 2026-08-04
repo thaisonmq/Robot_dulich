@@ -16,6 +16,7 @@ from app.models.entities import MapRecord, Robot, User
 from app.schemas.messages import (
     RobotConfigurationUpdate,
     MediaProbeRequest,
+    OnvifScanRequest,
     RobotCreate,
     RobotQuickCreate,
     RobotUpdate,
@@ -309,6 +310,7 @@ async def configuration_from_simulator(
     payload: dict,
     *,
     raise_on_negative: bool = True,
+    timeout_seconds: float = 5.0,
 ) -> dict:
     robot = hub.robots.get(robot_id)
     if robot is None:
@@ -316,7 +318,9 @@ async def configuration_from_simulator(
     if robot.status != "online":
         raise HTTPException(status_code=409, detail="Robot đang ngoại tuyến")
     try:
-        response = await hub.request_robot(robot_id, message_type, payload)
+        response = await hub.request_robot(
+            robot_id, message_type, payload, timeout_seconds=timeout_seconds
+        )
     except ConnectionError as exc:
         raise HTTPException(status_code=409, detail="Robot đang ngoại tuyến") from exc
     except asyncio.TimeoutError as exc:
@@ -366,6 +370,33 @@ async def get_robot_media_sources(
 ) -> dict:
     return await configuration_from_simulator(
         robot_id, "media.sources.get", {"media_kind": media_kind}
+    )
+
+
+@router.get("/{robot_id}/onvif-cameras")
+async def scan_robot_onvif_cameras(
+    robot_id: str,
+    _: str = Depends(operator_user_id),
+) -> dict:
+    return await configuration_from_simulator(
+        robot_id,
+        "media.onvif.scan",
+        {},
+        timeout_seconds=12.0,
+    )
+
+
+@router.post("/{robot_id}/onvif-cameras")
+async def authenticate_robot_onvif_camera(
+    robot_id: str,
+    body: OnvifScanRequest,
+    _: str = Depends(operator_user_id),
+) -> dict:
+    return await configuration_from_simulator(
+        robot_id,
+        "media.onvif.scan",
+        body.model_dump(),
+        timeout_seconds=12.0,
     )
 
 

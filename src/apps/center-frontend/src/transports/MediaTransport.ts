@@ -14,6 +14,9 @@ export interface IMediaTransport {
   disconnect(): Promise<void>;
 }
 
+const VIDEO_STALL_RECOVERY_MS = 2500;
+const VIDEO_WATCHDOG_INTERVAL_MS = 500;
+
 export class LiveKitMediaTransport implements IMediaTransport {
   private room: Room | null = null;
   private speakerMuted = false;
@@ -346,10 +349,10 @@ export class LiveKitMediaTransport implements IMediaTransport {
         }
         return;
       }
-      if (performance.now() - this.lastFrameAt < 8000) return;
+      if (performance.now() - this.lastFrameAt < VIDEO_STALL_RECOVERY_MS) return;
       this.showRecoveryFrame();
       void this.recoverVideoTrack();
-    }, 1000);
+    }, VIDEO_WATCHDOG_INTERVAL_MS);
   }
 
   private async updateAdaptiveVideoBuffer(): Promise<void> {

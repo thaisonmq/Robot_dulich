@@ -281,6 +281,24 @@ class MediaProbeRequest(BaseModel):
     configuration: RobotConfigurationUpdate
 
 
+class OnvifScanRequest(BaseModel):
+    target_host: str = Field(default="", max_length=255)
+    username: str = Field(default="", max_length=120)
+    password: str = Field(default="", max_length=512)
+
+    @field_validator("target_host")
+    @classmethod
+    def normalize_target_host(cls, value: str) -> str:
+        host = value.strip().casefold()
+        if host and (
+            any(character.isspace() for character in host)
+            or "/" in host
+            or "@" in host
+        ):
+            raise ValueError("Địa chỉ camera ONVIF không hợp lệ")
+        return host
+
+
 class NavigationPreviewRequest(BaseModel):
     robot_id: str
     destination_id: str

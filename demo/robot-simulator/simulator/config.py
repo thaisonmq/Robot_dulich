@@ -52,10 +52,13 @@ class SimulatorConfig(BaseSettings):
     microphone_label: str = "Microphone chính"
     speaker_label: str = "Loa chính"
     video_profile: str = "full_hd"
-    # Robot and its IP camera normally share the same LAN. UDP avoids TCP
-    # head-of-line bursts that turn a steady 25 fps RTP stream into alternating
-    # short/long frame intervals. Operators can still select TCP when required.
-    rtsp_transport: str = "udp"
+    # TCP is the reliable default. UDP remains available for managed wired LANs.
+    rtsp_transport: str = "tcp"
+    # Preserve clean H.264 without decoding. Auto-normalization only transcodes
+    # RTSP sources whose metadata cannot provide a safe, bounded frame cadence.
+    # ``rtsp_normalize`` remains a force switch for known-bad vendor streams.
+    rtsp_normalize: bool = False
+    rtsp_auto_normalize: bool = True
     media_enabled: bool = True
     video_width: int = Field(default=1920, ge=640, le=1920)
     video_height: int = Field(default=1080, ge=360, le=1080)

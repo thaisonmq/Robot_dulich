@@ -18,6 +18,7 @@ from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 import httpx
 import websockets
 
+from simulator.camera_ptz import CameraPtzController
 from simulator.config import SimulatorConfig
 from simulator.media_devices import (
     discover_media_sources,
@@ -43,6 +44,8 @@ class RobotConnectionClient:
         self.motion_driver: MotionDriver = build_motion_driver(config, self.motion)
         self.navigation = NavigationSimulator(self.motion)
         self.media = MediaPublisher(config, self._media_token)
+        self.camera_ptz = CameraPtzController()
+        self._ptz_task: asyncio.Task[bool] | None = None
         self.sequence = 0
         self.processed_ids: set[str] = set()
         self.processed_order: deque[str] = deque()
@@ -415,6 +418,7 @@ class RobotConnectionClient:
                 logger.warning("gateway reconnect robot_id=%s error=%s", self.config.robot_id, exc)
             finally:
                 self._stop_motion("gateway_disconnected")
+                await self.camera_ptz.stop(*self._ptz_source())
                 self.socket = None
                 self.media_leases.clear()
                 self.media_lease_changed.set()
@@ -584,7 +588,11 @@ class RobotConnectionClient:
                 await self._ack(socket, message, "accepted")
             elif message.message_type == "control.stop":
                 self._stop_motion(str(message.payload.get("reason", "control_stop")))
+                self._dispatch_ptz({"operation": "stop"})
                 await self._ack(socket, message, "completed")
+            elif message.message_type == "camera.ptz":
+                accepted = self._dispatch_ptz(message.payload)
+                await self._ack(socket, message, "accepted" if accepted else "rejected")
             elif message.message_type == "media.start":
                 try:
                     self._start_media_lease(message.payload)
@@ -647,6 +655,19 @@ class RobotConnectionClient:
                     str(message.payload.get("request_id", "")),
                     str(message.payload.get("media_kind", "all")),
                 )
+            elif message.message_type == "media.onvif.scan":
+                # Discovery can wait for multicast replies and several camera
+                # profile requests. Keep the gateway receive loop responsive
+                # to control and heartbeat traffic while it runs.
+                asyncio.create_task(
+                    self._onvif_sources(
+                        socket,
+                        str(message.payload.get("request_id", "")),
+                        str(message.payload.get("target_host", "")),
+                        str(message.payload.get("username", "")),
+                        str(message.payload.get("password", "")),
+                    )
+                )
             elif message.message_type == "media.cameras.get":
                 await self._camera_sources(
                     socket,
@@ -704,7 +725,13 @@ class RobotConnectionClient:
     def _source_with_credentials_from(source: str, current_source: str) -> str:
         requested = urlsplit(source)
         current = urlsplit(current_source)
-        if requested.username is not None or current.username is None:
+        if (
+            requested.username is not None
+            or current.username is None
+            or not requested.hostname
+            or not current.hostname
+            or requested.hostname.casefold() != current.hostname.casefold()
+        ):
             return source
         credentials = quote(current.username, safe="")
         if current.password is not None:
@@ -807,7 +834,9 @@ class RobotConnectionClient:
             profiles[profile]
         )
         self.config.simulator_media_source = (
-            self._source_with_preserved_credentials(source)
+            self.camera_ptz.credentialed_source(
+                self._source_with_preserved_credentials(source)
+            )
             if source_type == "rtsp"
             else source
         )
@@ -867,6 +896,36 @@ class RobotConnectionClient:
             )
         )
 
+    async def _onvif_sources(
+        self,
+        socket: Any,
+        request_id: str,
+        target_host: str = "",
+        username: str = "",
+        password: str = "",
+    ) -> None:
+        devices = await self.camera_ptz.scan_onvif(
+            self.config.device_ip,
+            self.config.simulator_media_source,
+            target_host,
+            username,
+            password,
+        )
+        await socket.send(
+            json.dumps(
+                make_message(
+                    "media.onvif.devices",
+                    self.config.robot_id,
+                    self._next_sequence(),
+                    {
+                        "request_id": request_id,
+                        "ok": True,
+                        "devices": devices,
+                    },
+                )
+            )
+        )
+
     async def _camera_sources(self, socket: Any, request_id: str) -> None:
         selected_source = ""
         if self.config.simulator_media_source_type == "camera":
@@ -885,6 +944,23 @@ class RobotConnectionClient:
             )
         else:
             sources, _rejected = await asyncio.to_thread(discover_video_sources)
+        if self.config.simulator_media_source_type == "rtsp":
+            selected_source = self._public_video_source()
+            sources.insert(
+                0,
+                {
+                    "type": "rtsp",
+                    "value": selected_source,
+                    "label": self.config.camera_label,
+                },
+            )
+        for source in sources:
+            capability_source = str(source.get("value", ""))
+            if source.get("type") == "rtsp" and capability_source == selected_source:
+                capability_source = self.config.simulator_media_source
+            source["ptz"] = await self.camera_ptz.capabilities(
+                str(source.get("type", "camera")), capability_source
+            )
         await socket.send(
             json.dumps(
                 make_message(
@@ -970,7 +1046,9 @@ class RobotConnectionClient:
                     ]
                     success_detail = "Camera USB đã trả về hình ảnh"
                 elif source_type == "rtsp":
-                    source = self._source_with_preserved_credentials(source)
+                    source = self.camera_ptz.credentialed_source(
+                        self._source_with_preserved_credentials(source)
+                    )
                     input_args = rtsp_input_args(
                         source,
                         str(configuration.get("rtsp_transport", "tcp")),
@@ -1194,9 +1272,49 @@ class RobotConnectionClient:
         if self.motion_driver is not self.motion:
             self.motion.stop(reason)
 
+    def _ptz_source(self) -> tuple[str, str]:
+        source_type = self.config.simulator_media_source_type
+        source = self.config.simulator_media_source
+        if source_type == "camera" and not source:
+            source = self.config.simulator_camera_device
+        return source_type, source
+
+    def _dispatch_ptz(self, payload: dict[str, Any]) -> bool:
+        source_type, source = self._ptz_source()
+        if source_type not in {"rtsp", "camera"} or not source:
+            return False
+        # PTZ must never block velocity, stop, heartbeat, or media messages.
+        # Only the newest UI intent matters; cancelling an in-flight request
+        # prevents a queue of stale move commands from building up.
+        if self._ptz_task is not None and not self._ptz_task.done():
+            self._ptz_task.cancel()
+        task = asyncio.create_task(
+            self.camera_ptz.command(source_type, source, dict(payload))
+        )
+        self._ptz_task = task
+
+        def command_finished(completed: asyncio.Task[bool]) -> None:
+            if completed.cancelled():
+                return
+            try:
+                accepted = completed.result()
+            except Exception as exc:
+                logger.debug("PTZ command failed error=%s", exc)
+            else:
+                if not accepted:
+                    logger.debug("PTZ command rejected source_type=%s", source_type)
+
+        task.add_done_callback(command_finished)
+        return True
+
     async def stop(self) -> None:
         self.running = False
         self._stop_motion("edge_shutdown")
+        if self._ptz_task is not None and not self._ptz_task.done():
+            self._ptz_task.cancel()
+            await asyncio.gather(self._ptz_task, return_exceptions=True)
+        await self.camera_ptz.stop(*self._ptz_source())
+        await self.camera_ptz.close()
         if self.socket:
             await self.socket.close()
         self.motion_driver.close()

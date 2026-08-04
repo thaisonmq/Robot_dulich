@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Activity, ArrowLeft, Camera, Check, CircleDot, Cpu, EthernetPort, Mic2,
-  Play, RadioTower, RefreshCw, Save, ServerCog, Square, Video, Volume2, WifiOff,
+  KeyRound, Play, Radar, RadioTower, RefreshCw, Save, ServerCog, Square, Video,
+  Volume2, WifiOff, X,
 } from "lucide-react";
 import { api } from "../api/client";
 import { Brand } from "../components/Brand";
@@ -10,7 +11,8 @@ import { GlobalLanguageSelect } from "../components/GlobalLanguageSelect";
 import { useI18n } from "../i18n/I18nProvider";
 import { useNavigate, useParams } from "../router";
 import type {
-  MediaSource, RejectedMediaSource, RobotConfigurationUpdate,
+  MediaSource, OnvifDevice, OnvifScanRequest, RejectedMediaSource,
+  RobotConfigurationUpdate,
 } from "../types";
 import type { LiveKitMediaTransport } from "../transports/MediaTransport";
 
@@ -60,6 +62,14 @@ export function RobotConfigurationPage() {
   const [rejectedVideoSources, setRejectedVideoSources] = useState<RejectedMediaSource[]>([]);
   const [rejectedAudioSources, setRejectedAudioSources] = useState<RejectedMediaSource[]>([]);
   const [rejectedSpeakerSources, setRejectedSpeakerSources] = useState<RejectedMediaSource[]>([]);
+  const [onvifDevices, setOnvifDevices] = useState<OnvifDevice[]>([]);
+  const [onvifScanned, setOnvifScanned] = useState(false);
+  const [onvifDialogOpen, setOnvifDialogOpen] = useState(false);
+  const [onvifSelectedHost, setOnvifSelectedHost] = useState("");
+  const [onvifCredentials, setOnvifCredentials] = useState({
+    username: "",
+    password: "",
+  });
   const [sourcesScanned, setSourcesScanned] = useState({
     video: false,
     audio: false,
@@ -92,6 +102,11 @@ export function RobotConfigurationPage() {
     setRejectedVideoSources([]);
     setRejectedAudioSources([]);
     setRejectedSpeakerSources([]);
+    setOnvifDevices([]);
+    setOnvifScanned(false);
+    setOnvifDialogOpen(false);
+    setOnvifSelectedHost("");
+    setOnvifCredentials({ username: "", password: "" });
     setSourcesScanned({ video: false, audio: false, speaker: false });
   }, [robotId]);
   useEffect(() => {
@@ -164,11 +179,58 @@ export function RobotConfigurationPage() {
       setSourcesScanned((current) => ({ ...current, [mediaKind]: true }));
     },
   });
+  const onvifScan = useMutation({
+    mutationFn: (credentials: OnvifScanRequest) =>
+      api.scanRobotOnvifCameras(robotId, credentials),
+    onSuccess: (result, credentials) => {
+      if (credentials.target_host) {
+        setOnvifDevices((current) => {
+          const updated = result.devices[0];
+          if (!updated) return current;
+          const exists = current.some((device) => device.host === updated.host);
+          return exists
+            ? current.map((device) => device.host === updated.host ? updated : device)
+            : [...current, updated];
+        });
+        if (result.devices[0]?.profiles.length) {
+          setOnvifCredentials({ username: "", password: "" });
+        }
+      } else {
+        setOnvifDevices(result.devices);
+      }
+      setOnvifScanned(true);
+    },
+  });
 
   function scanMediaSources(mediaKind: "video" | "audio" | "speaker") {
     mediaSourceScan.reset();
     mediaSourceScan.mutate(mediaKind);
   }
+
+  function selectOnvifProfile(device: OnvifDevice, rtspUrl: string, profileName: string) {
+    setForm((current) => ({
+      ...current,
+      video_source_type: "rtsp",
+      video_source: rtspUrl,
+      camera_label: `${device.name} · ${device.host} · ${profileName}`,
+    }));
+    setOnvifDialogOpen(false);
+    setOnvifSelectedHost("");
+    setOnvifCredentials({ username: "", password: "" });
+  }
+
+  function authenticateOnvifDevice(host: string) {
+    onvifScan.reset();
+    onvifScan.mutate({
+      target_host: host,
+      username: onvifCredentials.username.trim(),
+      password: onvifCredentials.password,
+    });
+  }
+
+  const selectedOnvifDevice = onvifDevices.find(
+    (device) => device.host === onvifSelectedHost,
+  );
 
   async function togglePreview() {
     if (previewTransport.current) {
@@ -427,39 +489,73 @@ export function RobotConfigurationPage() {
                           required
                         />
                       )}
-                      <button
-                        type="button"
-                        className="source-scan-button"
-                        onClick={() => scanMediaSources("video")}
-                        disabled={robot?.status !== "online" || mediaSourceScan.isPending}
-                      >
-                        <RefreshCw
-                          size={17}
-                          className={mediaSourceScan.isPending && mediaSourceScan.variables === "video" ? "is-spinning" : ""}
-                        />
-                        {mediaSourceScan.isPending && mediaSourceScan.variables === "video" ? t("Đang quét…") : t("Quét")}
-                      </button>
+                      {form.video_source_type === "camera" && (
+                        <button
+                          type="button"
+                          className="source-scan-button"
+                          onClick={() => scanMediaSources("video")}
+                          disabled={robot?.status !== "online" || mediaSourceScan.isPending}
+                        >
+                          <RefreshCw
+                            size={17}
+                            className={mediaSourceScan.isPending && mediaSourceScan.variables === "video" ? "is-spinning" : ""}
+                          />
+                          {mediaSourceScan.isPending && mediaSourceScan.variables === "video" ? t("Đang quét…") : t("Quét")}
+                        </button>
+                      )}
+                      {form.video_source_type === "rtsp" && (
+                        <button
+                          type="button"
+                          className="source-scan-button source-scan-button--onvif"
+                          onClick={() => {
+                            onvifScan.reset();
+                            setOnvifDialogOpen(true);
+                            setOnvifSelectedHost("");
+                            setOnvifCredentials({ username: "", password: "" });
+                            onvifScan.mutate({});
+                          }}
+                          disabled={robot?.status !== "online" || onvifScan.isPending}
+                        >
+                          <Radar size={17} className={onvifScan.isPending ? "is-spinning" : ""} />
+                          {onvifScan.isPending ? t("Đang quét…") : t("Quét ONVIF")}
+                        </button>
+                      )}
                     </div>
                     <small id="video-source-status" className={
-                      mediaSourceScan.isError && mediaSourceScan.variables === "video"
+                      (form.video_source_type === "rtsp" && onvifScan.isError)
+                      || (mediaSourceScan.isError && mediaSourceScan.variables === "video")
                         ? "source-scan-status is-error"
                         : "source-scan-status"
                     }>
-                      {mediaSourceScan.isPending && mediaSourceScan.variables === "video"
-                        ? t("Robot đang dò thiết bị camera trên máy đang chạy…")
-                        : mediaSourceScan.isError && mediaSourceScan.variables === "video"
-                          ? mediaSourceScan.error instanceof Error
-                            ? t(mediaSourceScan.error.message)
-                            : t("Không quét được camera trên robot")
-                          : sourcesScanned.video
-                            ? videoSources.length
-                              ? `${t("Đã xác minh {count} camera trả về hình ảnh.", { count: videoSources.length })}${rejectedVideoSources.length ? ` ${t("Loại {count} nguồn không hoạt động.", { count: rejectedVideoSources.length })}` : ""}`
-                              : rejectedVideoSources.length
-                                ? `${t("Không có camera hoạt động.")} ${t(rejectedVideoSources[0].reason)}`
-                                : t("Robot không phát hiện camera nào. Kiểm tra kết nối USB và quyền truy cập thiết bị.")
-                            : form.video_source_type === "camera"
-                              ? t("Bấm Quét để chỉ giữ camera thực sự trả về được frame hình ảnh.")
-                              : t("Bấm Quét để dò camera USB; nguồn không trả về hình ảnh sẽ bị loại.")}
+                      {form.video_source_type === "rtsp"
+                        ? onvifScan.isPending
+                          ? t("Robot đang quét camera ONVIF trong cùng mạng LAN…")
+                          : onvifScan.isError
+                            ? onvifScan.error instanceof Error
+                              ? t(onvifScan.error.message)
+                              : t("Không quét được camera ONVIF")
+                            : onvifScanned
+                              ? t("Tìm thấy {devices} camera ONVIF: {ready} đã đọc profile, {locked} chờ đăng nhập.", {
+                                  devices: onvifDevices.length,
+                                  ready: onvifDevices.filter((device) => device.profiles.length > 0).length,
+                                  locked: onvifDevices.filter((device) => device.auth_required).length,
+                                })
+                              : t("Quét ONVIF để tìm camera cùng dải mạng và chọn đúng RTSP path.")
+                        : mediaSourceScan.isPending && mediaSourceScan.variables === "video"
+                          ? t("Robot đang dò thiết bị camera trên máy đang chạy…")
+                          : mediaSourceScan.isError && mediaSourceScan.variables === "video"
+                            ? mediaSourceScan.error instanceof Error
+                              ? t(mediaSourceScan.error.message)
+                              : t("Không quét được camera trên robot")
+                            : sourcesScanned.video
+                              ? videoSources.length
+                                ? `${t("Đã xác minh {count} camera trả về hình ảnh.", { count: videoSources.length })}${rejectedVideoSources.length ? ` ${t("Loại {count} nguồn không hoạt động.", { count: rejectedVideoSources.length })}` : ""}`
+                                : rejectedVideoSources.length
+                                  ? `${t("Không có camera hoạt động.")} ${t(rejectedVideoSources[0].reason)}`
+                                  : t("Robot không phát hiện camera nào. Kiểm tra kết nối USB và quyền truy cập thiết bị.")
+                              : form.video_source_type === "camera"
+                                ? t("Bấm Quét để chỉ giữ camera thực sự trả về được frame hình ảnh.")
+                                : t("Nhập đường dẫn nguồn video cần phát.")}
                     </small>
                   </label>
                   <label className="config-field">
@@ -761,6 +857,256 @@ export function RobotConfigurationPage() {
           </div>
         </form>
       </section>
+
+      {form.video_source_type === "rtsp" && onvifDialogOpen && (
+        <div
+          className="onvif-modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !onvifScan.isPending) {
+              setOnvifDialogOpen(false);
+              setOnvifSelectedHost("");
+            }
+          }}
+        >
+          <section
+            className="onvif-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="onvif-modal-title"
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && !onvifScan.isPending) {
+                setOnvifDialogOpen(false);
+                setOnvifSelectedHost("");
+              }
+            }}
+          >
+            <header className="onvif-modal__header">
+              <button
+                type="button"
+                className={`onvif-modal__back ${selectedOnvifDevice ? "is-visible" : ""}`}
+                aria-label={t("Quay lại danh sách camera")}
+                onClick={() => {
+                  onvifScan.reset();
+                  setOnvifSelectedHost("");
+                  setOnvifCredentials({ username: "", password: "" });
+                }}
+              >
+                <ArrowLeft size={17} />
+              </button>
+              <span className="onvif-modal__mark"><Radar size={18} /></span>
+              <div>
+                <h2 id="onvif-modal-title">
+                  {selectedOnvifDevice ? selectedOnvifDevice.name : t("Chọn camera ONVIF")}
+                </h2>
+                <p>
+                  {selectedOnvifDevice
+                    ? `${selectedOnvifDevice.host} · ${selectedOnvifDevice.profiles.length
+                      ? t("Chọn luồng RTSP")
+                      : t("Đăng nhập riêng cho camera này")}`
+                    : t("Các camera được phát hiện trong cùng mạng LAN")}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="onvif-modal__close"
+                aria-label={t("Đóng")}
+                disabled={onvifScan.isPending}
+                onClick={() => {
+                  setOnvifDialogOpen(false);
+                  setOnvifSelectedHost("");
+                }}
+              >
+                <X size={17} />
+              </button>
+            </header>
+
+            <div className="onvif-modal__body">
+              {onvifScan.isPending && !onvifScan.variables?.target_host ? (
+                <div className="onvif-modal__scanning" aria-live="polite">
+                  <span><Radar size={24} /></span>
+                  <strong>{t("Đang quét camera ONVIF…")}</strong>
+                  <small>{t("Robot đang dò các thiết bị trong cùng dải mạng.")}</small>
+                  <i /><i /><i />
+                </div>
+              ) : selectedOnvifDevice ? (
+                selectedOnvifDevice.profiles.length ? (
+                  <div className="onvif-profile-list onvif-profile-list--modal">
+                    {selectedOnvifDevice.profiles.map((profile) => (
+                      <button
+                        type="button"
+                        key={`${selectedOnvifDevice.host}-${profile.token}`}
+                        className={form.video_source === profile.rtsp_url ? "is-selected" : ""}
+                        onClick={() => selectOnvifProfile(
+                          selectedOnvifDevice,
+                          profile.rtsp_url,
+                          profile.name,
+                        )}
+                      >
+                        <span>
+                          <strong>{profile.name}</strong>
+                          <small>
+                            {profile.width && profile.height
+                              ? `${profile.width}×${profile.height}`
+                              : profile.encoding || "RTSP"}
+                            {profile.fps ? ` · ${profile.fps} fps` : ""}
+                            {profile.ptz ? ` · PTZ` : ""}
+                          </small>
+                        </span>
+                        <code>{profile.path}</code>
+                        <Check size={16} />
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="onvif-login-panel">
+                    <div className="onvif-login-panel__intro">
+                      <span><KeyRound size={18} /></span>
+                      <div>
+                        <strong>{t("Nhập tài khoản của camera này")}</strong>
+                        <small>{t("Mỗi camera dùng tài khoản riêng; thông tin này không hiển thị trong URL RTSP.")}</small>
+                      </div>
+                    </div>
+
+                    {selectedOnvifDevice.error && (
+                      <p className={
+                        selectedOnvifDevice.error === "Tài khoản hoặc mật khẩu ONVIF không đúng"
+                          ? "onvif-device__error is-error"
+                          : "onvif-device__error"
+                      } role={selectedOnvifDevice.error === "Tài khoản hoặc mật khẩu ONVIF không đúng" ? "alert" : undefined}>
+                        {selectedOnvifDevice.auth_required
+                          && selectedOnvifDevice.error !== "Tài khoản hoặc mật khẩu ONVIF không đúng"
+                          ? t("Camera yêu cầu đăng nhập để đọc profile chính xác.")
+                          : t(selectedOnvifDevice.error)}
+                      </p>
+                    )}
+
+                    <div className="onvif-auth-fields onvif-auth-fields--modal">
+                      <label>
+                        <span>{t("Tài khoản ONVIF")}</span>
+                        <input
+                          value={onvifCredentials.username}
+                          onChange={(event) => setOnvifCredentials((current) => ({
+                            ...current,
+                            username: event.target.value,
+                          }))}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" && onvifCredentials.username.trim()) {
+                              event.preventDefault();
+                              authenticateOnvifDevice(selectedOnvifDevice.host);
+                            }
+                          }}
+                          placeholder={t("Nhập tài khoản")}
+                          autoComplete="username"
+                          autoFocus
+                        />
+                      </label>
+                      <label>
+                        <span>{t("Mật khẩu ONVIF")}</span>
+                        <input
+                          type="password"
+                          value={onvifCredentials.password}
+                          onChange={(event) => setOnvifCredentials((current) => ({
+                            ...current,
+                            password: event.target.value,
+                          }))}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" && onvifCredentials.username.trim()) {
+                              event.preventDefault();
+                              authenticateOnvifDevice(selectedOnvifDevice.host);
+                            }
+                          }}
+                          placeholder={t("Nhập mật khẩu")}
+                          autoComplete="current-password"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="onvif-auth-submit"
+                        disabled={
+                          !onvifCredentials.username.trim()
+                          || (onvifScan.isPending
+                            && onvifScan.variables?.target_host === selectedOnvifDevice.host)
+                        }
+                        onClick={() => authenticateOnvifDevice(selectedOnvifDevice.host)}
+                      >
+                        {onvifScan.isPending
+                          && onvifScan.variables?.target_host === selectedOnvifDevice.host
+                          ? t("Đang đăng nhập…")
+                          : t("Đăng nhập và đọc profile")}
+                      </button>
+                    </div>
+
+                    {Boolean(selectedOnvifDevice.suggested_profiles?.length) && (
+                      <div className="onvif-suggested-paths onvif-suggested-paths--modal">
+                        <small>{t("Path RTSP phổ biến của hãng")}</small>
+                        {selectedOnvifDevice.suggested_profiles!.map((profile) => (
+                          <div key={`${selectedOnvifDevice.host}-${profile.token}`}>
+                            <span>{t(profile.name)}</span>
+                            <code>{profile.path}</code>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              ) : onvifDevices.length ? (
+                <div className="onvif-camera-list" aria-label={t("Camera ONVIF đã tìm thấy")}>
+                  <div className="onvif-camera-list__summary">
+                    <strong>{t("Tìm thấy {count} camera", { count: onvifDevices.length })}</strong>
+                    <small>{t("Chọn một camera để tiếp tục")}</small>
+                  </div>
+                  {onvifDevices.map((device) => (
+                    <button
+                      type="button"
+                      className="onvif-camera-row"
+                      key={`${device.host}-${device.xaddr}`}
+                      onClick={() => {
+                        onvifScan.reset();
+                        setOnvifSelectedHost(device.host);
+                        setOnvifCredentials({ username: "", password: "" });
+                      }}
+                    >
+                      <span className="onvif-camera-row__icon"><Camera size={18} /></span>
+                      <span className="onvif-camera-row__identity">
+                        <strong>{device.name}</strong>
+                        <small>{device.host}</small>
+                      </span>
+                      <span className={device.profiles.length
+                        ? "onvif-camera-row__state is-ready"
+                        : "onvif-camera-row__state"}>
+                        {device.profiles.length ? <Check size={13} /> : <KeyRound size={13} />}
+                        {device.profiles.length ? t("Sẵn sàng") : t("Cần đăng nhập")}
+                      </span>
+                      <ArrowLeft className="onvif-camera-row__arrow" size={16} />
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="onvif-modal__empty">
+                  <Radar size={24} />
+                  <strong>{onvifScan.isError
+                    ? t("Không quét được camera ONVIF")
+                    : t("Không tìm thấy camera ONVIF")}</strong>
+                  <small>{onvifScan.isError && onvifScan.error instanceof Error
+                    ? t(onvifScan.error.message)
+                    : t("Kiểm tra kết nối mạng của robot rồi quét lại.")}</small>
+                  <button
+                    type="button"
+                    className="onvif-auth-submit"
+                    onClick={() => {
+                      onvifScan.reset();
+                      onvifScan.mutate({});
+                    }}
+                  >
+                    <RefreshCw size={14} /> {t("Quét lại")}
+                  </button>
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }

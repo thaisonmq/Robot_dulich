@@ -20,7 +20,7 @@ JWT phải khớp `robot_id`; token người dùng không thể dùng cho robot 
 
 Robot sends `robot.heartbeat`, `robot.pose`, `robot.health`,
 `navigation.status`, and `command.ack`. Center sends `control.velocity`,
-`control.stop`, `navigation.goal`, and `navigation.cancel`.
+`control.stop`, `camera.ptz`, `navigation.goal`, and `navigation.cancel`.
 
 ## User control
 
@@ -29,6 +29,24 @@ Robot sends `robot.heartbeat`, `robot.pose`, `robot.health`,
 The backend validates the JWT, session ownership, monotonic sequence, timestamp,
 TTL and live robot connection before forwarding. Joystick messages are never
 queued or retried. `control.stop` is forwarded immediately.
+
+`camera.ptz` chỉ được chuyển từ tab đang giữ quyền điều khiển. Payload dùng
+`operation=move|zoom|stop`, hai trục `pan`/`tilt` hoặc `zoom` trong khoảng
+`-1..1`, và `speed=slow|medium|fast`. Edge agent tự chọn V4L2/UVC cho camera
+USB hoặc ONVIF ContinuousMove/Stop cho nguồn RTSP, dựa trên capability đã dò.
+
+Màn cấu hình gửi `media.onvif.scan` khi người vận hành bấm **Quét ONVIF**.
+Edge dùng WS-Discovery trong cùng mạng LAN, đọc toàn bộ media profile rồi trả
+`media.onvif.devices` với codec, độ phân giải, FPS, PTZ và RTSP path tương ứng.
+Credential của nguồn RTSP hiện tại chỉ được dùng cho đúng hostname đó, không
+được thử trên camera khác. Thiết bị cần xác thực trả `auth_required=true`; UI
+gửi lại `media.onvif.scan` với `target_host`, `username`, `password` để đọc riêng
+thiết bị đó. RTSP URL gửi về Center luôn bỏ user/password; edge chỉ giữ credential
+đã xác thực và ghép vào nguồn tương ứng khi người vận hành chọn/lưu profile.
+Camera đã được WS-Discovery phát hiện nhưng khóa Media vẫn được trả trong danh
+sách với `auth_required=true`. Với Dahua/Hikvision, `suggested_profiles` cung cấp
+path RTSP chuẩn của hãng để hiển thị trước; đây là gợi ý, còn codec/FPS/PTZ chính
+xác chỉ được xác nhận sau lần đăng nhập riêng cho camera đó.
 
 `client_id` is generated once per page process and is not persisted. The first
 tab to claim a session remains its controller; another tab is closed with code

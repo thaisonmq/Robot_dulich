@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
-  Battery, Camera, CameraOff, ChevronDown, Eye, LogOut, Mic, MicOff,
-  RadioTower, Languages, LockKeyhole, MessageCircleMore, Settings, Signal,
-  Speaker, Volume2, VolumeX,
+  ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Battery, Camera, CameraOff, Gauge,
+  ChevronDown, Eye, LogOut, Mic, MicOff, Move, RadioTower, Languages,
+  LockKeyhole, MessageCircleMore, Settings, Signal, Speaker, Volume2, VolumeX,
+  ZoomIn, ZoomOut,
 } from "lucide-react";
 import { api } from "../api/client";
 import { Brand } from "../components/Brand";
@@ -16,6 +17,7 @@ import { useI18n } from "../i18n/I18nProvider";
 import { useNavigate, useParams } from "../router";
 import { useAppStore } from "../state/appStore";
 import type { LiveKitMediaTransport } from "../transports/MediaTransport";
+import type { PtzCommand, PtzSpeed } from "../transports/ControlTransport";
 import { WebSocketTelemetryTransport } from "../transports/TelemetryTransport";
 import type { Destination, MediaState } from "../types";
 
@@ -49,11 +51,15 @@ export function DashboardPage() {
   const mediaRef = useRef<LiveKitMediaTransport | null>(null);
   const sessionEndedRef = useRef(false);
   const disconnectingRef = useRef(false);
+  const activePtzRef = useRef<PtzCommand | null>(null);
+  const ptzRepeatRef = useRef<number | null>(null);
   const { control, manager, screen, inputState } = useTeleoperation();
   const [micEnabled, setMicEnabled] = useState(false);
   const [speakerMuted, setSpeakerMuted] = useState(false);
   const translationEnabled = false;
   const [conversationExpanded, setConversationExpanded] = useState(false);
+  const [ptzExpanded, setPtzExpanded] = useState(false);
+  const [ptzSpeed, setPtzSpeed] = useState<PtzSpeed>("medium");
   const [selectedDestination, setSelectedDestination] = useState<Destination | null>(null);
   const [connectionError, setConnectionError] = useState("");
   const [sessionEndedReason, setSessionEndedReason] = useState("");
@@ -103,9 +109,17 @@ export function DashboardPage() {
     queryFn: () => api.sessionCameras(session!.session_id),
     enabled: Boolean(session),
     staleTime: 5000,
+    refetchInterval: 30_000,
     retry: 1,
   });
   const cameraItems = camerasQuery.data?.items ?? [];
+  const selectedCamera = cameraItems.find((item) => item.selected);
+  const ptzCapabilities = selectedCamera?.ptz;
+  const ptzAvailable = Boolean(ptzCapabilities?.supported);
+  const ptzDisabled = Boolean(
+    isSpectator || sessionEndedReason || controlState === "disabled"
+    || controlState === "robot_offline",
+  );
   const selectCamera = useMutation({
     mutationFn: (cameraId: string) => api.selectSessionCamera(session!.session_id, cameraId),
     onSuccess: (selected) => {
@@ -132,6 +146,50 @@ export function DashboardPage() {
     onSuccess: () => setNavigationState("moving"),
     onError: () => setNavigationState("failed"),
   });
+
+  function stopPtz() {
+    if (ptzRepeatRef.current !== null) {
+      window.clearInterval(ptzRepeatRef.current);
+      ptzRepeatRef.current = null;
+    }
+    if (!activePtzRef.current) return;
+    activePtzRef.current = null;
+    control.sendPtz({ operation: "stop" });
+  }
+
+  function startPtz(command: PtzCommand) {
+    if (ptzDisabled || activePtzRef.current || command.operation === "stop") return;
+    activePtzRef.current = command;
+    control.sendPtz(command);
+    if (ptzCapabilities?.transport === "uvc") {
+      ptzRepeatRef.current = window.setInterval(() => {
+        if (activePtzRef.current) control.sendPtz(activePtzRef.current);
+      }, 240);
+    }
+  }
+
+  useEffect(() => {
+    const release = () => stopPtz();
+    const onVisibilityChange = () => {
+      if (document.hidden) release();
+    };
+    window.addEventListener("pointerup", release);
+    window.addEventListener("pointercancel", release);
+    window.addEventListener("blur", release);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("pointerup", release);
+      window.removeEventListener("pointercancel", release);
+      window.removeEventListener("blur", release);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      release();
+    };
+  }, [control]);
+
+  useEffect(() => {
+    stopPtz();
+    if (!ptzAvailable) setPtzExpanded(false);
+  }, [selectedCamera?.id, ptzAvailable]);
 
   useEffect(() => {
     if (!selectedRobot || !session || selectedRobot.robot_id !== robotId) {
@@ -460,10 +518,144 @@ export function DashboardPage() {
                 </div>
               </div>
             </section>}
+            {!isSpectator && ptzAvailable && ptzExpanded && <section
+              id="camera-ptz-panel"
+              className="ptz-dock"
+              aria-label={t("Điều khiển PTZ camera")}
+            >
+              <div className="ptz-dock__controls">
+                <div className="ptz-control-stack">
+                  <div className="ptz-direction-pad" aria-label={t("Điều khiển hướng quay")}>
+                    <button
+                      type="button"
+                      className="is-up"
+                      disabled={ptzDisabled || !ptzCapabilities?.tilt}
+                      aria-label={t("Quay lên")}
+                      onPointerDown={(event) => {
+                        event.preventDefault();
+                        startPtz({ operation: "move", pan: 0, tilt: 1, speed: ptzSpeed });
+                      }}
+                      onKeyDown={(event) => {
+                        if (["Enter", " "].includes(event.key)) startPtz({ operation: "move", pan: 0, tilt: 1, speed: ptzSpeed });
+                      }}
+                      onKeyUp={stopPtz}
+                    ><ArrowUp size={18} /></button>
+                    <button
+                      type="button"
+                      className="is-left"
+                      disabled={ptzDisabled || !ptzCapabilities?.pan}
+                      aria-label={t("Quay trái")}
+                      onPointerDown={(event) => {
+                        event.preventDefault();
+                        startPtz({ operation: "move", pan: -1, tilt: 0, speed: ptzSpeed });
+                      }}
+                      onKeyDown={(event) => {
+                        if (["Enter", " "].includes(event.key)) startPtz({ operation: "move", pan: -1, tilt: 0, speed: ptzSpeed });
+                      }}
+                      onKeyUp={stopPtz}
+                    ><ArrowLeft size={18} /></button>
+                    <span className="ptz-direction-pad__center" aria-hidden="true">
+                      <Camera size={15} />
+                    </span>
+                    <button
+                      type="button"
+                      className="is-right"
+                      disabled={ptzDisabled || !ptzCapabilities?.pan}
+                      aria-label={t("Quay phải")}
+                      onPointerDown={(event) => {
+                        event.preventDefault();
+                        startPtz({ operation: "move", pan: 1, tilt: 0, speed: ptzSpeed });
+                      }}
+                      onKeyDown={(event) => {
+                        if (["Enter", " "].includes(event.key)) startPtz({ operation: "move", pan: 1, tilt: 0, speed: ptzSpeed });
+                      }}
+                      onKeyUp={stopPtz}
+                    ><ArrowRight size={18} /></button>
+                    <button
+                      type="button"
+                      className="is-down"
+                      disabled={ptzDisabled || !ptzCapabilities?.tilt}
+                      aria-label={t("Quay xuống")}
+                      onPointerDown={(event) => {
+                        event.preventDefault();
+                        startPtz({ operation: "move", pan: 0, tilt: -1, speed: ptzSpeed });
+                      }}
+                      onKeyDown={(event) => {
+                        if (["Enter", " "].includes(event.key)) startPtz({ operation: "move", pan: 0, tilt: -1, speed: ptzSpeed });
+                      }}
+                      onKeyUp={stopPtz}
+                    ><ArrowDown size={18} /></button>
+                  </div>
+                  <div className="ptz-utility-row">
+                    <button
+                      type="button"
+                      disabled={ptzDisabled || !ptzCapabilities?.zoom}
+                      aria-label={t("Zoom out")}
+                      onPointerDown={(event) => {
+                        event.preventDefault();
+                        startPtz({ operation: "zoom", zoom: -1, speed: ptzSpeed });
+                      }}
+                      onKeyDown={(event) => {
+                        if (["Enter", " "].includes(event.key)) startPtz({ operation: "zoom", zoom: -1, speed: ptzSpeed });
+                      }}
+                      onKeyUp={stopPtz}
+                    ><ZoomOut size={16} /></button>
+                    <button
+                      type="button"
+                      className="ptz-speed-button"
+                      disabled={ptzDisabled}
+                      title={`${t("Tốc độ quay")}: ${ptzSpeed === "slow" ? t("Chậm") : ptzSpeed === "medium" ? t("Vừa") : t("Nhanh")}`}
+                      aria-label={`${t("Tốc độ quay")}: ${ptzSpeed === "slow" ? t("Chậm") : ptzSpeed === "medium" ? t("Vừa") : t("Nhanh")}`}
+                      onClick={() => setPtzSpeed(ptzSpeed === "slow" ? "medium" : ptzSpeed === "medium" ? "fast" : "slow")}
+                    >
+                      <Gauge size={16} aria-hidden="true" />
+                      <span className="ptz-speed-button__level" aria-hidden="true">
+                        {ptzSpeed === "slow" ? "1" : ptzSpeed === "medium" ? "2" : "3"}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={ptzDisabled || !ptzCapabilities?.zoom}
+                      aria-label={t("Zoom in")}
+                      onPointerDown={(event) => {
+                        event.preventDefault();
+                        startPtz({ operation: "zoom", zoom: 1, speed: ptzSpeed });
+                      }}
+                      onKeyDown={(event) => {
+                        if (["Enter", " "].includes(event.key)) startPtz({ operation: "zoom", zoom: 1, speed: ptzSpeed });
+                      }}
+                      onKeyUp={stopPtz}
+                    ><ZoomIn size={16} /></button>
+                  </div>
+                </div>
+              </div>
+            </section>}
+            {!isSpectator && ptzAvailable && <button
+              type="button"
+              className={`ptz-toggle ${ptzExpanded ? "is-open" : ""}`}
+              onClick={() => {
+                const next = !ptzExpanded;
+                if (!next) stopPtz();
+                if (next) setConversationExpanded(false);
+                setPtzExpanded(next);
+              }}
+              aria-label={ptzExpanded ? t("Ẩn điều khiển PTZ") : t("Hiện điều khiển PTZ")}
+              aria-expanded={ptzExpanded}
+              aria-controls="camera-ptz-panel"
+            >
+              <Move size={20} />
+            </button>}
             {!isSpectator && <button
               type="button"
               className={`conversation-settings-toggle ${conversationExpanded ? "is-open" : ""}`}
-              onClick={() => setConversationExpanded((current) => !current)}
+              onClick={() => {
+                const next = !conversationExpanded;
+                if (next) {
+                  stopPtz();
+                  setPtzExpanded(false);
+                }
+                setConversationExpanded(next);
+              }}
               aria-label={conversationExpanded
                 ? t("Ẩn cài đặt đàm thoại")
                 : t("Mở cài đặt đàm thoại")}

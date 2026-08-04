@@ -4,10 +4,16 @@ import type { MessageEnvelope } from "../types";
 import { createUuid } from "../utils/uuid";
 
 export interface VelocityCommand { linear_x: number; angular_z: number }
+export type PtzSpeed = "slow" | "medium" | "fast";
+export type PtzCommand =
+  | { operation: "move"; pan: number; tilt: number; speed: PtzSpeed }
+  | { operation: "zoom"; zoom: number; speed: PtzSpeed }
+  | { operation: "stop" };
 export interface IControlTransport {
   connect(robotId: string, sessionId: string, url: string): Promise<void>;
   sendVelocity(command: VelocityCommand): void;
   sendStop(reason: string): void;
+  sendPtz(command: PtzCommand): void;
   disconnect(): Promise<void>;
   isConnected(): boolean;
   isSessionController(): boolean;
@@ -194,6 +200,13 @@ export class WebSocketControlTransport implements IControlTransport {
   sendStop(reason: string): void {
     if (!this.isConnected()) return;
     const message = this.envelope("control.stop", { reason });
+    this.commandTypes.set(message.message_id, message.message_type);
+    this.socket!.send(JSON.stringify(message));
+  }
+
+  sendPtz(command: PtzCommand): void {
+    if (!this.isConnected()) return;
+    const message = this.envelope("camera.ptz", { ...command });
     this.commandTypes.set(message.message_id, message.message_type);
     this.socket!.send(JSON.stringify(message));
   }

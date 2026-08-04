@@ -82,6 +82,13 @@ def test_gateway_session_command_and_telemetry_flow() -> None:
                 control_ws.send_json(command)
                 assert robot_ws.receive_json()["message_id"] == command["message_id"]
                 assert control_ws.receive_json()["payload"]["status"] == "accepted"
+                ptz = envelope(
+                    "camera.ptz", session_id, 2,
+                    {"operation": "move", "pan": -1, "tilt": 0, "speed": "slow"},
+                )
+                control_ws.send_json(ptz)
+                assert robot_ws.receive_json()["message_id"] == ptz["message_id"]
+                assert control_ws.receive_json()["payload"]["status"] == "accepted"
                 duplicate_query = (
                     f"?session_id={session_id}&token={token}"
                     "&client_id=duplicated-tab"
@@ -109,7 +116,7 @@ def test_gateway_session_command_and_telemetry_flow() -> None:
                     robot_ws.send_json(pose)
                     received = telemetry_ws.receive_json()
                     assert received["payload"]["x"] == 6.0
-                heartbeat = envelope("session.heartbeat", session_id, 2, {})
+                heartbeat = envelope("session.heartbeat", session_id, 3, {})
                 control_ws.send_json(heartbeat)
                 assert control_ws.receive_json()["payload"]["status"] == "accepted"
             with client.websocket_connect(

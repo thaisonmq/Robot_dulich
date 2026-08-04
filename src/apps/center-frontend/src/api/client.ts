@@ -1,6 +1,8 @@
 import type {
   Destination, MapData, Robot, RobotConfiguration, RobotConfigurationUpdate,
   DiagnosticResult, MediaSources, RobotCreateInput, RobotEnrollment, RobotPage,
+  OnvifScanResult,
+  OnvifScanRequest,
   RobotQuickCreateInput, RobotUpdateInput, Route, Session, User, UserPage,
   RegisterInput, AdminUserCreateInput, ActiveControlSession, SessionCamera,
 } from "../types";
@@ -195,6 +197,11 @@ export const api = {
     request<MediaSources>(
       `/api/robots/${robotId}/media-sources?media_kind=${mediaKind}`,
     ),
+  scanRobotOnvifCameras: (robotId: string, credentials: OnvifScanRequest = {}) =>
+    request<OnvifScanResult>(`/api/robots/${robotId}/onvif-cameras`, {
+      method: "POST",
+      body: JSON.stringify(credentials),
+    }),
   testRobotMedia: (
     robotId: string,
     mediaKind: "video" | "audio" | "speaker",

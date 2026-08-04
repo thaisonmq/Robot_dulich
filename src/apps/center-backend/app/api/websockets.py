@@ -108,6 +108,7 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
                 "configuration.state",
                 "diagnostics.result",
                 "media.sources",
+                "media.onvif.devices",
                 "media.cameras",
                 "media.source.state",
             }:
@@ -223,7 +224,7 @@ async def user_control(
             elif message.sequence <= session.last_sequence:
                 ack_status = "rejected"
             elif message.message_type not in {
-                "control.velocity", "control.stop", "session.heartbeat"
+                "control.velocity", "control.stop", "camera.ptz", "session.heartbeat"
             }:
                 ack_status = "rejected"
             else:

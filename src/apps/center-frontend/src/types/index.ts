@@ -161,6 +161,40 @@ export interface MediaSources {
   rejected_speaker_sources?: RejectedMediaSource[];
 }
 
+export interface OnvifProfile {
+  token: string;
+  name: string;
+  encoding: string;
+  width: number;
+  height: number;
+  fps: number;
+  bitrate_kbps: number;
+  ptz: boolean;
+  rtsp_url: string;
+  path: string;
+}
+
+export interface OnvifDevice {
+  host: string;
+  name: string;
+  xaddr: string;
+  profiles: OnvifProfile[];
+  suggested_profiles?: OnvifProfile[];
+  error?: string;
+  auth_required?: boolean;
+}
+
+export interface OnvifScanRequest {
+  target_host?: string;
+  username?: string;
+  password?: string;
+}
+
+export interface OnvifScanResult {
+  ok: boolean;
+  devices: OnvifDevice[];
+}
+
 export interface DiagnosticResult {
   ok: boolean;
   diagnostic: string;
@@ -208,6 +242,15 @@ export interface SessionCamera {
   selected: boolean;
   source_type?: string;
   source?: string;
+  ptz?: CameraPtzCapabilities;
+}
+
+export interface CameraPtzCapabilities {
+  supported: boolean;
+  pan: boolean;
+  tilt: boolean;
+  zoom: boolean;
+  transport: "uvc" | "onvif" | "none";
 }
 
 export interface Pose {

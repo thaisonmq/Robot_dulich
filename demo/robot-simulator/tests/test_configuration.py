@@ -150,6 +150,28 @@ def test_configuration_is_owned_and_applied_by_simulator() -> None:
     assert client._public_video_source() == "rtsp://camera.local:8554/main"
 
 
+def test_configuration_does_not_copy_rtsp_credentials_to_another_camera() -> None:
+    client = RobotConnectionClient(
+        SimulatorConfig(
+            simulator_media_source_type="rtsp",
+            simulator_media_source="rtsp://operator:secret@192.168.6.142/live",
+        )
+    )
+
+    client._apply_configuration(
+        {
+            "device_ip": "192.168.6.145",
+            "video_source_type": "rtsp",
+            "video_source": "rtsp://192.168.6.128/main",
+            "video_profile": "full_hd",
+            "rtsp_transport": "tcp",
+            "camera_label": "Camera 128",
+        }
+    )
+
+    assert client.config.simulator_media_source == "rtsp://192.168.6.128/main"
+
+
 def test_enrolled_device_identity_is_loaded_from_protected_state(tmp_path) -> None:
     state_file = tmp_path / "device.json"
     first = RobotConnectionClient(
