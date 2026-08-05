@@ -1,0 +1,13 @@
+[Unit]
+Description=ROVERA low-latency Wi-Fi queue
+Wants=network-online.target
+After=NetworkManager.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/iw dev wlan0 set power_save off
+ExecStart=/usr/sbin/tc qdisc replace dev wlan0 root fq_codel limit 256 target 5ms interval 100ms
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -128,3 +128,35 @@ describe("Robot media source scan", () => {
     expect(sources.speaker_sources[0].label).toBe("USB Speaker");
   });
 });
+
+describe("Live stream settings", () => {
+  afterEach(() => {
+    authStorage.clear();
+    sessionStorage.clear();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("applies a video profile to the active control session", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        robot_id: "ROBOT-229",
+        video_profile: "balanced",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.selectSessionVideoProfile("SESSION-1", "balanced");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/SESSION-1/video-profile",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ video_profile: "balanced" }),
+      }),
+    );
+    expect(result.video_profile).toBe("balanced");
+  });
+});

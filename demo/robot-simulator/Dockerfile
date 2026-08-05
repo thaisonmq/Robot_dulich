@@ -15,7 +15,7 @@ RUN git clone https://github.com/livekit/gstreamer-publisher.git . \
     && git checkout "${GSTREAMER_PUBLISHER_COMMIT}" \
     && git apply /tmp/gstreamer-publisher-duration.patch \
     && gofmt -w main.go publish.go track.go
-RUN CGO_ENABLED=1 go build \
+RUN GOMAXPROCS=2 CGO_ENABLED=1 go build -p=1 \
     -trimpath \
     -ldflags="-s -w" \
     -o /out/gstreamer-publisher .
@@ -58,13 +58,17 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "-m", "simulator.main"]
 
 
-# RK3588 build: compile MPP and the Rockchip FFmpeg backend in the ARM64 image.
-# It is used only when the input is not already H.264; H.264 sources bypass it.
+# RK3588 build: compile MPP only when the board is explicitly selected. ARM64
+# alone is not sufficient: Raspberry Pi 5 is ARM64 but cannot use Rockchip MPP,
+# and compiling that stack on a 4 GB Pi can exhaust swap during deployment.
 FROM debian:bookworm-slim AS rk-media-builder
 
+ARG MEDIA_PLATFORM=generic
 ARG ROCKCHIP_MPP_COMMIT=df4864bd1e907cbfd427c397348976c5b2b05ee9
 ARG FFMPEG_ROCKCHIP_COMMIT=388741a3544b92cf525f1cb3746ba9fb8f301d9a
-RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+RUN mkdir -p /opt/rockchip /opt/ffmpeg-rk \
+    && if [ "$(dpkg --print-architecture)" = "arm64" ] \
+        && [ "${MEDIA_PLATFORM}" = "rk3588" ]; then \
         apt-get update \
         && apt-get install -y --no-install-recommends \
             build-essential \
@@ -79,10 +83,9 @@ RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
             pkg-config \
             yasm \
         && rm -rf /var/lib/apt/lists/*; \
-    else \
-        mkdir -p /opt/rockchip /opt/ffmpeg-rk; \
     fi
-RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+RUN if [ "$(dpkg --print-architecture)" = "arm64" ] \
+        && [ "${MEDIA_PLATFORM}" = "rk3588" ]; then \
         git clone https://github.com/rockchip-linux/mpp.git /src/mpp \
         && git -C /src/mpp checkout "${ROCKCHIP_MPP_COMMIT}" \
         && cmake \
@@ -94,7 +97,8 @@ RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
         && cmake --build /build/mpp --parallel 2 \
         && cmake --install /build/mpp; \
     fi
-RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+RUN if [ "$(dpkg --print-architecture)" = "arm64" ] \
+        && [ "${MEDIA_PLATFORM}" = "rk3588" ]; then \
         git clone https://github.com/nyanmisaka/ffmpeg-rockchip.git /src/ffmpeg \
         && git -C /src/ffmpeg checkout "${FFMPEG_ROCKCHIP_COMMIT}" \
         && cd /src/ffmpeg \

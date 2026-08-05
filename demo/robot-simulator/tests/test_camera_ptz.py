@@ -6,6 +6,31 @@ import pytest
 from simulator import camera_ptz
 
 
+@pytest.mark.parametrize(
+    ("encoding", "width", "height", "fps", "expected_level", "route"),
+    [
+        ("H264", 1280, 720, 20, "A", "passthrough"),
+        ("H265", 1280, 720, 20, "B", "transcode"),
+        ("MJPEG", 1920, 1080, 25, "B", "transcode"),
+        ("H265", 3840, 2160, 25, "C", "unsupported-realtime"),
+    ],
+)
+def test_onvif_profiles_are_classified_for_pi5_realtime(
+    encoding: str,
+    width: int,
+    height: int,
+    fps: int,
+    expected_level: str,
+    route: str,
+) -> None:
+    result = camera_ptz.classify_camera_profile(
+        encoding, width, height, fps, 4_000
+    )
+
+    assert result["support_level"] == expected_level
+    assert result["route"] == route
+
+
 V4L2_PTZ_CONTROLS = """
 Camera Controls
 

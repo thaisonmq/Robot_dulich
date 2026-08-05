@@ -20,8 +20,8 @@ const EMPTY_CONFIGURATION: RobotConfigurationUpdate = {
   device_ip: "",
   video_source_type: "rtsp",
   video_source: "",
-  video_profile: "full_hd",
-  rtsp_transport: "tcp",
+  video_profile: "balanced",
+  rtsp_transport: "auto",
   camera_label: "Camera chính",
   audio_source_type: "silent",
   audio_source: "",
@@ -582,6 +582,7 @@ export function RobotConfigurationPage() {
                         rtsp_transport: event.target.value as RobotConfigurationUpdate["rtsp_transport"],
                       })}
                     >
+                      <option value="auto">Auto · UDP → TCP fallback</option>
                       <option value="tcp">TCP · {t("ưu tiên ổn định")}</option>
                       <option value="udp">UDP · {t("ưu tiên độ trễ")}</option>
                     </select>
@@ -950,8 +951,12 @@ export function RobotConfigurationPage() {
                               ? `${profile.width}×${profile.height}`
                               : profile.encoding || "RTSP"}
                             {profile.fps ? ` · ${profile.fps} fps` : ""}
+                            {profile.bitrate_kbps ? ` · ${profile.bitrate_kbps} kbps` : ""}
+                            {` · ${profile.encoding || "codec ?"}`}
+                            {` · Mức ${profile.support_level} · ${profile.route}`}
                             {profile.ptz ? ` · PTZ` : ""}
                           </small>
+                          {profile.warning && <small>{t(profile.warning)}</small>}
                         </span>
                         <code>{profile.path}</code>
                         <Check size={16} />

@@ -5,6 +5,7 @@ import type {
   OnvifScanRequest,
   RobotQuickCreateInput, RobotUpdateInput, Route, Session, User, UserPage,
   RegisterInput, AdminUserCreateInput, ActiveControlSession, SessionCamera,
+  SessionVideoProfile, VideoProfile,
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "";
@@ -251,6 +252,13 @@ export const api = {
     request<SessionCamera>(`/api/sessions/${sessionId}/camera`, {
       method: "PUT",
       body: JSON.stringify({ camera_id: cameraId }),
+    }),
+  sessionVideoProfile: (sessionId: string) =>
+    request<SessionVideoProfile>(`/api/sessions/${sessionId}/video-profile`),
+  selectSessionVideoProfile: (sessionId: string, videoProfile: VideoProfile) =>
+    request<SessionVideoProfile>(`/api/sessions/${sessionId}/video-profile`, {
+      method: "PUT",
+      body: JSON.stringify({ video_profile: videoProfile }),
     }),
   deleteSession: (sessionId: string) =>
     request(`/api/sessions/${sessionId}`, { method: "DELETE", keepalive: true }),

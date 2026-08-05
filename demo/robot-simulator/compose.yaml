@@ -6,6 +6,8 @@ services:
       context: .
       args:
         ROVERA_EDGE_VERSION: "1.1.0"
+        # generic is correct for Raspberry Pi 5. Set rk3588 only on Rockchip.
+        MEDIA_PLATFORM: ${MEDIA_PLATFORM:-generic}
     hostname: ${ROBOT_CONTAINER_HOSTNAME:-rovera-robot-edge}
     network_mode: host
     # Keep the edge agent running across Docker/host restarts. The Pulse mount
@@ -28,6 +30,9 @@ services:
       # Cho phép FFmpeg/pactl trong container thấy nguồn thu PipeWire/PulseAudio
       # của user trên host (đặc biệt là microphone Bluetooth HSP/HFP).
       PULSE_SERVER: unix:/run/rovera-user/${PULSE_UID:-1000}/pulse/native
+      # LiveKit native SDK uses the process trust store for WSS. Reuse the same
+      # optional CA file as the Center HTTP/WebSocket client.
+      SSL_CERT_FILE: ${CENTER_TLS_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}
 
     user: "${ROBOT_UID:-1000}:${ROBOT_GID:-1000}"
     group_add:
@@ -43,6 +48,10 @@ services:
       - type: bind
         source: /etc/machine-id
         target: /etc/machine-id
+        read_only: true
+      - type: bind
+        source: ${CENTER_TLS_CA_HOST_FILE:-/etc/ssl/certs/ca-certificates.crt}
+        target: ${CENTER_TLS_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}
         read_only: true
       # Cho phép Center liệt kê và lựa chọn camera/microphone sau khi robot
       # online mà không cần khai báo trước /dev/videoN trong .env.

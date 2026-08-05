@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   AdaptiveVideoBuffer,
+  VideoDecodeHealth,
   VIDEO_BUFFER_INITIAL_TARGET_MS,
   VIDEO_BUFFER_MAX_TARGET_MS,
   VIDEO_BUFFER_MIN_TARGET_MS,
+  mediaPlayoutTargets,
+  nextVideoRecoveryAction,
 } from "../src/transports/AdaptiveVideoBuffer";
 
 function sample(
@@ -87,5 +90,54 @@ describe("AdaptiveVideoBuffer", () => {
     expect(controller.currentTargetMs).toBe(VIDEO_BUFFER_INITIAL_TARGET_MS);
     expect(controller.update(sample(10, { renderedGapCount: 5 })))
       .toBe(VIDEO_BUFFER_INITIAL_TARGET_MS);
+  });
+});
+
+describe("video stall recovery", () => {
+  const decodeSample = (
+    bytesReceived: number,
+    framesDecoded: number,
+    keyFramesDecoded = 1,
+  ) => ({
+    bytesReceived,
+    framesDecoded,
+    framesDropped: 0,
+    freezeCount: 0,
+    keyFramesDecoded,
+    framesPerSecond: 25,
+  });
+
+  it("distinguishes a dead upstream from a decoder waiting for a keyframe", () => {
+    const upstream = new VideoDecodeHealth();
+    upstream.update(decodeSample(1000, 10));
+    upstream.update(decodeSample(1000, 10));
+    expect(upstream.update(decodeSample(1000, 10))).toBe("upstream-stalled");
+
+    const decoder = new VideoDecodeHealth();
+    decoder.update(decodeSample(1000, 0, 0));
+    decoder.update(decodeSample(2000, 0, 0));
+    expect(decoder.update(decodeSample(3000, 0, 0))).toBe("missing-keyframe");
+  });
+
+  it("returns healthy as soon as decoded frames advance", () => {
+    const health = new VideoDecodeHealth();
+    health.update(decodeSample(1000, 10));
+    health.update(decodeSample(2000, 10));
+
+    expect(health.update(decodeSample(3000, 11))).toBe("healthy");
+  });
+
+  it("limits publication resubscribe attempts before reconnecting the room", () => {
+    expect(nextVideoRecoveryAction(0, true)).toBe("resubscribe");
+    expect(nextVideoRecoveryAction(1, true)).toBe("resubscribe");
+    expect(nextVideoRecoveryAction(2, true)).toBe("reconnect");
+    expect(nextVideoRecoveryAction(0, false)).toBe("reconnect");
+  });
+});
+
+describe("audio and video playout targets", () => {
+  it("never copies an enlarged video jitter target onto full-duplex audio", () => {
+    expect(mediaPlayoutTargets(140)).toEqual({ videoMs: 140, audioMs: 40 });
+    expect(mediaPlayoutTargets(60)).toEqual({ videoMs: 60, audioMs: 40 });
   });
 });

@@ -20,6 +20,7 @@ import websockets
 
 from simulator.camera_ptz import CameraPtzController
 from simulator.config import SimulatorConfig
+from simulator.media import MediaPublisher, redact_media_source
 from simulator.media_devices import (
     discover_media_sources,
     discover_video_sources,
@@ -27,8 +28,8 @@ from simulator.media_devices import (
     prepare_audio_source,
     probe_audio_output,
     probe_audio_source,
+    select_v4l2_mode,
 )
-from simulator.media import MediaPublisher, rtsp_input_args
 from simulator.messages import Message, make_message
 from simulator.motion import MotionSimulator
 from simulator.motion_driver import MotionDriver, build_motion_driver
@@ -770,13 +771,15 @@ class RobotConnectionClient:
             # Leave Wi-Fi airtime for low-latency control while preserving
             # good 1080p25 quality on the robot's MJPEG camera.
             "full_hd": (1920, 1080, 6_000_000),
-            "balanced": (1280, 720, 2_500_000),
+            # Superfast x264 preserves the selected camera mode at this rate
+            # while leaving airtime for control on congested 2.4 GHz Wi-Fi.
+            "balanced": (1280, 720, 2_000_000),
             "low_bandwidth": (854, 480, 1_200_000),
         }
         if profile not in profiles:
             raise ValueError("Profile video không hợp lệ")
         transport = str(payload.get("rtsp_transport", ""))
-        if transport not in {"tcp", "udp"}:
+        if transport not in {"auto", "tcp", "udp"}:
             raise ValueError("Giao thức RTSP không hợp lệ")
         source_type = str(payload.get("video_source_type", ""))
         if source_type not in {"rtsp", "camera", "file", "test"}:
@@ -961,6 +964,15 @@ class RobotConnectionClient:
             source["ptz"] = await self.camera_ptz.capabilities(
                 str(source.get("type", "camera")), capability_source
             )
+            if source.get("type") == "camera":
+                modes = list(source.get("capture_modes") or [])
+                source["recommended_mode"] = select_v4l2_mode(
+                    modes,
+                    self.config.simulator_camera_width or self.config.video_width,
+                    self.config.simulator_camera_height or self.config.video_height,
+                    self.config.simulator_camera_fps or self.config.video_fps,
+                    self.config.simulator_camera_format,
+                )
         await socket.send(
             json.dumps(
                 make_message(
@@ -1041,26 +1053,64 @@ class RobotConnectionClient:
                 source_type = str(configuration.get("video_source_type", "rtsp"))
                 source = str(configuration.get("video_source", ""))
                 if source_type == "camera":
-                    input_args = [
-                        "-f", "v4l2", "-framerate", "15", "-i", source
-                    ]
-                    success_detail = "Camera USB đã trả về hình ảnh"
+                    resolved_source = source
                 elif source_type == "rtsp":
-                    source = self.camera_ptz.credentialed_source(
+                    resolved_source = self.camera_ptz.credentialed_source(
                         self._source_with_preserved_credentials(source)
                     )
-                    input_args = rtsp_input_args(
-                        source,
-                        str(configuration.get("rtsp_transport", "tcp")),
-                    )
-                    success_detail = "Luồng RTSP đã trả về hình ảnh"
                 else:
-                    input_args = ["-i", source]
-                    success_detail = "Tệp hoặc stream video đã trả về hình ảnh"
-                command = [
-                    "ffmpeg", "-hide_banner", "-loglevel", "error",
-                    *input_args, "-t", "2", "-an", "-f", "null", "-",
-                ]
+                    resolved_source = source
+                probe_config = self.config.model_copy(deep=True)
+                probe_config.simulator_media_source_type = source_type
+                probe_config.simulator_media_source = resolved_source
+                probe_config.rtsp_transport = str(
+                    configuration.get("rtsp_transport", "auto")
+                )
+                probe_publisher = MediaPublisher(probe_config)
+                probe = await asyncio.wait_for(
+                    asyncio.to_thread(probe_publisher._probe_video_source),
+                    timeout=8,
+                )
+                reasons = probe_publisher._video_transcode_reasons(probe)
+                route = "transcode" if reasons else "passthrough"
+                return {
+                    "ok": True,
+                    "latency_ms": round((time.monotonic() - started) * 1000),
+                    "detail": "Nguồn video đã hoàn tất kiểm tra realtime",
+                    "codec": probe.codec,
+                    "width": probe.width,
+                    "height": probe.height,
+                    "fps_metadata": (
+                        str(probe.fps) if probe.fps is not None else None
+                    ),
+                    "fps_measured": (
+                        str(probe.measured_fps)
+                        if probe.measured_fps is not None
+                        else None
+                    ),
+                    "has_b_frames": probe.has_b_frames,
+                    "timing_reliable": probe.timing_reliable,
+                    "timing_reason": probe.timing_reason,
+                    "packet_count": probe.packet_count,
+                    "median_frame_interval_ms": round(
+                        probe.median_frame_interval_ms, 2
+                    ),
+                    "p95_frame_interval_ms": round(
+                        probe.p95_frame_interval_ms, 2
+                    ),
+                    "frame_interval_jitter_ms": round(
+                        probe.frame_interval_jitter_ms, 2
+                    ),
+                    "bitrate": probe.bitrate,
+                    "largest_access_unit": probe.largest_access_unit,
+                    "largest_keyframe": probe.largest_keyframe,
+                    "cadence_bursty": probe.cadence_bursty,
+                    "passthrough_safe": probe.passthrough_safe,
+                    "needs_normalization": bool(reasons),
+                    "route": route,
+                    "encoder": "copy" if not reasons else probe_config.video_encoder,
+                    "warnings": reasons,
+                }
             elif kind == "audio":
                 audio_type = str(configuration.get("audio_source_type", "device"))
                 audio_source = str(configuration.get("audio_source", "default"))
@@ -1131,13 +1181,24 @@ class RobotConnectionClient:
             return {
                 "ok": False,
                 "latency_ms": round((time.monotonic() - started) * 1000),
-                "detail": "Nguồn media không phản hồi trong 7 giây",
+                "detail": (
+                    "Nguồn video không phản hồi trong 8 giây"
+                    if kind == "video"
+                    else "Nguồn media không phản hồi trong 7 giây"
+                ),
             }
         except Exception as exc:
             return {
                 "ok": False,
                 "latency_ms": round((time.monotonic() - started) * 1000),
-                "detail": str(exc),
+                "detail": redact_media_source(
+                    exc,
+                    str(
+                        configuration.get("video_source")
+                        or configuration.get("audio_source")
+                        or ""
+                    ),
+                ),
             }
 
     async def _diagnostics_result(
@@ -1218,7 +1279,21 @@ class RobotConnectionClient:
                             "network_rtt_ms": random.randint(36, 68),
                             "packet_loss_percent": round(random.uniform(0.0, 0.7), 2),
                             "camera": "online" if self.media.connected else "offline",
-                            "audio": "online" if self.media.connected else "offline",
+                            "audio": (
+                                "online"
+                                if self.media.connected
+                                and (
+                                    self.config.simulator_audio_source_type == "silent"
+                                    or self.media.audio_capture_healthy
+                                )
+                                else "offline"
+                            ),
+                            "audio_playback": (
+                                "online"
+                                if self.media.audio_playback_healthy
+                                else "offline"
+                            ),
+                            "aec": "active" if self.media.aec_active else "inactive",
                             "navigation": self.navigation.status,
                             "simulator": "running",
                             "motion_backend": self.config.motion_backend,

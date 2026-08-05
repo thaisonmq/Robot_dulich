@@ -125,7 +125,10 @@ for environment_name in "${ENVIRONMENT_NAMES[@]}"; do
 done
 
 if [[ -n "${CENTER_TLS_CA_FILE:-}" && -f "$CENTER_TLS_CA_FILE" ]]; then
-  DOCKER_ARGUMENTS+=(--volume "$CENTER_TLS_CA_FILE:$CENTER_TLS_CA_FILE:ro")
+  DOCKER_ARGUMENTS+=(
+    --volume "$CENTER_TLS_CA_FILE:$CENTER_TLS_CA_FILE:ro"
+    --env "SSL_CERT_FILE=$CENTER_TLS_CA_FILE"
+  )
 fi
 
 mapfile -t VIDEO_DEVICES < <(compgen -G "/dev/video*" || true)

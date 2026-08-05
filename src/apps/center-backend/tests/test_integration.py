@@ -502,6 +502,93 @@ def test_guest_control_camera_privacy_and_supervisor_force_end() -> None:
             assert selected_response.json()["label"] == "Camera 2"
             assert "source" not in selected_response.json()
 
+            configuration = {
+                "device_ip": "192.168.1.20",
+                "video_source_type": "camera",
+                "video_source": "/dev/video2",
+                "video_profile": "balanced",
+                "rtsp_transport": "auto",
+                "camera_label": "Camera hành lang",
+                "audio_source_type": "silent",
+                "audio_source": "",
+                "microphone_label": "Microphone chính",
+                "audio_output_type": "disabled",
+                "audio_output": "",
+                "speaker_label": "Loa chính",
+            }
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending_profile = executor.submit(
+                    client.get,
+                    f"/api/sessions/{session['session_id']}/video-profile",
+                    headers=guest_headers,
+                )
+                profile_request = robot_ws.receive_json()
+                assert profile_request["message_type"] == "configuration.get"
+                robot_ws.send_json(
+                    envelope(
+                        "configuration.state",
+                        "",
+                        22,
+                        {
+                            "request_id": profile_request["payload"]["request_id"],
+                            "ok": True,
+                            **configuration,
+                        },
+                    )
+                )
+                profile_response = pending_profile.result(timeout=5)
+
+            assert profile_response.status_code == 200
+            assert profile_response.json()["video_profile"] == "balanced"
+            assert client.put(
+                f"/api/sessions/{session['session_id']}/video-profile",
+                headers=guest_headers,
+                json={"video_profile": "low_bandwidth"},
+            ).status_code == 403
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending_quality = executor.submit(
+                    client.put,
+                    f"/api/sessions/{session['session_id']}/video-profile",
+                    headers=operator_headers,
+                    json={"video_profile": "low_bandwidth"},
+                )
+                get_request = robot_ws.receive_json()
+                assert get_request["message_type"] == "configuration.get"
+                robot_ws.send_json(
+                    envelope(
+                        "configuration.state",
+                        "",
+                        23,
+                        {
+                            "request_id": get_request["payload"]["request_id"],
+                            "ok": True,
+                            **configuration,
+                        },
+                    )
+                )
+                quality_request = robot_ws.receive_json()
+                assert quality_request["message_type"] == "configuration.update"
+                assert quality_request["payload"]["video_profile"] == "low_bandwidth"
+                assert quality_request["payload"]["video_source"] == "/dev/video2"
+                robot_ws.send_json(
+                    envelope(
+                        "configuration.state",
+                        "",
+                        24,
+                        {
+                            "request_id": quality_request["payload"]["request_id"],
+                            "ok": True,
+                            **configuration,
+                            "video_profile": "low_bandwidth",
+                        },
+                    )
+                )
+                quality_response = pending_quality.result(timeout=5)
+
+            assert quality_response.status_code == 200
+            assert quality_response.json()["video_profile"] == "low_bandwidth"
+
             active = client.get(
                 "/api/sessions/active", headers=operator_headers
             )

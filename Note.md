@@ -119,8 +119,8 @@ cản và chưa dùng Nav2. Edge đang chạy `MOTION_BACKEND=ros2` sẽ từ ch
 - [ ] Package chuyển đổi tọa độ map đã có và có unit test, nhưng `MapPanel` vẫn
   hard-code kích thước thế giới `16 x 10 m` thay vì dùng metadata của map.
 - [ ] API lịch sử tài khoản đã có nhưng frontend chưa có màn hình hiển thị.
-- [ ] Container coturn đã có, nhưng cấu hình hiện tại chưa nối TURN server vào
-  luồng LiveKit/browser và vẫn dùng credential mẫu.
+- [x] Coturn đã được nối vào LiveKit/browser bằng credential HMAC ngắn hạn,
+  hỗ trợ TURN relay qua UDP và TCP.
 - [ ] Giao diện hội thoại đã có lựa chọn ngôn ngữ nhưng dịch giọng nói realtime
   đang bị khóa bằng `translationEnabled = false`.
 - [ ] Battery luôn là `78%`; RTT và packet loss của simulator là số ngẫu nhiên,
@@ -163,7 +163,7 @@ cản và chưa dùng Nav2. Edge đang chạy `MOTION_BACKEND=ros2` sẽ từ ch
    - Không tự seed tài khoản demo ở môi trường production.
 
 5. **Hoàn thiện TURN/NAT**
-   - Cấp credential TURN an toàn, khai báo TURN đúng trong LiveKit/WebRTC.
+   - Đã cấp credential TURN ngắn hạn và khai báo coturn trong LiveKit/WebRTC.
    - Kiểm thử qua NAT, firewall, mạng di động và mạng doanh nghiệp.
 
 6. **Sửa luồng Docker demo mới hoàn toàn**

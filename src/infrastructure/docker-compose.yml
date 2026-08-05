@@ -34,17 +34,40 @@ services:
   livekit:
     image: livekit/livekit-server:v1.12.0
     restart: unless-stopped
-    command: ["--config", "/etc/livekit.yaml"]
     environment:
       LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-dev-secret-at-least-32-characters-long}"
       # Advertise the host/LAN address instead of Docker's 172.x bridge address.
       NODE_IP: "${LIVEKIT_NODE_IP:-127.0.0.1}"
-    volumes:
-      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+      # LiveKit passes these external coturn servers and short-lived HMAC
+      # credentials to every browser/robot during signaling.
+      LIVEKIT_CONFIG: |
+        port: 7880
+        bind_addresses:
+          - "0.0.0.0"
+        rtc:
+          tcp_port: ${LIVEKIT_TCP_PORT:-7881}
+          port_range_start: ${LIVEKIT_UDP_START:-51000}
+          port_range_end: ${LIVEKIT_UDP_END:-51020}
+          use_external_ip: false
+          turn_servers:
+            - host: "${TURN_HOST:-127.0.0.1}"
+              port: ${TURN_PORT:-3478}
+              protocol: udp
+              secret: "${TURN_SECRET:-dev-turn-secret-change-me}"
+              ttl: 3600
+            - host: "${TURN_HOST:-127.0.0.1}"
+              port: ${TURN_PORT:-3478}
+              protocol: tcp
+              secret: "${TURN_SECRET:-dev-turn-secret-change-me}"
+              ttl: 3600
+        redis:
+          address: redis:6379
+        logging:
+          level: info
     ports:
-      - "${LIVEKIT_HTTP_PORT:-7880}:7880"
-      - "${LIVEKIT_TCP_PORT:-7881}:7881"
-      - "${LIVEKIT_UDP_START:-51000}-${LIVEKIT_UDP_END:-51020}:51000-51020/udp"
+      - "127.0.0.1:${LIVEKIT_HTTP_PORT:-7880}:7880"
+      - "${LIVEKIT_TCP_PORT:-7881}:${LIVEKIT_TCP_PORT:-7881}"
+      - "${LIVEKIT_UDP_START:-51000}-${LIVEKIT_UDP_END:-51020}:${LIVEKIT_UDP_START:-51000}-${LIVEKIT_UDP_END:-51020}/udp"
     depends_on:
       redis:
         condition: service_healthy
@@ -58,13 +81,21 @@ services:
   coturn:
     image: coturn/coturn:4.6.3-r3
     restart: unless-stopped
-    command: ["-c", "/etc/coturn/turnserver.conf"]
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+      - "--listening-port=${TURN_PORT:-3478}"
+      - "--realm=${TURN_REALM:-rovera.local}"
+      - "--static-auth-secret=${TURN_SECRET:-dev-turn-secret-change-me}"
+      - "--external-ip=${TURN_EXTERNAL_IP:-127.0.0.1}"
+      - "--min-port=${TURN_UDP_START:-49160}"
+      - "--max-port=${TURN_UDP_END:-49200}"
     volumes:
       - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
     ports:
-      - "${TURN_PORT:-3478}:3478/tcp"
-      - "${TURN_PORT:-3478}:3478/udp"
-      - "${TURN_UDP_START:-49160}-${TURN_UDP_END:-49200}:49160-49200/udp"
+      - "${TURN_PORT:-3478}:${TURN_PORT:-3478}/tcp"
+      - "${TURN_PORT:-3478}:${TURN_PORT:-3478}/udp"
+      - "${TURN_UDP_START:-49160}-${TURN_UDP_END:-49200}:${TURN_UDP_START:-49160}-${TURN_UDP_END:-49200}/udp"
     networks: [rovera]
 
   center-backend:
@@ -83,7 +114,7 @@ services:
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-admin123}
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@rovera.local}
       BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Quản trị hệ thống}
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-http://localhost:8080}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://localhost}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
@@ -91,18 +122,19 @@ services:
       SESSION_RECONNECT_TIMEOUT_SECONDS: ${SESSION_RECONNECT_TIMEOUT_SECONDS:-300}
       ROBOT_ID: ${ROBOT_ID:-ROBOT-001}
       ROBOT_CREDENTIAL: ${ROBOT_CREDENTIAL:-robot-001-change-me}
-      LIVEKIT_URL: ${LIVEKIT_PUBLIC_URL:-ws://localhost:7880}
+      LIVEKIT_URL: ${LIVEKIT_PUBLIC_URL:-wss://localhost}
       LIVEKIT_ROBOT_URL: ${LIVEKIT_ROBOT_URL:-ws://livekit:7880}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-dev-secret-at-least-32-characters-long}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8080}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost,http://localhost:5173}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1,172.16.0.0/12}
       SAMPLE_DATA_DIR: /sample-data
     volumes:
       - ../../sample-data:/sample-data:ro
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     ports:
-      # Robot/edge agents connect directly to this port from the LAN.
-      - "${BACKEND_PORT:-8888}:8000"
+      # Chỉ giữ cổng debug trên loopback; robot ngoài máy đi qua HTTPS/WSS :443.
+      - "127.0.0.1:${BACKEND_PORT:-8888}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -157,9 +189,17 @@ services:
     pull_policy: build
     ports:
       - "${FRONTEND_PORT:-8080}:80"
+      - "${FRONTEND_HTTPS_PORT:-443}:443"
+    environment:
+      TLS_HOSTNAME: ${TLS_HOSTNAME:-localhost}
+      TLS_CERT_DAYS: ${TLS_CERT_DAYS:-825}
+    volumes:
+      - ./tls:/etc/nginx/tls
     depends_on:
       center-backend:
         condition: service_healthy
+      livekit:
+        condition: service_started
     restart: unless-stopped
     networks: [rovera]
 

@@ -44,26 +44,29 @@ class SimulatorConfig(BaseSettings):
     simulator_audio_output_type: str = "disabled"
     simulator_camera_device: str = "/dev/video0"
     simulator_camera_format: str = ""
-    simulator_camera_width: int = Field(default=1920, ge=320, le=3840)
-    simulator_camera_height: int = Field(default=1080, ge=240, le=2160)
-    simulator_camera_fps: int = Field(default=25, ge=5, le=60)
+    # Zero means auto: select one of the discrete modes advertised by the
+    # chosen V4L2 camera for the active video profile. Non-zero values remain
+    # available as an explicit deployment override.
+    simulator_camera_width: int = Field(default=0, ge=0, le=3840)
+    simulator_camera_height: int = Field(default=0, ge=0, le=2160)
+    simulator_camera_fps: int = Field(default=0, ge=0, le=120)
     device_ip: str = "127.0.0.1"
     camera_label: str = "Camera chính"
     microphone_label: str = "Microphone chính"
     speaker_label: str = "Loa chính"
-    video_profile: str = "full_hd"
-    # TCP is the reliable default. UDP remains available for managed wired LANs.
-    rtsp_transport: str = "tcp"
+    video_profile: str = "balanced"
+    # Auto tries UDP first for latency and lets GStreamer fall back to TCP.
+    rtsp_transport: str = "auto"
     # Preserve clean H.264 without decoding. Auto-normalization only transcodes
     # RTSP sources whose metadata cannot provide a safe, bounded frame cadence.
     # ``rtsp_normalize`` remains a force switch for known-bad vendor streams.
     rtsp_normalize: bool = False
     rtsp_auto_normalize: bool = True
     media_enabled: bool = True
-    video_width: int = Field(default=1920, ge=640, le=1920)
-    video_height: int = Field(default=1080, ge=360, le=1080)
-    video_fps: int = Field(default=25, ge=10, le=30)
-    video_bitrate: int = Field(default=6_000_000, ge=500_000, le=12_000_000)
+    video_width: int = Field(default=1280, ge=640, le=1920)
+    video_height: int = Field(default=720, ge=360, le=1080)
+    video_fps: int = Field(default=20, ge=10, le=30)
+    video_bitrate: int = Field(default=2_500_000, ge=500_000, le=12_000_000)
     video_encoder: str = "auto"
     video_pipeline: str = "auto"
     video_passthrough: bool = True

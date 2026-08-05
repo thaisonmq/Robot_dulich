@@ -1,23 +1,22 @@
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
 import hashlib
 import os
 import re
 import socket
 import subprocess
 import time
-from uuid import uuid4
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from uuid import uuid4
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 import httpx
-
 
 _V4L2_CONTROL = re.compile(
     r"^\s*(?P<name>[a-zA-Z0-9_]+)\s+0x[0-9a-fA-F]+\s+"
@@ -314,9 +313,59 @@ def parse_onvif_profiles(xml: str) -> list[dict[str, Any]]:
                 "fps": fps,
                 "bitrate_kbps": bitrate,
                 "ptz": ptz,
+                **classify_camera_profile(encoder, width, height, fps, bitrate),
             }
         )
     return profiles
+
+
+def classify_camera_profile(
+    encoding: str,
+    width: int,
+    height: int,
+    fps: int,
+    bitrate_kbps: int,
+) -> dict[str, str]:
+    """Classify an advertised profile against a Pi 5 telepresence budget."""
+    codec = encoding.strip().casefold().replace(".", "")
+    is_h264 = codec in {"h264", "avc", "avc1"}
+    needs_transcode = not is_h264 or width > 1920 or height > 1080 or fps > 30
+    too_heavy_to_transcode = needs_transcode and (
+        width > 1920
+        or height > 1080
+        or fps > 30
+        or bitrate_kbps > 12_000
+    )
+    if too_heavy_to_transcode:
+        return {
+            "support_level": "C",
+            "route": "unsupported-realtime",
+            "warning": (
+                "Profile cần transcode vượt ngân sách realtime của Raspberry Pi 5; "
+                "hãy chọn H.264/substream 720p 15–25 fps."
+            ),
+        }
+    if (
+        is_h264
+        and 0 < width <= 1920
+        and 0 < height <= 1080
+        and 15 <= fps <= 25
+        and (bitrate_kbps == 0 or bitrate_kbps <= 8_000)
+    ):
+        return {
+            "support_level": "A",
+            "route": "passthrough",
+            "warning": "",
+        }
+    route = "passthrough" if is_h264 and not needs_transcode else "transcode"
+    return {
+        "support_level": "B",
+        "route": route,
+        "warning": (
+            "Best effort trên Raspberry Pi 5; hệ thống có thể tự giảm FPS hoặc "
+            "độ phân giải để giữ gần thời gian thực."
+        ),
+    }
 
 
 def parse_onvif_stream_uri(xml: str) -> str:
@@ -400,6 +449,7 @@ def suggested_rtsp_profiles(
             "ptz": False,
             "rtsp_url": f"rtsp://{hostname}:554{path}",
             "path": path,
+            **classify_camera_profile("H264", 0, 0, 0, 0),
         }
         for index, (profile_name, path) in enumerate(candidates, start=1)
     ]

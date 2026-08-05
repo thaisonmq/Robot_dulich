@@ -1,16 +1,78 @@
 export const VIDEO_BUFFER_MIN_TARGET_MS = 60;
 export const VIDEO_BUFFER_INITIAL_TARGET_MS = 80;
 export const VIDEO_BUFFER_MAX_TARGET_MS = 140;
+export const AUDIO_BUFFER_TARGET_MS = 40;
 
 const VIDEO_BUFFER_INCREASE_STEP_MS = 20;
 const VIDEO_BUFFER_DECREASE_STEP_MS = 10;
 const VIDEO_BUFFER_STABLE_SAMPLES = 15;
+
+export function mediaPlayoutTargets(videoTargetMs: number): {
+  videoMs: number;
+  audioMs: number;
+} {
+  return {
+    videoMs: clampTarget(videoTargetMs),
+    audioMs: AUDIO_BUFFER_TARGET_MS,
+  };
+}
 
 export interface VideoBufferSample {
   jitterMs: number;
   freezeCount: number;
   totalFreezesDuration: number;
   renderedGapCount: number;
+}
+
+export type VideoDecodeState =
+  | "unknown"
+  | "healthy"
+  | "upstream-stalled"
+  | "missing-keyframe"
+  | "decoder-stalled";
+
+export interface VideoDecodeSample {
+  bytesReceived: number;
+  framesDecoded: number;
+  framesDropped: number;
+  freezeCount: number;
+  keyFramesDecoded: number;
+  framesPerSecond: number;
+}
+
+export function nextVideoRecoveryAction(
+  completedTrackAttempts: number,
+  hasPublication: boolean,
+): "resubscribe" | "reconnect" {
+  return hasPublication && completedTrackAttempts < 2
+    ? "resubscribe"
+    : "reconnect";
+}
+
+/** Distinguishes an idle upstream from a receiver that gets bytes but cannot decode. */
+export class VideoDecodeHealth {
+  private previous: VideoDecodeSample | null = null;
+  private stagnantSamples = 0;
+
+  reset(): void {
+    this.previous = null;
+    this.stagnantSamples = 0;
+  }
+
+  update(sample: VideoDecodeSample): VideoDecodeState {
+    const previous = this.previous;
+    this.previous = sample;
+    if (!previous) return "unknown";
+    if (sample.framesDecoded > previous.framesDecoded) {
+      this.stagnantSamples = 0;
+      return "healthy";
+    }
+    this.stagnantSamples += 1;
+    if (this.stagnantSamples < 2) return "unknown";
+    if (sample.bytesReceived <= previous.bytesReceived) return "upstream-stalled";
+    if (sample.keyFramesDecoded === 0) return "missing-keyframe";
+    return "decoder-stalled";
+  }
 }
 
 function clampTarget(targetMs: number): number {

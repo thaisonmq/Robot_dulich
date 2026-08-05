@@ -8,7 +8,11 @@ from app.core.config import Settings, get_settings
 from app.core.security import authenticated_user, require_roles
 from app.models.database import get_db
 from app.models.entities import ControlSession, User
-from app.schemas.messages import SessionCameraSelect, SessionCreate
+from app.schemas.messages import (
+    SessionCameraSelect,
+    SessionCreate,
+    SessionVideoProfileSelect,
+)
 from app.services.hub import CameraSourceRuntime, SessionRuntime, hub
 from app.services.media import create_media_token, create_spectator_media_token
 
@@ -219,6 +223,50 @@ async def select_robot_camera(
             configuration,
             timeout_seconds=8,
         )
+
+
+_CONFIGURATION_FIELDS = (
+    "device_ip",
+    "video_source_type",
+    "video_source",
+    "video_profile",
+    "rtsp_transport",
+    "camera_label",
+    "audio_source_type",
+    "audio_source",
+    "microphone_label",
+    "audio_output_type",
+    "audio_output",
+    "speaker_label",
+)
+
+
+async def robot_video_profile(robot_id: str) -> dict:
+    return await hub.request_robot(
+        robot_id,
+        "configuration.get",
+        {},
+        timeout_seconds=5,
+    )
+
+
+async def select_robot_video_profile(
+    session: SessionRuntime, video_profile: str
+) -> dict:
+    current = await robot_video_profile(session.robot_id)
+    configuration = {
+        key: current[key]
+        for key in _CONFIGURATION_FIELDS
+        if key in current
+    }
+    configuration["video_profile"] = video_profile
+    configuration["session_id"] = session.session_id
+    return await hub.request_robot(
+        session.robot_id,
+        "configuration.update",
+        configuration,
+        timeout_seconds=5,
+    )
 
 
 @router.post("")
@@ -453,6 +501,70 @@ async def select_session_camera(
         sources.index(selected),
         detailed=actor.role in {"admin", "operator"},
     )
+
+
+@router.get("/{session_id}/video-profile")
+async def session_video_profile(
+    session_id: str,
+    actor: User = Depends(authenticated_user),
+    database: Session = Depends(get_db),
+) -> dict:
+    session = hub.get_session(session_id)
+    owner = session_owner(database, session) if session else None
+    if session is None or not can_view_session(actor, owner, session):
+        raise HTTPException(
+            status_code=404, detail="Phiên không tồn tại hoặc đã kết thúc"
+        )
+    try:
+        response = await robot_video_profile(session.robot_id)
+    except ConnectionError as exc:
+        raise HTTPException(status_code=409, detail="Robot đang ngoại tuyến") from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504, detail="Robot không phản hồi chất lượng video"
+        ) from exc
+    return {
+        "robot_id": session.robot_id,
+        "video_profile": str(response.get("video_profile") or "balanced"),
+    }
+
+
+@router.put("/{session_id}/video-profile")
+async def update_session_video_profile(
+    session_id: str,
+    body: SessionVideoProfileSelect,
+    actor: User = Depends(authenticated_user),
+) -> dict:
+    if actor.role not in {"admin", "operator"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Chỉ tài khoản vận hành được đổi chất lượng video",
+        )
+    session = hub.get_session(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Phiên không tồn tại hoặc đã kết thúc",
+        )
+    try:
+        response = await select_robot_video_profile(session, body.video_profile)
+    except ConnectionError as exc:
+        raise HTTPException(status_code=409, detail="Robot đang ngoại tuyến") from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504, detail="Robot không phản hồi thay đổi chất lượng"
+        ) from exc
+    if response.get("ok") is False:
+        raise HTTPException(
+            status_code=502,
+            detail=str(
+                response.get("error") or "Robot không đổi được chất lượng video"
+            ),
+        )
+    return {
+        "robot_id": session.robot_id,
+        "video_profile": str(response.get("video_profile") or body.video_profile),
+    }
 
 
 @router.get("/{session_id}")

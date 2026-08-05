@@ -5,13 +5,15 @@ import math
 import os
 import re
 import shutil
+import statistics
 import struct
 import subprocess
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
+from itertools import pairwise
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,25 +23,44 @@ from livekit.rtc._proto import room_pb2 as proto_room
 from simulator.config import SimulatorConfig
 from simulator.media_devices import (
     audio_output_args,
+    discover_v4l2_modes,
     prepare_audio_output,
     prepare_audio_source,
+    select_v4l2_mode,
 )
 
 logger = logging.getLogger("simulator.media")
 VIDEO_FRAME_TIMEOUT_SECONDS = 10
 VIDEO_JITTER_BUFFER_FRAMES = 2
 VIDEO_PIPE_BUFFER_FRAMES = 4
+VIDEO_RUNTIME_PROBE_SECONDS = 2.5
+VIDEO_RUNTIME_PROBE_TIMEOUT_SECONDS = 7
+VIDEO_RUNTIME_PROBE_MIN_PACKETS = 6
+VIDEO_FPS_MISMATCH_RATIO = 0.12
+VIDEO_CADENCE_JITTER_RATIO = 0.35
+ENCODED_VIDEO_STARTUP_TIMEOUT_SECONDS = 8.0
+ENCODED_VIDEO_STALL_TIMEOUT_SECONDS = 3.0
+ENCODED_VIDEO_HEALTHY_RESET_SECONDS = 10.0
+ENCODED_VIDEO_RATE_WINDOW_SECONDS = 5.0
+ENCODED_VIDEO_MIN_RATE_RATIO = 0.65
+ENCODED_VIDEO_MAX_DEGRADE_LEVEL = 2
 VIDEO_PACER_BASE_BITRATE = 8_000_000
 VIDEO_PACER_MAX_BITRATE = 20_000_000
 VIDEO_PACER_FRAME_FRACTION_MS = 750
 VIDEO_PACER_MIN_LATENCY_MS = 12
 VIDEO_PACER_MAX_LATENCY_MS = 35
 UNRELIABLE_RTSP_FPS = 20
-AUDIO_PLAYBACK_BUFFER_FRAMES = 4
-AUDIO_DEVICE_BUFFER_MS = 60
-AUDIO_DEVICE_PERIOD_MS = 20
+AUDIO_PLAYBACK_BUFFER_FRAMES = 2
+AUDIO_DEVICE_BUFFER_MS = 40
+AUDIO_DEVICE_PERIOD_MS = 10
 AUDIO_PULSE_CAPTURE_LATENCY_MS = 20
 AUDIO_PULSE_CAPTURE_PROCESS_MS = 10
+AUDIO_LIVEKIT_QUEUE_MS = 40
+AUDIO_FRAME_MS = 10
+AUDIO_FRAME_SAMPLES = 480
+AUDIO_FRAME_BYTES = AUDIO_FRAME_SAMPLES * 2
+AUDIO_CAPTURE_STALL_TIMEOUT_SECONDS = 2.0
+AUDIO_PLAYBACK_WRITE_TIMEOUT_SECONDS = 0.15
 
 _V4L2_FOURCC_TO_FFMPEG = {
     "AVC1": "h264",
@@ -84,6 +105,7 @@ class EncodedVideoPlan:
     source_bitrate: int = 0
     output_width: int = 0
     output_height: int = 0
+    source_timing_reliable: bool = True
 
 
 @dataclass(frozen=True)
@@ -100,6 +122,37 @@ class SourceVideoProbe:
     has_b_frames: bool = False
     timing_reliable: bool = True
     timing_reason: str = ""
+    measured_fps: Fraction | None = None
+    packet_count: int = 0
+    repeated_timestamps: int = 0
+    backward_timestamps: int = 0
+    median_frame_interval_ms: float = 0.0
+    p95_frame_interval_ms: float = 0.0
+    frame_interval_jitter_ms: float = 0.0
+    measured_bitrate: int = 0
+    largest_access_unit: int = 0
+    largest_keyframe: int = 0
+    cadence_bursty: bool = False
+    passthrough_safe: bool = False
+
+    @property
+    def effective_fps(self) -> Fraction | None:
+        return self.measured_fps or self.fps
+
+
+@dataclass
+class EncodedPipelineProgress:
+    """Progress reported by the native publisher for edge-side watchdogs."""
+
+    started_at: float
+    received: int = 0
+    published: int = 0
+    last_received_at: float = 0.0
+    last_published_at: float = 0.0
+
+    @property
+    def last_progress_at(self) -> float:
+        return max(self.last_received_at, self.last_published_at)
 
 
 @dataclass(frozen=True)
@@ -137,6 +190,147 @@ def parse_ffprobe_fraction(value: object) -> Fraction | None:
     except (ValueError, ZeroDivisionError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _positive_int(value: object) -> int:
+    try:
+        parsed = int(str(value or "0"))
+    except ValueError:
+        return 0
+    return max(0, parsed)
+
+
+def _timestamp_values(
+    packets: list[dict[str, object]], field: str
+) -> list[float]:
+    values: list[float] = []
+    for packet in packets:
+        try:
+            value = float(str(packet.get(field, "")))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return values
+
+
+def analyze_runtime_video_packets(
+    packets: list[dict[str, object]],
+    metadata_fps: Fraction | None,
+) -> dict[str, object]:
+    """Measure source cadence from demuxed access units, not FPS metadata.
+
+    ffprobe emits one packet per compressed access unit for the selected video
+    stream. DTS is used for cadence when available because B-frames can reorder
+    PTS; PTS is still checked independently for duplicates and regressions.
+    """
+    pts = _timestamp_values(packets, "pts_time")
+    dts = _timestamp_values(packets, "dts_time")
+    repeated = sum(
+        math.isclose(current, previous, abs_tol=1e-6)
+        for previous, current in pairwise(pts)
+    )
+    backwards = sum(
+        current < previous - 1e-6
+        for previous, current in pairwise(pts)
+    )
+
+    cadence_timestamps = dts if len(dts) >= 2 else pts
+    intervals = [
+        current - previous
+        for previous, current in pairwise(cadence_timestamps)
+        if current > previous + 1e-6
+    ]
+    median_interval = statistics.median(intervals) if intervals else 0.0
+    sorted_intervals = sorted(intervals)
+    p95_interval = (
+        sorted_intervals[math.ceil(len(sorted_intervals) * 0.95) - 1]
+        if sorted_intervals
+        else 0.0
+    )
+    jitter = statistics.pstdev(intervals) if len(intervals) >= 2 else 0.0
+    measured_fps = None
+    if intervals and sum(intervals) > 0:
+        measured_fps = Fraction(len(intervals) / sum(intervals)).limit_denominator(
+            1001
+        )
+
+    tiny_intervals = (
+        sum(interval < median_interval * 0.35 for interval in intervals)
+        if median_interval > 0
+        else 0
+    )
+    cadence_bursty = bool(
+        median_interval > 0
+        and (
+            p95_interval > median_interval * 2.5
+            or jitter > median_interval * VIDEO_CADENCE_JITTER_RATIO
+            or tiny_intervals > max(1, len(intervals) // 5)
+        )
+    )
+
+    reasons: list[str] = []
+    if len(packets) < VIDEO_RUNTIME_PROBE_MIN_PACKETS:
+        reasons.append("runtime-sample-too-short")
+    if len(intervals) < VIDEO_RUNTIME_PROBE_MIN_PACKETS - 1:
+        reasons.append("timestamps-missing")
+    if repeated:
+        reasons.append("timestamp-repeated")
+    if backwards:
+        reasons.append("timestamp-backwards")
+    if measured_fps is None or measured_fps > 60 or measured_fps < 1:
+        reasons.append("measured-fps-invalid")
+    elif metadata_fps is None:
+        reasons.append("metadata-fps-missing")
+    else:
+        mismatch = abs(float(measured_fps - metadata_fps))
+        if mismatch > max(2.0, float(metadata_fps) * VIDEO_FPS_MISMATCH_RATIO):
+            reasons.append("metadata-fps-mismatch")
+    if cadence_bursty:
+        reasons.append("cadence-bursty")
+
+    duration = sum(intervals)
+    total_bytes = sum(_positive_int(packet.get("size")) for packet in packets)
+    measured_bitrate = round(total_bytes * 8 / duration) if duration > 0 else 0
+    largest_access_unit = max(
+        (_positive_int(packet.get("size")) for packet in packets), default=0
+    )
+    largest_keyframe = max(
+        (
+            _positive_int(packet.get("size"))
+            for packet in packets
+            if "K" in str(packet.get("flags") or "")
+        ),
+        default=0,
+    )
+    return {
+        "measured_fps": measured_fps,
+        "packet_count": len(packets),
+        "repeated_timestamps": repeated,
+        "backward_timestamps": backwards,
+        "median_frame_interval_ms": median_interval * 1000,
+        "p95_frame_interval_ms": p95_interval * 1000,
+        "frame_interval_jitter_ms": jitter * 1000,
+        "measured_bitrate": measured_bitrate,
+        "largest_access_unit": largest_access_unit,
+        "largest_keyframe": largest_keyframe,
+        "cadence_bursty": cadence_bursty,
+        "timing_reliable": not reasons,
+        "timing_reason": ",".join(reasons),
+    }
+
+
+def redact_media_source(value: object, source: str = "") -> str:
+    """Remove RTSP credentials and exact configured URLs from diagnostics."""
+    text = str(value)
+    if source:
+        text = text.replace(source, "<media-source>")
+    return re.sub(
+        r"(rtsps?://)([^/@\s]+)@",
+        r"\1<redacted>@",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def bounded_video_dimensions(
@@ -255,11 +449,20 @@ class MediaPublisher:
         self._camera_profile_key: tuple[object, ...] | None = None
         self._camera_profile: CameraCaptureProfile | None = None
         self._encoder_cache: tuple[str, str] | None = None
+        self._failed_video_encoders: set[str] = set()
+        self._video_degrade_level = 0
         self._vaapi_rate_control = "auto"
         self._vaapi_low_power = False
         self._video_plan_lock = threading.Lock()
         self._prepared_video_key: tuple[object, ...] | None = None
         self._prepared_video_plan: EncodedVideoPlan | None = None
+        self._rtsp_selected_transport = ""
+        self._operator_audio_frames: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=AUDIO_PLAYBACK_BUFFER_FRAMES
+        )
+        self.aec_active = False
+        self.audio_capture_healthy = False
+        self.audio_playback_healthy = False
 
     async def connect(self) -> None:
         if not self.config.media_enabled:
@@ -406,6 +609,8 @@ class MediaPublisher:
                 and self._prepared_video_plan is not None
             ):
                 return self._prepared_video_plan
+            if self._prepared_video_key != key:
+                self._rtsp_selected_transport = ""
             plan = self._build_encoded_video_plan()
             self._prepared_video_key = key
             self._prepared_video_plan = plan
@@ -469,20 +674,56 @@ class MediaPublisher:
             self.config.video_width,
             self.config.video_height,
         )
+        support_level = "A"
+        if reasons:
+            support_level = "B"
+            # Decode/encode is best effort on Pi 5. Start from a bounded 720p20
+            # profile even when the selected display profile is 1080p; a clean
+            # H.264 passthrough may still keep its native 1080p resolution.
+            output_width, output_height = bounded_video_dimensions(
+                output_width,
+                output_height,
+                1280,
+                720,
+            )
+        if reasons and (
+            probe.width > 1920
+            or probe.height > 1080
+            or (probe.codec != "h264" and probe.bitrate > 12_000_000)
+        ):
+            support_level = "C"
+            logger.error(
+                "video profile support=C reason=transcode-over-pi5-budget "
+                "codec=%s source=%dx%d bitrate=%d recommendation=h264-substream-720p",
+                probe.codec,
+                probe.width,
+                probe.height,
+                probe.bitrate,
+            )
+        if self._video_degrade_level:
+            scale = 0.75 ** self._video_degrade_level
+            output_width = max(
+                min(640, output_width), round(output_width * scale / 2) * 2
+            )
+            output_height = max(
+                min(360, output_height), round(output_height * scale / 2) * 2
+            )
         target_fps = Fraction(self.config.video_fps, 1)
+        if reasons:
+            target_fps = min(target_fps, Fraction(20, 1))
         if not reasons:
-            # USB H.264 goes straight from V4L2 to LiveKit. RTSP/file H.264
-            # crosses a zero-copy FFmpeg MPEG-TS bridge: this repairs access-unit
-            # boundaries without decoding while keeping vendor compatibility.
+            # USB and RTSP H.264 go straight through one GStreamer pipeline.
+            # Files still need FFmpeg to demux arbitrary containers, but are
+            # emitted as Annex-B H.264 without the old MPEG-TS mux/demux loop.
             mode = (
                 "direct"
-                if self.config.simulator_media_source_type == "camera"
+                if self.config.simulator_media_source_type in {"camera", "rtsp"}
                 else "bridge"
             )
-            passthrough_fps = probe.fps or target_fps
+            passthrough_fps = probe.effective_fps or target_fps
             logger.info(
-                "video route mode=%s codec=h264 copy=true fps=%s size=%dx%d "
-                "bitrate=%d",
+                "video route support=A mode=%s codec=h264 copy=true fps=%s "
+                "size=%dx%d bitrate=%d",
                 mode,
                 fps_text(passthrough_fps),
                 probe.width,
@@ -498,10 +739,11 @@ class MediaPublisher:
                 source_bitrate=probe.bitrate,
                 output_width=probe.width,
                 output_height=probe.height,
+                source_timing_reliable=probe.timing_reliable,
             )
 
-        if probe.fps is not None and probe.timing_reliable:
-            output_fps = min(probe.fps, target_fps)
+        if probe.effective_fps is not None:
+            output_fps = min(probe.effective_fps, target_fps)
         elif (
             self.config.simulator_media_source_type == "rtsp"
             and not probe.timing_reliable
@@ -513,8 +755,24 @@ class MediaPublisher:
             output_fps = min(target_fps, Fraction(UNRELIABLE_RTSP_FPS, 1))
         else:
             output_fps = target_fps
+        if self._video_degrade_level:
+            output_fps = max(
+                Fraction(10, 1),
+                Fraction(
+                    round(float(output_fps) * (0.8 ** self._video_degrade_level)),
+                    1,
+                ),
+            )
+            logger.warning(
+                "video profile reduced to preserve realtime level=%d output=%dx%d@%s",
+                self._video_degrade_level,
+                output_width,
+                output_height,
+                fps_text(output_fps),
+            )
         logger.info(
-            "video route transcode=true codec=%s reason=%s output=%dx%d@%s",
+            "video route support=%s transcode=true codec=%s reason=%s output=%dx%d@%s",
+            support_level,
             probe.codec,
             ",".join(reasons),
             output_width,
@@ -543,11 +801,12 @@ class MediaPublisher:
             probe.codec,
             encoder,
             binary,
-            source_fps=probe.fps,
+            source_fps=probe.effective_fps,
             output_fps=output_fps,
             source_bitrate=probe.bitrate,
             output_width=output_width,
             output_height=output_height,
+            source_timing_reliable=probe.timing_reliable,
         )
 
     def _video_transcode_reasons(self, probe: SourceVideoProbe) -> list[str]:
@@ -559,11 +818,13 @@ class MediaPublisher:
         if self.config.simulator_media_source_type == "rtsp":
             if self.config.rtsp_normalize:
                 reasons.append("normalize-forced")
-            elif self.config.rtsp_auto_normalize and not probe.timing_reliable:
+            elif not probe.timing_reliable:
                 reasons.append(probe.timing_reason or "timing-unreliable")
+        if probe.has_b_frames:
+            reasons.append("b-frames-require-normalization")
         if probe.width > self.config.video_width or probe.height > self.config.video_height:
             reasons.append("profile-resolution")
-        if probe.fps is not None and probe.fps > 30:
+        if probe.effective_fps is not None and probe.effective_fps > 30:
             reasons.append("profile-fps")
         maximum_passthrough_bitrate = max(
             self.config.video_bitrate * 3 // 2,
@@ -587,11 +848,15 @@ class MediaPublisher:
         kind = self.config.simulator_media_source_type
         if kind == "camera":
             profile = self._camera_capture_profile_for_source()
-            return SourceVideoProbe(
+            probe = SourceVideoProbe(
                 codec=profile.source_codec,
                 width=profile.width,
                 height=profile.height,
                 fps=profile.fps,
+            )
+            return replace(
+                probe,
+                passthrough_safe=not self._video_transcode_reasons(probe),
             )
 
         if kind not in {"rtsp", "file"}:
@@ -599,16 +864,37 @@ class MediaPublisher:
         if shutil.which("ffprobe") is None:
             raise RuntimeError("ffprobe is required to inspect the video source")
         if kind == "rtsp":
-            input_args = [
-                "-rtsp_transport",
-                self.config.rtsp_transport,
-                "-i",
-                self._resolved_rtsp_source(),
-            ]
+            configured = self.config.rtsp_transport.strip().lower()
+            transports = (
+                [self._rtsp_selected_transport]
+                if self._rtsp_selected_transport
+                else (["udp", "tcp"] if configured == "auto" else [configured])
+            )
         else:
-            input_args = ["-i", self.config.simulator_media_source]
-        try:
-            result = subprocess.run(
+            transports = [""]
+        runtime_args = (
+            [
+                "-read_intervals",
+                f"%+{VIDEO_RUNTIME_PROBE_SECONDS}",
+                "-show_packets",
+            ]
+            if kind == "rtsp"
+            else []
+        )
+        result: subprocess.CompletedProcess[str] | None = None
+        for transport in transports:
+            input_args = (
+                [
+                    "-rtsp_transport",
+                    transport,
+                    "-i",
+                    self._resolved_rtsp_source(),
+                ]
+                if kind == "rtsp"
+                else ["-i", self.config.simulator_media_source]
+            )
+            try:
+                attempt = subprocess.run(
                 [
                     "ffprobe",
                     "-v",
@@ -616,10 +902,12 @@ class MediaPublisher:
                     *input_args,
                     "-select_streams",
                     "v:0",
+                    *runtime_args,
                     "-show_entries",
                     (
                         "stream=codec_name,width,height,pix_fmt,profile,"
-                        "avg_frame_rate,r_frame_rate,bit_rate,has_b_frames"
+                        "avg_frame_rate,r_frame_rate,bit_rate,has_b_frames:"
+                        "packet=pts_time,dts_time,duration_time,size,flags"
                     ),
                     "-of",
                     "json",
@@ -627,18 +915,29 @@ class MediaPublisher:
                 capture_output=True,
                 check=False,
                 text=True,
-                timeout=8,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("video source codec probe timed out") from exc
+                timeout=VIDEO_RUNTIME_PROBE_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                attempt = None
+            if attempt is not None:
+                result = attempt
+                if attempt.returncode == 0:
+                    if kind == "rtsp":
+                        self._rtsp_selected_transport = transport
+                        logger.info("RTSP transport selected transport=%s", transport)
+                    break
+            if kind == "rtsp" and transport == "udp" and len(transports) > 1:
+                logger.warning("RTSP UDP probe failed; falling back transport=tcp")
+        if result is None:
+            raise RuntimeError("video source runtime probe timed out")
         try:
             payload = json.loads(result.stdout or "{}")
             stream = payload.get("streams", [])[0]
         except (IndexError, KeyError, TypeError, json.JSONDecodeError):
             stream = None
         if result.returncode != 0 or not isinstance(stream, dict):
-            detail = result.stderr.strip().replace(
-                self.config.simulator_media_source, "<media-source>"
+            detail = redact_media_source(
+                result.stderr.strip(), self.config.simulator_media_source
             )
             raise RuntimeError(
                 f"cannot detect video source codec: {detail[-300:] or 'no video stream'}"
@@ -652,41 +951,81 @@ class MediaPublisher:
         fps = average_fps or advertised_fps
         timing_reliable = True
         timing_reason = ""
+        runtime: dict[str, object] = {}
+        if kind == "rtsp":
+            raw_packets = payload.get("packets", [])
+            packets = (
+                [item for item in raw_packets if isinstance(item, dict)]
+                if isinstance(raw_packets, list)
+                else []
+            )
+            runtime = analyze_runtime_video_packets(packets, fps)
+            timing_reliable = bool(runtime["timing_reliable"])
+            timing_reason = str(runtime["timing_reason"])
         if kind == "rtsp" and (fps is None or fps > 60):
             timing_reliable = False
-            timing_reason = (
+            metadata_reason = (
                 "timing-missing" if fps is None else "timing-out-of-range"
+            )
+            timing_reason = ",".join(
+                reason for reason in (metadata_reason, timing_reason) if reason
             )
             fps = None
 
-        def positive_int(value: object) -> int:
-            try:
-                parsed = int(str(value or "0"))
-            except ValueError:
-                return 0
-            return max(0, parsed)
-
         probe = SourceVideoProbe(
             codec=codec,
-            width=positive_int(stream.get("width")),
-            height=positive_int(stream.get("height")),
+            width=_positive_int(stream.get("width")),
+            height=_positive_int(stream.get("height")),
             fps=fps,
-            bitrate=positive_int(stream.get("bit_rate")),
+            bitrate=(
+                _positive_int(stream.get("bit_rate"))
+                or int(runtime.get("measured_bitrate", 0))
+            ),
             pixel_format=str(stream.get("pix_fmt") or "").strip().lower(),
             profile=str(stream.get("profile") or "").strip(),
-            has_b_frames=positive_int(stream.get("has_b_frames")) > 0,
+            has_b_frames=_positive_int(stream.get("has_b_frames")) > 0,
             timing_reliable=timing_reliable,
             timing_reason=timing_reason,
+            measured_fps=runtime.get("measured_fps"),  # type: ignore[arg-type]
+            packet_count=int(runtime.get("packet_count", 0)),
+            repeated_timestamps=int(runtime.get("repeated_timestamps", 0)),
+            backward_timestamps=int(runtime.get("backward_timestamps", 0)),
+            median_frame_interval_ms=float(
+                runtime.get("median_frame_interval_ms", 0.0)
+            ),
+            p95_frame_interval_ms=float(
+                runtime.get("p95_frame_interval_ms", 0.0)
+            ),
+            frame_interval_jitter_ms=float(
+                runtime.get("frame_interval_jitter_ms", 0.0)
+            ),
+            measured_bitrate=int(runtime.get("measured_bitrate", 0)),
+            largest_access_unit=int(runtime.get("largest_access_unit", 0)),
+            largest_keyframe=int(runtime.get("largest_keyframe", 0)),
+            cadence_bursty=bool(runtime.get("cadence_bursty", False)),
+        )
+        probe = replace(
+            probe,
+            passthrough_safe=not self._video_transcode_reasons(probe),
         )
         logger.info(
-            "video source probe kind=%s codec=%s size=%dx%d fps=%s bitrate=%d "
-            "pix_fmt=%s profile=%s b_frames=%s timing=%s",
+            "video source probe kind=%s codec=%s size=%dx%d metadata_fps=%s "
+            "measured_fps=%s packets=%d interval_median_ms=%.2f "
+            "interval_p95_ms=%.2f jitter_ms=%.2f bitrate=%d largest_au=%d "
+            "largest_keyframe=%d pix_fmt=%s profile=%s b_frames=%s timing=%s",
             kind,
             probe.codec,
             probe.width,
             probe.height,
             fps_text(probe.fps) if probe.fps else "unknown",
+            fps_text(probe.measured_fps) if probe.measured_fps else "unknown",
+            probe.packet_count,
+            probe.median_frame_interval_ms,
+            probe.p95_frame_interval_ms,
+            probe.frame_interval_jitter_ms,
             probe.bitrate,
+            probe.largest_access_unit,
+            probe.largest_keyframe,
             probe.pixel_format or "unknown",
             probe.profile or "unknown",
             probe.has_b_frames,
@@ -708,6 +1047,9 @@ class MediaPublisher:
             self.config.simulator_camera_width,
             self.config.simulator_camera_height,
             self.config.simulator_camera_fps,
+            self.config.video_width,
+            self.config.video_height,
+            self.config.video_fps,
         )
         if self._camera_profile_key == key and self._camera_profile is not None:
             return self._camera_profile
@@ -717,7 +1059,24 @@ class MediaPublisher:
         if not requested_fourcc and len(requested_format) == 4:
             requested_fourcc = requested_format.upper()
         v4l2_binary = shutil.which("v4l2-ctl")
-        if v4l2_binary and not requested_format:
+        target_width = self.config.simulator_camera_width or self.config.video_width
+        target_height = self.config.simulator_camera_height or self.config.video_height
+        target_fps = self.config.simulator_camera_fps or self.config.video_fps
+        selected_mode = None
+        if v4l2_binary:
+            selected_mode = select_v4l2_mode(
+                discover_v4l2_modes(device),
+                target_width,
+                target_height,
+                target_fps,
+                requested_format,
+            )
+        if selected_mode:
+            requested_fourcc = str(selected_mode["fourcc"])
+            target_width = int(selected_mode["width"])
+            target_height = int(selected_mode["height"])
+            target_fps = float(selected_mode["fps"])
+        elif v4l2_binary and not requested_format:
             requested_fourcc = self._preferred_camera_fourcc(v4l2_binary, device)
         fallback_format = (
             _V4L2_FOURCC_TO_FFMPEG.get(requested_fourcc, requested_format)
@@ -727,9 +1086,9 @@ class MediaPublisher:
         fallback = CameraCaptureProfile(
             device=device,
             input_format=fallback_format,
-            width=self.config.simulator_camera_width,
-            height=self.config.simulator_camera_height,
-            fps=Fraction(self.config.simulator_camera_fps, 1),
+            width=target_width,
+            height=target_height,
+            fps=Fraction(str(target_fps)).limit_denominator(1001),
         )
         profile = fallback
         if v4l2_binary:
@@ -745,9 +1104,9 @@ class MediaPublisher:
             "camera capture negotiated device=%s requested=%dx%d@%d format=%s "
             "actual=%dx%d@%s format=%s",
             device,
-            self.config.simulator_camera_width,
-            self.config.simulator_camera_height,
-            self.config.simulator_camera_fps,
+            target_width,
+            target_height,
+            round(target_fps),
             requested_format or "auto",
             profile.width,
             profile.height,
@@ -785,9 +1144,10 @@ class MediaPublisher:
         fallback: CameraCaptureProfile,
         requested_fourcc: str,
     ) -> CameraCaptureProfile:
+        self._stabilize_camera_frame_timing(v4l2_binary, fallback.device)
         format_fields = [
-            f"width={self.config.simulator_camera_width}",
-            f"height={self.config.simulator_camera_height}",
+            f"width={fallback.width}",
+            f"height={fallback.height}",
         ]
         if requested_fourcc:
             format_fields.append(f"pixelformat={requested_fourcc}")
@@ -800,7 +1160,7 @@ class MediaPublisher:
                     "--set-fmt-video",
                     ",".join(format_fields),
                     "--set-parm",
-                    str(self.config.simulator_camera_fps),
+                    fps_text(fallback.fps),
                 ],
                 capture_output=True,
                 check=False,
@@ -854,6 +1214,55 @@ class MediaPublisher:
             )
         return profile
 
+    @staticmethod
+    def _stabilize_camera_frame_timing(v4l2_binary: str, device: str) -> None:
+        """Prevent auto exposure from silently lowering a USB camera's FPS."""
+        try:
+            controls = subprocess.run(
+                [v4l2_binary, "--device", device, "--list-ctrls"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=3,
+            )
+            if controls.returncode != 0 or not re.search(
+                r"^\s*exposure_dynamic_framerate\b",
+                controls.stdout,
+                re.MULTILINE,
+            ):
+                return
+            result = subprocess.run(
+                [
+                    v4l2_binary,
+                    "--device",
+                    device,
+                    "--set-ctrl=exposure_dynamic_framerate=0",
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.debug(
+                "camera frame-timing control unavailable device=%s error=%s",
+                device,
+                exc,
+            )
+            return
+        if result.returncode == 0:
+            logger.info(
+                "camera frame timing stabilized device=%s "
+                "exposure_dynamic_framerate=0",
+                device,
+            )
+        else:
+            logger.debug(
+                "camera frame-timing control rejected device=%s error=%s",
+                device,
+                result.stderr.strip(),
+            )
+
     def _select_video_encoder(self) -> tuple[str, str]:
         if self._encoder_cache is not None:
             return self._encoder_cache
@@ -881,8 +1290,13 @@ class MediaPublisher:
         candidates = explicit.get(requested)
         if candidates is None:
             raise ValueError(f"unsupported VIDEO_ENCODER: {self.config.video_encoder}")
+        if requested not in {"auto", "software"} and "libx264" not in candidates:
+            candidates = [*candidates, "libx264"]
         failures: list[str] = []
         for encoder in candidates:
+            if encoder in self._failed_video_encoders:
+                failures.append(f"{encoder}: failed during this media session")
+                continue
             binary = "ffmpeg"
             if encoder == "h264_rkmpp":
                 binary = self.config.video_ffmpeg_binary
@@ -995,10 +1409,14 @@ class MediaPublisher:
     def _direct_h264_pipeline(self) -> list[str]:
         kind = self.config.simulator_media_source_type
         if kind == "rtsp":
+            configured_transport = self.config.rtsp_transport.strip().lower()
+            protocols = (
+                "udp+tcp" if configured_transport == "auto" else configured_transport
+            )
             return [
                 "rtspsrc",
                 f"location={self._gst_quote(self._resolved_rtsp_source())}",
-                f"protocols={self.config.rtsp_transport}",
+                f"protocols={protocols}",
                 # Keep a small RTSP reorder buffer. Dropping an encoded H.264
                 # delta frame corrupts the rest of its GOP, which appears as
                 # scratches until the next keyframe.
@@ -1007,7 +1425,12 @@ class MediaPublisher:
                 # reports. The publisher assigns a fixed RTP frame duration.
                 "buffer-mode=none",
                 "max-ts-offset=0",
-                "drop-on-latency=false",
+                "drop-on-latency=true",
+                # In auto mode rtspsrc starts with UDP and switches to TCP if
+                # no UDP packets arrive. Both timeouts are bounded so a live
+                # socket that stops producing frames reaches the watchdog.
+                "timeout=1500000",
+                "tcp-timeout=3000000",
                 "!",
                 "rtph264depay",
                 "request-keyframe=true",
@@ -1040,9 +1463,9 @@ class MediaPublisher:
     def _bridge_h264_pipeline(
         self, plan: EncodedVideoPlan | None = None
     ) -> list[str]:
-        # Decouple the two native processes without preserving a full second of
-        # stale pictures. Four to five access units cover normal 25/30 fps TCP
-        # bursts while back-pressure keeps encoded GOPs intact.
+        # Decouple the two native processes without another container/demuxer.
+        # The queue is bounded; if it stops draining the watchdog restarts both
+        # processes instead of allowing an encoded GOP backlog to grow.
         queue_frames = max(
             2,
             min(6, math.ceil(float(self._publisher_video_fps(plan)) * 0.16)),
@@ -1050,11 +1473,6 @@ class MediaPublisher:
         return [
             "fdsrc",
             "fd=0",
-            "!",
-            "tsdemux",
-            # tsdemux defaults to 700 ms, which made an otherwise smooth USB
-            # camera arrive almost one second late after the browser buffer.
-            "latency=0",
             "!",
             "queue",
             # Back-pressure is intentional: dropping an H.264 delta frame
@@ -1088,7 +1506,7 @@ class MediaPublisher:
             "--pacer-max-latency-ms",
             str(video_pacer_max_latency_ms(fps)),
             "--video-fps",
-            str(max(1, round(float(fps)))),
+            fps_text(fps),
             "--",
             *pipeline,
         ]
@@ -1136,9 +1554,9 @@ class MediaPublisher:
         output_fps: Fraction | None = None,
     ) -> list[str]:
         selected_fps = output_fps or Fraction(self.config.video_fps, 1)
-        # A one-second VBV can preserve a full second of stale video after a
-        # motion burst. A 250 ms window still covers normal IDRs while bounding
-        # the encoder/pacer latency for live control.
+        # Hardware encoders keep a short 250 ms rate-control window. This is a
+        # bitrate model, not a frame queue; actual media latency is bounded by
+        # async_depth, B-frames and the downstream latest-wins queues.
         vbv_buffer = max(250_000, self.config.video_bitrate // 4)
         common = [
             "-g",
@@ -1208,12 +1626,26 @@ class MediaPublisher:
             str(vbv_buffer),
         ]
         if encoder == "libx264":
+            # A 250 ms VBV makes each one-second IDR consume most of the
+            # available budget and visibly starves the following P-frames.
+            # A 500 ms model evens out QP without adding frame lookahead or an
+            # encoder queue; zerolatency and bf=0 still emit each frame at once.
+            software_vbv_buffer = max(500_000, self.config.video_bitrate // 2)
             return [
                 "-preset",
-                "ultrafast",
+                "superfast",
                 "-tune",
                 "zerolatency",
-                *rate_control,
+                "-b:v",
+                str(self.config.video_bitrate),
+                "-maxrate",
+                str(self.config.video_bitrate),
+                "-bufsize",
+                str(software_vbv_buffer),
+                "-qcomp",
+                "0.75",
+                "-x264-params",
+                "scenecut=0:force-cfr=1",
                 *common,
             ]
         return [*rate_control, *common]
@@ -1234,7 +1666,14 @@ class MediaPublisher:
                 raise RuntimeError("/dev/dri/renderD* disappeared")
             render_device = str(render_devices[0])
             command.extend(["-vaapi_device", render_device])
-        command.extend([*self._video_input_args(), "-map", "0:v:0", "-an"])
+        command.extend(
+            [
+                *self._video_input_args(preserve_timestamps=plan.encoder == "copy"),
+                "-map",
+                "0:v:0",
+                "-an",
+            ]
+        )
 
         if plan.encoder == "copy":
             command.extend(
@@ -1248,7 +1687,7 @@ class MediaPublisher:
                     f"fps=fps={fps_text(output_fps)}:round=down:eof_action=pass"
                 )
             elif self.config.simulator_media_source_type == "rtsp":
-                if plan.source_fps is None:
+                if not plan.source_timing_reliable:
                     # Some ONVIF cameras advertise values such as 100 FPS while
                     # actually producing about 20-25 FPS. Rebase those frames
                     # from their arrival clock before fps normalization; using
@@ -1279,7 +1718,7 @@ class MediaPublisher:
             output_height = plan.output_height or self.config.video_height
             filters = (
                 f"{cadence_filter},"
-                f"scale={output_width}:{output_height}:flags=fast_bilinear"
+                f"scale={output_width}:{output_height}:flags=bicubic"
             )
             # USB MJPEG cameras commonly decode to YUV 4:2:2. WebRTC H.264
             # decoders are most reliable on 4:2:0, and leaving x264 on the
@@ -1303,40 +1742,36 @@ class MediaPublisher:
             # The fps filter already owns cadence. Do not let the output layer
             # duplicate frames and recreate a stale queue after the encoder.
             command.extend(["-fps_mode", "passthrough"])
-        command.extend(
-            [
-                "-muxdelay",
-                "0",
-                "-muxpreload",
-                "0",
-                # Send each muxed frame into the OS pipe immediately instead
-                # of waiting for FFmpeg's AVIO buffer to fill on quiet scenes.
-                "-flush_packets",
-                "1",
-                "-mpegts_flags",
-                "+resend_headers+initial_discontinuity",
-                "-f",
-                "mpegts",
-                "pipe:1",
-            ]
-        )
+        command.extend(["-f", "h264", "pipe:1"])
         return command
 
     async def _encoded_video_loop(self, plan: EncodedVideoPlan) -> None:
         delay = 1.0
+        refresh_plan = False
         while True:
             processes: list[asyncio.subprocess.Process] = []
             output_tasks: list[asyncio.Task[str]] = []
             process_names: list[str] = []
             token = ""
+            progress = EncodedPipelineProgress(time.monotonic())
+            child_exited = ""
+            keyframe_reconnect = False
             try:
+                if refresh_plan:
+                    with self._video_plan_lock:
+                        self._prepared_video_key = None
+                        self._prepared_video_plan = None
+                    plan = await asyncio.to_thread(self._prepare_encoded_video)
+                    refresh_plan = False
                 assert self.token_provider is not None
                 token = await self.token_provider("video")
                 if plan.mode == "direct":
                     command = self._publisher_command(
                         token, self._direct_h264_pipeline(), plan
                     )
-                    process, output_task = await self._start_media_process(command)
+                    process, output_task = await self._start_media_process(
+                        command, progress
+                    )
                     processes.append(process)
                     output_tasks.append(output_task)
                     process_names.append("publisher")
@@ -1348,6 +1783,7 @@ class MediaPublisher:
                     ) = await self._start_bridge_media_processes(
                         token,
                         plan,
+                        progress,
                     )
 
                 logger.info(
@@ -1360,12 +1796,21 @@ class MediaPublisher:
                     video_pacer_max_latency_ms(self._publisher_video_fps(plan)),
                 )
                 waiters = [asyncio.create_task(process.wait()) for process in processes]
+                watchdog = asyncio.create_task(
+                    self._watch_encoded_video_progress(progress, processes, plan)
+                )
                 done, pending = await asyncio.wait(
-                    waiters, return_when=asyncio.FIRST_COMPLETED
+                    [*waiters, watchdog], return_when=asyncio.FIRST_COMPLETED
                 )
                 for waiter in pending:
                     waiter.cancel()
-                await asyncio.gather(*waiters, return_exceptions=True)
+                await asyncio.gather(*pending, return_exceptions=True)
+                if watchdog in done:
+                    await watchdog
+                for index, waiter in enumerate(waiters):
+                    if waiter in done:
+                        child_exited = process_names[index]
+                        break
                 exit_codes = [process.returncode for process in processes]
                 for process in reversed(processes):
                     await self._stop_process(process)
@@ -1376,9 +1821,11 @@ class MediaPublisher:
                 for name, item in zip(process_names, details, strict=True):
                     if isinstance(item, str) and item:
                         labeled_details.append(f"{name}: {item[-1600:]}")
-                detail = " | ".join(labeled_details).replace(
-                    token, "<redacted>"
+                detail = redact_media_source(
+                    " | ".join(labeled_details).replace(token, "<redacted>"),
+                    self.config.simulator_media_source,
                 )
+                keyframe_reconnect = "video-keyframe-timeout" in detail
                 raise RuntimeError(
                     f"encoded video child exited codes={exit_codes} "
                     f"detail={detail or 'no detail'}"
@@ -1386,7 +1833,42 @@ class MediaPublisher:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                safe_error = str(exc).replace(token, "<redacted>")
+                if (
+                    "below realtime rate" in str(exc)
+                    and plan.encoder != "copy"
+                    and self._video_degrade_level
+                    < ENCODED_VIDEO_MAX_DEGRADE_LEVEL
+                ):
+                    self._video_degrade_level += 1
+                healthy_run = (
+                    progress.published > 0
+                    and time.monotonic() - progress.started_at
+                    >= ENCODED_VIDEO_HEALTHY_RESET_SECONDS
+                )
+                if healthy_run:
+                    delay = 1.0
+                if (
+                    child_exited == "ffmpeg"
+                    and plan.encoder not in {"copy", "libx264"}
+                ):
+                    self._failed_video_encoders.add(plan.encoder)
+                    self._encoder_cache = None
+                    logger.warning(
+                        "hardware video encoder failed; selecting fallback encoder=%s",
+                        plan.encoder,
+                    )
+                if keyframe_reconnect:
+                    # PLI/FIR recovery intentionally reconnects the existing
+                    # source. It is not a source/encoder failure, so do not
+                    # increase backoff or spend another probe interval here.
+                    delay = 1.0
+                    refresh_plan = False
+                else:
+                    refresh_plan = True
+                safe_error = redact_media_source(
+                    str(exc).replace(token, "<redacted>"),
+                    self.config.simulator_media_source,
+                )
                 logger.warning(
                     "encoded video unavailable; retrying in %.1fs error=%s",
                     delay,
@@ -1401,12 +1883,95 @@ class MediaPublisher:
                 if output_tasks:
                     await asyncio.gather(*output_tasks, return_exceptions=True)
             await asyncio.sleep(delay)
-            delay = min(15.0, delay * 2)
+            delay = 1.0 if keyframe_reconnect else min(15.0, delay * 2)
+
+    async def _watch_encoded_video_progress(
+        self,
+        progress: EncodedPipelineProgress,
+        processes: list[asyncio.subprocess.Process],
+        plan: EncodedVideoPlan,
+    ) -> None:
+        last_stats_at = progress.started_at
+        previous_received = 0
+        previous_published = 0
+        rate_started_at = 0.0
+        rate_started_published = 0
+        while True:
+            await asyncio.sleep(0.5)
+            if any(process.returncode is not None for process in processes):
+                return
+            now = time.monotonic()
+            if progress.last_progress_at == 0:
+                if now - progress.started_at > ENCODED_VIDEO_STARTUP_TIMEOUT_SECONDS:
+                    raise RuntimeError(
+                        "encoded video watchdog: no access unit received during startup"
+                    )
+                continue
+            if rate_started_at == 0:
+                rate_started_at = now
+                rate_started_published = progress.published
+            elif now - rate_started_at >= ENCODED_VIDEO_RATE_WINDOW_SECONDS:
+                rate_interval = now - rate_started_at
+                published_fps = (
+                    progress.published - rate_started_published
+                ) / rate_interval
+                expected_fps = float(self._publisher_video_fps(plan))
+                if (
+                    progress.published > rate_started_published
+                    and published_fps
+                    < expected_fps * ENCODED_VIDEO_MIN_RATE_RATIO
+                ):
+                    logger.warning(
+                        "encoded video watchdog restart reason=below-realtime-rate "
+                        "route=%s encoder=%s published_fps=%.1f target_fps=%.1f",
+                        plan.mode,
+                        plan.encoder,
+                        published_fps,
+                        expected_fps,
+                    )
+                    raise RuntimeError(
+                        "encoded video watchdog: output below realtime rate"
+                    )
+                rate_started_at = now
+                rate_started_published = progress.published
+            if now - progress.last_progress_at > ENCODED_VIDEO_STALL_TIMEOUT_SECONDS:
+                logger.warning(
+                    "encoded video watchdog restart reason=no-progress route=%s "
+                    "encoder=%s received=%d published=%d last_frame_age_ms=%d",
+                    plan.mode,
+                    plan.encoder,
+                    progress.received,
+                    progress.published,
+                    round((now - progress.last_progress_at) * 1000),
+                )
+                raise RuntimeError("encoded video watchdog: pipeline made no progress")
+            if now - last_stats_at >= 15:
+                interval = max(0.001, now - last_stats_at)
+                logger.info(
+                    "encoded video stats route=%s encoder=%s input_fps=%.1f "
+                    "published_fps=%.1f backlog_frames=%d backlog_ms=%d "
+                    "last_frame_age_ms=%d",
+                    plan.mode,
+                    plan.encoder,
+                    (progress.received - previous_received) / interval,
+                    (progress.published - previous_published) / interval,
+                    max(0, progress.received - progress.published),
+                    round(
+                        max(0, progress.received - progress.published)
+                        * 1000
+                        / max(1.0, float(self._publisher_video_fps(plan)))
+                    ),
+                    round((now - progress.last_progress_at) * 1000),
+                )
+                last_stats_at = now
+                previous_received = progress.received
+                previous_published = progress.published
 
     async def _start_bridge_media_processes(
         self,
         token: str,
         plan: EncodedVideoPlan,
+        progress: EncodedPipelineProgress,
     ) -> tuple[
         list[asyncio.subprocess.Process],
         list[asyncio.Task[str]],
@@ -1444,7 +2009,7 @@ class MediaPublisher:
                         self._capture_stream_output(ffmpeg.stderr)
                     ),
                     asyncio.create_task(
-                        self._capture_stream_output(publisher.stdout)
+                        self._capture_stream_output(publisher.stdout, progress)
                     ),
                 ],
                 ["ffmpeg", "publisher"],
@@ -1461,6 +2026,7 @@ class MediaPublisher:
     @staticmethod
     async def _start_media_process(
         command: list[str],
+        progress: EncodedPipelineProgress,
     ) -> tuple[asyncio.subprocess.Process, asyncio.Task[str]]:
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -1468,27 +2034,50 @@ class MediaPublisher:
             stderr=asyncio.subprocess.STDOUT,
         )
         return process, asyncio.create_task(
-            MediaPublisher._capture_process_output(process)
+            MediaPublisher._capture_process_output(process, progress)
         )
 
     @staticmethod
     async def _capture_process_output(
         process: asyncio.subprocess.Process,
+        progress: EncodedPipelineProgress | None = None,
     ) -> str:
-        return await MediaPublisher._capture_stream_output(process.stdout)
+        return await MediaPublisher._capture_stream_output(process.stdout, progress)
 
     @staticmethod
     async def _capture_stream_output(
         stream: asyncio.StreamReader | None,
+        progress: EncodedPipelineProgress | None = None,
     ) -> str:
         if stream is None:
             return ""
         tail = ""
         while True:
-            chunk = await stream.read(2048)
+            chunk = await stream.readline()
             if not chunk:
                 return tail.strip()
-            tail = (tail + chunk.decode(errors="replace"))[-4000:]
+            line = chunk.decode(errors="replace")
+            if progress is not None:
+                MediaPublisher._update_encoded_progress(progress, line)
+            tail = (tail + line)[-4000:]
+
+    @staticmethod
+    def _update_encoded_progress(
+        progress: EncodedPipelineProgress, line: str
+    ) -> None:
+        match = re.search(
+            r"video-progress\s+received=(\d+)\s+published=(\d+)", line
+        )
+        if not match:
+            return
+        received, published = (int(value) for value in match.groups())
+        now = time.monotonic()
+        if received > progress.received:
+            progress.received = received
+            progress.last_received_at = now
+        if published > progress.published:
+            progress.published = published
+            progress.last_published_at = now
 
     async def _video_loop(self, source: rtc.VideoSource, width: int, height: int) -> None:
         if self.config.simulator_media_source_type != "test":
@@ -1521,7 +2110,7 @@ class MediaPublisher:
             )
         return media_source
 
-    def _video_input_args(self) -> list[str]:
+    def _video_input_args(self, *, preserve_timestamps: bool = False) -> list[str]:
         kind = self.config.simulator_media_source_type
         media_source = self.config.simulator_media_source
         if kind == "file":
@@ -1530,21 +2119,30 @@ class MediaPublisher:
             return ["-stream_loop", "-1", "-re", "-i", media_source]
         if kind == "rtsp":
             media_source = self._resolved_rtsp_source()
+            configured_transport = self.config.rtsp_transport.strip().lower()
+            transport = self._rtsp_selected_transport or (
+                "udp" if configured_transport == "auto" else configured_transport
+            )
             # TCP already guarantees packet order, so a large RTP reorder queue
             # only makes stale video accumulate when decoding briefly falls
             # behind. Keep a small socket/input queue and ask FFmpeg to emit
             # decoded frames as soon as possible.
             low_latency = [
-                "-fflags", "+genpts+discardcorrupt+nobuffer",
+                "-fflags", (
+                    "+discardcorrupt+nobuffer"
+                    if preserve_timestamps
+                    else "+genpts+discardcorrupt+nobuffer"
+                ),
                 "-flags", "low_delay",
                 # Cap input backlog below half a second for common 25/30 fps
                 # cameras. Preserving a larger queue only preserves stale video.
                 "-thread_queue_size", "8",
-                "-use_wallclock_as_timestamps", "1",
-                "-rtsp_transport", self.config.rtsp_transport,
+                "-rtsp_transport", transport,
                 "-buffer_size", "262144",
             ]
-            if self.config.rtsp_transport == "tcp":
+            if not preserve_timestamps:
+                low_latency.extend(["-use_wallclock_as_timestamps", "1"])
+            if transport == "tcp":
                 low_latency.extend([
                     "-max_delay", "0",
                     "-reorder_queue_size", "0",
@@ -1758,7 +2356,14 @@ class MediaPublisher:
     async def _publish_audio(self) -> None:
         assert self.room
         sample_rate, channels = 48_000, 1
-        source = rtc.AudioSource(sample_rate, channels)
+        # The SDK default is a one-second internal queue. That is suitable for
+        # synthesized speech, not telepresence: a short CPU/network stall would
+        # otherwise be replayed long after it is useful.
+        source = rtc.AudioSource(
+            sample_rate,
+            channels,
+            queue_size_ms=AUDIO_LIVEKIT_QUEUE_MS,
+        )
         track = rtc.LocalAudioTrack.create_audio_track("robot-microphone", source)
         await self.room.local_participant.publish_track(
             track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
@@ -1766,7 +2371,12 @@ class MediaPublisher:
         self.tasks.append(asyncio.create_task(self._audio_loop(source, sample_rate, channels)))
 
     async def _audio_loop(self, source: rtc.AudioSource, sample_rate: int, channels: int) -> None:
-        samples = 480
+        samples = AUDIO_FRAME_SAMPLES
+        if self._uses_full_duplex_aec():
+            await self._full_duplex_audio_loop(
+                source, sample_rate, channels, samples
+            )
+            return
         if (
             self.config.simulator_audio_source_type != "silent"
             and self.config.simulator_audio_source
@@ -1778,6 +2388,248 @@ class MediaPublisher:
             frame = rtc.AudioFrame(silence, sample_rate, channels, samples)
             await source.capture_frame(frame)
             await asyncio.sleep(samples / sample_rate)
+
+    def _uses_full_duplex_aec(self) -> bool:
+        return (
+            self.config.simulator_audio_source_type == "device"
+            and bool(self.config.simulator_audio_source)
+            and self.config.simulator_audio_output_type == "device"
+            and bool(self.config.simulator_audio_output)
+        )
+
+    def _audio_duplex_command(self) -> list[str]:
+        """Build one top-level pipeline for capture, render, and AEC reference."""
+        microphone = self.config.simulator_audio_source
+        speaker = self.config.simulator_audio_output
+        capture_error = prepare_audio_source(microphone)
+        playback_error = prepare_audio_output(speaker)
+        if capture_error:
+            raise ValueError(capture_error)
+        if playback_error:
+            raise ValueError(playback_error)
+
+        source_element = "pulsesrc" if microphone.startswith("pulse:") else "alsasrc"
+        source_device = microphone.removeprefix("pulse:")
+        output_args = audio_output_args(speaker)
+        output_format = output_args[1]
+        output_device = output_args[-1]
+        sink_element = "pulsesink" if output_format == "pulse" else "alsasink"
+        caps = "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1"
+        buffer_us = AUDIO_DEVICE_BUFFER_MS * 1000
+        period_us = AUDIO_DEVICE_PERIOD_MS * 1000
+        return [
+            "gst-launch-1.0",
+            "-q",
+            # Render branch. The bounded leaky raw-audio queue discards old PCM
+            # before the echo probe, so the reverse stream represents audio
+            # that is actually about to reach the loudspeaker.
+            "fdsrc",
+            "fd=0",
+            "do-timestamp=true",
+            f"blocksize={AUDIO_FRAME_BYTES}",
+            "!",
+            "rawaudioparse",
+            "use-sink-caps=false",
+            "format=pcm",
+            "pcm-format=s16le",
+            "sample-rate=48000",
+            "num-channels=1",
+            "!",
+            caps,
+            "!",
+            "queue",
+            "max-size-buffers=2",
+            "max-size-bytes=0",
+            "max-size-time=0",
+            "leaky=downstream",
+            "!",
+            "webrtcechoprobe",
+            "name=robot_echo_reference",
+            "!",
+            sink_element,
+            f"device={self._gst_quote(output_device)}",
+            f"buffer-time={buffer_us}",
+            f"latency-time={period_us}",
+            "sync=true",
+            # Capture branch. DSP receives the render reference from the probe
+            # above inside this same top-level GstPipeline.
+            source_element,
+            f"device={self._gst_quote(source_device)}",
+            f"buffer-time={buffer_us}",
+            f"latency-time={period_us}",
+            "do-timestamp=true",
+            "!",
+            caps,
+            "!",
+            "queue",
+            "max-size-buffers=2",
+            "max-size-bytes=0",
+            "max-size-time=0",
+            "leaky=downstream",
+            "!",
+            "webrtcdsp",
+            "probe=robot_echo_reference",
+            "echo-cancel=true",
+            "noise-suppression=true",
+            "gain-control=true",
+            "high-pass-filter=true",
+            "delay-agnostic=true",
+            "!",
+            caps,
+            "!",
+            "fdsink",
+            "fd=1",
+            "sync=false",
+        ]
+
+    @staticmethod
+    def _require_aec_plugins() -> None:
+        if shutil.which("gst-launch-1.0") is None:
+            raise RuntimeError("AEC unavailable: gst-launch-1.0 is missing")
+        for element in ("webrtcechoprobe", "webrtcdsp"):
+            try:
+                result = subprocess.run(
+                    ["gst-inspect-1.0", element],
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                    timeout=4,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RuntimeError(f"AEC unavailable: cannot inspect {element}") from exc
+            if result.returncode != 0:
+                raise RuntimeError(f"AEC unavailable: GStreamer element {element} is missing")
+
+    async def _write_duplex_playback(
+        self, stream: asyncio.StreamWriter
+    ) -> None:
+        silence = bytes(AUDIO_FRAME_BYTES)
+        pending = bytearray()
+        loop = asyncio.get_running_loop()
+        next_write_at = loop.time()
+        while True:
+            # Drain queued far-end frames, but cap retained PCM to the most
+            # recent 20 ms. This prevents a recovered speaker from replaying a
+            # sentence fragment that is no longer live.
+            while True:
+                try:
+                    pending.extend(self._operator_audio_frames.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            if len(pending) > AUDIO_FRAME_BYTES * AUDIO_PLAYBACK_BUFFER_FRAMES:
+                del pending[:-AUDIO_FRAME_BYTES * AUDIO_PLAYBACK_BUFFER_FRAMES]
+                logger.warning("audio playback resync reason=application-backlog")
+            data = bytes(pending[:AUDIO_FRAME_BYTES]) if pending else silence
+            if pending:
+                del pending[:AUDIO_FRAME_BYTES]
+            if len(data) < AUDIO_FRAME_BYTES:
+                data += bytes(AUDIO_FRAME_BYTES - len(data))
+            stream.write(data)
+            await self._drain_audio_stream(stream)
+            self.audio_playback_healthy = True
+            next_write_at += AUDIO_FRAME_MS / 1000
+            now = loop.time()
+            if now - next_write_at > AUDIO_FRAME_MS / 1000:
+                next_write_at = now
+                pending.clear()
+                logger.warning("audio playback resync reason=writer-late")
+            await asyncio.sleep(max(0, next_write_at - loop.time()))
+
+    @staticmethod
+    async def _drain_audio_stream(stream: asyncio.StreamWriter) -> None:
+        """Bound a blocked audio device without asyncio.wait_for's cancel race."""
+        drain_task = asyncio.create_task(stream.drain())
+        try:
+            done, _pending = await asyncio.wait(
+                {drain_task}, timeout=AUDIO_PLAYBACK_WRITE_TIMEOUT_SECONDS
+            )
+            if not done:
+                drain_task.cancel()
+                await asyncio.gather(drain_task, return_exceptions=True)
+                raise TimeoutError("audio playback writer stalled")
+            await drain_task
+        except asyncio.CancelledError:
+            drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
+            raise
+
+    async def _full_duplex_audio_loop(
+        self,
+        source: rtc.AudioSource,
+        sample_rate: int,
+        channels: int,
+        samples: int,
+    ) -> None:
+        delay = 1.0
+        while True:
+            process: asyncio.subprocess.Process | None = None
+            playback_task: asyncio.Task[None] | None = None
+            output_task: asyncio.Task[str] | None = None
+            try:
+                await asyncio.to_thread(self._require_aec_plugins)
+                command = self._audio_duplex_command()
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    limit=AUDIO_FRAME_BYTES * 4,
+                )
+                assert process.stdin and process.stdout
+                output_task = asyncio.create_task(
+                    self._capture_stream_output(process.stderr)
+                )
+                playback_task = asyncio.create_task(
+                    self._write_duplex_playback(process.stdin)
+                )
+                self.aec_active = True
+                logger.info(
+                    "audio processing initialized aec=true ns=true agc=true "
+                    "sample_rate=%d frame_ms=%d device_buffer_ms=%d",
+                    sample_rate,
+                    AUDIO_FRAME_MS,
+                    AUDIO_DEVICE_BUFFER_MS,
+                )
+                while True:
+                    data = await asyncio.wait_for(
+                        process.stdout.readexactly(samples * channels * 2),
+                        timeout=AUDIO_CAPTURE_STALL_TIMEOUT_SECONDS,
+                    )
+                    if source.queued_duration > AUDIO_LIVEKIT_QUEUE_MS / 1000:
+                        source.clear_queue()
+                        logger.warning("audio capture resync reason=livekit-backlog")
+                    await source.capture_frame(
+                        rtc.AudioFrame(data, sample_rate, channels, samples)
+                    )
+                    self.audio_capture_healthy = True
+                    delay = 1.0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                detail = ""
+                if output_task and output_task.done():
+                    result = output_task.result()
+                    detail = f" detail={result[-500:]}" if result else ""
+                logger.warning(
+                    "audio duplex unavailable; retrying in %.1fs aec=false error=%s%s",
+                    delay,
+                    exc,
+                    detail,
+                )
+            finally:
+                self.aec_active = False
+                self.audio_capture_healthy = False
+                self.audio_playback_healthy = False
+                if playback_task:
+                    playback_task.cancel()
+                    await asyncio.gather(playback_task, return_exceptions=True)
+                await self._stop_process(process)
+                if output_task:
+                    if not output_task.done():
+                        output_task.cancel()
+                    await asyncio.gather(output_task, return_exceptions=True)
+            await asyncio.sleep(delay)
+            delay = min(15.0, delay * 2)
 
     async def _ffmpeg_audio_loop(
         self, source: rtc.AudioSource, sample_rate: int, channels: int, samples: int
@@ -1799,10 +2651,17 @@ class MediaPublisher:
                 )
                 assert process.stdout
                 while True:
-                    data = await process.stdout.readexactly(frame_size)
+                    data = await asyncio.wait_for(
+                        process.stdout.readexactly(frame_size),
+                        timeout=AUDIO_CAPTURE_STALL_TIMEOUT_SECONDS,
+                    )
+                    if source.queued_duration > AUDIO_LIVEKIT_QUEUE_MS / 1000:
+                        source.clear_queue()
+                        logger.warning("audio capture resync reason=livekit-backlog")
                     await source.capture_frame(
                         rtc.AudioFrame(data, sample_rate, channels, samples)
                     )
+                    self.audio_capture_healthy = True
                     delay = 1.0
             except asyncio.IncompleteReadError:
                 logger.warning("audio source ended; reconnecting")
@@ -1811,6 +2670,7 @@ class MediaPublisher:
             except Exception as exc:
                 logger.warning("audio source error; retrying error=%s", exc)
             finally:
+                self.audio_capture_healthy = False
                 await self._stop_process(process)
             await asyncio.sleep(delay)
             delay = min(15.0, delay * 2)
@@ -2026,7 +2886,8 @@ class MediaPublisher:
                     if process.stdin is None:
                         raise BrokenPipeError("Audio player stdin unavailable")
                     process.stdin.write(data)
-                    await process.stdin.drain()
+                    await self._drain_audio_stream(process.stdin)
+                    self.audio_playback_healthy = True
                 except asyncio.CancelledError:
                     raise
                 except (BrokenPipeError, ConnectionError, OSError) as exc:
@@ -2044,21 +2905,26 @@ class MediaPublisher:
                     retry_at = time.monotonic() + retry_delay
                     retry_delay = min(15.0, retry_delay * 2)
         finally:
+            self.audio_playback_healthy = False
             await stop_output()
 
     async def _consume_audio(self, track: rtc.AudioTrack) -> None:
         stream = rtc.AudioStream(
             track,
-            capacity=AUDIO_PLAYBACK_BUFFER_FRAMES * 2,
+            capacity=AUDIO_PLAYBACK_BUFFER_FRAMES,
             sample_rate=48_000,
             num_channels=1,
+            frame_size_ms=AUDIO_FRAME_MS,
         )
-        playback_frames: asyncio.Queue[bytes] = asyncio.Queue(
-            maxsize=AUDIO_PLAYBACK_BUFFER_FRAMES
+        playback_frames = (
+            self._operator_audio_frames
+            if self._uses_full_duplex_aec()
+            else asyncio.Queue(maxsize=AUDIO_PLAYBACK_BUFFER_FRAMES)
         )
         playback_task: asyncio.Task[None] | None = None
         if (
-            self.config.simulator_audio_output_type == "device"
+            not self._uses_full_duplex_aec()
+            and self.config.simulator_audio_output_type == "device"
             and self.config.simulator_audio_output
         ):
             playback_task = asyncio.create_task(
@@ -2071,7 +2937,7 @@ class MediaPublisher:
                     self.audio_level = min(
                         1.0, max(abs(value) for value in samples) / 32768
                     )
-                    if playback_task:
+                    if playback_task or self._uses_full_duplex_aec():
                         self._queue_latest_audio_frame(
                             playback_frames, bytes(samples)
                         )
@@ -2082,6 +2948,14 @@ class MediaPublisher:
 
     async def disconnect(self) -> None:
         self.connected = False
+        self.aec_active = False
+        self.audio_capture_healthy = False
+        self.audio_playback_healthy = False
+        while not self._operator_audio_frames.empty():
+            try:
+                self._operator_audio_frames.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         tasks, self.tasks = self.tasks, []
         for task in tasks:
             task.cancel()

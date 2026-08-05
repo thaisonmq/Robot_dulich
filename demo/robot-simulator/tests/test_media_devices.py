@@ -35,6 +35,65 @@ Card #4430
         headset-head-unit-msbc: Headset Head Unit (sinks: 1, sources: 1, priority: 3, available: yes)
 """
 
+V4L2_MODES_OUTPUT = """\
+ioctl: VIDIOC_ENUM_FMT
+    Type: Video Capture
+    [0]: 'MJPG' (Motion-JPEG, compressed)
+        Size: Discrete 1280x720
+            Interval: Discrete 0.017s (60.000 fps)
+        Size: Discrete 1920x1080
+            Interval: Discrete 0.033s (30.000 fps)
+    [1]: 'YUYV' (YUYV 4:2:2)
+        Size: Discrete 1280x720
+            Interval: Discrete 0.111s (9.000 fps)
+        Size: Discrete 640x480
+            Interval: Discrete 0.033s (30.000 fps)
+        Size: Discrete 800x600
+            Interval: Discrete 0.050s (20.000 fps)
+"""
+
+
+def test_v4l2_scan_parses_real_discrete_capture_modes() -> None:
+    modes = media_devices.parse_v4l2_modes(V4L2_MODES_OUTPUT)
+
+    assert modes == [
+        {"format": "mjpeg", "fourcc": "MJPG", "width": 1280, "height": 720, "fps": 60.0},
+        {"format": "mjpeg", "fourcc": "MJPG", "width": 1920, "height": 1080, "fps": 30.0},
+        {"format": "yuyv422", "fourcc": "YUYV", "width": 1280, "height": 720, "fps": 9.0},
+        {"format": "yuyv422", "fourcc": "YUYV", "width": 640, "height": 480, "fps": 30.0},
+        {"format": "yuyv422", "fourcc": "YUYV", "width": 800, "height": 600, "fps": 20.0},
+    ]
+
+
+def test_camera_mode_selection_uses_supported_mode_nearest_stream_profile() -> None:
+    selected = media_devices.select_v4l2_mode(
+        media_devices.parse_v4l2_modes(V4L2_MODES_OUTPUT),
+        854,
+        480,
+        20,
+    )
+
+    assert selected == {
+        "format": "yuyv422",
+        "fourcc": "YUYV",
+        "width": 800,
+        "height": 600,
+        "fps": 20.0,
+    }
+
+
+def test_camera_mode_selection_honours_supported_format_override() -> None:
+    selected = media_devices.select_v4l2_mode(
+        media_devices.parse_v4l2_modes(V4L2_MODES_OUTPUT),
+        1280,
+        720,
+        20,
+        "mjpeg",
+    )
+
+    assert selected is not None
+    assert selected["format"] == "mjpeg"
+
 
 def test_arecord_hardware_is_returned_as_plughw_source() -> None:
     assert media_devices.parse_arecord_devices(ARECORD_OUTPUT) == [

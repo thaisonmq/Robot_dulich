@@ -11,3 +11,5 @@ playwright-report/
 test-results/
 .DS_Store
 demo/robot-simulator/state/
+src/infrastructure/tls/*.crt
+src/infrastructure/tls/*.key

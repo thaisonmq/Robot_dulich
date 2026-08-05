@@ -1,5 +1,5 @@
 diff --git a/main.go b/main.go
-index b2ab7a4..5b992fb 100644
+index b2ab7a4..5cbc825 100644
 --- a/main.go
 +++ b/main.go
 @@ -49,15 +49,33 @@ func main() {
@@ -16,10 +16,10 @@ index b2ab7a4..5b992fb 100644
 +				Usage: "maximum RTP pacer queue latency in milliseconds",
 +				Value: 60,
 +			},
-+			&cli.IntFlag{
++			&cli.StringFlag{
 +				Name:  "video-fps",
-+				Usage: "fixed video frame rate used for monotonic RTP timestamps",
-+				Value: 25,
++				Usage: "fallback video frame rate (integer or rational, for example 30000/1001)",
++				Value: "0",
 +			},
  			&cli.BoolFlag{
  				Name: "verbose",
@@ -35,12 +35,12 @@ index b2ab7a4..5b992fb 100644
 +				PipelineString:  strings.Join(c.Args().Slice(), " "),
 +				PacerBitrate:    c.Int("pacer-bitrate"),
 +				PacerMaxLatency: time.Duration(c.Int("pacer-max-latency-ms")) * time.Millisecond,
-+				VideoFPS:        c.Int("video-fps"),
++				VideoFPS:        c.String("video-fps"),
  			})
  			if delay := c.Int("delay"); delay != 0 {
  				time.Sleep(time.Duration(delay) * time.Second)
 diff --git a/publish.go b/publish.go
-index d5ec92f..4e28f37 100644
+index d5ec92f..1e04001 100644
 --- a/publish.go
 +++ b/publish.go
 @@ -20,10 +20,12 @@ import (
@@ -68,7 +68,7 @@ index d5ec92f..4e28f37 100644
 +	PipelineString  string
 +	PacerBitrate    int
 +	PacerMaxLatency time.Duration
-+	VideoFPS        int
++	VideoFPS        string
  }
  
  type Publisher struct {
@@ -102,50 +102,73 @@ index d5ec92f..4e28f37 100644
  		if err != nil {
  			return err
  		}
+@@ -212,6 +226,11 @@ func (p *Publisher) initialize() error {
+ 		if target.isAudio {
+ 			p.audioTrack = pt
+ 		} else {
++			pt.upstreamPad = target.srcPad
++			pt.onKeyframeRequest = func() {
++				logger.Infow("keyframe timeout; restarting source pipeline")
++				p.Stop()
++			}
+ 			p.videoTrack = pt
+ 		}
+ 	}
 diff --git a/track.go b/track.go
-index f6494a6..f1d490c 100644
+index f6494a6..d36409c 100644
 --- a/track.go
 +++ b/track.go
-@@ -37,9 +37,12 @@ type publisherTrack struct {
+@@ -18,6 +18,8 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"strconv"
++	"strings"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -37,9 +39,18 @@ type publisherTrack struct {
  	publication *lksdk.LocalTrackPublication
  	isEnded     atomic.Bool
  	onEOS       func()
-+	lastTimestamp gst.ClockTime
-+	frameDuration time.Duration
-+	nextWriteAt   time.Time
++	lastTimestamp       gst.ClockTime
++	fallbackDuration    time.Duration
++	onKeyframeRequest   func()
++	receivedSamples     atomic.Uint64
++	publishedSamples    atomic.Uint64
++	lastProgressLog     atomic.Int64
++	keyframesPublished  atomic.Uint64
++	keyframeRequestPending atomic.Bool
++	upstreamPad         *gst.Pad
  }
  
 -func createPublisherTrack(mimeType string) (*publisherTrack, error) {
-+func createPublisherTrack(mimeType string, videoFPS int) (*publisherTrack, error) {
++func createPublisherTrack(mimeType string, videoFPS string) (*publisherTrack, error) {
  	webrtcMime := ""
  	if mimeType == "audio/x-opus" {
  		webrtcMime = webrtc.MimeTypeOpus
-@@ -60,17 +63,33 @@ func createPublisherTrack(mimeType string) (*publisherTrack, error) {
+@@ -60,17 +71,29 @@ func createPublisherTrack(mimeType string) (*publisherTrack, error) {
  		return nil, err
  	}
  
-+	frameDuration := time.Duration(0)
-+	if mimeType != "audio/x-opus" && videoFPS > 0 {
-+		frameDuration = time.Second / time.Duration(videoFPS)
-+	}
++	fallbackDuration := parseFrameDuration(videoFPS)
 +
  	pt := &publisherTrack{
 -		mimeType: webrtcMime,
 -		sink:     sink,
-+		mimeType:      webrtcMime,
-+		sink:          sink,
-+		lastTimestamp: gst.ClockTimeNone,
-+		frameDuration:  frameDuration,
++		mimeType:         webrtcMime,
++		sink:             sink,
++		lastTimestamp:    gst.ClockTimeNone,
++		fallbackDuration: fallbackDuration,
  	}
  	sink.SetCallbacks(&app.SinkCallbacks{
  		EOSFunc:       pt.handleEOS,
  		NewSampleFunc: pt.handleSample,
  	})
-+	if frameDuration > 0 {
-+		sink.SetSync(false)
-+		// The callback already paces each access unit. Keep only enough room to
-+		// decouple GStreamer scheduling; a one-second appsink queue turns a brief
-+		// RTSP burst into permanent live-view delay.
++	if mimeType != "audio/x-opus" {
++		// Keep GStreamer clock synchronization so valid source PTS, including
++		// 30000/1001, controls playout. A bounded non-dropping queue preserves an
++		// encoded GOP; the edge watchdog reconnects instead of replaying backlog.
 +		sink.SetMaxBuffers(2)
 +	}
  
@@ -157,7 +180,7 @@ index f6494a6..f1d490c 100644
  	}
  
  	pt.track, err = lksdk.NewLocalTrack(
-@@ -111,14 +126,11 @@ func (t *publisherTrack) handleSample(sink *app.Sink) gst.FlowReturn {
+@@ -111,18 +134,22 @@ func (t *publisherTrack) handleSample(sink *app.Sink) gst.FlowReturn {
  	if segment == nil {
  		return gst.FlowError
  	}
@@ -165,7 +188,8 @@ index f6494a6..f1d490c 100644
 -	duration := buffer.Duration()
 -	// pts := buffer.PresentationTimestamp()
 -	// ts := time.Duration(segment.ToRunningTime(gst.FormatTime, uint64(pts)))
-+	t.paceVideo()
++	t.receivedSamples.Add(1)
++	t.logProgress()
  
  	err := t.track.WriteSample(media.Sample{
  		Data:     buffer.Bytes(),
@@ -174,30 +198,37 @@ index f6494a6..f1d490c 100644
  	}, nil)
  
  	switch {
-@@ -131,6 +143,68 @@ func (t *publisherTrack) handleSample(sink *app.Sink) gst.FlowReturn {
+ 	case err == nil:
++		if t.mimeType == webrtc.MimeTypeH264 && !buffer.HasFlags(gst.BufferFlagDeltaUnit) {
++			t.keyframesPublished.Add(1)
++			t.keyframeRequestPending.Store(false)
++		}
++		t.publishedSamples.Add(1)
++		t.logProgress()
+ 		return gst.FlowOK
+ 	case errors.Is(err, io.EOF):
+ 		return gst.FlowEOS
+@@ -131,6 +158,113 @@ func (t *publisherTrack) handleSample(sink *app.Sink) gst.FlowReturn {
  	}
  }
  
-+func (t *publisherTrack) paceVideo() {
-+	if t.frameDuration <= 0 {
-+		return
++func parseFrameDuration(value string) time.Duration {
++	parts := strings.SplitN(value, "/", 2)
++	numerator, err := strconv.ParseInt(parts[0], 10, 64)
++	if err != nil || numerator <= 0 {
++		return 0
 +	}
-+	now := time.Now()
-+	if t.nextWriteAt.IsZero() || now.Sub(t.nextWriteAt) > 3*t.frameDuration {
-+		t.nextWriteAt = now
++	denominator := int64(1)
++	if len(parts) == 2 {
++		denominator, err = strconv.ParseInt(parts[1], 10, 64)
++		if err != nil || denominator <= 0 {
++			return 0
++		}
 +	}
-+	if wait := time.Until(t.nextWriteAt); wait > 0 {
-+		time.Sleep(wait)
-+	}
-+	t.nextWriteAt = t.nextWriteAt.Add(t.frameDuration)
++	return time.Second * time.Duration(denominator) / time.Duration(numerator)
 +}
 +
 +func (t *publisherTrack) sampleDuration(s *gst.Sample, buffer *gst.Buffer) time.Duration {
-+	if t.frameDuration > 0 {
-+		t.rememberTimestamp(buffer)
-+		return t.frameDuration
-+	}
-+
 +	if duration := buffer.Duration().AsDuration(); duration != nil && *duration > 0 {
 +		t.rememberTimestamp(buffer)
 +		return *duration
@@ -230,6 +261,9 @@ index f6494a6..f1d490c 100644
 +		}
 +	}
 +
++	if t.fallbackDuration > 0 {
++		return t.fallbackDuration
++	}
 +	return time.Second / 30
 +}
 +
@@ -240,6 +274,52 @@ index f6494a6..f1d490c 100644
 +	}
 +}
 +
++func (t *publisherTrack) logProgress() {
++	now := time.Now().Unix()
++	previous := t.lastProgressLog.Load()
++	if now == previous || !t.lastProgressLog.CompareAndSwap(previous, now) {
++		return
++	}
++	fmt.Printf("video-progress received=%d published=%d\n",
++		t.receivedSamples.Load(), t.publishedSamples.Load())
++}
++
  func (t *publisherTrack) onRTCP(packet rtcp.Packet) {
- 	// TODO: handle PLI by instructing the encoder to send a keyframe
+-	// TODO: handle PLI by instructing the encoder to send a keyframe
++	requestType := ""
++	switch packet.(type) {
++	case *rtcp.PictureLossIndication:
++		requestType = "pli"
++	case *rtcp.FullIntraRequest:
++		requestType = "fir"
++	default:
++		return
++	}
++	if !t.keyframeRequestPending.CompareAndSwap(false, true) {
++		return
++	}
++	keyframesAtRequest := t.keyframesPublished.Load()
++	requestedUpstream := false
++	if t.upstreamPad != nil {
++		structure := gst.NewStructureFromString(
++			"GstForceKeyUnit, all-headers=(boolean)true, count=(uint)0",
++		)
++		requestedUpstream = t.upstreamPad.SendEvent(
++			gst.NewCustomEvent(gst.EventTypeCustomUpstream, structure),
++		)
++	}
++	fmt.Printf("video-keyframe-request type=%s action=request-upstream success=%t\n",
++		requestType, requestedUpstream)
++	go func() {
++		time.Sleep(3 * time.Second)
++		t.keyframeRequestPending.Store(false)
++		if t.keyframesPublished.Load() > keyframesAtRequest {
++			fmt.Printf("video-keyframe-request type=%s action=keyframe-published\n", requestType)
++			return
++		}
++		fmt.Printf("video-keyframe-timeout type=%s action=reconnect\n", requestType)
++		if t.onKeyframeRequest != nil {
++			t.onKeyframeRequest()
++		}
++	}()
  }

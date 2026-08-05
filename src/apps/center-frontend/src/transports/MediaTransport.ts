@@ -4,7 +4,11 @@ import {
 } from "livekit-client";
 import {
   AdaptiveVideoBuffer,
+  VideoDecodeHealth,
   VIDEO_BUFFER_INITIAL_TARGET_MS,
+  mediaPlayoutTargets,
+  nextVideoRecoveryAction,
+  type VideoDecodeState,
 } from "./AdaptiveVideoBuffer";
 
 export interface IMediaTransport {
@@ -29,6 +33,7 @@ export class LiveKitMediaTransport implements IMediaTransport {
   private recoveryAttempts = 0;
   private manualDisconnect = false;
   private reconnectTimer: number | null = null;
+  private roomReconnectDelayMs = 900;
   private staleSnapshotTimer: number | null = null;
   private connection: { url: string; token: string } | null = null;
   private videoKeyframeReady = false;
@@ -36,6 +41,8 @@ export class LiveKitMediaTransport implements IMediaTransport {
   private videoTrack: RemoteTrack | null = null;
   private audioTrack: RemoteTrack | null = null;
   private readonly adaptiveVideoBuffer = new AdaptiveVideoBuffer();
+  private readonly videoDecodeHealth = new VideoDecodeHealth();
+  private videoDecodeState: VideoDecodeState = "unknown";
   private videoBufferUpdatePending = false;
   private renderedGapCount = 0;
   private lastRenderedFrameAt = 0;
@@ -69,6 +76,8 @@ export class LiveKitMediaTransport implements IMediaTransport {
         this.videoTrack = track;
         this.videoKeyframeReady = false;
         this.adaptiveVideoBuffer.reset();
+        this.videoDecodeHealth.reset();
+        this.videoDecodeState = "unknown";
         this.renderedGapCount = 0;
         this.lastRenderedFrameAt = 0;
         this.expectedFrameIntervalMs = 40;
@@ -100,7 +109,8 @@ export class LiveKitMediaTransport implements IMediaTransport {
       }
       if (track.kind === Track.Kind.Audio) {
         this.audioTrack = track;
-        // Follow the current video target so A/V remains synchronized.
+        // Conversational audio has its own smaller target. A bursty camera must
+        // not inflate mouth-to-ear delay for the full-duplex talk path.
         this.applyMediaPlayoutTarget(this.adaptiveVideoBuffer.currentTargetMs);
         track.attach(this.audioElement);
         this.audioElement.muted = this.speakerMuted;
@@ -116,6 +126,8 @@ export class LiveKitMediaTransport implements IMediaTransport {
         this.videoTrack = null;
         this.videoKeyframeReady = false;
         this.adaptiveVideoBuffer.reset();
+        this.videoDecodeHealth.reset();
+        this.videoDecodeState = "unknown";
         this.videoBufferUpdatePending = false;
         this.renderedGapCount = 0;
         this.lastRenderedFrameAt = 0;
@@ -178,6 +190,8 @@ export class LiveKitMediaTransport implements IMediaTransport {
     this.audioTrack = null;
     this.videoKeyframeReady = false;
     this.adaptiveVideoBuffer.reset();
+    this.videoDecodeHealth.reset();
+    this.videoDecodeState = "unknown";
     this.videoBufferUpdatePending = false;
     this.renderedGapCount = 0;
     this.lastRenderedFrameAt = 0;
@@ -267,6 +281,7 @@ export class LiveKitMediaTransport implements IMediaTransport {
             this.lastFrameAt = performance.now();
             this.lastVideoTime = this.videoElement.currentTime;
             this.recoveryAttempts = 0;
+            this.roomReconnectDelayMs = 900;
             this.clearStaleSnapshotTimer();
             this.videoElement.classList.remove("is-recovering");
             this.onState("connected");
@@ -373,11 +388,22 @@ export class LiveKitMediaTransport implements IMediaTransport {
           freezeCount?: number;
           totalFreezesDuration?: number;
           framesPerSecond?: number;
+          framesDecoded?: number;
+          framesDropped?: number;
+          keyFramesDecoded?: number;
         };
         const framesPerSecond = stat.framesPerSecond ?? 0;
         if (framesPerSecond >= 5 && framesPerSecond <= 60) {
           this.expectedFrameIntervalMs = 1000 / framesPerSecond;
         }
+        this.videoDecodeState = this.videoDecodeHealth.update({
+          bytesReceived: stat.bytesReceived ?? 0,
+          framesDecoded: stat.framesDecoded ?? 0,
+          framesDropped: stat.framesDropped ?? 0,
+          freezeCount: stat.freezeCount ?? 0,
+          keyFramesDecoded: stat.keyFramesDecoded ?? 0,
+          framesPerSecond,
+        });
         const previousTarget = this.adaptiveVideoBuffer.currentTargetMs;
         const target = this.adaptiveVideoBuffer.update({
           jitterMs: (stat.jitter ?? 0) * 1000,
@@ -398,16 +424,20 @@ export class LiveKitMediaTransport implements IMediaTransport {
   }
 
   private applyMediaPlayoutTarget(targetMs: number): void {
-    for (const track of [this.videoTrack, this.audioTrack]) {
+    const targets = mediaPlayoutTargets(targetMs);
+    for (const [track, playoutMs] of [
+      [this.videoTrack, targets.videoMs],
+      [this.audioTrack, targets.audioMs],
+    ] as const) {
       if (!track) continue;
       try {
-        track.setPlayoutDelay(targetMs / 1000);
+        track.setPlayoutDelay(playoutMs / 1000);
       } catch {
         // Unsupported on older WebKit.
       }
       try {
         if (track.receiver && "jitterBufferTarget" in track.receiver) {
-          track.receiver.jitterBufferTarget = targetMs;
+          track.receiver.jitterBufferTarget = playoutMs;
         }
       } catch {
         // Some older browsers expose a read-only compatibility property.
@@ -418,7 +448,6 @@ export class LiveKitMediaTransport implements IMediaTransport {
   private async recoverVideoTrack(): Promise<void> {
     if (this.recovering || !this.room) return;
     this.recovering = true;
-    this.recoveryAttempts += 1;
     try {
       // Audio/control and optimized H.264 video use separate robot
       // participants, so select the participant that actually owns video.
@@ -426,14 +455,27 @@ export class LiveKitMediaTransport implements IMediaTransport {
         .filter((participant) => participant.identity.startsWith("robot:"))
         .flatMap((participant) => [...participant.videoTrackPublications.values()])
         .find(Boolean);
-      if (publication) {
+      const effectiveAttempts = (
+        this.videoDecodeState === "upstream-stalled"
+        || this.videoDecodeState === "decoder-stalled"
+      ) ? this.recoveryAttempts + 1 : this.recoveryAttempts;
+      const action = nextVideoRecoveryAction(
+        effectiveAttempts,
+        Boolean(publication),
+      );
+      if (action === "resubscribe" && publication) {
+        this.recoveryAttempts += 1;
         this.stopFrameCallback();
         publication.setSubscribed(false);
         await new Promise((resolve) => window.setTimeout(resolve, 220));
         publication.setSubscribed(true);
         this.lastFrameAt = performance.now();
+      } else {
+        // Repeated resubscribe cannot repair a dead upstream or a decoder that
+        // never receives an IDR. Escalate to a fresh room/ICE connection with
+        // bounded backoff instead of looping on the publication forever.
+        this.scheduleRoomReconnect();
       }
-      if (!publication) this.scheduleRoomReconnect(900);
     } finally {
       window.setTimeout(() => {
         this.recovering = false;
@@ -441,7 +483,7 @@ export class LiveKitMediaTransport implements IMediaTransport {
     }
   }
 
-  private scheduleRoomReconnect(delay = 900): void {
+  private scheduleRoomReconnect(delay = this.roomReconnectDelayMs): void {
     if (this.manualDisconnect || !this.connection || this.reconnectTimer !== null) return;
     this.onState("reconnecting");
     const connection = this.connection;
@@ -459,7 +501,8 @@ export class LiveKitMediaTransport implements IMediaTransport {
       } catch {
         this.connection = connection;
         this.manualDisconnect = false;
-        this.scheduleRoomReconnect(1800);
+        this.roomReconnectDelayMs = Math.min(10000, this.roomReconnectDelayMs * 2);
+        this.scheduleRoomReconnect();
       }
     }, delay);
   }

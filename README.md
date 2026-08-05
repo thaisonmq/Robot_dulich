@@ -45,6 +45,7 @@ Mở `.env` và chỉnh các nhóm biến sau.
 | `POSTGRES_PASSWORD` | Mật khẩu PostgreSQL. Dùng mật khẩu mạnh khi triển khai thật. |
 | `JWT_SECRET` | Khóa ký access token, tối thiểu 32 ký tự ngẫu nhiên. |
 | `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | Cặp khóa LiveKit; secret phải có tối thiểu 32 ký tự ngẫu nhiên. |
+| `TURN_SECRET` | Shared secret tối thiểu 32 ký tự; LiveKit dùng để cấp credential coturn ngắn hạn. |
 | `BOOTSTRAP_ADMIN_USERNAME` | Tên đăng nhập quản trị được tạo ở lần khởi tạo database đầu tiên. |
 | `BOOTSTRAP_ADMIN_PASSWORD` | Mật khẩu quản trị ban đầu. |
 | `BOOTSTRAP_ADMIN_EMAIL` | Email của tài khoản quản trị. |
@@ -58,10 +59,13 @@ biến này sau đó không đổi thông tin của tài khoản đã tồn tạ
 Thay `192.168.1.10` bằng IP của máy chạy Docker:
 
 ```env
-FRONTEND_PUBLIC_URL=http://192.168.1.10:8080
-LIVEKIT_PUBLIC_URL=ws://192.168.1.10:7880
-LIVEKIT_ROBOT_URL=ws://192.168.1.10:7880
+FRONTEND_PUBLIC_URL=https://192.168.1.10
+LIVEKIT_PUBLIC_URL=wss://192.168.1.10
+LIVEKIT_ROBOT_URL=wss://192.168.1.10
 LIVEKIT_NODE_IP=192.168.1.10
+TURN_HOST=192.168.1.10
+TURN_EXTERNAL_IP=192.168.1.10
+TLS_HOSTNAME=192.168.1.10
 ```
 
 Nếu chỉ dùng trên chính máy chạy Docker (`localhost`), có thể giữ giá trị mặc
@@ -69,12 +73,12 @@ Nếu chỉ dùng trên chính máy chạy Docker (`localhost`), có thể giữ
 
 ### Tùy chọn
 
-- `FRONTEND_PORT`, `BACKEND_PORT`: đổi cổng web và API.
+- `FRONTEND_PORT`, `FRONTEND_HTTPS_PORT`, `BACKEND_PORT`: đổi cổng web và API.
 - `LIVEKIT_HTTP_PORT`, `LIVEKIT_TCP_PORT`, `LIVEKIT_UDP_START`,
   `LIVEKIT_UDP_END`: đổi cổng LiveKit khi bị trùng cổng.
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`: bật đăng
   nhập Google. Redirect URI phải có dạng
-  `http://<CENTER_IP>:8080/api/auth/google/callback` và trùng cấu hình trên
+  `https://<CENTER_HOST>/api/auth/google/callback` và trùng cấu hình trên
   Google Cloud.
 - `SIMULATOR_MEDIA_SOURCE_TYPE`, `SIMULATOR_MEDIA_SOURCE`,
   `SIMULATOR_AUDIO_SOURCE`: cấu hình nguồn media cho simulator.
@@ -104,10 +108,21 @@ docker compose up -d --build
 
 Các địa chỉ mặc định:
 
-- Giao diện: <http://localhost:8080>
-- OpenAPI: <http://localhost:8080/docs>
-- Backend cho robot trong LAN: `http://<CENTER_IP>:8888`
-- LiveKit: `ws://<CENTER_IP>:7880`
+- Giao diện: <https://localhost>
+- OpenAPI: <https://localhost/docs>
+- Robot API/WebSocket: `https://<CENTER_HOST>` / `wss://<CENTER_HOST>/ws/robot/connect`
+- LiveKit signaling: `wss://<CENTER_HOST>` (được proxy tại `/rtc`)
+- TURN relay: `turn:<TURN_HOST>:3478` qua UDP/TCP
+
+Cổng HTTP `8080` chỉ chuyển hướng sang HTTPS. Cổng backend `8888` và signaling
+LiveKit `7880` chỉ bind loopback để chẩn đoán tại máy chủ.
+
+Ở lần chạy đầu, container frontend tự tạo CA nội bộ và server certificate tại
+`src/infrastructure/tls`. Import `ca.crt` vào trust store của trình duyệt/robot
+trong LAN. Khi triển khai Internet, thay `server.crt` và
+`server.key` bằng chứng thư của CA tin cậy rồi recreate `center-frontend`.
+Khi dùng robot Docker, copy `ca.crt` sang đúng đường dẫn
+`CENTER_TLS_CA_FILE` trên máy robot; launcher sẽ mount CA cho cả API và LiveKit.
 
 Xem trạng thái và log:
 
@@ -135,8 +150,9 @@ chmod 600 .env
 Cần sửa tối thiểu các biến sau trong `.env`:
 
 ```env
-CENTER_API_URL=http://192.168.1.10:8888
-CENTER_ROBOT_WS_URL=ws://192.168.1.10:8888/ws/robot/connect
+CENTER_API_URL=https://192.168.1.10
+CENTER_ROBOT_WS_URL=wss://192.168.1.10/ws/robot/connect
+CENTER_TLS_CA_FILE=/etc/rovera/rovera-ca.crt
 ROBOT_MANAGEMENT_ADDRESS=192.168.1.20
 ROBOT_USERNAME=operator
 ROBOT_PASSWORD=<mat-khau-quan-tri-cua-robot>

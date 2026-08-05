@@ -19,7 +19,7 @@ import { useAppStore } from "../state/appStore";
 import type { LiveKitMediaTransport } from "../transports/MediaTransport";
 import type { PtzCommand, PtzSpeed } from "../transports/ControlTransport";
 import { WebSocketTelemetryTransport } from "../transports/TelemetryTransport";
-import type { Destination, MediaState } from "../types";
+import type { Destination, MediaState, VideoProfile } from "../types";
 
 const ROBOT_LANGUAGE_CODE = "vi";
 
@@ -57,7 +57,8 @@ export function DashboardPage() {
   const [micEnabled, setMicEnabled] = useState(false);
   const [speakerMuted, setSpeakerMuted] = useState(false);
   const translationEnabled = false;
-  const [conversationExpanded, setConversationExpanded] = useState(false);
+  const [streamSettingsExpanded, setStreamSettingsExpanded] = useState(false);
+  const [requestedVideoProfile, setRequestedVideoProfile] = useState<VideoProfile | null>(null);
   const [ptzExpanded, setPtzExpanded] = useState(false);
   const [ptzSpeed, setPtzSpeed] = useState<PtzSpeed>("medium");
   const [selectedDestination, setSelectedDestination] = useState<Destination | null>(null);
@@ -67,6 +68,7 @@ export function DashboardPage() {
   const robotLanguageOption = getLanguage(ROBOT_LANGUAGE_CODE);
   const sameLanguage = language === ROBOT_LANGUAGE_CODE;
   const isSpectator = session?.mode === "spectator";
+  const canConfigureVideo = user?.role === "admin" || user?.role === "operator";
 
   const telemetry = useMemo(() => new WebSocketTelemetryTransport({
     onPose: setPose,
@@ -114,6 +116,13 @@ export function DashboardPage() {
   });
   const cameraItems = camerasQuery.data?.items ?? [];
   const selectedCamera = cameraItems.find((item) => item.selected);
+  const videoProfileQuery = useQuery({
+    queryKey: ["session-video-profile", session?.session_id],
+    queryFn: () => api.sessionVideoProfile(session!.session_id),
+    enabled: Boolean(session && streamSettingsExpanded),
+    staleTime: 5000,
+    retry: 1,
+  });
   const ptzCapabilities = selectedCamera?.ptz;
   const ptzAvailable = Boolean(ptzCapabilities?.supported);
   const ptzDisabled = Boolean(
@@ -130,6 +139,33 @@ export function DashboardPage() {
     onError: (reason) => {
       setConnectionError(reason instanceof Error ? reason.message : t("Không thể đổi camera"));
     },
+  });
+  const changeVideoQuality = useMutation({
+    mutationFn: (videoProfile: VideoProfile) => api.selectSessionVideoProfile(
+      session!.session_id,
+      videoProfile,
+    ),
+    onMutate: (videoProfile) => {
+      setRequestedVideoProfile(videoProfile);
+      setConnectionError(t("Đang áp dụng chất lượng video…"));
+    },
+    onSuccess: async (configuration) => {
+      await videoProfileQuery.refetch();
+      setConnectionError(t("Đã áp dụng {quality}; luồng đang đồng bộ lại…", {
+        quality: configuration.video_profile === "full_hd"
+          ? "Full HD"
+          : configuration.video_profile === "balanced"
+            ? t("Cân bằng")
+            : t("Băng thông thấp"),
+      }));
+      window.setTimeout(() => setConnectionError(""), 2200);
+    },
+    onError: (reason) => {
+      setConnectionError(
+        reason instanceof Error ? reason.message : t("Không thể đổi chất lượng video"),
+      );
+    },
+    onSettled: () => setRequestedVideoProfile(null),
   });
   const preview = useMutation({
     mutationFn: (destination: Destination) => api.previewRoute(robotId, destination.destination_id),
@@ -397,39 +433,6 @@ export function DashboardPage() {
                       : t("ĐANG KẾT NỐI")}
               </span>
               <div className="video-panel__tools">
-                {cameraItems.length === 1 && (
-                  <div className="camera-source-picker" aria-label={t("Nguồn camera")}>
-                    <Camera size={14} />
-                    <span>
-                      {cameraItems[0].label}
-                      {cameraItems[0].source && user?.role !== "guest"
-                        ? ` · ${cameraItems[0].source}`
-                        : ""}
-                    </span>
-                  </div>
-                )}
-                {cameraItems.length > 1 && (
-                  <label className="camera-source-picker">
-                    <Camera size={14} />
-                    <span className="sr-only">{t("Nguồn camera")}</span>
-                    <select
-                      value={cameraItems.find((item) => item.selected)?.id ?? ""}
-                      disabled={Boolean(isSpectator || selectCamera.isPending || sessionEndedReason)}
-                      onChange={(event) => selectCamera.mutate(event.target.value)}
-                      aria-label={t("Chọn nguồn camera")}
-                    >
-                      {!cameraItems.some((item) => item.selected) && (
-                        <option value="">{t("Chọn camera")}</option>
-                      )}
-                      {cameraItems.map((camera) => (
-                        <option key={camera.id} value={camera.id}>
-                          {camera.label}
-                          {camera.source && user?.role !== "guest" ? ` · ${camera.source}` : ""}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                )}
                 <span>
                   {isSpectator
                     ? t("CHẾ ĐỘ THEO DÕI")
@@ -439,11 +442,102 @@ export function DashboardPage() {
                 </span>
               </div>
             </div>
-            {!isSpectator && conversationExpanded && <section
-              id="conversation-settings-panel"
+            {!isSpectator && streamSettingsExpanded && <section
+              id="stream-settings-panel"
               className={`conversation-dock ${translationEnabled ? "is-translating" : "is-direct"}`}
-              aria-label={t("Điều khiển đàm thoại")}
+              aria-label={t("Cài đặt luồng trực tiếp")}
             >
+              <header className="conversation-dock__header stream-settings__header">
+                <span className="conversation-dock__identity">
+                  <Settings size={18} />
+                  <span>
+                    <small>{t("Luồng trực tiếp")}</small>
+                    <strong>{t("Camera và chất lượng video")}</strong>
+                  </span>
+                </span>
+                <span className="conversation-dock__status">
+                  <i />
+                  {selectCamera.isPending || changeVideoQuality.isPending
+                    ? t("Đang áp dụng…")
+                    : t("Áp dụng ngay")}
+                </span>
+              </header>
+
+              <div className="stream-settings__video">
+                <label className="stream-setting">
+                  <span className="stream-setting__label">
+                    <Camera size={15} />
+                    {t("Nguồn camera")}
+                  </span>
+                  <select
+                    value={selectedCamera?.id ?? ""}
+                    disabled={Boolean(
+                      !cameraItems.length || selectCamera.isPending
+                      || changeVideoQuality.isPending || sessionEndedReason,
+                    )}
+                    onChange={(event) => selectCamera.mutate(event.target.value)}
+                    aria-label={t("Chọn nguồn camera")}
+                  >
+                    {!selectedCamera && (
+                      <option value="">{t("Chọn camera")}</option>
+                    )}
+                    {cameraItems.map((camera) => (
+                      <option key={camera.id} value={camera.id}>
+                        {camera.label}
+                        {camera.source && user?.role !== "guest"
+                          ? ` · ${camera.source}`
+                          : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <small>
+                    {selectCamera.isPending
+                      ? t("Đang chuyển nguồn và đồng bộ lại video…")
+                      : selectedCamera?.label ?? t("Robot chưa báo nguồn camera")}
+                  </small>
+                </label>
+
+                <label className="stream-setting">
+                  <span className="stream-setting__label">
+                    <Signal size={15} />
+                    {t("Chất lượng video")}
+                  </span>
+                  <select
+                    value={requestedVideoProfile
+                      ?? videoProfileQuery.data?.video_profile
+                      ?? ""}
+                    disabled={Boolean(
+                      !canConfigureVideo || videoProfileQuery.isLoading
+                      || videoProfileQuery.isError
+                      || changeVideoQuality.isPending || selectCamera.isPending
+                      || sessionEndedReason,
+                    )}
+                    onChange={(event) => changeVideoQuality.mutate(
+                      event.target.value as VideoProfile,
+                    )}
+                    aria-label={t("Chọn chất lượng video")}
+                  >
+                    {!videoProfileQuery.data && (
+                      <option value="">{videoProfileQuery.isLoading
+                        ? t("Đang tải cấu hình…")
+                        : t("Chưa đọc được cấu hình")}</option>
+                    )}
+                    <option value="full_hd">Full HD · 1080p</option>
+                    <option value="balanced">{t("Cân bằng")} · 720p</option>
+                    <option value="low_bandwidth">{t("Băng thông thấp")} · 480p</option>
+                  </select>
+                  <small>
+                    {!canConfigureVideo
+                      ? t("Chỉ tài khoản vận hành được thay đổi chất lượng.")
+                      : changeVideoQuality.isPending
+                        ? t("Đang khởi động lại riêng luồng video…")
+                        : t("Thay đổi được áp dụng ngay cho luồng hiện tại.")}
+                  </small>
+                </label>
+              </div>
+
+              <div className="stream-settings__divider" />
+
               <header className="conversation-dock__header">
                 <span className="conversation-dock__identity">
                   <MessageCircleMore size={18} />
@@ -636,7 +730,7 @@ export function DashboardPage() {
               onClick={() => {
                 const next = !ptzExpanded;
                 if (!next) stopPtz();
-                if (next) setConversationExpanded(false);
+                if (next) setStreamSettingsExpanded(false);
                 setPtzExpanded(next);
               }}
               aria-label={ptzExpanded ? t("Ẩn điều khiển PTZ") : t("Hiện điều khiển PTZ")}
@@ -647,20 +741,20 @@ export function DashboardPage() {
             </button>}
             {!isSpectator && <button
               type="button"
-              className={`conversation-settings-toggle ${conversationExpanded ? "is-open" : ""}`}
+              className={`conversation-settings-toggle ${streamSettingsExpanded ? "is-open" : ""}`}
               onClick={() => {
-                const next = !conversationExpanded;
+                const next = !streamSettingsExpanded;
                 if (next) {
                   stopPtz();
                   setPtzExpanded(false);
                 }
-                setConversationExpanded(next);
+                setStreamSettingsExpanded(next);
               }}
-              aria-label={conversationExpanded
-                ? t("Ẩn cài đặt đàm thoại")
-                : t("Mở cài đặt đàm thoại")}
-              aria-expanded={conversationExpanded}
-              aria-controls="conversation-settings-panel"
+              aria-label={streamSettingsExpanded
+                ? t("Ẩn cài đặt luồng")
+                : t("Mở cài đặt luồng")}
+              aria-expanded={streamSettingsExpanded}
+              aria-controls="stream-settings-panel"
             >
               <Settings size={20} />
             </button>}

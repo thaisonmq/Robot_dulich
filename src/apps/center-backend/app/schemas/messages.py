@@ -239,12 +239,16 @@ class SessionCameraSelect(BaseModel):
     camera_id: str = Field(min_length=8, max_length=128)
 
 
+class SessionVideoProfileSelect(BaseModel):
+    video_profile: Literal["full_hd", "balanced", "low_bandwidth"]
+
+
 class RobotConfigurationUpdate(BaseModel):
     device_ip: str = Field(min_length=1, max_length=255)
     video_source_type: Literal["rtsp", "camera", "file", "test"] = "rtsp"
     video_source: str = Field(min_length=1, max_length=2048)
-    video_profile: Literal["full_hd", "balanced", "low_bandwidth"] = "full_hd"
-    rtsp_transport: Literal["tcp", "udp"] = "tcp"
+    video_profile: Literal["full_hd", "balanced", "low_bandwidth"] = "balanced"
+    rtsp_transport: Literal["auto", "tcp", "udp"] = "auto"
     camera_label: str = Field(default="Camera chính", min_length=1, max_length=120)
     audio_source_type: Literal["silent", "device", "file"] = "silent"
     audio_source: str = Field(default="", max_length=2048)

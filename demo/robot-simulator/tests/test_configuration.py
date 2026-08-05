@@ -1,12 +1,14 @@
-import hashlib
 import asyncio
+import hashlib
 import json
 import time
+from fractions import Fraction
 
 import pytest
 
 from simulator.client import RobotConnectionClient
 from simulator.config import SimulatorConfig
+from simulator.media import MediaPublisher, SourceVideoProbe
 
 
 @pytest.mark.asyncio
@@ -142,7 +144,7 @@ def test_configuration_is_owned_and_applied_by_simulator() -> None:
     assert client.config.device_ip == "192.168.1.40"
     assert client.config.video_width == 1280
     assert client.config.video_height == 720
-    assert client.config.video_bitrate == 2_500_000
+    assert client.config.video_bitrate == 2_000_000
     assert client.config.rtsp_transport == "udp"
     assert client.config.simulator_media_source == (
         "rtsp://operator:secret@camera.local:8554/main"
@@ -471,17 +473,21 @@ async def test_speaker_probe_plays_an_audible_tone(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_video_probe_identifies_an_active_rtsp_stream(monkeypatch) -> None:
     client = RobotConnectionClient(SimulatorConfig())
-
-    class Process:
-        returncode = 0
-
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"", b""
-
-    async def create_process(*args, **kwargs):
-        return Process()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(
+        MediaPublisher,
+        "_probe_video_source",
+        lambda _publisher: SourceVideoProbe(
+            codec="h264",
+            width=1920,
+            height=1080,
+            fps=Fraction(25, 1),
+            measured_fps=Fraction(25, 1),
+            packet_count=63,
+            pixel_format="yuv420p",
+            profile="Main",
+            passthrough_safe=True,
+        ),
+    )
 
     result = await client._probe_media(
         {
@@ -495,7 +501,10 @@ async def test_video_probe_identifies_an_active_rtsp_stream(monkeypatch) -> None
     )
 
     assert result["ok"] is True
-    assert result["detail"] == "Luồng RTSP đã trả về hình ảnh"
+    assert result["detail"] == "Nguồn video đã hoàn tất kiểm tra realtime"
+    assert result["fps_measured"] == "25"
+    assert result["route"] == "passthrough"
+    assert result["encoder"] == "copy"
 
 
 def test_new_enrollment_token_takes_priority_over_existing_device_state(tmp_path) -> None:

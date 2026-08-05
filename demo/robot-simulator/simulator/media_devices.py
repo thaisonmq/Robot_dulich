@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import math
 import re
 import subprocess
 import time
@@ -36,6 +37,159 @@ _BLUETOOTH_PROFILES = (
     "headset-head-unit",
     "headset-head-unit-cvsd",
 )
+
+_V4L2_FORMAT_NAMES = {
+    "AVC1": "h264",
+    "H264": "h264",
+    "JPEG": "mjpeg",
+    "MJPG": "mjpeg",
+    "NV12": "nv12",
+    "UYVY": "uyvy422",
+    "YU12": "yuv420p",
+    "YUYV": "yuyv422",
+    "YV12": "yuv420p",
+}
+
+
+def parse_v4l2_modes(output: str) -> list[dict[str, Any]]:
+    """Parse the discrete modes advertised by ``v4l2-ctl``.
+
+    One item is returned per format/size/frame-rate combination. Keeping the
+    camera's actual discrete modes prevents a nominal request such as 1080p25
+    from silently negotiating to an expensive 1080p30 capture.
+    """
+    modes: list[dict[str, Any]] = []
+    fourcc = ""
+    width = height = 0
+    size_has_interval = False
+
+    def append_mode(fps: float) -> None:
+        if not fourcc or width <= 0 or height <= 0:
+            return
+        mode = {
+            "format": _V4L2_FORMAT_NAMES.get(fourcc, fourcc.lower()),
+            "fourcc": fourcc,
+            "width": width,
+            "height": height,
+            "fps": round(fps, 3),
+        }
+        if mode not in modes:
+            modes.append(mode)
+
+    for raw_line in output.splitlines():
+        format_match = re.match(r"\s*\[\d+\]:\s*'([^']+)'", raw_line)
+        if format_match:
+            if width and not size_has_interval:
+                append_mode(0)
+            fourcc = format_match.group(1).strip().upper()
+            width = height = 0
+            size_has_interval = False
+            continue
+        size_match = re.search(
+            r"Size:\s*Discrete\s+(\d+)x(\d+)", raw_line, re.IGNORECASE
+        )
+        if size_match:
+            if width and not size_has_interval:
+                append_mode(0)
+            width = int(size_match.group(1))
+            height = int(size_match.group(2))
+            size_has_interval = False
+            continue
+        interval_match = re.search(
+            r"Interval:\s*Discrete.*\(([\d.]+)\s+fps\)",
+            raw_line,
+            re.IGNORECASE,
+        )
+        if interval_match and width and height:
+            append_mode(float(interval_match.group(1)))
+            size_has_interval = True
+    if width and not size_has_interval:
+        append_mode(0)
+    return modes
+
+
+def discover_v4l2_modes(device: str) -> list[dict[str, Any]]:
+    try:
+        result = subprocess.run(
+            ["v4l2-ctl", "--device", device, "--list-formats-ext"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=4,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    return parse_v4l2_modes(result.stdout)
+
+
+def select_v4l2_mode(
+    modes: list[dict[str, Any]],
+    target_width: int,
+    target_height: int,
+    target_fps: float,
+    preferred_format: str = "",
+) -> dict[str, Any] | None:
+    """Choose a real camera mode closest to the active streaming profile.
+
+    Frame-rate mismatch is deliberately expensive: capturing 60/120 fps only
+    to discard frames consumes USB bandwidth and decoder CPU, while a mode
+    below the target makes motion visibly uneven. H.264 is preferred when it
+    is genuinely available because it can bypass transcoding.
+    """
+    candidates = [
+        mode
+        for mode in modes
+        if int(mode.get("width", 0)) > 0
+        and int(mode.get("height", 0)) > 0
+        and float(mode.get("fps", 0)) > 0
+    ]
+    if not candidates:
+        return None
+
+    normalized_preference = preferred_format.strip().lower()
+    aliases = {"mjpg": "mjpeg", "jpeg": "mjpeg", "yuyv": "yuyv422"}
+    normalized_preference = aliases.get(normalized_preference, normalized_preference)
+    matching = [
+        mode
+        for mode in candidates
+        if str(mode.get("format", "")).lower() == normalized_preference
+        or str(mode.get("fourcc", "")).lower() == normalized_preference
+    ]
+    if normalized_preference and matching:
+        candidates = matching
+
+    wanted_width = max(2, target_width)
+    wanted_height = max(2, target_height)
+    wanted_fps = max(1.0, target_fps)
+    wanted_pixels = wanted_width * wanted_height
+    wanted_aspect = wanted_width / wanted_height
+    format_cost = {
+        "h264": 0.0,
+        "yuv420p": 0.1,
+        "nv12": 0.1,
+        "yuyv422": 0.12,
+        "uyvy422": 0.12,
+        "mjpeg": 0.28,
+    }
+
+    def score(mode: dict[str, Any]) -> tuple[float, float, int]:
+        width_value = int(mode["width"])
+        height_value = int(mode["height"])
+        fps_value = float(mode["fps"])
+        pixel_ratio = (width_value * height_value) / wanted_pixels
+        resolution_cost = abs(math.log(pixel_ratio))
+        if pixel_ratio > 1:
+            resolution_cost *= 1.2
+        aspect_cost = abs((width_value / height_value) - wanted_aspect) / wanted_aspect
+        fps_ratio = (fps_value - wanted_fps) / wanted_fps
+        fps_cost = abs(fps_ratio) * (2.0 if fps_ratio < 0 else 1.0)
+        codec_cost = format_cost.get(str(mode.get("format", "")).lower(), 0.5)
+        total = resolution_cost + aspect_cost * 0.6 + fps_cost + codec_cost
+        return total, abs(fps_value - wanted_fps), width_value * height_value
+
+    return dict(min(candidates, key=score))
 
 
 def _unique_sources(sources: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -838,7 +992,7 @@ def _active_sources(
 
 def discover_video_sources(
     known_active_sources: set[str] | None = None,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     # Probe sequentially. Multiple /dev/videoN nodes can belong to one physical
     # UVC camera and opening them concurrently can make a valid node look busy.
     # A camera already reserved by the live media lease must not be opened by a
@@ -851,9 +1005,12 @@ def discover_video_sources(
             return True, "Camera đang được phiên trực tiếp sử dụng"
         return probe_video_source(source)
 
-    return _active_sources(
+    active, rejected = _active_sources(
         discover_video_candidates(), probe, max_workers=1
     )
+    for source in active:
+        source["capture_modes"] = discover_v4l2_modes(str(source["value"]))
+    return active, rejected
 
 
 def discover_audio_sources() -> tuple[list[dict[str, str]], list[dict[str, str]]]:

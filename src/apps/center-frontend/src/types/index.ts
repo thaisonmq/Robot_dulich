@@ -116,13 +116,15 @@ export interface RobotEnrollment {
   enrollment_endpoint: string;
 }
 
+export type VideoProfile = "full_hd" | "balanced" | "low_bandwidth";
+
 export interface RobotConfiguration {
   robot_id: string;
   device_ip: string;
   video_source_type: "rtsp" | "camera" | "file" | "test";
   video_source: string;
-  video_profile: "full_hd" | "balanced" | "low_bandwidth";
-  rtsp_transport: "tcp" | "udp";
+  video_profile: VideoProfile;
+  rtsp_transport: "auto" | "tcp" | "udp";
   camera_label: string;
   audio_source_type: "silent" | "device" | "file";
   audio_source: string;
@@ -169,6 +171,9 @@ export interface OnvifProfile {
   height: number;
   fps: number;
   bitrate_kbps: number;
+  support_level: "A" | "B" | "C";
+  route: "passthrough" | "transcode" | "unsupported-realtime";
+  warning: string;
   ptz: boolean;
   rtsp_url: string;
   path: string;
@@ -243,6 +248,11 @@ export interface SessionCamera {
   source_type?: string;
   source?: string;
   ptz?: CameraPtzCapabilities;
+}
+
+export interface SessionVideoProfile {
+  robot_id: string;
+  video_profile: VideoProfile;
 }
 
 export interface CameraPtzCapabilities {
