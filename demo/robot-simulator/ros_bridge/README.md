@@ -8,6 +8,7 @@ Web -> robot-simulator -> Unix datagram (latest only) -> control_bridge
                                                      -> /cmd_vel
 Joystick/Yahboom hiện có ----------------------------> /cmd_vel -> YB_Car_Node
                            \-> /joy -> physical-override guard
+Obstacle detector -> /rovera/obstacle_stop ----------> safety interlock
 ```
 
 ## Đặc tính vận hành
@@ -26,6 +27,33 @@ Joystick/Yahboom hiện có ----------------------------> /cmd_vel -> YB_Car_Nod
 - Chế độ `twist_mux` vẫn có sẵn cho một lần chuyển đổi toàn bộ stack trong tương
   lai, nhưng không được bật cùng Yahboom cũ đang publish trực tiếp `/cmd_vel`.
 - Giới hạn tốc độ được kẹp ở cả edge và bridge.
+- Chương trình chống vật cản phát `std_msgs/Bool` lên
+  `/rovera/obstacle_stop`: `true` khóa và phát zero liên tục, `false` mở khóa.
+  Lệnh velocity của web không thể tự xóa khóa này. Khi dùng `twist_mux`, zero
+  đi qua `/cmd_vel_safety` với priority 255; web là 50 và joystick là 100.
+- `ROS_OBSTACLE_WATCHDOG_MS=0` giữ tương thích khi chưa cài chương trình cảm
+  biến. Khi đã tích hợp, đặt giá trị dương (khuyến nghị bắt đầu từ 500 ms) và
+  publish cả `true` lẫn `false` định kỳ; bridge sẽ khóa ngay từ lúc khởi động
+  và khóa lại nếu heartbeat quá hạn.
+
+## Giao thức dừng do vật cản
+
+Chương trình cảm biến không publish trực tiếp vào `/cmd_vel`. Nó publish ở
+10--20 Hz:
+
+```bash
+# Có vật cản: giữ khóa cho tới khi vùng an toàn thực sự thông thoáng.
+ros2 topic pub /rovera/obstacle_stop std_msgs/msg/Bool '{data: true}' -r 10
+
+# Hết vật cản: tiếp tục heartbeat an toàn nếu watchdog đang bật.
+ros2 topic pub /rovera/obstacle_stop std_msgs/msg/Bool '{data: false}' -r 10
+```
+
+Trong chế độ song song với Yahboom legacy, interlock luôn ưu tiên hơn lệnh web
+vì nó nằm ngay trong `control_bridge`. Muốn khóa cả joystick với thứ tự ưu tiên
+xác định, phải remap joystick sang `/cmd_vel_joy`, đặt
+`ROS_USE_TWIST_MUX=true`, `ROS_WEB_CMD_VEL_TOPIC=/cmd_vel_web` và để
+`twist_mux` là publisher duy nhất của `/cmd_vel`.
 
 ## Dịch vụ Compose
 

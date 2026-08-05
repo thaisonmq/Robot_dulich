@@ -1,6 +1,10 @@
 twist_mux:
   ros__parameters:
     topics:
+      safety_stop:
+        topic: /cmd_vel_safety
+        timeout: 0.15
+        priority: 255
       joystick:
         topic: /cmd_vel_joy
         timeout: 0.25
@@ -10,6 +14,10 @@ twist_mux:
         timeout: 0.30
         priority: 50
     locks:
+      obstacle_stop:
+        topic: /rovera/obstacle_stop
+        timeout: 0.0
+        priority: 255
       web_emergency_stop:
         topic: /rovera/emergency_stop
         timeout: 0.0

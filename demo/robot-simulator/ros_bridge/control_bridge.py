@@ -25,6 +25,7 @@ from simulator.control_protocol import (
     LatestMotionSlot,
     MAX_MOTION_DATAGRAM_BYTES,
     MotionDatagram,
+    SafetyInterlock,
     decode_motion_datagram,
     joy_input_active,
 )
@@ -51,6 +52,25 @@ def _int_env(name: str, default: int) -> int:
     if value <= 0:
         raise RuntimeError(f"{name} must be positive")
     return value
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value < 0:
+        raise RuntimeError(f"{name} must not be negative")
+    return value
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, str(default)).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean")
 
 
 def _axis_indices_env(name: str, default: str) -> tuple[int, ...]:
@@ -82,6 +102,10 @@ class RosControlBridge(Node):
         self.max_forward = _float_env("ROS_MAX_FORWARD_SPEED", 0.33)
         self.max_reverse = _float_env("ROS_MAX_REVERSE_SPEED", 0.25)
         self.max_angular = _float_env("ROS_MAX_ANGULAR_SPEED", 0.8)
+        self.use_twist_mux = _bool_env("ROS_USE_TWIST_MUX", False)
+        self.obstacle_watchdog_ms = _nonnegative_int_env(
+            "ROS_OBSTACLE_WATCHDOG_MS", 0
+        )
         self.legacy_joy_deadzone = _float_env("ROS_LEGACY_JOY_DEADZONE", 0.12)
         self.legacy_joy_axes = _axis_indices_env("ROS_LEGACY_JOY_AXES", "1,2")
         self.legacy_override_ms = _int_env("ROS_LEGACY_OVERRIDE_MS", 350)
@@ -95,8 +119,19 @@ class RosControlBridge(Node):
         self.velocity_publisher = self.create_publisher(
             Twist, os.getenv("ROS_WEB_CMD_VEL_TOPIC", "/cmd_vel_web"), qos
         )
+        self.safety_velocity_publisher = self.create_publisher(
+            Twist,
+            os.getenv("ROS_SAFETY_CMD_VEL_TOPIC", "/cmd_vel_safety"),
+            qos,
+        )
         self.estop_publisher = self.create_publisher(
             Bool, os.getenv("ROS_ESTOP_TOPIC", "/rovera/emergency_stop"), qos
+        )
+        self.obstacle_stop_subscription = self.create_subscription(
+            Bool,
+            os.getenv("ROS_OBSTACLE_STOP_TOPIC", "/rovera/obstacle_stop"),
+            self._on_obstacle_stop,
+            qos,
         )
         self.legacy_joy_subscription = self.create_subscription(
             Joy,
@@ -123,6 +158,12 @@ class RosControlBridge(Node):
         self._legacy_override_logged = False
         self._stop_burst_remaining = 0
         self._estop_latched = False
+        self._obstacle_interlock = SafetyInterlock(self.obstacle_watchdog_ms)
+        # Avoid a misleading "released" transition on startup when the
+        # optional heartbeat watchdog is disabled. A positive watchdog still
+        # starts fail-closed and logs the initial lock transition.
+        self._obstacle_lock_reported = False
+        self._last_safety_zero_monotonic = 0.0
         self._closing = threading.Event()
         self._guard = self.create_guard_condition(self._apply_pending)
         self._socket = self._open_socket()
@@ -134,10 +175,12 @@ class RosControlBridge(Node):
         self._receiver.start()
         self._timer = self.create_timer(0.01, self._tick)
         self._publish_estop_state()
+        self._sync_obstacle_lock_state(time.monotonic())
         self.get_logger().info(
             "motion bridge ready "
             f"path={self.socket_path} watchdog_ms={self.watchdog_ms} "
-            f"output_hz={self.command_rate_hz}"
+            f"output_hz={self.command_rate_hz} "
+            f"obstacle_watchdog_ms={self.obstacle_watchdog_ms}"
         )
 
     def _open_socket(self) -> socket.socket:
@@ -221,10 +264,19 @@ class RosControlBridge(Node):
             self._active_command = None
             if command.reason == "emergency_stop":
                 self._set_estop(True)
+            if self._estop_latched or self._sync_obstacle_lock_state(now):
+                self._publish_safety_zero(now)
+                return
             if self._legacy_override_active(now):
                 self._stop_burst_remaining = 0
                 return
             self._publish_zero_burst()
+            return
+
+        if self._sync_obstacle_lock_state(now):
+            self._active_command = None
+            self._stop_burst_remaining = 0
+            self._publish_safety_zero(now)
             return
 
         if self._legacy_override_active(now):
@@ -264,6 +316,12 @@ class RosControlBridge(Node):
         # already-latched software emergency stop on the volatile ROS topic.
         if now - self._last_estop_publish_monotonic >= 0.5:
             self._publish_estop_state(now)
+        if self._estop_latched or self._sync_obstacle_lock_state(now):
+            self._active_command = None
+            self._stop_burst_remaining = 0
+            if now - self._last_safety_zero_monotonic >= 1 / self.command_rate_hz:
+                self._publish_safety_zero(now)
+            return
         command = self._active_command
         if command is not None:
             if self._legacy_override_active(now):
@@ -312,6 +370,33 @@ class RosControlBridge(Node):
                 time.monotonic() + self.legacy_override_ms / 1000,
             )
 
+    def _on_obstacle_stop(self, message: Bool) -> None:
+        now = time.monotonic()
+        self._obstacle_interlock.update(bool(message.data), now)
+        if self._sync_obstacle_lock_state(now):
+            self._active_command = None
+            self._stop_burst_remaining = 0
+            # Do not wait for the 100 Hz timer before issuing the first stop.
+            self._publish_safety_zero(now)
+
+    def _sync_obstacle_lock_state(self, now: float) -> bool:
+        locked = self._obstacle_interlock.locked(now)
+        if locked == self._obstacle_lock_reported:
+            return locked
+        self._obstacle_lock_reported = locked
+        if locked:
+            self._active_command = None
+            self._stop_burst_remaining = 0
+            self.get_logger().warning(
+                "obstacle safety stop engaged "
+                f"reason={self._obstacle_interlock.reason(now)}"
+            )
+        else:
+            self.get_logger().info(
+                "obstacle safety stop released; waiting for fresh velocity"
+            )
+        return locked
+
     def _legacy_override_active(self, now: float) -> bool:
         active = self._legacy_mode_active or now < self._legacy_override_until
         if not active:
@@ -330,6 +415,18 @@ class RosControlBridge(Node):
 
     def _publish_zero(self) -> None:
         self.velocity_publisher.publish(Twist())
+
+    def _publish_safety_zero(self, now: float | None = None) -> None:
+        message = Twist()
+        # In mux mode this priority-255 input is the only velocity allowed
+        # through while a safety lock is active. In parallel legacy mode the
+        # regular web output is /cmd_vel, so publish zero there as well.
+        self.safety_velocity_publisher.publish(message)
+        if not self.use_twist_mux:
+            self.velocity_publisher.publish(message)
+        self._last_safety_zero_monotonic = (
+            time.monotonic() if now is None else now
+        )
 
     def _publish_zero_burst(self) -> None:
         self._publish_zero()
@@ -351,9 +448,9 @@ class RosControlBridge(Node):
         if self._closing.is_set():
             return
         self._active_command = None
-        self._publish_zero()
-        self._publish_zero()
-        self._publish_zero()
+        for _ in range(3):
+            self._publish_zero()
+            self._publish_safety_zero()
         self._closing.set()
         self._socket.close()
         self._receiver.join(timeout=1.0)

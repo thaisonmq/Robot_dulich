@@ -111,6 +111,11 @@ services:
       ROS_LEGACY_JOY_AXES: ${ROS_LEGACY_JOY_AXES:-1,2}
       ROS_LEGACY_OVERRIDE_MS: ${ROS_LEGACY_OVERRIDE_MS:-350}
       ROS_ESTOP_TOPIC: /rovera/emergency_stop
+      # Chương trình tránh vật cản phát Bool liên tục: true=dừng, false=an toàn.
+      # Đặt watchdog > 0 để mất heartbeat cũng khóa chuyển động (fail closed).
+      ROS_OBSTACLE_STOP_TOPIC: /rovera/obstacle_stop
+      ROS_OBSTACLE_WATCHDOG_MS: ${ROS_OBSTACLE_WATCHDOG_MS:-0}
+      ROS_SAFETY_CMD_VEL_TOPIC: /cmd_vel_safety
     volumes:
       - type: bind
         source: ${ROBOT_STATE_DIR:-./state}

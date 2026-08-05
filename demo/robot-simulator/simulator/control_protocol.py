@@ -30,6 +30,44 @@ def joy_input_active(
     )
 
 
+@dataclass(slots=True)
+class SafetyInterlock:
+    """Fail-safe state for a periodically refreshed local safety signal."""
+
+    watchdog_ms: int = 0
+    sensor_stop_active: bool = False
+    last_update_monotonic: float = 0.0
+    received_update: bool = False
+
+    def __post_init__(self) -> None:
+        if self.watchdog_ms < 0:
+            raise ValueError("safety watchdog must not be negative")
+
+    def update(self, stop_active: bool, now: float | None = None) -> None:
+        self.sensor_stop_active = bool(stop_active)
+        self.last_update_monotonic = time.monotonic() if now is None else now
+        self.received_update = True
+
+    def watchdog_expired(self, now: float | None = None) -> bool:
+        if self.watchdog_ms == 0:
+            return False
+        if not self.received_update:
+            return True
+        now = time.monotonic() if now is None else now
+        elapsed_ms = (now - self.last_update_monotonic) * 1000
+        return elapsed_ms < 0 or elapsed_ms > self.watchdog_ms
+
+    def locked(self, now: float | None = None) -> bool:
+        return self.sensor_stop_active or self.watchdog_expired(now)
+
+    def reason(self, now: float | None = None) -> str:
+        if self.sensor_stop_active:
+            return "obstacle"
+        if self.watchdog_expired(now):
+            return "watchdog"
+        return ""
+
+
 @dataclass(frozen=True, slots=True)
 class MotionDatagram:
     protocol_version: int

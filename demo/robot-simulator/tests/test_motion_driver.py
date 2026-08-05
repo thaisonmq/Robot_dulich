@@ -9,6 +9,7 @@ from simulator.control_protocol import (
     LatestMotionSlot,
     MOTION_PROTOCOL_VERSION,
     MotionDatagram,
+    SafetyInterlock,
     decode_motion_datagram,
     encode_motion_datagram,
     joy_input_active,
@@ -107,6 +108,35 @@ def test_legacy_joystick_override_ignores_resting_noise() -> None:
     assert joy_input_active(
         [0.0, 0.0], [0, 1], deadzone=0.12, axis_indices=(1, 2)
     ) is True
+
+
+def test_safety_interlock_obstacle_has_priority_over_clear_heartbeat() -> None:
+    interlock = SafetyInterlock(watchdog_ms=500)
+
+    assert interlock.locked(now=10.0)
+    assert interlock.reason(now=10.0) == "watchdog"
+
+    interlock.update(False, now=10.0)
+    assert not interlock.locked(now=10.4)
+
+    interlock.update(True, now=10.4)
+    assert interlock.locked(now=10.41)
+    assert interlock.reason(now=10.41) == "obstacle"
+
+    interlock.update(False, now=10.5)
+    assert not interlock.locked(now=10.9)
+    assert interlock.locked(now=11.001)
+    assert interlock.reason(now=11.001) == "watchdog"
+
+
+def test_safety_interlock_can_run_without_heartbeat_watchdog() -> None:
+    interlock = SafetyInterlock()
+
+    assert not interlock.locked(now=20.0)
+    interlock.update(True, now=20.0)
+    assert interlock.locked(now=200.0)
+    interlock.update(False, now=200.0)
+    assert not interlock.locked(now=500.0)
 
 
 def test_unix_motion_driver_clamps_and_never_blocks() -> None:
