@@ -10,6 +10,13 @@ from typing import Literal
 MOTION_PROTOCOL_VERSION = 1
 MAX_MOTION_DATAGRAM_BYTES = 1024
 MotionMessageType = Literal["velocity", "stop"]
+OBSTACLE_FRONT = 1 << 0
+OBSTACLE_REAR = 1 << 1
+OBSTACLE_LEFT = 1 << 2
+OBSTACLE_RIGHT = 1 << 3
+OBSTACLE_DIRECTION_MASK = (
+    OBSTACLE_FRONT | OBSTACLE_REAR | OBSTACLE_LEFT | OBSTACLE_RIGHT
+)
 
 
 def joy_input_active(
@@ -36,6 +43,7 @@ class SafetyInterlock:
 
     watchdog_ms: int = 0
     sensor_stop_active: bool = False
+    blocked_directions: int = 0
     last_update_monotonic: float = 0.0
     received_update: bool = False
 
@@ -45,6 +53,17 @@ class SafetyInterlock:
 
     def update(self, stop_active: bool, now: float | None = None) -> None:
         self.sensor_stop_active = bool(stop_active)
+        self._mark_updated(now)
+
+    def update_directions(
+        self, blocked_directions: int, now: float | None = None
+    ) -> None:
+        if blocked_directions < 0 or blocked_directions & ~OBSTACLE_DIRECTION_MASK:
+            raise ValueError("invalid obstacle direction mask")
+        self.blocked_directions = blocked_directions
+        self._mark_updated(now)
+
+    def _mark_updated(self, now: float | None) -> None:
         self.last_update_monotonic = time.monotonic() if now is None else now
         self.received_update = True
 
@@ -66,6 +85,24 @@ class SafetyInterlock:
         if self.watchdog_expired(now):
             return "watchdog"
         return ""
+
+    def filter_velocity(
+        self,
+        linear_x: float,
+        angular_z: float,
+        now: float | None = None,
+    ) -> tuple[float, float]:
+        if self.locked(now):
+            return 0.0, 0.0
+        if linear_x > 0 and self.blocked_directions & OBSTACLE_FRONT:
+            linear_x = 0.0
+        elif linear_x < 0 and self.blocked_directions & OBSTACLE_REAR:
+            linear_x = 0.0
+        if angular_z > 0 and self.blocked_directions & OBSTACLE_LEFT:
+            angular_z = 0.0
+        elif angular_z < 0 and self.blocked_directions & OBSTACLE_RIGHT:
+            angular_z = 0.0
+        return linear_x, angular_z
 
 
 @dataclass(frozen=True, slots=True)

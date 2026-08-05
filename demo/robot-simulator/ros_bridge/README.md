@@ -35,6 +35,10 @@ Obstacle detector -> /rovera/obstacle_stop ----------> safety interlock
   biến. Khi đã tích hợp, đặt giá trị dương (khuyến nghị bắt đầu từ 500 ms) và
   publish cả `true` lẫn `false` định kỳ; bridge sẽ khóa ngay từ lúc khởi động
   và khóa lại nếu heartbeat quá hạn.
+- Để chỉ khóa chiều gần vật cản, publish `std_msgs/UInt8` lên
+  `/rovera/obstacle_directions`: bit 0 chặn tiến, bit 1 chặn lùi, bit 2 chặn
+  quay trái và bit 3 chặn quay phải. Các thành phần vận tốc không hướng vào vật
+  cản vẫn được giữ nguyên.
 
 ## Giao thức dừng do vật cản
 
@@ -47,6 +51,19 @@ ros2 topic pub /rovera/obstacle_stop std_msgs/msg/Bool '{data: true}' -r 10
 
 # Hết vật cản: tiếp tục heartbeat an toàn nếu watchdog đang bật.
 ros2 topic pub /rovera/obstacle_stop std_msgs/msg/Bool '{data: false}' -r 10
+```
+
+Khóa theo hướng dùng bitmask:
+
+```bash
+# Cản phía trước (1): chặn tiến, vẫn cho lùi/quay.
+ros2 topic pub /rovera/obstacle_directions std_msgs/msg/UInt8 '{data: 1}' -r 10
+
+# Cản trước + trái (1 + 4 = 5): chặn tiến và quay trái.
+ros2 topic pub /rovera/obstacle_directions std_msgs/msg/UInt8 '{data: 5}' -r 10
+
+# Không có hướng bị chặn.
+ros2 topic pub /rovera/obstacle_directions std_msgs/msg/UInt8 '{data: 0}' -r 10
 ```
 
 Trong chế độ song song với Yahboom legacy, interlock luôn ưu tiên hơn lệnh web
@@ -94,3 +111,37 @@ identity `user:*`. Vì camera encoded dùng một identity khác, Pi không còn
 ngược chính luồng video mình vừa phát. Cấu hình mẫu dùng 1080p25 ở 6 Mbps để
 chừa băng thông Wi-Fi cho gói điều khiển; pipeline camera vẫn dùng FPS V4L2 đã
 thương lượng và hàng đợi chỉ giữ khung mới nhất ở đường raw.
+
+
+cản trước:
+
+ros2 topic pub /rovera/obstacle_directions std_msgs/msg/UInt8 \
+  '{data: 1}' -r 10
+
+cản sau:
+
+ros2 topic pub /rovera/obstacle_directions std_msgs/msg/UInt8 \
+  '{data: 2}' -r 10
+
+cản trái:
+
+ros2 topic pub /rovera/obstacle_directions std_msgs/msg/UInt8 \
+  '{data: 4}' -r 10
+
+cản phải:
+
+ros2 topic pub /rovera/obstacle_directions std_msgs/msg/UInt8 \
+  '{data: 8}' -r 10
+
+Có thể cộng các giá trị:
+Trước + trái: 1 + 4 = 5.
+Trước + phải: 1 + 8 = 9.
+Tất cả hướng: 15.
+
+
+
+
+Khi hết vật cản:
+
+ros2 topic pub /rovera/obstacle_directions std_msgs/msg/UInt8 \
+  '{data: 0}' -r 10

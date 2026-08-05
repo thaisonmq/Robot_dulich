@@ -19,7 +19,7 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import Joy
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, UInt8
 
 from simulator.control_protocol import (
     LatestMotionSlot,
@@ -133,6 +133,15 @@ class RosControlBridge(Node):
             self._on_obstacle_stop,
             qos,
         )
+        self.obstacle_directions_subscription = self.create_subscription(
+            UInt8,
+            os.getenv(
+                "ROS_OBSTACLE_DIRECTIONS_TOPIC",
+                "/rovera/obstacle_directions",
+            ),
+            self._on_obstacle_directions,
+            qos,
+        )
         self.legacy_joy_subscription = self.create_subscription(
             Joy,
             os.getenv("ROS_LEGACY_JOY_TOPIC", "/joy"),
@@ -163,6 +172,7 @@ class RosControlBridge(Node):
         # optional heartbeat watchdog is disabled. A positive watchdog still
         # starts fail-closed and logs the initial lock transition.
         self._obstacle_lock_reported = False
+        self._obstacle_directions_reported = 0
         self._last_safety_zero_monotonic = 0.0
         self._closing = threading.Event()
         self._guard = self.create_guard_condition(self._apply_pending)
@@ -379,6 +389,29 @@ class RosControlBridge(Node):
             # Do not wait for the 100 Hz timer before issuing the first stop.
             self._publish_safety_zero(now)
 
+    def _on_obstacle_directions(self, message: UInt8) -> None:
+        now = time.monotonic()
+        try:
+            self._obstacle_interlock.update_directions(int(message.data), now)
+        except ValueError as exc:
+            self.get_logger().warning(f"dropping obstacle directions: {exc}")
+            return
+        if message.data != self._obstacle_directions_reported:
+            self._obstacle_directions_reported = int(message.data)
+            self.get_logger().info(
+                f"obstacle direction mask changed mask={message.data}"
+            )
+        if self._sync_obstacle_lock_state(now):
+            self._active_command = None
+            self._stop_burst_remaining = 0
+            self._publish_safety_zero(now)
+            return
+        # Apply a newly blocked direction to the current command immediately;
+        # never wait for the next browser packet to stop that component.
+        if self._active_command is not None:
+            self._publish_velocity(self._active_command, now=now)
+            self._last_publish_monotonic = now
+
     def _sync_obstacle_lock_state(self, now: float) -> bool:
         locked = self._obstacle_interlock.locked(now)
         if locked == self._obstacle_lock_reported:
@@ -403,13 +436,18 @@ class RosControlBridge(Node):
             self._legacy_override_logged = False
         return active
 
-    def _publish_velocity(self, command: MotionDatagram) -> None:
+    def _publish_velocity(
+        self, command: MotionDatagram, *, now: float | None = None
+    ) -> None:
         message = Twist()
-        message.linear.x = max(
+        linear_x = max(
             -self.max_reverse, min(self.max_forward, command.linear_x)
         )
-        message.angular.z = max(
+        angular_z = max(
             -self.max_angular, min(self.max_angular, command.angular_z)
+        )
+        message.linear.x, message.angular.z = (
+            self._obstacle_interlock.filter_velocity(linear_x, angular_z, now)
         )
         self.velocity_publisher.publish(message)
 

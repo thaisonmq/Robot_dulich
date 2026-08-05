@@ -114,6 +114,7 @@ services:
       # Chương trình tránh vật cản phát Bool liên tục: true=dừng, false=an toàn.
       # Đặt watchdog > 0 để mất heartbeat cũng khóa chuyển động (fail closed).
       ROS_OBSTACLE_STOP_TOPIC: /rovera/obstacle_stop
+      ROS_OBSTACLE_DIRECTIONS_TOPIC: /rovera/obstacle_directions
       ROS_OBSTACLE_WATCHDOG_MS: ${ROS_OBSTACLE_WATCHDOG_MS:-0}
       ROS_SAFETY_CMD_VEL_TOPIC: /cmd_vel_safety
     volumes:

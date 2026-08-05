@@ -8,6 +8,10 @@ from simulator.config import SimulatorConfig
 from simulator.control_protocol import (
     LatestMotionSlot,
     MOTION_PROTOCOL_VERSION,
+    OBSTACLE_FRONT,
+    OBSTACLE_LEFT,
+    OBSTACLE_REAR,
+    OBSTACLE_RIGHT,
     MotionDatagram,
     SafetyInterlock,
     decode_motion_datagram,
@@ -137,6 +141,27 @@ def test_safety_interlock_can_run_without_heartbeat_watchdog() -> None:
     assert interlock.locked(now=200.0)
     interlock.update(False, now=200.0)
     assert not interlock.locked(now=500.0)
+
+
+def test_safety_interlock_filters_only_blocked_directions() -> None:
+    interlock = SafetyInterlock()
+    interlock.update_directions(OBSTACLE_FRONT | OBSTACLE_LEFT, now=10.0)
+
+    assert interlock.filter_velocity(0.3, 0.4, now=10.1) == (0.0, 0.0)
+    assert interlock.filter_velocity(-0.2, -0.3, now=10.1) == (-0.2, -0.3)
+    assert interlock.filter_velocity(-0.2, 0.4, now=10.1) == (-0.2, 0.0)
+    assert interlock.filter_velocity(0.3, -0.3, now=10.1) == (0.0, -0.3)
+
+    interlock.update_directions(OBSTACLE_REAR | OBSTACLE_RIGHT, now=10.2)
+    assert interlock.filter_velocity(0.3, 0.4, now=10.3) == (0.3, 0.4)
+    assert interlock.filter_velocity(-0.2, -0.3, now=10.3) == (0.0, 0.0)
+
+
+def test_safety_interlock_rejects_unknown_direction_bits() -> None:
+    interlock = SafetyInterlock()
+
+    with pytest.raises(ValueError, match="direction mask"):
+        interlock.update_directions(16, now=10.0)
 
 
 def test_unix_motion_driver_clamps_and_never_blocks() -> None:
