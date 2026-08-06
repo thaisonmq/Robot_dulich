@@ -1,0 +1,13 @@
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: OPEN_LOOP
+    max_velocity: [0.10, 0.0, 0.60]
+    min_velocity: [-0.08, 0.0, -0.60]
+    max_accel: [0.20, 0.0, 0.80]
+    max_decel: [-0.35, 0.0, -1.20]
+    odom_topic: /odometry/filtered
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 0.30

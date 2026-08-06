@@ -28,12 +28,21 @@ class SimulatorConfig(BaseSettings):
     max_forward_speed: float = 0.4
     max_reverse_speed: float = 0.25
     max_angular_speed: float = 0.8
-    motion_backend: Literal["simulator", "ros2"] = "simulator"
+    # ``disabled`` is the fail-closed mode used while Rovera coexists with a
+    # vendor stack that still owns /cmd_vel. It keeps camera, telemetry and
+    # mapping online without pretending that Web motion was delivered.
+    motion_backend: Literal["disabled", "simulator", "ros2"] = "simulator"
+    navigation_backend: Literal["simulator", "ros2"] = "simulator"
+    navigation_socket_path: str = "/var/lib/rovera/navigation/navigation.sock"
+    map_cache_dir: str = "/var/lib/rovera/maps"
     motion_socket_path: str = "/var/lib/rovera/control/motion.sock"
     motion_watchdog_ms: int = Field(default=250, ge=150, le=500)
     ros_max_forward_speed: float = Field(default=0.33, gt=0, le=1.0)
     ros_max_reverse_speed: float = Field(default=0.25, gt=0, le=1.0)
     ros_max_angular_speed: float = Field(default=0.8, gt=0, le=3.0)
+    mapping_max_forward_speed: float = Field(default=0.12, gt=0, le=0.15)
+    mapping_max_reverse_speed: float = Field(default=0.10, gt=0, le=0.15)
+    mapping_max_angular_speed: float = Field(default=0.40, gt=0, le=0.8)
     heartbeat_seconds: float = 2.0
     livekit_url: str = "ws://localhost:7880"
     simulator_media_source_type: str = "test"

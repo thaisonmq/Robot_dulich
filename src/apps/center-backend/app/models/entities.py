@@ -154,6 +154,122 @@ class MapRecord(Base):
     height_pixels: Mapped[int]
     resolution_m_per_pixel: Mapped[float]
     origin: Mapped[dict[str, Any]] = mapped_column(JSON)
+    site_id: Mapped[str] = mapped_column(String(64), default="")
+    floor_id: Mapped[str] = mapped_column(String(64), default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="ACTIVE", index=True)
+    active_version: Mapped[int | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now, onupdate=now
+    )
+
+
+class MapVersion(Base):
+    __tablename__ = "map_versions"
+    __table_args__ = (
+        UniqueConstraint("map_id", "version", name="uq_map_version_number"),
+        UniqueConstraint("map_id", "checksum", name="uq_map_version_checksum"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    map_id: Mapped[str] = mapped_column(ForeignKey("maps.map_id"), index=True)
+    version: Mapped[int]
+    status: Mapped[str] = mapped_column(String(32), default="DRAFT", index=True)
+    checksum: Mapped[str] = mapped_column(String(64), index=True)
+    storage_path: Mapped[str] = mapped_column(String(1024))
+    resolution: Mapped[float]
+    origin: Mapped[dict[str, Any]] = mapped_column(JSON)
+    width: Mapped[int]
+    height: Mapped[int]
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_by_robot: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MappingSession(Base):
+    __tablename__ = "mapping_sessions"
+
+    session_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    map_id: Mapped[str] = mapped_column(ForeignKey("maps.map_id"), index=True)
+    version: Mapped[int]
+    robot_id: Mapped[str] = mapped_column(String(64), index=True)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="STARTING", index=True)
+    last_request_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now, onupdate=now
+    )
+
+
+class RobotMapCache(Base):
+    __tablename__ = "robot_map_caches"
+    __table_args__ = (
+        UniqueConstraint("robot_id", "map_id", "version", name="uq_robot_map_cache"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    robot_id: Mapped[str] = mapped_column(String(64), index=True)
+    map_id: Mapped[str] = mapped_column(ForeignKey("maps.map_id"), index=True)
+    version: Mapped[int]
+    checksum: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), default="MISSING", index=True)
+    progress_percent: Mapped[float] = mapped_column(Float, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now, onupdate=now
+    )
+
+
+class POI(Base):
+    __tablename__ = "map_pois"
+
+    poi_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    map_id: Mapped[str] = mapped_column(ForeignKey("maps.map_id"), index=True)
+    version: Mapped[int]
+    name: Mapped[str] = mapped_column(String(120))
+    x: Mapped[float]
+    y: Mapped[float]
+    yaw: Mapped[float] = mapped_column(Float, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class KeepoutZone(Base):
+    __tablename__ = "keepout_zones"
+
+    zone_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    map_id: Mapped[str] = mapped_column(ForeignKey("maps.map_id"), index=True)
+    version: Mapped[int]
+    name: Mapped[str] = mapped_column(String(120))
+    points: Mapped[list[dict[str, float]]] = mapped_column(JSON)
+
+
+class SpeedZone(Base):
+    __tablename__ = "speed_zones"
+
+    zone_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    map_id: Mapped[str] = mapped_column(ForeignKey("maps.map_id"), index=True)
+    version: Mapped[int]
+    name: Mapped[str] = mapped_column(String(120))
+    points: Mapped[list[dict[str, float]]] = mapped_column(JSON)
+    max_speed_mps: Mapped[float]
 
 
 class Destination(Base):
@@ -175,6 +291,44 @@ class NavigationRoute(Base):
     points: Mapped[list[dict[str, float]]] = mapped_column(JSON)
     distance_m: Mapped[float]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class NavigationMission(Base):
+    __tablename__ = "navigation_missions"
+
+    mission_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    request_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    robot_id: Mapped[str] = mapped_column(String(64), index=True)
+    control_session_id: Mapped[str] = mapped_column(String(36), index=True)
+    map_id: Mapped[str] = mapped_column(ForeignKey("maps.map_id"), index=True)
+    map_version: Mapped[int]
+    status: Mapped[str] = mapped_column(String(32), default="PLANNING", index=True)
+    goal: Mapped[dict[str, Any]] = mapped_column(JSON)
+    path: Mapped[list[dict[str, float]]] = mapped_column(JSON, default=list)
+    distance_m: Mapped[float] = mapped_column(Float, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now, onupdate=now
+    )
+
+
+class CommandReceipt(Base):
+    __tablename__ = "command_receipts"
+
+    request_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    robot_id: Mapped[str] = mapped_column(String(64), index=True)
+    command_type: Mapped[str] = mapped_column(String(64), index=True)
+    expected_state: Mapped[str | None] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32), default="PENDING")
+    response: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now, onupdate=now
+    )
 
 
 class CommandLog(Base):

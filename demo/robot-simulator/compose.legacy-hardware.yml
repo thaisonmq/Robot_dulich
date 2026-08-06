@@ -1,0 +1,36 @@
+name: rovera-robot-legacy-hardware
+
+services:
+  legacy-micro-ros-agent:
+    build:
+      context: ./micro-ros-agent-guard
+    image: rovera-micro-ros-agent-guard:humble
+    network_mode: host
+    pid: host
+    restart: unless-stopped
+    privileged: true
+    environment:
+      ROVERA_HARDWARE_MODE: legacy
+      MICRO_ROS_SERIAL_DEVICE: /dev/ttyUSB0
+      ROVERA_SERIAL_LOCK_FILE: /var/lock/rovera-micro-ros/ttyUSB0.lock
+      # The vendor runtime uses domain 20. Leaving this unset silently puts
+      # MCU topics in domain 0, where the Web/bringup graph cannot see them.
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
+      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      MICRO_ROS_AGENT_VERBOSITY: ${MICRO_ROS_AGENT_VERBOSITY:-2}
+      MICRO_ROS_AGENT_VMEM_KB: ${MICRO_ROS_AGENT_VMEM_KB:-1572864}
+    volumes:
+      - /dev:/dev
+      - /dev/shm:/dev/shm
+      - /var/lock/rovera-micro-ros:/var/lock/rovera-micro-ros
+    command: ["serial", "--dev", "/dev/ttyUSB0", "-b", "921600", "-v${MICRO_ROS_AGENT_VERBOSITY:-2}"]
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

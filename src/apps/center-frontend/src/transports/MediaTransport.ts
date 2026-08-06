@@ -18,6 +18,10 @@ export interface IMediaTransport {
   disconnect(): Promise<void>;
 }
 
+export interface LiveKitMediaOptions {
+  videoOnly?: boolean;
+}
+
 const VIDEO_STALL_RECOVERY_MS = 2500;
 const VIDEO_WATCHDOG_INTERVAL_MS = 500;
 
@@ -54,6 +58,7 @@ export class LiveKitMediaTransport implements IMediaTransport {
     private readonly onState: (state: string) => void,
     private readonly snapshotCanvas?: HTMLCanvasElement,
     private readonly refreshConnection?: () => Promise<{ url: string; token: string }>,
+    private readonly options: LiveKitMediaOptions = {},
   ) {}
 
   async connect(url: string, token: string): Promise<void> {
@@ -65,6 +70,12 @@ export class LiveKitMediaTransport implements IMediaTransport {
     // instead of allowing viewport heuristics to pause or switch quality.
     const room = new Room({ adaptiveStream: false, dynacast: false });
     this.room = room;
+    if (this.options.videoOnly) {
+      room.on(RoomEvent.TrackPublished, (publication, participant) => {
+        if (!participant.identity.startsWith("robot:")) return;
+        publication.setSubscribed(publication.kind === Track.Kind.Video);
+      });
+    }
     room.on(RoomEvent.TrackSubscribed, (
       track: RemoteTrack,
       publication: RemoteTrackPublication,
@@ -108,6 +119,10 @@ export class LiveKitMediaTransport implements IMediaTransport {
         void this.videoElement.play().catch(() => undefined);
       }
       if (track.kind === Track.Kind.Audio) {
+        if (this.options.videoOnly) {
+          publication.setSubscribed(false);
+          return;
+        }
         this.audioTrack = track;
         // Conversational audio has its own smaller target. A bursty camera must
         // not inflate mouth-to-ear delay for the full-duplex talk path.
@@ -157,10 +172,18 @@ export class LiveKitMediaTransport implements IMediaTransport {
       this.scheduleRoomReconnect();
     });
     try {
-      await room.connect(url, token);
+      await room.connect(url, token, { autoSubscribe: !this.options.videoOnly });
     } catch (reason) {
       if (!this.manualDisconnect) this.scheduleRoomReconnect();
       throw reason;
+    }
+    if (this.options.videoOnly) {
+      for (const participant of room.remoteParticipants.values()) {
+        if (!participant.identity.startsWith("robot:")) continue;
+        for (const publication of participant.trackPublications.values()) {
+          publication.setSubscribed(publication.kind === Track.Kind.Video);
+        }
+      }
     }
     if (this.microphoneEnabled) {
       await room.localParticipant.setMicrophoneEnabled(true);

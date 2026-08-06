@@ -32,8 +32,17 @@ from simulator.media_devices import (
 )
 from simulator.messages import Message, make_message
 from simulator.motion import MotionSimulator
-from simulator.motion_driver import MotionDriver, build_motion_driver
+from simulator.motion_driver import (
+    MotionDisabledError,
+    MotionDriver,
+    build_motion_driver,
+)
 from simulator.navigation import NavigationSimulator
+from simulator.navigation_backends import (
+    NavigationBackendError,
+    build_navigation_backend,
+)
+from simulator.map_cache import MapCacheError, RobotMapCacheManager
 
 logger = logging.getLogger("simulator.gateway")
 
@@ -44,9 +53,22 @@ class RobotConnectionClient:
         self.motion = MotionSimulator(config)
         self.motion_driver: MotionDriver = build_motion_driver(config, self.motion)
         self.navigation = NavigationSimulator(self.motion)
+        self.navigation_backend = build_navigation_backend(
+            config.navigation_backend,
+            self.navigation,
+            self.motion,
+            config.navigation_socket_path,
+        )
+        self.map_cache = RobotMapCacheManager(
+            config.map_cache_dir,
+            config.center_api_url,
+            self._robot_bearer_token,
+            verify=self.http_verify,
+        )
         self.media = MediaPublisher(config, self._media_token)
         self.camera_ptz = CameraPtzController()
         self._ptz_task: asyncio.Task[bool] | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self.sequence = 0
         self.processed_ids: set[str] = set()
         self.processed_order: deque[str] = deque()
@@ -303,6 +325,13 @@ class RobotConnectionClient:
             if not self.state_path.is_file():
                 self._save_device_state()
 
+    async def _robot_bearer_token(self) -> str:
+        # Map transfer is infrequent and may happen long after the persistent
+        # gateway WebSocket was opened. Always refresh here so an expired JWT
+        # cannot turn a continuation/save into a 90-second command timeout.
+        await self._authenticate()
+        return self.robot_access_token
+
     async def _claim(self) -> None:
         management_address = (
             self.config.robot_management_address.strip()
@@ -440,11 +469,17 @@ class RobotConnectionClient:
             asyncio.create_task(self._telemetry_loop(socket)),
             asyncio.create_task(self._heartbeat_loop(socket)),
             asyncio.create_task(self._media_loop()),
+            asyncio.create_task(self._mapping_upload_retry_loop()),
+            asyncio.create_task(self._navigation_runtime_loop(socket)),
         ]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for task in pending:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tuple(self._background_tasks):
+            task.cancel()
+        await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
         for task in done:
             if task.exception():
                 raise task.exception()
@@ -567,9 +602,36 @@ class RobotConnectionClient:
                     self._stop_motion("invalid_velocity")
                     await self._ack(socket, message, "rejected")
                     continue
-                self.navigation.cancel() if self.navigation.status == "moving" else None
+                navigation_state = self.navigation_backend.state()
+                if str(navigation_state.get("mode", "")).upper() == "MAPPING":
+                    linear_x = max(
+                        -self.config.mapping_max_reverse_speed,
+                        min(self.config.mapping_max_forward_speed, linear_x),
+                    )
+                    angular_z = max(
+                        -self.config.mapping_max_angular_speed,
+                        min(self.config.mapping_max_angular_speed, angular_z),
+                    )
+                if self.config.navigation_backend == "simulator":
+                    await self.navigation_backend.manual_takeover()
+                else:
+                    # Safety arbitration switches to the manual source at once;
+                    # Nav2 cancellation is independent and must not delay input.
+                    self._spawn_background(self.navigation_backend.manual_takeover())
                 dispatch_started = time.monotonic()
-                self.motion_driver.set_velocity(linear_x, angular_z)
+                try:
+                    self.motion_driver.set_velocity(linear_x, angular_z)
+                except MotionDisabledError as exc:
+                    await self._ack(
+                        socket,
+                        message,
+                        "rejected",
+                        {
+                            "error_code": "MOTION_DISABLED",
+                            "error_message": str(exc),
+                        },
+                    )
+                    continue
                 dispatch_finished = time.monotonic()
                 if (
                     dispatch_finished - self._last_control_latency_log_monotonic
@@ -606,24 +668,32 @@ class RobotConnectionClient:
                     await self._ack(socket, message, "completed")
                 except ValueError:
                     await self._ack(socket, message, "rejected")
-            elif message.message_type == "navigation.goal":
-                if self.config.motion_backend == "ros2":
-                    self.navigation.status = "failed"
-                    self.navigation.route_id = str(message.payload.get("route_id", ""))
-                    self._stop_motion("navigation_unsupported")
-                    await self._ack(socket, message, "rejected")
-                else:
-                    self.navigation.start(
-                        str(message.payload["route_id"]),
-                        list(message.payload["points"]),
-                    )
-                    await self._ack(socket, message, "accepted")
-                await self._navigation_status(socket)
-            elif message.message_type == "navigation.cancel":
-                self.navigation.cancel()
-                self._stop_motion("navigation_cancelled")
-                await self._ack(socket, message, "completed")
-                await self._navigation_status(socket)
+            elif (
+                message.message_type.startswith("mapping.")
+                or message.message_type.startswith("map.")
+                or message.message_type in {
+                    "navigation.compute_path",
+                    "navigation.start",
+                    "navigation.pause",
+                    "navigation.resume",
+                    "navigation.cancel",
+                    "navigation.goal",
+                }
+            ):
+                if (
+                    self.config.motion_backend == "ros2"
+                    and self.config.navigation_backend != "ros2"
+                ):
+                    # Reject this invalid hardware configuration immediately.
+                    # The normal ROS/Nav2 path stays asynchronous below so map
+                    # I/O can never delay a manual stop command.
+                    await self._handle_navigation_command(socket, message)
+                    continue
+                # Map I/O and Nav2 actions can take seconds. Run them outside
+                # the receive loop so stop/manual commands remain immediate.
+                self._spawn_background(
+                    self._handle_navigation_command(socket, message)
+                )
             elif message.message_type == "configuration.get":
                 await self._configuration_state(
                     socket, str(message.payload.get("request_id", ""))
@@ -1229,14 +1299,275 @@ class RobotConnectionClient:
         while len(self.processed_order) > 2048:
             self.processed_ids.discard(self.processed_order.popleft())
 
-    async def _ack(self, socket: Any, command: Message, status: str) -> None:
+    async def _execute_navigation_command(
+        self, command: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if (
+            self.config.motion_backend == "ros2"
+            and self.config.navigation_backend != "ros2"
+        ):
+            raise NavigationBackendError(
+                "NAVIGATION_BACKEND_UNAVAILABLE",
+                "Real motion requires the ROS 2 navigation backend",
+                current_state="FAULT",
+            )
+        command_payload = dict(payload)
+        if command == "map.load" and self.config.navigation_backend == "ros2":
+            destination = await self.map_cache.ensure(
+                map_id=str(payload["map_id"]),
+                version=int(payload["version"]),
+                checksum=str(payload["checksum"]),
+                download_url=str(payload["download_url"]),
+            )
+            command_payload["map_path"] = str(destination)
+        if (
+            command == "mapping.start"
+            and self.config.navigation_backend == "ros2"
+            and payload.get("source_version")
+        ):
+            destination = await self.map_cache.ensure(
+                map_id=str(payload["map_id"]),
+                version=int(payload["source_version"]),
+                checksum=str(payload["source_checksum"]),
+                download_url=str(payload["source_download_url"]),
+            )
+            basename = str(payload.get("posegraph_basename") or "posegraph")
+            if Path(basename).name != basename:
+                raise MapCacheError("invalid pose-graph basename")
+            posegraph = destination / basename
+            if not posegraph.with_suffix(".posegraph").is_file() or not posegraph.with_suffix(".data").is_file():
+                raise MapCacheError("downloaded map has no serialized pose-graph")
+            command_payload["posegraph_path"] = str(posegraph)
+        result = await self.navigation_backend.execute(command, command_payload)
+        bundle_path = str(result.get("bundle_path", ""))
+        if command in {"mapping.save_draft", "mapping.finish"} and bundle_path:
+            upload = {
+                "map_id": str(payload["map_id"]),
+                "version": int(payload["version"]),
+                "robot_id": self.config.robot_id,
+                "bundle_path": bundle_path,
+            }
+            self._queue_mapping_upload(upload)
+            self._spawn_background(self._upload_mapping_bundle_safely(upload))
+            result["upload_status"] = "PENDING"
+        return result
+
+    def _spawn_background(self, operation: Any) -> None:
+        task = asyncio.create_task(operation)
+        self._background_tasks.add(task)
+
+        def finished(completed: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except Exception as exc:
+                logger.warning("background operation failed error=%s", exc)
+
+        task.add_done_callback(finished)
+
+    async def _handle_navigation_command(self, socket: Any, message: Message) -> None:
+        try:
+            result = await self._execute_navigation_command(
+                message.message_type, message.payload
+            )
+            await self._ack(
+                socket,
+                message,
+                str(result.get("status", "accepted")),
+                result,
+            )
+        except (NavigationBackendError, MapCacheError) as exc:
+            if getattr(exc, "code", "") == "NAVIGATION_BACKEND_UNAVAILABLE":
+                self.navigation.status = "failed"
+            self._stop_motion(
+                "navigation_unsupported"
+                if getattr(exc, "code", "") == "NAVIGATION_BACKEND_UNAVAILABLE"
+                else "navigation_command_rejected"
+            )
+            await self._ack(
+                socket,
+                message,
+                "rejected",
+                {
+                    "current_state": getattr(exc, "current_state", "FAULT"),
+                    "error_code": getattr(exc, "code", "MAP_CACHE_ERROR"),
+                    "error_message": str(exc),
+                },
+            )
+        await self._navigation_status(socket)
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    async def _upload_mapping_bundle(self, upload: dict[str, Any]) -> None:
+        path = Path(str(upload["bundle_path"]))
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        checksum = await asyncio.to_thread(self._file_sha256, path)
+        token = await self._robot_bearer_token()
+
+        def send() -> None:
+            with path.open("rb") as source, httpx.Client(
+                base_url=self.config.center_api_url.rstrip("/"),
+                verify=self.http_verify,
+                timeout=120,
+            ) as client:
+                response = client.post(
+                    f"/api/maps/{upload['map_id']}/versions",
+                    headers={"Authorization": f"Bearer {token}"},
+                    data={
+                        "version": str(upload["version"]),
+                        "robot_id": str(upload["robot_id"]),
+                        "checksum": checksum,
+                    },
+                    files={"bundle": (path.name, source, "application/gzip")},
+                )
+                response.raise_for_status()
+
+        await asyncio.to_thread(send)
+        path.with_name(".upload-pending.json").unlink(missing_ok=True)
+
+    async def _upload_mapping_bundle_safely(self, upload: dict[str, Any]) -> None:
+        try:
+            await self._upload_mapping_bundle(upload)
+            logger.info("mapping bundle uploaded path=%s", upload["bundle_path"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The persistent marker is intentionally retained for reconnect.
+            logger.warning(
+                "mapping bundle queued for retry path=%s error=%s",
+                upload["bundle_path"],
+                exc,
+            )
+
+    def _queue_mapping_upload(self, upload: dict[str, Any]) -> None:
+        marker = Path(str(upload["bundle_path"])).with_name(".upload-pending.json")
+        marker.write_text(json.dumps(upload))
+
+    async def _mapping_upload_retry_loop(self) -> None:
+        root = Path(self.config.map_cache_dir).parent / "created"
+        while True:
+            for marker in (root.glob("*/*/.upload-pending.json") if root.exists() else ()):
+                try:
+                    upload = json.loads(marker.read_text())
+                    await self._upload_mapping_bundle(upload)
+                    logger.info("mapping bundle upload recovered path=%s", upload["bundle_path"])
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("mapping bundle retry pending marker=%s error=%s", marker, exc)
+            await asyncio.sleep(10)
+
+    async def _navigation_runtime_loop(self, socket: Any) -> None:
+        if self.config.navigation_backend != "ros2":
+            return
+        last_map_revision = -1
+        last_scan: list[dict[str, float]] | None = None
+        last_poll_warning = 0.0
+        adapter_was_unavailable = False
+        while True:
+            try:
+                result = await self.navigation_backend.execute("system.status", {})
+                if adapter_was_unavailable:
+                    logger.info("ROS 2 navigation adapter connection recovered")
+                    adapter_was_unavailable = False
+                state = dict(result.get("state") or {})
+                await socket.send(
+                    json.dumps(
+                        make_message(
+                            "navigation.status",
+                            self.config.robot_id,
+                            self._next_sequence(),
+                            {"status": state.get("state", "FAULT"), **state},
+                        )
+                    )
+                )
+                snapshot = result.get("mapping_snapshot")
+                if isinstance(snapshot, dict):
+                    revision = int(snapshot.get("revision", -1))
+                    if revision != last_map_revision:
+                        last_map_revision = revision
+                        await socket.send(
+                            json.dumps(
+                                make_message(
+                                    "mapping.snapshot",
+                                    self.config.robot_id,
+                                    self._next_sequence(),
+                                    snapshot,
+                                )
+                            )
+                        )
+                scan = result.get("scan")
+                if isinstance(scan, list) and scan != last_scan:
+                    last_scan = scan
+                    await socket.send(
+                        json.dumps(
+                            make_message(
+                                "mapping.scan",
+                                self.config.robot_id,
+                                self._next_sequence(),
+                                {"points": scan},
+                            )
+                        )
+                    )
+                pose = result.get("pose")
+                if isinstance(pose, dict):
+                    await socket.send(
+                        json.dumps(
+                            make_message(
+                                "robot.pose",
+                                self.config.robot_id,
+                                self._next_sequence(),
+                                {
+                                    "map_id": state.get("map_id", self.config.map_id),
+                                    "x": pose.get("x", 0),
+                                    "y": pose.get("y", 0),
+                                    "yaw": pose.get("yaw", 0),
+                                    "linear_velocity": 0,
+                                    "angular_velocity": 0,
+                                },
+                            )
+                        )
+                    )
+            except asyncio.CancelledError:
+                raise
+            except NavigationBackendError as exc:
+                now = time.monotonic()
+                adapter_was_unavailable = True
+                if now - last_poll_warning >= 5.0:
+                    logger.warning("navigation status poll failed error=%s", exc)
+                    last_poll_warning = now
+            await asyncio.sleep(0.2)
+
+    async def _ack(
+        self,
+        socket: Any,
+        command: Message,
+        status: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        request_id = str(command.payload.get("request_id", ""))
+        payload = {
+            "command_message_id": str(command.message_id),
+            "request_id": request_id,
+            "status": status,
+            **(details or {}),
+        }
         await socket.send(
             json.dumps(
                 make_message(
                     "command.ack",
                     self.config.robot_id,
                     self._next_sequence(),
-                    {"command_message_id": str(command.message_id), "status": status},
+                    payload,
                     command.session_id,
                 )
             )
@@ -1258,16 +1589,18 @@ class RobotConnectionClient:
     async def _telemetry_loop(self, socket: Any) -> None:
         previous_status = self.navigation.status
         while True:
-            await socket.send(
-                json.dumps(
-                    make_message(
-                        "robot.pose",
-                        self.config.robot_id,
-                        self._next_sequence(),
-                        self.motion.as_payload(),
+            if self.config.navigation_backend == "simulator":
+                await socket.send(
+                    json.dumps(
+                        make_message(
+                            "robot.pose",
+                            self.config.robot_id,
+                            self._next_sequence(),
+                            self.motion.as_payload(),
+                        )
                     )
                 )
-            )
+            backend_state = self.navigation_backend.state()
             await socket.send(
                 json.dumps(
                     make_message(
@@ -1297,6 +1630,32 @@ class RobotConnectionClient:
                             "navigation": self.navigation.status,
                             "simulator": "running",
                             "motion_backend": self.config.motion_backend,
+                            "navigation_backend": self.config.navigation_backend,
+                            "map_state": backend_state.get("state"),
+                            "localized": backend_state.get("localized", False),
+                            "nav2": backend_state.get("nav2", "UNAVAILABLE"),
+                            "safety": (
+                                "HEALTHY"
+                                if self.config.motion_backend == "simulator"
+                                else "READ_ONLY"
+                                if self.config.motion_backend == "disabled"
+                                else backend_state.get("safety", "UNKNOWN")
+                            ),
+                            "scan_fresh": (
+                                True
+                                if self.config.motion_backend == "simulator"
+                                else backend_state.get("scan_fresh", False)
+                            ),
+                            "odometry_ready": backend_state.get(
+                                "odometry_ready",
+                                self.config.motion_backend == "simulator",
+                            ),
+                            "lidar_tf_ready": backend_state.get(
+                                "lidar_tf_ready",
+                                self.config.motion_backend == "simulator",
+                            ),
+                            "estop": False,
+                            "collision_fault": False,
                         },
                     )
                 )
@@ -1307,6 +1666,7 @@ class RobotConnectionClient:
             await asyncio.sleep(1 / self.config.telemetry_hz)
 
     async def _navigation_status(self, socket: Any) -> None:
+        backend_state = self.navigation_backend.state()
         await socket.send(
             json.dumps(
                 make_message(
@@ -1317,6 +1677,7 @@ class RobotConnectionClient:
                         "route_id": self.navigation.route_id,
                         "status": self.navigation.status,
                         "point_index": self.navigation.point_index,
+                        **backend_state,
                     },
                 )
             )

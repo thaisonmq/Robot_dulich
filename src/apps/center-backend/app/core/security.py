@@ -131,6 +131,35 @@ def operator_user_id(user: User = Depends(authenticated_user)) -> str:
     return user.id
 
 
+def user_or_robot(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    settings: Settings = Depends(get_settings),
+    database: Session = Depends(get_db),
+) -> tuple[str, str]:
+    """Authenticate a browser user or an enrolled robot for map transfer APIs."""
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Thiếu access token")
+    token = credentials.credentials
+    try:
+        user_id = decode_token(token, settings)
+    except HTTPException:
+        user_id = ""
+    if user_id:
+        user = database.get(User, user_id)
+        if user is not None and user.active:
+            return "user", user.id
+    try:
+        robot_id = decode_robot_token(token, settings)
+    except HTTPException as exc:
+        raise HTTPException(status_code=401, detail="Token không hợp lệ hoặc đã hết hạn") from exc
+    from app.models.entities import Robot
+
+    robot = database.query(Robot).filter(Robot.robot_id == robot_id).first()
+    if robot is None or not robot.enabled or robot.credential_hash is None:
+        raise HTTPException(status_code=401, detail="Robot chưa được đăng ký")
+    return "robot", robot_id
+
+
 def require_roles(*roles: str):
     allowed = frozenset(roles)
 

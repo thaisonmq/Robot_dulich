@@ -1,0 +1,10 @@
+rovera_motion_safety:
+  ros__parameters:
+    half_length: 0.15
+    half_width: 0.05
+    clearance: 0.10
+    slow_extra: 0.20
+    latency: 0.12
+    braking_acceleration: 0.35
+    scan_timeout: 0.28
+    clear_hysteresis: 0.40

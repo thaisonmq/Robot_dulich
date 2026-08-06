@@ -26,7 +26,8 @@ class RobotRuntime:
             "media": ["video", "audio"],
             "control": ["velocity", "stop"],
             "navigation": True,
-            "source": "simulator",
+            # Fail closed until the edge reports which motion backend it uses.
+            "source": "unknown",
         }
     )
     pose: dict[str, Any] = field(
@@ -49,6 +50,7 @@ class RobotRuntime:
             "navigation": "idle",
         }
     )
+    mapping_snapshot: dict[str, Any] | None = None
 @dataclass(slots=True)
 class SessionRuntime:
     session_id: str
@@ -595,10 +597,13 @@ class ConnectionHub:
         message_type: str,
         payload: dict[str, Any],
         timeout_seconds: float = 5.0,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         if robot_id not in self.robot_sockets:
             raise ConnectionError("robot_offline")
-        request_id = str(uuid4())
+        request_id = request_id or str(uuid4())
+        if request_id in self.pending_robot_requests:
+            raise RuntimeError("request_already_pending")
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self.pending_robot_requests[request_id] = (robot_id, future)
         message = {
@@ -609,7 +614,10 @@ class ConnectionHub:
             "session_id": "",
             "sequence": 0,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "ttl_ms": int(timeout_seconds * 1000),
+            # The wire contract caps TTL at 30 seconds. Long-running SLAM
+            # commands may still use a longer ACK wait below; TTL only limits
+            # how long a queued command may wait before the robot starts it.
+            "ttl_ms": min(int(timeout_seconds * 1000), 30_000),
             "payload": {**payload, "request_id": request_id},
         }
         try:

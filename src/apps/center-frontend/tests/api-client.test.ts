@@ -65,6 +65,35 @@ describe("API authentication", () => {
       }),
     );
   });
+
+  it("clamps robot pagination to the backend limit", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ items: [], page: 1, page_size: 50, total: 0 }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.robots({ pageSize: 100, status: "online" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/robots?page=1&page_size=50&search=&status=online",
+      expect.any(Object),
+    );
+  });
+
+  it("updates and deletes a draft map through the registry API", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: vi.fn().mockResolvedValue({ map_id: "MAP-DRAFT", name: "Renamed" }) })
+      .mockResolvedValueOnce({ ok: true, status: 204, json: vi.fn() });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.updateMap("MAP-DRAFT", { name: "Renamed", site_id: "A", floor_id: "2", notes: "note" });
+    await api.deleteMap("MAP-DRAFT");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/maps/MAP-DRAFT", expect.objectContaining({ method: "PATCH" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/maps/MAP-DRAFT", expect.objectContaining({ method: "DELETE" }));
+  });
 });
 
 describe("Robot media source scan", () => {

@@ -6,6 +6,7 @@ import pytest
 
 from app.api import robots as robot_api
 from app.api import websockets as websocket_api
+from app.api.websockets import runtime_capabilities_from_health
 from app.schemas.messages import RealtimeMessage
 from app.services.hub import ConnectionHub
 
@@ -26,6 +27,41 @@ def message(timestamp: datetime, ttl_ms: int = 300) -> RealtimeMessage:
 def test_ttl_validation() -> None:
     assert message(datetime.now(timezone.utc)).expired() is False
     assert message(datetime.now(timezone.utc) - timedelta(seconds=1)).expired() is True
+
+
+def test_real_mapping_capability_requires_scan_odometry_and_lidar_tf() -> None:
+    base = {
+        "motion_backend": "ros2",
+        "navigation_backend": "ros2",
+        "nav2": "READY",
+        "scan_fresh": True,
+        "odometry_ready": True,
+        "lidar_tf_ready": True,
+    }
+    ready = runtime_capabilities_from_health(base)
+    assert ready["mapping"] is True
+    assert ready["mapping_blockers"] == []
+
+    missing_scan = runtime_capabilities_from_health({**base, "scan_fresh": False})
+    assert missing_scan["mapping"] is False
+    assert missing_scan["mapping_blockers"] == ["SCAN_STALE"]
+
+    missing_tf = runtime_capabilities_from_health(
+        {**base, "odometry_ready": False, "lidar_tf_ready": False}
+    )
+    assert missing_tf["mapping"] is False
+    assert missing_tf["mapping_blockers"] == [
+        "ODOMETRY_UNAVAILABLE",
+        "LIDAR_TF_UNAVAILABLE",
+    ]
+
+
+def test_simulator_capability_remains_self_contained() -> None:
+    capabilities = runtime_capabilities_from_health(
+        {"motion_backend": "simulator", "navigation_backend": "simulator"}
+    )
+    assert capabilities["mapping"] is True
+    assert capabilities["source"] == "simulator"
 
 
 @pytest.mark.asyncio
@@ -258,10 +294,11 @@ async def test_robot_request_waits_for_matching_simulator_response() -> None:
 
     hub.robot_sockets["ROBOT-001"] = Socket()  # type: ignore[assignment]
     request = asyncio.create_task(
-        hub.request_robot("ROBOT-001", "configuration.get", {}, timeout_seconds=1)
+        hub.request_robot("ROBOT-001", "configuration.get", {}, timeout_seconds=31)
     )
     await asyncio.sleep(0)
     assert sent[0]["message_type"] == "configuration.get"
+    assert sent[0]["ttl_ms"] == 30_000
     request_id = sent[0]["payload"]["request_id"]
     assert not hub.resolve_robot_request(
         "ROBOT-002", request_id, {"request_id": request_id, "ok": True}

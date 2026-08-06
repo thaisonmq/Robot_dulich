@@ -19,7 +19,13 @@ from simulator.control_protocol import (
     joy_input_active,
 )
 from simulator.messages import make_message
-from simulator.motion_driver import UnixMotionDriver
+from simulator.motion import MotionSimulator
+from simulator.motion_driver import (
+    DisabledMotionDriver,
+    MotionDisabledError,
+    UnixMotionDriver,
+    build_motion_driver,
+)
 
 
 class FakeDatagramSocket:
@@ -40,6 +46,18 @@ class FakeDatagramSocket:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_disabled_motion_driver_is_explicitly_fail_closed() -> None:
+    config = SimulatorConfig(motion_backend="disabled")
+    driver = build_motion_driver(config, MotionSimulator(config))
+
+    assert isinstance(driver, DisabledMotionDriver)
+    with pytest.raises(MotionDisabledError, match="legacy /cmd_vel"):
+        driver.set_velocity(0.1, 0.0)
+    assert driver.watchdog() is False
+    driver.stop("safe_noop")
+    driver.close()
 
 
 def test_motion_protocol_rejects_expired_and_non_finite_commands() -> None:
@@ -254,6 +272,35 @@ class FakeGatewaySocket:
 
     async def send(self, payload: str) -> None:
         self.sent.append(json.loads(payload))
+
+
+@pytest.mark.asyncio
+async def test_disabled_motion_backend_rejects_web_velocity(tmp_path) -> None:
+    client = RobotConnectionClient(
+        SimulatorConfig(
+            motion_backend="disabled",
+            navigation_backend="ros2",
+            robot_state_file=str(tmp_path / "missing-device.json"),
+            map_cache_dir=str(tmp_path / "maps"),
+        )
+    )
+    socket = FakeGatewaySocket(
+        [
+            make_message(
+                "control.velocity",
+                "ROBOT-001",
+                1,
+                {"linear_x": 0.1, "angular_z": 0.0},
+                "session-1",
+                300,
+            )
+        ]
+    )
+
+    await client._receive_loop(socket)
+
+    assert socket.sent[-1]["payload"]["status"] == "rejected"
+    assert socket.sent[-1]["payload"]["error_code"] == "MOTION_DISABLED"
 
 
 @pytest.mark.asyncio

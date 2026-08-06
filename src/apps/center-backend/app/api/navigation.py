@@ -1,37 +1,447 @@
+from __future__ import annotations
+
+import math
 from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
+from app.core.config import Settings, get_settings
 from app.core.security import current_user
+from app.models.database import get_db
+from app.models.entities import (
+    CommandReceipt,
+    Destination,
+    MapRecord,
+    MapVersion,
+    NavigationMission,
+    POI,
+    RobotMapCache,
+)
 from app.schemas.messages import (
     NavigationCancelRequest,
     NavigationGoalRequest,
     NavigationPreviewRequest,
 )
 from app.services.hub import hub
-from app.services.maps import destination_by_id
+from app.services.state_machines import InvalidTransition, navigation_transition
 
 router = APIRouter(prefix="/api/navigation", tags=["navigation"])
 
 
+class GoalPose(BaseModel):
+    x: float
+    y: float
+    yaw: float = 0.0
+
+    @field_validator("x", "y", "yaw")
+    @classmethod
+    def finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("Tọa độ phải là số hữu hạn")
+        return value
+
+
+class NavigationCommandBase(BaseModel):
+    request_id: str = Field(min_length=8, max_length=64)
+    robot_id: str = Field(min_length=3, max_length=64)
+    session_id: str = Field(min_length=8, max_length=128)
+    expected_state: str = Field(max_length=32)
+
+
+class MapLoadRequest(NavigationCommandBase):
+    map_id: str = Field(min_length=2, max_length=64)
+    version: int = Field(ge=1)
+
+
+class InitialPoseRequest(NavigationCommandBase):
+    map_id: str = Field(min_length=2, max_length=64)
+    version: int = Field(ge=1)
+    pose: GoalPose
+
+
+class ComputePathRequest(NavigationCommandBase):
+    map_id: str = Field(min_length=2, max_length=64)
+    version: int = Field(ge=1)
+    goal: GoalPose
+
+
+class MissionCommandRequest(NavigationCommandBase):
+    mission_id: str = Field(min_length=8, max_length=64)
+
+
+def _mission_view(mission: NavigationMission) -> dict:
+    return {
+        "route_id": mission.mission_id,
+        "mission_id": mission.mission_id,
+        "destination_id": "CUSTOM-GOAL",
+        "request_id": mission.request_id,
+        "robot_id": mission.robot_id,
+        "session_id": mission.control_session_id,
+        "map_id": mission.map_id,
+        "map_version": mission.map_version,
+        "status": mission.status,
+        "goal": mission.goal,
+        "points": mission.path,
+        "distance_m": mission.distance_m,
+        "estimated_seconds": max(1, round(mission.distance_m / 0.1)),
+        "error_code": mission.error_code,
+        "error_message": mission.error_message,
+        "created_at": mission.created_at.isoformat(),
+        "updated_at": mission.updated_at.isoformat(),
+    }
+
+
+def _valid_lease(robot_id: str, session_id: str, user_id: str) -> None:
+    session = hub.get_session(session_id, user_id)
+    if session is None or session.robot_id != robot_id:
+        raise HTTPException(status_code=403, detail="Phiên điều khiển không hợp lệ")
+
+
+def _active_version(database: Session, map_id: str, version: int) -> MapVersion | None:
+    record = database.get(MapRecord, map_id)
+    if record is None or record.status != "ACTIVE" or record.active_version != version:
+        return None
+    return database.scalar(
+        select(MapVersion).where(
+            MapVersion.map_id == map_id,
+            MapVersion.version == version,
+            MapVersion.status == "ACTIVE",
+        )
+    )
+
+
+async def _command(
+    database: Session,
+    settings: Settings,
+    *,
+    request_id: str,
+    robot_id: str,
+    command_type: str,
+    expected_state: str,
+    payload: dict,
+) -> dict:
+    receipt = database.get(CommandReceipt, request_id)
+    if receipt is not None:
+        if receipt.robot_id != robot_id or receipt.command_type != command_type:
+            raise HTTPException(status_code=409, detail="request_id đã được dùng cho lệnh khác")
+        return receipt.response
+    receipt = CommandReceipt(
+        request_id=request_id,
+        robot_id=robot_id,
+        command_type=command_type,
+        expected_state=expected_state,
+        status="PENDING",
+        response={"request_id": request_id, "status": "pending"},
+    )
+    database.add(receipt)
+    database.commit()
+    try:
+        result = await hub.request_robot(
+            robot_id,
+            command_type,
+            {**payload, "expected_state": expected_state},
+            timeout_seconds=settings.robot_command_timeout_seconds,
+            request_id=request_id,
+        )
+    except ConnectionError as exc:
+        receipt.status = "REJECTED"
+        receipt.response = {
+            "request_id": request_id,
+            "status": "rejected",
+            "error_code": "ROBOT_OFFLINE",
+            "error_message": "Robot đang ngoại tuyến",
+        }
+        database.commit()
+        raise HTTPException(status_code=409, detail="Robot đang ngoại tuyến") from exc
+    except TimeoutError as exc:
+        receipt.status = "REJECTED"
+        receipt.response = {
+            "request_id": request_id,
+            "status": "rejected",
+            "error_code": "ROBOT_TIMEOUT",
+            "error_message": "Robot không ACK lệnh đúng hạn",
+        }
+        database.commit()
+        raise HTTPException(status_code=504, detail="Robot không ACK lệnh đúng hạn") from exc
+    receipt.status = str(result.get("status", "accepted")).upper()
+    receipt.response = result
+    database.commit()
+    return result
+
+
+def _navigation_preflight(robot_id: str) -> list[str]:
+    robot = hub.robots.get(robot_id)
+    if robot is None or robot.status != "online":
+        return ["ROBOT_OFFLINE"]
+    if robot.capabilities.get("source") == "simulator":
+        return []
+    health = robot.health
+    checks = {
+        "MAP_NOT_READY": health.get("map_state") == "READY",
+        "NOT_LOCALIZED": bool(health.get("localized")),
+        "NAV2_NOT_READY": health.get("nav2") == "READY",
+        "SAFETY_UNHEALTHY": health.get("safety") == "HEALTHY",
+        "SCAN_STALE": bool(health.get("scan_fresh")),
+        "ESTOP_ACTIVE": not bool(health.get("estop")),
+        "COLLISION_FAULT": not bool(health.get("collision_fault")),
+        "BATTERY_LOW": float(health.get("battery_percent", 0)) >= 15,
+    }
+    return [code for code, passed in checks.items() if not passed]
+
+
+@router.post("/map/load")
+async def load_map(
+    body: MapLoadRequest,
+    user_id: str = Depends(current_user),
+    database: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    _valid_lease(body.robot_id, body.session_id, user_id)
+    version = _active_version(database, body.map_id, body.version)
+    if version is None:
+        raise HTTPException(status_code=409, detail="Map/version chưa ACTIVE")
+    result = await _command(
+        database,
+        settings,
+        request_id=body.request_id,
+        robot_id=body.robot_id,
+        command_type="map.load",
+        expected_state=body.expected_state,
+        payload={
+            "map_id": body.map_id,
+            "version": body.version,
+            "checksum": version.checksum,
+            "download_url": f"/api/maps/{body.map_id}/versions/{body.version}/download",
+        },
+    )
+    cache = database.scalar(
+        select(RobotMapCache).where(
+            RobotMapCache.robot_id == body.robot_id,
+            RobotMapCache.map_id == body.map_id,
+            RobotMapCache.version == body.version,
+        )
+    )
+    if cache is None:
+        cache = RobotMapCache(
+            robot_id=body.robot_id,
+            map_id=body.map_id,
+            version=body.version,
+            checksum=version.checksum,
+        )
+        database.add(cache)
+    cache.status = str(result.get("current_state", "LOADING_MAP"))
+    cache.progress_percent = float(result.get("progress_percent", 0))
+    cache.error_message = result.get("error_message")
+    database.commit()
+    return {**result, "map_id": body.map_id, "version": body.version}
+
+
+@router.post("/map/initial-pose")
+async def set_initial_pose(
+    body: InitialPoseRequest,
+    user_id: str = Depends(current_user),
+    database: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    _valid_lease(body.robot_id, body.session_id, user_id)
+    if _active_version(database, body.map_id, body.version) is None:
+        raise HTTPException(status_code=409, detail="Map/version chưa ACTIVE")
+    return await _command(
+        database,
+        settings,
+        request_id=body.request_id,
+        robot_id=body.robot_id,
+        command_type="map.set_initial_pose",
+        expected_state=body.expected_state,
+        payload={"map_id": body.map_id, "version": body.version, "pose": body.pose.model_dump()},
+    )
+
+
+@router.post("/compute-path")
+async def compute_path(
+    body: ComputePathRequest,
+    user_id: str = Depends(current_user),
+    database: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    _valid_lease(body.robot_id, body.session_id, user_id)
+    if _active_version(database, body.map_id, body.version) is None:
+        raise HTTPException(status_code=409, detail="Map/version chưa ACTIVE")
+    existing = database.scalar(
+        select(NavigationMission).where(NavigationMission.request_id == body.request_id)
+    )
+    if existing is not None:
+        return _mission_view(existing)
+    result = await _command(
+        database,
+        settings,
+        request_id=body.request_id,
+        robot_id=body.robot_id,
+        command_type="navigation.compute_path",
+        expected_state=body.expected_state,
+        payload={
+            "map_id": body.map_id,
+            "version": body.version,
+            "goal": body.goal.model_dump(),
+        },
+    )
+    points = list(result.get("points") or result.get("path") or [])
+    status = "READY" if result.get("status") in {"accepted", "completed"} and points else "BLOCKED"
+    mission = NavigationMission(
+        request_id=body.request_id,
+        robot_id=body.robot_id,
+        control_session_id=body.session_id,
+        map_id=body.map_id,
+        map_version=body.version,
+        status=status,
+        goal=body.goal.model_dump(),
+        path=points,
+        distance_m=float(result.get("distance_m", 0)),
+        error_code=result.get("error_code"),
+        error_message=result.get("error_message"),
+    )
+    database.add(mission)
+    database.commit()
+    database.refresh(mission)
+    return _mission_view(mission)
+
+
+@router.post("/start")
+async def start_navigation(
+    body: MissionCommandRequest,
+    user_id: str = Depends(current_user),
+    database: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    _valid_lease(body.robot_id, body.session_id, user_id)
+    mission = database.get(NavigationMission, body.mission_id)
+    if mission is None or mission.robot_id != body.robot_id:
+        raise HTTPException(status_code=404, detail="Không tìm thấy mission")
+    failures = _navigation_preflight(body.robot_id)
+    if failures:
+        raise HTTPException(status_code=409, detail={"code": "PREFLIGHT_FAILED", "failures": failures})
+    try:
+        navigation_transition(mission.status, "NAVIGATING")
+    except InvalidTransition as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    result = await _command(
+        database,
+        settings,
+        request_id=body.request_id,
+        robot_id=body.robot_id,
+        command_type="navigation.start",
+        expected_state=body.expected_state,
+        payload={
+            "mission_id": mission.mission_id,
+            "map_id": mission.map_id,
+            "version": mission.map_version,
+            "goal": mission.goal,
+        },
+    )
+    if result.get("status") in {"accepted", "completed"}:
+        mission.status = "NAVIGATING"
+    else:
+        mission.status = "FAULT"
+        mission.error_code = result.get("error_code")
+        mission.error_message = result.get("error_message")
+    database.commit()
+    return _mission_view(mission)
+
+
+@router.post("/missions/{mission_id}/{action}")
+async def mission_action(
+    mission_id: str,
+    action: str,
+    body: MissionCommandRequest,
+    user_id: str = Depends(current_user),
+    database: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    actions = {
+        "pause": ("navigation.pause", "PAUSED"),
+        "resume": ("navigation.resume", "NAVIGATING"),
+        "cancel": ("navigation.cancel", "CANCELED"),
+    }
+    selected = actions.get(action)
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Thao tác navigation không hợp lệ")
+    _valid_lease(body.robot_id, body.session_id, user_id)
+    if body.mission_id != mission_id:
+        raise HTTPException(status_code=409, detail="mission_id không khớp đường dẫn")
+    mission = database.get(NavigationMission, mission_id)
+    if mission is None or mission.robot_id != body.robot_id:
+        raise HTTPException(status_code=404, detail="Không tìm thấy mission")
+    command_type, target = selected
+    if database.get(CommandReceipt, body.request_id) is None:
+        try:
+            navigation_transition(mission.status, target)
+        except InvalidTransition as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    result = await _command(
+        database,
+        settings,
+        request_id=body.request_id,
+        robot_id=body.robot_id,
+        command_type=command_type,
+        expected_state=body.expected_state,
+        payload={"mission_id": mission.mission_id},
+    )
+    if result.get("status") in {"accepted", "completed"}:
+        mission.status = target
+    database.commit()
+    return _mission_view(mission)
+
+
+@router.get("/missions/{mission_id}")
+async def mission_status(
+    mission_id: str,
+    _: str = Depends(current_user),
+    database: Session = Depends(get_db),
+) -> dict:
+    mission = database.get(NavigationMission, mission_id)
+    if mission is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy mission")
+    return _mission_view(mission)
+
+
+# Backward-compatible endpoints used by the current Center UI and simulator.
 @router.post("/preview")
-async def preview(body: NavigationPreviewRequest, _: str = Depends(current_user)) -> dict:
+async def preview(
+    body: NavigationPreviewRequest,
+    _: str = Depends(current_user),
+    database: Session = Depends(get_db),
+) -> dict:
     robot = hub.robots.get(body.robot_id)
-    destination = destination_by_id(body.destination_id)
+    destination = database.get(Destination, body.destination_id)
+    if destination is None:
+        destination = database.get(POI, body.destination_id)
     if robot is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy robot")
-    if destination is None or destination["map_id"] != robot.map_id:
+    if destination is None or destination.map_id != robot.map_id:
         raise HTTPException(status_code=400, detail="Điểm đến không hợp lệ với bản đồ")
-    return hub.create_route(body.robot_id, destination)
+    # Simulator preview remains deterministic. Real robots use /compute-path,
+    # which is backed by Nav2 ComputePathToPose and never by this fallback.
+    return hub.create_route(
+        body.robot_id,
+        {
+            "destination_id": body.destination_id,
+            "x": destination.x,
+            "y": destination.y,
+        },
+    )
 
 
 @router.post("/goal")
-async def goal(body: NavigationGoalRequest, user_id: str = Depends(current_user)) -> dict:
-    session = hub.get_session(body.session_id, user_id)
+async def goal(
+    body: NavigationGoalRequest,
+    user_id: str = Depends(current_user),
+) -> dict:
+    _valid_lease(body.robot_id, body.session_id, user_id)
     route = hub.routes.get(body.route_id)
-    if session is None or session.robot_id != body.robot_id:
-        raise HTTPException(status_code=403, detail="Phiên điều khiển không hợp lệ")
     if route is None or route["robot_id"] != body.robot_id:
         raise HTTPException(status_code=404, detail="Không tìm thấy tuyến đường")
     message = {
@@ -40,7 +450,7 @@ async def goal(body: NavigationGoalRequest, user_id: str = Depends(current_user)
         "message_type": "navigation.goal",
         "robot_id": body.robot_id,
         "session_id": body.session_id,
-        "sequence": session.last_sequence + 1,
+        "sequence": 0,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "ttl_ms": 5000,
         "payload": route,
@@ -51,20 +461,23 @@ async def goal(body: NavigationGoalRequest, user_id: str = Depends(current_user)
 
 
 @router.post("/cancel")
-async def cancel(body: NavigationCancelRequest, user_id: str = Depends(current_user)) -> dict:
-    session = hub.get_session(body.session_id, user_id)
-    if session is None or session.robot_id != body.robot_id:
-        raise HTTPException(status_code=403, detail="Phiên điều khiển không hợp lệ")
-    message = {
-        "message_id": str(uuid4()),
-        "schema_version": "1.0",
-        "message_type": "navigation.cancel",
-        "robot_id": body.robot_id,
-        "session_id": body.session_id,
-        "sequence": session.last_sequence + 1,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "ttl_ms": 1000,
-        "payload": {"reason": "user_cancelled"},
-    }
-    await hub.forward_to_robot(body.robot_id, message)
+async def cancel_legacy(
+    body: NavigationCancelRequest,
+    user_id: str = Depends(current_user),
+) -> dict:
+    _valid_lease(body.robot_id, body.session_id, user_id)
+    await hub.forward_to_robot(
+        body.robot_id,
+        {
+            "message_id": str(uuid4()),
+            "schema_version": "1.0",
+            "message_type": "navigation.cancel",
+            "robot_id": body.robot_id,
+            "session_id": body.session_id,
+            "sequence": 0,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ttl_ms": 1000,
+            "payload": {"reason": "user_cancelled"},
+        },
+    )
     return {"status": "cancelled"}

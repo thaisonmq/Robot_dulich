@@ -20,6 +20,7 @@ import type { LiveKitMediaTransport } from "../transports/MediaTransport";
 import type { PtzCommand, PtzSpeed } from "../transports/ControlTransport";
 import { WebSocketTelemetryTransport } from "../transports/TelemetryTransport";
 import type { Destination, MediaState, VideoProfile } from "../types";
+import { createUuid } from "../utils/uuid";
 
 const ROBOT_LANGUAGE_CODE = "vi";
 
@@ -35,6 +36,7 @@ export function DashboardPage() {
   const mediaState = useAppStore((state) => state.mediaState);
   const commandStatus = useAppStore((state) => state.commandStatus);
   const controlState = useAppStore((state) => state.controlState);
+  const connectionState = useAppStore((state) => state.connectionState);
   const navigationState = useAppStore((state) => state.navigationState);
   const route = useAppStore((state) => state.route);
   const setPose = useAppStore((state) => state.setPose);
@@ -62,6 +64,8 @@ export function DashboardPage() {
   const [ptzExpanded, setPtzExpanded] = useState(false);
   const [ptzSpeed, setPtzSpeed] = useState<PtzSpeed>("medium");
   const [selectedDestination, setSelectedDestination] = useState<Destination | null>(null);
+  const [selectedMapId, setSelectedMapId] = useState(selectedRobot?.map_id ?? "");
+  const [mapState, setMapState] = useState("READY");
   const [connectionError, setConnectionError] = useState("");
   const [sessionEndedReason, setSessionEndedReason] = useState("");
   const accountLanguageOption = getLanguage(language);
@@ -74,9 +78,15 @@ export function DashboardPage() {
     onPose: setPose,
     onHealth: setHealth,
     onNavigation: (status) => {
-      if (["moving", "arrived", "cancelled", "failed"].includes(status)) {
-        setNavigationState(status as "moving" | "arrived" | "cancelled" | "failed");
-      }
+      const normalized = status.toUpperCase();
+      const states = {
+        NAVIGATING: "moving", MOVING: "moving", PAUSED: "paused", BLOCKED: "blocked",
+        ARRIVED: "arrived", CANCELED: "cancelled", CANCELLED: "cancelled", FAULT: "failed", FAILED: "failed",
+        READY: "ready", LOCALIZING: "localizing", LOADING_MAP: "loading_map", PLANNING: "planning",
+      } as const;
+      const next = states[normalized as keyof typeof states];
+      if (next) setNavigationState(next);
+      setMapState(normalized);
     },
     onDisconnect: () => {
       if (sessionEndedRef.current) return;
@@ -96,15 +106,21 @@ export function DashboardPage() {
     },
   }), [manager, setConnectionState, setControlState, setHealth, setNavigationState, setPose]);
 
-  const { data: map } = useQuery({
-    queryKey: ["map", selectedRobot?.map_id],
-    queryFn: () => api.map(selectedRobot!.map_id),
+  const { data: activeMaps = [] } = useQuery({
+    queryKey: ["maps", "ACTIVE"],
+    queryFn: () => api.maps("ACTIVE"),
     enabled: Boolean(selectedRobot),
+    staleTime: 5000,
+  });
+  const { data: map } = useQuery({
+    queryKey: ["map", selectedMapId],
+    queryFn: () => api.map(selectedMapId),
+    enabled: Boolean(selectedMapId),
   });
   const { data: destinations = [] } = useQuery({
-    queryKey: ["destinations", selectedRobot?.map_id],
-    queryFn: () => api.destinations(selectedRobot!.map_id),
-    enabled: Boolean(selectedRobot),
+    queryKey: ["destinations", selectedMapId],
+    queryFn: () => api.destinations(selectedMapId),
+    enabled: Boolean(selectedMapId),
   });
   const camerasQuery = useQuery({
     queryKey: ["session-cameras", session?.session_id],
@@ -167,8 +183,40 @@ export function DashboardPage() {
     },
     onSettled: () => setRequestedVideoProfile(null),
   });
+  const loadMap = useMutation({
+    mutationFn: (selectedMap: typeof map) => api.loadNavigationMap({
+      request_id: createUuid(),
+      robot_id: robotId,
+      session_id: session!.session_id,
+      expected_state: mapState,
+      map_id: selectedMap!.map_id,
+      version: selectedMap!.active_version!,
+    }),
+    onMutate: () => {
+      setMapState("LOADING_MAP");
+      setNavigationState("loading_map");
+      setRoute(null);
+    },
+    onSuccess: (result) => setMapState(String(result.current_state ?? "LOCALIZING")),
+    onError: () => {
+      setMapState("FAULT");
+      setNavigationState("failed");
+    },
+  });
   const preview = useMutation({
-    mutationFn: (destination: Destination) => api.previewRoute(robotId, destination.destination_id),
+    mutationFn: (destination: Destination) => (
+      map?.active_version
+        ? api.computePath({
+          request_id: createUuid(),
+          robot_id: robotId,
+          session_id: session!.session_id,
+          expected_state: mapState,
+          map_id: map.map_id,
+          version: map.active_version,
+          goal: { x: destination.x, y: destination.y, yaw: destination.yaw },
+        })
+        : api.previewRoute(robotId, destination.destination_id)
+    ),
     onMutate: () => setNavigationState("previewing"),
     onSuccess: (newRoute) => {
       setRoute(newRoute);
@@ -176,12 +224,63 @@ export function DashboardPage() {
     },
     onError: () => setNavigationState("failed"),
   });
+  const setInitialPose = useMutation({
+    mutationFn: (destination: Destination) => api.setInitialPose({
+      request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
+      expected_state: mapState, map_id: map!.map_id, version: map!.active_version!,
+      pose: { x: destination.x, y: destination.y, yaw: destination.yaw },
+    }),
+    onSuccess: (result) => {
+      const state = String(result.current_state ?? "LOCALIZING");
+      setMapState(state);
+      setNavigationState(state === "READY" ? "ready" : "localizing");
+      if (state === "READY") setSelectedDestination(null);
+    },
+    onError: () => setNavigationState("failed"),
+  });
   const sendGoal = useMutation({
-    mutationFn: () => api.sendGoal(robotId, session!.session_id, route!.route_id),
+    mutationFn: () => route?.mission_id
+      ? api.startNavigation({
+        request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
+        expected_state: mapState, mission_id: route.mission_id,
+      })
+      : api.sendGoal(robotId, session!.session_id, route!.route_id),
     onMutate: () => setNavigationState("sending_goal"),
     onSuccess: () => setNavigationState("moving"),
     onError: () => setNavigationState("failed"),
   });
+
+  const missionAction = useMutation({
+    mutationFn: (action: "pause" | "resume" | "cancel") => api.missionAction(action, {
+      request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
+      expected_state: mapState, mission_id: route!.mission_id!,
+    }),
+    onSuccess: (mission) => {
+      setRoute(mission);
+      const state = mission.status?.toUpperCase();
+      if (state === "PAUSED") setNavigationState("paused");
+      else if (state === "NAVIGATING") setNavigationState("moving");
+      else if (state === "CANCELED") setNavigationState("cancelled");
+      if (state) setMapState(state);
+    },
+    onError: () => setNavigationState("failed"),
+  });
+
+  const realRobot = health.motion_backend === "ros2"
+    || health.navigation_backend === "ros2"
+    || selectedRobot?.capabilities.source !== "simulator";
+  const preflightFailures = [
+    ...(connectionState === "connected" ? [] : ["ROBOT_OFFLINE"]),
+    ...(map?.active_version || !realRobot ? [] : ["MAP_NOT_ACTIVE"]),
+    ...(!realRobot || health.localized ? [] : ["NOT_LOCALIZED"]),
+    ...(!realRobot || health.nav2 === "READY" ? [] : ["NAV2_NOT_READY"]),
+    ...(!realRobot || health.safety === "HEALTHY" ? [] : ["SAFETY_UNHEALTHY"]),
+    ...(!realRobot || health.scan_fresh ? [] : ["SCAN_STALE"]),
+    ...(health.estop ? ["ESTOP_ACTIVE"] : []),
+    ...(health.collision_fault ? ["COLLISION_FAULT"] : []),
+    ...(health.battery_percent >= 15 ? [] : ["BATTERY_LOW"]),
+    ...(controlState === "ready" || controlState === "active" || isSpectator ? [] : ["NO_CONTROL_LEASE"]),
+  ];
 
   function stopPtz() {
     if (ptzRepeatRef.current !== null) {
@@ -791,21 +890,45 @@ export function DashboardPage() {
             {map && (
               <MapPanel
                 map={map}
+                maps={activeMaps}
+                selectedMapId={selectedMapId}
                 destinations={destinations}
                 pose={pose}
                 route={route}
                 selected={selectedDestination}
-                loading={preview.isPending}
+                loading={preview.isPending || loadMap.isPending || setInitialPose.isPending}
                 navigationStatus={navigationState}
+                mapState={mapState}
+                canStart={Boolean(route && preflightFailures.length === 0)}
+                preflightFailures={preflightFailures}
                 readOnly={isSpectator}
+                onMapChange={(mapId) => {
+                  const nextMap = activeMaps.find((item) => item.map_id === mapId);
+                  setSelectedMapId(mapId);
+                  setSelectedDestination(null);
+                  setRoute(null);
+                  if (nextMap?.active_version) loadMap.mutate(nextMap);
+                }}
                 onSelect={(destination) => {
                   setSelectedDestination(destination);
-                  preview.mutate(destination);
+                  if (mapState !== "LOCALIZING") preview.mutate(destination);
+                }}
+                onSetInitialPose={() => {
+                  if (selectedDestination && map?.active_version) setInitialPose.mutate(selectedDestination);
                 }}
                 onGo={() => sendGoal.mutate()}
+                onPause={() => {
+                  if (route?.mission_id) missionAction.mutate("pause");
+                }}
+                onResume={() => {
+                  if (route?.mission_id) missionAction.mutate("resume");
+                }}
                 onCancel={() => {
-                  void api.cancelNavigation(robotId, session.session_id);
-                  setNavigationState("cancelled");
+                  if (route?.mission_id) missionAction.mutate("cancel");
+                  else {
+                    void api.cancelNavigation(robotId, session.session_id);
+                    setNavigationState("cancelled");
+                  }
                 }}
               />
             )}

@@ -9,7 +9,8 @@ export type ControlState =
   | "session_lost" | "robot_offline";
 export type NavigationState =
   | "idle" | "previewing" | "route_ready" | "sending_goal"
-  | "moving" | "arrived" | "cancelled" | "failed";
+  | "loading_map" | "localizing" | "ready" | "planning"
+  | "moving" | "paused" | "blocked" | "arrived" | "cancelled" | "failed";
 
 export interface User {
   id: string;
@@ -68,7 +69,14 @@ export interface Robot {
   battery_percent: number;
   last_seen_at: string | null;
   software_version: string;
-  capabilities: { source?: string; navigation?: boolean };
+  capabilities: {
+    source?: string;
+    navigation?: boolean;
+    mapping?: boolean;
+    motion_backend?: string;
+    navigation_backend?: string;
+    mapping_blockers?: string[];
+  };
   network_rtt_ms: number;
   enabled: boolean;
   enrollment_status: "pending" | "enrolled";
@@ -280,6 +288,15 @@ export interface Health {
   audio: string;
   navigation: string;
   simulator?: string;
+  motion_backend?: string;
+  navigation_backend?: string;
+  map_state?: string;
+  localized?: boolean;
+  nav2?: string;
+  safety?: string;
+  scan_fresh?: boolean;
+  estop?: boolean;
+  collision_fault?: boolean;
 }
 
 export interface MessageEnvelope<T = Record<string, unknown>> {
@@ -302,7 +319,46 @@ export interface MapData {
   height_pixels: number;
   resolution_m_per_pixel: number;
   origin: { x: number; y: number; yaw: number };
-  restricted_zones: { zone_id: string; name: string; points: Point[] }[];
+  restricted_zones?: { zone_id: string; name: string; points: Point[] }[];
+  site_id?: string;
+  floor_id?: string;
+  notes?: string;
+  status?: "DRAFT" | "VALIDATING" | "ACTIVE" | "ARCHIVED";
+  active_version?: number | null;
+  checksum?: string;
+  versions?: MapVersion[];
+  mapping_session?: MappingSession | null;
+  pois?: Destination[];
+  keepout_zones?: { zone_id: string; name: string; points: Point[] }[];
+  speed_zones?: { zone_id: string; name: string; points: Point[]; max_speed_mps: number }[];
+}
+
+export interface MapVersion {
+  version: number;
+  status: "DRAFT" | "VALIDATING" | "ACTIVE" | "ARCHIVED";
+  checksum: string;
+  resolution: number;
+  origin: { x: number; y: number; yaw: number };
+  width_pixels: number;
+  height_pixels: number;
+  created_by_robot: string;
+  created_at: string;
+  download_url: string;
+  preview_url: string;
+  can_continue?: boolean;
+}
+
+export interface MappingSession {
+  session_id: string;
+  map_id: string;
+  version: number;
+  robot_id: string;
+  status: "STARTING" | "MAPPING" | "PAUSED" | "SAVED_DRAFT" | "FINISHED" | "CANCELED" | "FAULT";
+  metadata: { name: string; site_id: string; floor_id: string; notes: string };
+  error_code?: string | null;
+  error_message?: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Point { x: number; y: number }
@@ -315,9 +371,14 @@ export interface Destination extends Point {
 }
 export interface Route {
   route_id: string;
+  mission_id?: string;
   robot_id: string;
   destination_id: string;
   points: Point[];
   distance_m: number;
   estimated_seconds: number;
+  status?: string;
+  goal?: { x: number; y: number; yaw: number };
+  map_id?: string;
+  map_version?: number;
 }

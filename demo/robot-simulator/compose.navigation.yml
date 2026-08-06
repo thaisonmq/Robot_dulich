@@ -1,0 +1,78 @@
+name: rovera-robot-navigation
+
+services:
+  motion-safety:
+    profiles: ["safety", "navigation", "managed-motion"]
+    build:
+      context: ./motion-safety
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 3s
+    environment:
+      ROVERA_CMD_VEL_MODE: ${ROVERA_CMD_VEL_MODE:-}
+      ROVERA_EXCLUSIVE_CMD_VEL_ACK: ${ROVERA_EXCLUSIVE_CMD_VEL_ACK:-}
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
+      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+    healthcheck:
+      # CMD-SHELL uses /bin/sh (which has no `source`). Avoid spawning a DDS
+      # probe every five seconds; verify the actual safety node process that
+      # ros2 launch supervises instead.
+      test: ["CMD-SHELL", "grep -a -q '/rovera_motion_safety/safety_node' /proc/[0-9]*/cmdline 2>/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 12s
+    mem_limit: 384m
+    cpus: 0.75
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  navigation-stack:
+    profiles: ["navigation"]
+    build:
+      context: ./navigation-stack
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 10s
+    # Run with the same uid/gid as the edge agent so map bundles, autosaves and
+    # upload markers stay writable by both services on the shared state bind.
+    user: "${ROBOT_UID:-1000}:${ROBOT_GID:-1000}"
+    environment:
+      HOME: /tmp/rovera-navigation
+      ROS_LOG_DIR: /tmp/rovera-navigation/ros-log
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
+      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      ROBOT_ID: ${ROBOT_ID:-ROBOT-001}
+      NAVIGATION_MODE: ${NAVIGATION_MODE:-NAVIGATION}
+      ROVERA_USE_VENDOR_BASE_RUNTIME: ${ROVERA_USE_VENDOR_BASE_RUNTIME:-0}
+      NAVIGATION_SOCKET_PATH: /var/lib/rovera/navigation/navigation.sock
+      NAVIGATION_SOCKET_GID: ${ROBOT_GID:-1000}
+      ROVERA_MAP_ROOT: /var/lib/rovera/maps
+      NAV2_MAP_YAML: ${NAV2_MAP_YAML:-/opt/rovera/config/bootstrap-map.yaml}
+      MAPPING_PREVIEW_MAX_CELLS: ${MAPPING_PREVIEW_MAX_CELLS:-20000}
+      REQUIRE_SENSOR_HEALTH: ${REQUIRE_SENSOR_HEALTH:-1}
+    volumes:
+      - type: bind
+        source: ${ROBOT_STATE_DIR:-./state}
+        target: /var/lib/rovera
+    depends_on:
+      motion-safety:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/opt/rovera/scripts/healthcheck.sh"]
+      interval: 8s
+      timeout: 5s
+      retries: 10
+      start_period: 25s
+    mem_limit: 1800m
+    cpus: 2.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"

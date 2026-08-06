@@ -6,6 +6,7 @@ import type {
   RobotQuickCreateInput, RobotUpdateInput, Route, Session, User, UserPage,
   RegisterInput, AdminUserCreateInput, ActiveControlSession, SessionCamera,
   SessionVideoProfile, VideoProfile,
+  MappingSession,
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "";
@@ -84,6 +85,15 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export async function authenticatedAsset(path: string): Promise<Blob> {
+  const token = authStorage.get();
+  const response = await fetch(`${API_BASE}${path}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.blob();
+}
+
 export const api = {
   async login(identifier: string, password: string): Promise<{ access_token: string; user: User }> {
     return request("/api/auth/login", {
@@ -155,9 +165,10 @@ export const api = {
       }),
     }),
   robots: (options: { page?: number; pageSize?: number; search?: string; status?: string } = {}) => {
+    const pageSize = Math.min(50, Math.max(1, options.pageSize ?? 6));
     const params = new URLSearchParams({
       page: String(options.page ?? 1),
-      page_size: String(options.pageSize ?? 6),
+      page_size: String(pageSize),
       search: options.search ?? "",
       status: options.status ?? "all",
     });
@@ -262,7 +273,39 @@ export const api = {
     }),
   deleteSession: (sessionId: string) =>
     request(`/api/sessions/${sessionId}`, { method: "DELETE", keepalive: true }),
+  maps: (status?: string) => request<MapData[]>(`/api/maps${status ? `?status=${status}` : ""}`),
   map: (mapId: string) => request<MapData>(`/api/maps/${mapId}`),
+  updateMap: (mapId: string, input: { name: string; site_id: string; floor_id: string; notes: string }) =>
+    request<MapData>(`/api/maps/${mapId}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+  deleteMap: (mapId: string) => request<void>(`/api/maps/${mapId}`, { method: "DELETE" }),
+  startMapping: (input: {
+    request_id: string; robot_id: string; expected_state: string;
+    name: string; site_id: string; floor_id: string; notes: string;
+    map_id?: string; source_version?: number;
+  }) => request<MappingSession>("/api/maps/mapping-sessions", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }),
+  mappingSession: (sessionId: string) =>
+    request<MappingSession>(`/api/maps/mapping-sessions/${sessionId}`),
+  mappingAction: (
+    sessionId: string,
+    action: "pause" | "resume" | "save-draft" | "finish" | "cancel",
+    requestId: string,
+    expectedState: string,
+  ) => request<MappingSession>(`/api/maps/mapping-sessions/${sessionId}/${action}`, {
+    method: "POST",
+    body: JSON.stringify({ request_id: requestId, expected_state: expectedState }),
+  }),
+  activateMap: (mapId: string, version: number) =>
+    request<MapData>(`/api/maps/${mapId}/activate`, {
+      method: "POST",
+      body: JSON.stringify({ version }),
+    }),
+  archiveMap: (mapId: string) => request<MapData>(`/api/maps/${mapId}/archive`, { method: "POST" }),
   destinations: (mapId: string) =>
     request<Destination[]>(`/api/maps/${mapId}/destinations`),
   previewRoute: (robotId: string, destinationId: string) =>
@@ -280,4 +323,31 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ robot_id: robotId, session_id: sessionId }),
     }),
+  loadNavigationMap: (input: {
+    request_id: string; robot_id: string; session_id: string; expected_state: string;
+    map_id: string; version: number;
+  }) => request<Record<string, unknown>>("/api/navigation/map/load", {
+    method: "POST", body: JSON.stringify(input),
+  }),
+  setInitialPose: (input: {
+    request_id: string; robot_id: string; session_id: string; expected_state: string;
+    map_id: string; version: number; pose: { x: number; y: number; yaw: number };
+  }) => request<Record<string, unknown>>("/api/navigation/map/initial-pose", {
+    method: "POST", body: JSON.stringify(input),
+  }),
+  computePath: (input: {
+    request_id: string; robot_id: string; session_id: string; expected_state: string;
+    map_id: string; version: number; goal: { x: number; y: number; yaw: number };
+  }) => request<Route>("/api/navigation/compute-path", {
+    method: "POST", body: JSON.stringify(input),
+  }),
+  startNavigation: (input: {
+    request_id: string; robot_id: string; session_id: string; expected_state: string; mission_id: string;
+  }) => request<Route>("/api/navigation/start", { method: "POST", body: JSON.stringify(input) }),
+  missionAction: (
+    action: "pause" | "resume" | "cancel",
+    input: { request_id: string; robot_id: string; session_id: string; expected_state: string; mission_id: string },
+  ) => request<Route>(`/api/navigation/missions/${input.mission_id}/${action}`, {
+    method: "POST", body: JSON.stringify(input),
+  }),
 };

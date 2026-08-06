@@ -19,6 +19,10 @@ from simulator.motion import MotionSimulator
 logger = logging.getLogger("simulator.motion-driver")
 
 
+class MotionDisabledError(RuntimeError):
+    """Raised when this deployment deliberately has no chassis output path."""
+
+
 class MotionDriver(Protocol):
     def set_velocity(self, linear_x: float, angular_z: float) -> None: ...
 
@@ -27,6 +31,29 @@ class MotionDriver(Protocol):
     def watchdog(self, now: float | None = None) -> bool: ...
 
     def close(self) -> None: ...
+
+
+class DisabledMotionDriver:
+    """Read-only driver for legacy coexistence and mapping observation.
+
+    Dropping a Web command while ACKing it would be dangerously misleading,
+    so velocity requests fail explicitly. Stop remains an idempotent no-op
+    because this process does not own the chassis output in this mode.
+    """
+
+    def set_velocity(self, _linear_x: float, _angular_z: float) -> None:
+        raise MotionDisabledError(
+            "Web motion is disabled while the legacy /cmd_vel owner is active"
+        )
+
+    def stop(self, _reason: str = "") -> None:
+        return
+
+    def watchdog(self, _now: float | None = None) -> bool:
+        return False
+
+    def close(self) -> None:
+        return
 
 
 class UnixMotionDriver:
@@ -141,4 +168,6 @@ def build_motion_driver(
 ) -> MotionDriver:
     if config.motion_backend == "simulator":
         return simulator
+    if config.motion_backend == "disabled":
+        return DisabledMotionDriver()
     return UnixMotionDriver(config)

@@ -25,7 +25,10 @@ services:
       # Hardware motion remains opt-in. Enabling the ros2-control profile alone
       # cannot move the car while MOTION_BACKEND keeps its safe default.
       MOTION_BACKEND: ${MOTION_BACKEND:-simulator}
+      NAVIGATION_BACKEND: ${NAVIGATION_BACKEND:-simulator}
       MOTION_SOCKET_PATH: /var/lib/rovera/control/motion.sock
+      NAVIGATION_SOCKET_PATH: /var/lib/rovera/navigation/navigation.sock
+      MAP_CACHE_DIR: /var/lib/rovera/maps/cache
       MOTION_WATCHDOG_MS: ${MOTION_WATCHDOG_MS:-250}
       # Cho phép FFmpeg/pactl trong container thấy nguồn thu PipeWire/PulseAudio
       # của user trên host (đặc biệt là microphone Bluetooth HSP/HFP).
@@ -85,7 +88,7 @@ services:
         max-file: "3"
 
   ros-control-bridge:
-    profiles: ["ros2-control"]
+    profiles: ["ros2-control", "managed-motion"]
     build:
       context: .
       dockerfile: ros_bridge/Dockerfile
@@ -94,7 +97,10 @@ services:
     stop_grace_period: 5s
     user: "${ROBOT_UID:-1000}:${ROBOT_GID:-1000}"
     environment:
+      ROVERA_CONTROL_MODE: ${ROVERA_CONTROL_MODE:-disabled}
+      ROVERA_EXCLUSIVE_CMD_VEL_ACK: ${ROVERA_EXCLUSIVE_CMD_VEL_ACK:-}
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
+      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
       MOTION_SOCKET_PATH: /var/lib/rovera/control/motion.sock
       MOTION_WATCHDOG_MS: ${MOTION_WATCHDOG_MS:-250}
       ROS_COMMAND_RATE_HZ: ${ROS_COMMAND_RATE_HZ:-30}
@@ -104,13 +110,14 @@ services:
       # Parallel mode leaves the existing Yahboom and micro-ROS containers
       # untouched. The bridge publishes /cmd_vel only while /joy is inactive.
       ROS_USE_TWIST_MUX: ${ROS_USE_TWIST_MUX:-false}
-      ROS_WEB_CMD_VEL_TOPIC: ${ROS_WEB_CMD_VEL_TOPIC:-/cmd_vel}
+      # With motion-safety enabled no source may write the chassis topic.
+      ROS_WEB_CMD_VEL_TOPIC: ${ROS_WEB_CMD_VEL_TOPIC:-/cmd_vel_web}
       ROS_LEGACY_JOY_TOPIC: ${ROS_LEGACY_JOY_TOPIC:-/joy}
       ROS_LEGACY_JOY_STATE_TOPIC: ${ROS_LEGACY_JOY_STATE_TOPIC:-/JoyState}
       ROS_LEGACY_JOY_DEADZONE: ${ROS_LEGACY_JOY_DEADZONE:-0.12}
       ROS_LEGACY_JOY_AXES: ${ROS_LEGACY_JOY_AXES:-1,2}
       ROS_LEGACY_OVERRIDE_MS: ${ROS_LEGACY_OVERRIDE_MS:-350}
-      ROS_ESTOP_TOPIC: /rovera/emergency_stop
+      ROS_ESTOP_TOPIC: /safety/estop
       # Chương trình tránh vật cản phát Bool liên tục: true=dừng, false=an toàn.
       # Đặt watchdog > 0 để mất heartbeat cũng khóa chuyển động (fail closed).
       ROS_OBSTACLE_STOP_TOPIC: /rovera/obstacle_stop
@@ -134,16 +141,47 @@ services:
 
   micro-ros-agent:
     # Optional managed replacement. It is deliberately not part of the
-    # ros2-control profile used beside an existing legacy stack.
-    profiles: ["ros2-managed-stack"]
-    image: microros/micro-ros-agent:humble
+    # ros2-control profile used beside an existing legacy stack. Pi thật có
+    # thể bật riêng hardware-core mà không khởi động joystick thay thế.
+    profiles: ["ros2-managed-stack", "hardware-core"]
+    build:
+      context: ./micro-ros-agent-guard
+    image: rovera-micro-ros-agent-guard:humble
     network_mode: host
-    restart: unless-stopped
+    pid: host
+    # Managed ownership must be acknowledged explicitly and never survives a
+    # host reboot by default. This prevents a legacy Agent and this service
+    # from consuming /dev/ttyUSB0 at the same time.
+    restart: "no"
+    environment:
+      ROVERA_HARDWARE_MODE: managed
+      ROVERA_MANAGED_HARDWARE_ACK: ${ROVERA_MANAGED_HARDWARE_ACK:-}
+      MICRO_ROS_SERIAL_DEVICE: /dev/ttyUSB0
+      ROVERA_SERIAL_LOCK_FILE: /var/lock/rovera-micro-ros/ttyUSB0.lock
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
+      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      MICRO_ROS_AGENT_VERBOSITY: ${MICRO_ROS_AGENT_VERBOSITY:-2}
+      MICRO_ROS_AGENT_VMEM_KB: ${MICRO_ROS_AGENT_VMEM_KB:-1572864}
+      # Keep XRCE on serial and the ROS-side DDS leg on loopback UDPv4. This
+      # prevents incompatible ROS distributions elsewhere on the LAN (and
+      # cross-container shared memory) from crashing Humble Agent in FastCDR.
+      FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
     devices:
       - /dev/ttyUSB0:/dev/ttyUSB0
     volumes:
       - /dev/shm:/dev/shm
-    command: ["serial", "--dev", "/dev/ttyUSB0", "-b", "921600", "-v4"]
+      - /var/lock/rovera-micro-ros:/var/lock/rovera-micro-ros
+      - type: bind
+        source: ./micro_ros_fastdds.xml
+        target: /etc/rovera/micro_ros_fastdds.xml
+        read_only: true
+    command: ["serial", "--dev", "/dev/ttyUSB0", "-b", "921600", "-v${MICRO_ROS_AGENT_VERBOSITY:-2}"]
+    # A malformed XRCE/DDS sample must restart only the Agent instead of
+    # exhausting the Pi. Normal RSS is only a few MiB.
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
     logging:
       driver: json-file
       options:
@@ -151,26 +189,46 @@ services:
         max-file: "3"
 
   yahboom-joystick:
-    profiles: ["ros2-managed-stack"]
+    profiles: ["ros2-managed-stack", "managed-motion"]
     image: yahboomtechnology/ros-humble:4.1.2
     network_mode: host
     restart: unless-stopped
     privileged: true
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
+      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
+      # Fast DDS nodes reserve more than 1 GiB of virtual address space during
+      # bringup even while RSS remains modest. Keep this below the historical
+      # 2.2 GiB runaway size; the 900 MiB combined-RSS guard is the hard stop.
+      YAHBOOM_PROCESS_VMEM_KB: ${YAHBOOM_PROCESS_VMEM_KB:-1572864}
+      YAHBOOM_CONTAINER_RSS_KB: ${YAHBOOM_CONTAINER_RSS_KB:-921600}
     volumes:
       - /dev/input:/dev/input
       - type: bind
         source: ./ros_bridge/yahboomcar_joy_web_compatible.launch.py
         target: /opt/rovera/yahboomcar_joy_web_compatible.launch.py
         read_only: true
+      - type: bind
+        source: ./ros_bridge/yahboom_managed_entrypoint.sh
+        target: /opt/rovera/yahboom_managed_entrypoint.sh
+        read_only: true
+      - type: bind
+        source: ./micro_ros_fastdds.xml
+        target: /etc/rovera/micro_ros_fastdds.xml
+        read_only: true
     command:
       - /bin/bash
-      - -lc
-      - >-
-        source /opt/ros/humble/setup.bash &&
-        source /root/yahboomcar_ws/install/setup.bash &&
-        exec ros2 launch /opt/rovera/yahboomcar_joy_web_compatible.launch.py
+      - /opt/rovera/yahboom_managed_entrypoint.sh
+    # The vendor bringup has previously grown beyond 3 GiB after a Fast DDS
+    # failure. Keep that failure inside this replaceable container.
+    mem_limit: 1200m
+    memswap_limit: 1200m
+    # Fast DDS counts each worker thread against the pids cgroup. The vendor
+    # bringup (joy + EKF + TF + robot state) exceeds 128 threads at startup.
+    pids_limit: 512
+    cpus: 2.0
     logging:
       driver: json-file
       options:

@@ -74,7 +74,7 @@ export class WebSocketTelemetryTransport {
         } else if (message.message_type === "robot.health") {
           this.callbacks.onHealth(message.payload as unknown as Health);
         } else if (message.message_type === "navigation.status") {
-          this.callbacks.onNavigation(String(message.payload.status));
+          this.callbacks.onNavigation(String(message.payload.state ?? message.payload.status));
         } else if (message.message_type === "session.ended") {
           this.manualDisconnect = true;
           this.clearReconnectTimer();

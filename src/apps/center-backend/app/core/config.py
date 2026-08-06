@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     simulator_rtsp_path: str = ""
     cors_origins: str = "http://localhost:5173,http://localhost:8080"
     sample_data_dir: str = "/sample-data"
+    map_storage_dir: str = "./map-storage"
+    map_bundle_max_bytes: int = 512 * 1024 * 1024
+    robot_command_timeout_seconds: float = 15.0
+    # SLAM save/load serializes a pose-graph on the Pi and legitimately takes
+    # longer than interactive motion/navigation commands.
+    mapping_command_timeout_seconds: float = 90.0
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

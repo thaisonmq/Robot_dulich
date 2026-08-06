@@ -27,6 +27,39 @@ def envelope(message_type: str, session_id: str, sequence: int, payload: dict) -
     }
 
 
+def test_draft_map_metadata_can_be_edited_and_deleted() -> None:
+    client = TestClient(app)
+    with client:
+        login = client.post(
+            "/api/auth/login",
+            json={"email": "demo@rovera.local", "password": "demo123"},
+        )
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+        created = client.post(
+            "/api/maps",
+            headers=headers,
+            json={"name": "Draft map", "site_id": "A", "floor_id": "1", "notes": ""},
+        )
+        assert created.status_code == 201
+        map_id = created.json()["map_id"]
+
+        updated = client.patch(
+            f"/api/maps/{map_id}",
+            headers=headers,
+            json={"name": "Draft map renamed", "floor_id": "2", "notes": "updated"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["name"] == "Draft map renamed"
+        assert updated.json()["floor_id"] == "2"
+
+        removed = client.delete(f"/api/maps/{map_id}", headers=headers)
+        assert removed.status_code == 204
+        assert client.get(f"/api/maps/{map_id}", headers=headers).status_code == 404
+
+        active = client.delete("/api/maps/MAP-001", headers=headers)
+        assert active.status_code == 409
+
+
 def test_gateway_session_command_and_telemetry_flow() -> None:
     hub.robot_sockets.clear()
     hub.sessions.clear()

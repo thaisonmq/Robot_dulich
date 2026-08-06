@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -7,12 +7,134 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from app.core.config import Settings, get_settings
 from app.core.security import decode_robot_token, decode_token
 from app.models.database import SessionLocal
-from app.models.entities import Robot, RobotConnection, User
+from app.models.entities import (
+    MappingSession,
+    NavigationMission,
+    Robot,
+    RobotConnection,
+    RobotMapCache,
+    User,
+)
 from app.schemas.messages import RealtimeMessage
 from app.services.hub import hub
 
 router = APIRouter(tags=["websockets"])
 MAX_MESSAGE_BYTES = 65_536
+
+
+def runtime_capabilities_from_health(payload: dict) -> dict:
+    motion_backend = str(payload.get("motion_backend", ""))
+    navigation_backend = str(payload.get("navigation_backend", ""))
+    simulated = motion_backend == "simulator" and navigation_backend == "simulator"
+    blockers: list[str] = []
+    if navigation_backend == "ros2":
+        if not payload.get("scan_fresh", False):
+            blockers.append("SCAN_STALE")
+        if not payload.get("odometry_ready", False):
+            blockers.append("ODOMETRY_UNAVAILABLE")
+        if not payload.get("lidar_tf_ready", False):
+            blockers.append("LIDAR_TF_UNAVAILABLE")
+        if str(payload.get("nav2", "UNAVAILABLE")).upper() in {"UNAVAILABLE", "FAULT"}:
+            blockers.append("NAV2_UNAVAILABLE")
+    elif not simulated:
+        blockers.append("NAVIGATION_BACKEND_UNAVAILABLE")
+    ready = simulated or (navigation_backend == "ros2" and not blockers)
+    source = (
+        "simulator"
+        if simulated
+        else "robot"
+        if motion_backend == "ros2" or navigation_backend == "ros2"
+        else "unknown"
+    )
+    return {
+        "motion_backend": motion_backend or "unknown",
+        "navigation_backend": navigation_backend or "unknown",
+        "mapping": ready,
+        "navigation": ready,
+        "mapping_blockers": blockers,
+        "source": source,
+    }
+
+
+def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict) -> None:
+    """Persist authoritative edge state without coupling media/control delivery to it."""
+    with SessionLocal.begin() as database:
+        if message_type == "mapping.status":
+            session_id = str(payload.get("mapping_session_id", ""))
+            session = database.get(MappingSession, session_id) if session_id else None
+            if session is not None and session.robot_id == robot_id:
+                session.status = str(payload.get("status", session.status)).upper()
+                session.error_code = payload.get("error_code")
+                session.error_message = payload.get("error_message")
+        elif message_type == "map.cache.state":
+            map_id = str(payload.get("map_id", ""))
+            version = int(payload.get("version", 0) or 0)
+            cache = database.query(RobotMapCache).filter(
+                RobotMapCache.robot_id == robot_id,
+                RobotMapCache.map_id == map_id,
+                RobotMapCache.version == version,
+            ).first()
+            if cache is not None:
+                cache.status = str(payload.get("status", cache.status)).upper()
+                cache.progress_percent = float(payload.get("progress_percent", cache.progress_percent))
+                cache.error_message = payload.get("error_message")
+        elif message_type in {"navigation.status", "navigation.result"}:
+            runtime_mode = str(payload.get("mode", "")).upper()
+            runtime_state = str(payload.get("state") or payload.get("status") or "").upper()
+            if runtime_mode == "MAPPING" and runtime_state in {
+                "IDLE",
+                "MAPPING",
+                "PAUSED",
+                "FINISHED",
+                "CANCELED",
+                "FAULT",
+            }:
+                mapping = (
+                    database.query(MappingSession)
+                    .filter(
+                        MappingSession.robot_id == robot_id,
+                        MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT")),
+                    )
+                    .order_by(MappingSession.created_at.desc())
+                    .first()
+                )
+                if mapping is not None:
+                    mapping_updated_at = mapping.updated_at
+                    if mapping_updated_at.tzinfo is None:
+                        mapping_updated_at = mapping_updated_at.replace(tzinfo=timezone.utc)
+                    starting_grace = (
+                        mapping.status == "STARTING"
+                        and datetime.now(timezone.utc) - mapping_updated_at
+                        <= timedelta(seconds=120)
+                    )
+                    if runtime_state == "IDLE" and not starting_grace:
+                        # The mapping process restarted while Center still had
+                        # an active session. Mark the orphan terminal so maps
+                        # are not locked forever and the UI can start a clean
+                        # continuation from a saved pose-graph.
+                        mapping.status = "FAULT"
+                        mapping.error_code = "MAPPING_RUNTIME_RESET"
+                        mapping.error_message = "SLAM runtime đã reset trước khi phiên mapping kết thúc"
+                    elif runtime_state != "IDLE":
+                        mapping.status = runtime_state
+                        if runtime_state in {"MAPPING", "PAUSED", "FINISHED", "CANCELED"}:
+                            mapping.error_code = None
+                            mapping.error_message = None
+                    if runtime_state == "FAULT":
+                        mapping.error_code = str(payload.get("error_code") or "MAPPING_FAULT")
+                        mapping.error_message = str(payload.get("error_message") or "ROS mapping runtime fault")
+            mission_id = str(payload.get("mission_id", ""))
+            mission = database.get(NavigationMission, mission_id) if mission_id else None
+            if mission is not None and mission.robot_id == robot_id:
+                status_value = str(payload.get("state") or payload.get("status") or mission.status).upper()
+                status_value = {
+                    "MOVING": "NAVIGATING",
+                    "FAILED": "FAULT",
+                    "CANCELLED": "CANCELED",
+                }.get(status_value, status_value)
+                mission.status = status_value
+                mission.error_code = payload.get("error_code")
+                mission.error_message = payload.get("error_message")
 
 
 async def ws_error(socket: WebSocket, code: int, reason: str) -> None:
@@ -104,7 +226,13 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
                 hub.robots[robot_id].pose.update(message.payload)
             elif message.message_type == "robot.health":
                 hub.robots[robot_id].health.update(message.payload)
+                hub.robots[robot_id].capabilities.update(
+                    runtime_capabilities_from_health(message.payload)
+                )
+            elif message.message_type == "mapping.snapshot":
+                hub.robots[robot_id].mapping_snapshot = dict(message.payload)
             elif message.message_type in {
+                "command.ack",
                 "configuration.state",
                 "diagnostics.result",
                 "media.sources",
@@ -115,6 +243,13 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
                 request_id = str(message.payload.get("request_id", ""))
                 if hub.resolve_robot_request(robot_id, request_id, message.payload):
                     continue
+            if message.message_type in {
+                "mapping.status",
+                "map.cache.state",
+                "navigation.status",
+                "navigation.result",
+            }:
+                persist_robot_runtime_event(robot_id, message.message_type, message.payload)
             if message.message_type != "robot.heartbeat":
                 await hub.broadcast_telemetry(robot_id, data)
     except (WebSocketDisconnect, ValueError, json.JSONDecodeError, OSError):
@@ -316,3 +451,70 @@ async def user_telemetry(
     finally:
         hub.telemetry_sockets.get(robot_id, set()).discard(socket)
         hub.session_sockets.get(session_id, set()).discard(socket)
+
+
+@router.websocket("/ws/user/mapping/{mapping_session_id}")
+async def user_mapping(
+    socket: WebSocket,
+    mapping_session_id: str,
+    settings: Settings = Depends(get_settings),
+) -> None:
+    user = ws_user(socket, settings)
+    with SessionLocal() as database:
+        mapping = database.get(MappingSession, mapping_session_id)
+        allowed = bool(
+            user
+            and mapping
+            and (mapping.user_id == user[0] or user[1] in {"admin", "operator"})
+        )
+        robot_id = mapping.robot_id if mapping else ""
+        initial = (
+            {
+                "mapping_session_id": mapping.session_id,
+                "map_id": mapping.map_id,
+                "version": mapping.version,
+                "status": mapping.status,
+            }
+            if mapping
+            else {}
+        )
+    await socket.accept()
+    if not allowed:
+        await ws_error(socket, status.WS_1008_POLICY_VIOLATION, "invalid mapping session")
+        return
+    hub.telemetry_sockets.setdefault(robot_id, set()).add(socket)
+    await socket.send_json(
+        {
+            "message_id": str(uuid4()),
+            "schema_version": "1.0",
+            "message_type": "mapping.status",
+            "robot_id": robot_id,
+            "session_id": mapping_session_id,
+            "sequence": 0,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ttl_ms": 0,
+            "payload": initial,
+        }
+    )
+    snapshot = hub.robots.get(robot_id).mapping_snapshot if hub.robots.get(robot_id) else None
+    if snapshot is not None:
+        await socket.send_json(
+            {
+                "message_id": str(uuid4()),
+                "schema_version": "1.0",
+                "message_type": "mapping.snapshot",
+                "robot_id": robot_id,
+                "session_id": mapping_session_id,
+                "sequence": 0,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "ttl_ms": 0,
+                "payload": snapshot,
+            }
+        )
+    try:
+        while True:
+            await socket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        hub.telemetry_sockets.get(robot_id, set()).discard(socket)

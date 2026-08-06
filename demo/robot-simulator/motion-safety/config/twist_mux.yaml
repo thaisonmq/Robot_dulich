@@ -1,0 +1,20 @@
+twist_mux:
+  ros__parameters:
+    topics:
+      joystick:
+        topic: /cmd_vel_joy
+        timeout: 0.25
+        priority: 100
+      web_manual:
+        topic: /cmd_vel_web
+        timeout: 0.30
+        priority: 50
+      nav2:
+        topic: /cmd_vel_nav
+        timeout: 0.30
+        priority: 10
+    locks:
+      emergency_stop:
+        topic: /safety/estop
+        timeout: 0.0
+        priority: 255

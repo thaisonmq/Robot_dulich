@@ -3,6 +3,8 @@
 ROVERA là hệ thống điều khiển robot từ xa qua trình duyệt, gồm giao diện quản
 lý, API trung tâm, kết nối thời gian thực và phần mềm chạy trên robot.
 
+Hướng dẫn mapping, phân phối map, Nav2 và motion safety: [docs/navigation-mapping.md](./docs/navigation-mapping.md).
+
 ## Các thành phần
 
 - `center-frontend`: giao diện web để quản lý, xem camera và điều khiển robot.

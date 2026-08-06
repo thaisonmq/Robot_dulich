@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Battery, Bot, ChevronLeft, ChevronRight, Clock3, MapPin,
+  Battery, Bot, ChevronLeft, ChevronRight, Clock3, Map as MapIcon, MapPin,
   MonitorPlay, OctagonX, Plus, PlugZap, RadioTower, Search, Server,
   Settings2, SlidersHorizontal, UserRound, Wifi,
 } from "lucide-react";
@@ -132,6 +132,7 @@ export function RobotListPage() {
           <span><Server size={20} /><small>{t("Đang online")}</small><strong>{summary.online} / {summary.total}</strong></span>
           <span><RadioTower size={20} /><small>{t("Chờ kết nối")}</small><strong>{summary.pending}</strong></span>
         </div>
+        <button type="button" className="header-action" onClick={() => navigate("/maps")}><MapIcon size={17} /> Maps</button>
         <GlobalLanguageSelect />
         <AccountMenu />
       </header>

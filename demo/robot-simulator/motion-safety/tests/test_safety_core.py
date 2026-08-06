@@ -1,0 +1,77 @@
+import math
+
+from safety_core import (
+    Direction,
+    SafetyConfig,
+    ScanSample,
+    StopHysteresis,
+    evaluate_scan,
+    motion_blocked_by_mask,
+    stopping_clearance,
+)
+
+
+CONFIG = SafetyConfig()
+
+
+def scan_with_points(points: list[tuple[float, float]]) -> ScanSample:
+    ranges = [math.inf] * 360
+    for x, y in points:
+        angle = math.atan2(y, x)
+        index = round((angle + math.pi) / (2 * math.pi / 360)) % 360
+        ranges[index] = math.hypot(x, y)
+    return ScanSample(-math.pi, 2 * math.pi / 360, 0.12, 8.0, tuple(ranges))
+
+
+def test_front_and_rear_obstacles_only_block_matching_translation() -> None:
+    front = scan_with_points([(0.24, 0.0)])
+    assert evaluate_scan(front, linear_x=0.1, angular_z=0, config=CONFIG).stop
+    assert not evaluate_scan(front, linear_x=-0.1, angular_z=0, config=CONFIG).stop
+    rear = scan_with_points([(-0.24, 0.0)])
+    assert evaluate_scan(rear, linear_x=-0.1, angular_z=0, config=CONFIG).stop
+
+
+def test_side_and_corner_set_directional_polygon_mask() -> None:
+    side = evaluate_scan(scan_with_points([(0.0, 0.14)]), linear_x=0, angular_z=0.4, config=CONFIG)
+    assert side.stop and side.blocked & Direction.LEFT
+    corner = evaluate_scan(scan_with_points([(0.20, 0.10)]), linear_x=0.1, angular_z=0, config=CONFIG)
+    assert corner.blocked & Direction.FRONT
+    assert corner.blocked & Direction.LEFT
+
+
+def test_dynamic_braking_distance_grows_with_velocity() -> None:
+    assert stopping_clearance(0.15, CONFIG) > stopping_clearance(0.05, CONFIG) >= 0.10
+
+
+def test_nan_inf_and_out_of_range_are_ignored_fail_closed_when_empty() -> None:
+    scan = ScanSample(-1, 0.1, 0.12, 8.0, (math.nan, math.inf, 0.0, 9.0))
+    result = evaluate_scan(scan, linear_x=0.1, angular_z=0, config=CONFIG)
+    assert result.stop and result.reason == "empty_scan"
+
+
+def test_slow_zone_scales_without_stopping() -> None:
+    result = evaluate_scan(scan_with_points([(0.38, 0.0)]), linear_x=0.05, angular_z=0, config=CONFIG)
+    assert not result.stop
+    assert 0 < result.speed_scale < 1
+
+
+def test_clear_hysteresis_rejects_chatter() -> None:
+    gate = StopHysteresis(0.4)
+    assert gate.update(True, 1.0)
+    assert gate.update(False, 1.1)
+    assert gate.update(True, 1.2)
+    assert gate.update(False, 1.3)
+    assert gate.update(False, 1.69)
+    assert not gate.update(False, 1.71)
+
+
+def test_external_direction_mask_blocks_only_matching_motion() -> None:
+    assert motion_blocked_by_mask(0.1, 0.0, Direction.FRONT)
+    assert not motion_blocked_by_mask(-0.1, 0.0, Direction.FRONT)
+    assert motion_blocked_by_mask(0.0, 0.2, Direction.LEFT)
+    assert not motion_blocked_by_mask(0.0, -0.2, Direction.LEFT)
+    assert motion_blocked_by_mask(
+        -0.1,
+        -0.2,
+        Direction.REAR | Direction.RIGHT,
+    )

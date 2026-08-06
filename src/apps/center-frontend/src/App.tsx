@@ -4,6 +4,8 @@ import { AccountPage } from "./pages/AccountPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { GoogleCallbackPage } from "./pages/GoogleCallbackPage";
 import { LoginPage } from "./pages/LoginPage";
+import { CreateMapPage } from "./pages/CreateMapPage";
+import { MapManagementPage } from "./pages/MapManagementPage";
 import { RegisterPage } from "./pages/RegisterPage";
 import { RobotConfigurationPage } from "./pages/RobotConfigurationPage";
 import { RobotEditorPage } from "./pages/RobotEditorPage";
@@ -68,6 +70,12 @@ export function App() {
     return null;
   }
   if (pathname === "/robots") return <RobotListPage />;
+  if (pathname === "/maps/create") {
+    if (user.role === "admin" || user.role === "operator") return <CreateMapPage />;
+    queueMicrotask(() => navigate("/maps", { replace: true }));
+    return null;
+  }
+  if (pathname === "/maps" || /^\/maps\/[^/]+$/.test(pathname)) return <MapManagementPage />;
   if (
     user.role === "guest"
     && (
