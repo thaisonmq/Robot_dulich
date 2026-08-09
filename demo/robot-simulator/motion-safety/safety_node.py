@@ -27,6 +27,7 @@ class MotionSafetyNode(Node):
         super().__init__("rovera_motion_safety")
         self.declare_parameter("scan_timeout", 0.28)
         self.declare_parameter("clear_hysteresis", 0.40)
+        self.declare_parameter("lidar_obstacle_avoidance_enabled", True)
         self.declare_parameter("half_length", 0.15)
         self.declare_parameter("half_width", 0.05)
         self.declare_parameter("clearance", 0.10)
@@ -42,6 +43,9 @@ class MotionSafetyNode(Node):
             braking_acceleration=float(self.get_parameter("braking_acceleration").value),
             clear_hysteresis_seconds=float(self.get_parameter("clear_hysteresis").value),
             scan_timeout_seconds=float(self.get_parameter("scan_timeout").value),
+        )
+        self.lidar_obstacle_avoidance_enabled = bool(
+            self.get_parameter("lidar_obstacle_avoidance_enabled").value
         )
         self.output = self.create_publisher(Twist, "/cmd_vel", 1)
         self.stop_state = self.create_publisher(Bool, "/safety/stop", 1)
@@ -82,6 +86,11 @@ class MotionSafetyNode(Node):
         self.hysteresis = StopHysteresis(self.config.clear_hysteresis_seconds)
         self.last_manual = 0.0
         self.create_timer(0.02, self._tick)
+        if not self.lidar_obstacle_avoidance_enabled:
+            self.get_logger().warning(
+                "LiDAR obstacle avoidance is disabled by safety.yaml; "
+                "external safety topics and hard-stop inputs remain active"
+            )
 
     def _on_command(self, message: Twist) -> None:
         self.command = message
@@ -203,10 +212,6 @@ class MotionSafetyNode(Node):
             # output still goes to zero, but preflight may remain healthy.
             self._publish_zero("command_timeout", Direction.NONE, healthy_idle=True)
             return
-        if self.scan is None or now - self.last_scan > self.config.scan_timeout_seconds:
-            self.hysteresis.update(True, now)
-            self._publish_zero("scan_timeout", Direction.FRONT | Direction.REAR | Direction.LEFT | Direction.RIGHT)
-            return
         if motion_blocked_by_mask(
             self.command.linear.x,
             self.command.angular.z,
@@ -217,6 +222,19 @@ class MotionSafetyNode(Node):
                 "external_direction",
                 self.external_directions,
             )
+            return
+        if not self.lidar_obstacle_avoidance_enabled:
+            if self.hysteresis.update(False, now):
+                self._publish_zero("clear_hysteresis", self.external_directions)
+                return
+            self.output.publish(self.command)
+            self.stop_state.publish(Bool(data=False))
+            self.direction_state.publish(UInt8(data=int(self.external_directions)))
+            self.health.publish(String(data="HEALTHY:LIDAR_AVOIDANCE_DISABLED"))
+            return
+        if self.scan is None or now - self.last_scan > self.config.scan_timeout_seconds:
+            self.hysteresis.update(True, now)
+            self._publish_zero("scan_timeout", Direction.FRONT | Direction.REAR | Direction.LEFT | Direction.RIGHT)
             return
         decision = evaluate_scan(
             self.scan,

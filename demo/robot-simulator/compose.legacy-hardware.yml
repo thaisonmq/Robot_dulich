@@ -6,6 +6,7 @@ services:
       context: ./micro-ros-agent-guard
     image: rovera-micro-ros-agent-guard:humble
     network_mode: host
+    ipc: host
     pid: host
     restart: unless-stopped
     privileged: true
@@ -16,14 +17,18 @@ services:
       # The vendor runtime uses domain 20. Leaving this unset silently puts
       # MCU topics in domain 0, where the Web/bringup graph cannot see them.
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
-      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
       RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
       MICRO_ROS_AGENT_VERBOSITY: ${MICRO_ROS_AGENT_VERBOSITY:-2}
       MICRO_ROS_AGENT_VMEM_KB: ${MICRO_ROS_AGENT_VMEM_KB:-1572864}
     volumes:
       - /dev:/dev
       - /dev/shm:/dev/shm
       - /var/lock/rovera-micro-ros:/var/lock/rovera-micro-ros
+      - type: bind
+        source: ./micro_ros_fastdds.xml
+        target: /etc/rovera/micro_ros_fastdds.xml
+        read_only: true
     command: ["serial", "--dev", "/dev/ttyUSB0", "-b", "921600", "-v${MICRO_ROS_AGENT_VERBOSITY:-2}"]
     mem_limit: 256m
     memswap_limit: 256m

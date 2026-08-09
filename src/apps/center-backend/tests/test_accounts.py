@@ -44,9 +44,20 @@ def test_registration_defaults_to_guest_and_rbac_blocks_operations() -> None:
         assert user["role"] == "guest"
         assert user["active"] is True
         assert user["password_enabled"] is True
+        assert "maps.view" not in user["permissions"]
         headers = auth_headers(registered.json()["access_token"])
 
         assert client.get("/api/robots", headers=headers).status_code == 200
+        assert client.get("/api/maps", headers=headers).status_code == 403
+        active_maps = client.get("/api/maps?status=ACTIVE", headers=headers)
+        assert active_maps.status_code == 200
+        assert all(item["status"] == "ACTIVE" for item in active_maps.json())
+        active_map = client.get("/api/maps/MAP-001", headers=headers)
+        assert active_map.status_code == 200
+        assert "versions" not in active_map.json()
+        assert client.get(
+            "/api/maps/MAP-001/cache?robot_id=ROBOT-001", headers=headers
+        ).status_code == 403
         blocked = client.post(
             "/api/robots/quick-add",
             headers=headers,

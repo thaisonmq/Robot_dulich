@@ -4,7 +4,7 @@ amcl:
     base_frame_id: base_footprint
     global_frame_id: map
     odom_frame_id: odom
-    scan_topic: scan
+    scan_topic: /scan_navigation
     min_particles: 300
     max_particles: 1200
     update_min_d: 0.05
@@ -97,7 +97,7 @@ local_costmap:
         mark_threshold: 0
         observation_sources: scan
         scan:
-          topic: /scan
+          topic: /scan_navigation
           max_obstacle_height: 2.0
           clearing: true
           marking: true
@@ -132,7 +132,7 @@ global_costmap:
         enabled: true
         observation_sources: scan
         scan:
-          topic: /scan
+          topic: /scan_navigation
           clearing: true
           marking: true
           data_type: LaserScan

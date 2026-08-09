@@ -13,6 +13,8 @@ ROLE_PERMISSIONS: dict[str, tuple[str, ...]] = {
         "robots.view",
         "robots.manage",
         "robots.operate",
+        "maps.view",
+        "maps.manage",
     ),
     "operator": (
         "account.self",
@@ -21,6 +23,8 @@ ROLE_PERMISSIONS: dict[str, tuple[str, ...]] = {
         "robots.manage",
         "robots.operate",
         "sessions.supervise_guests",
+        "maps.view",
+        "maps.manage",
     ),
     "guest": (
         "account.self",

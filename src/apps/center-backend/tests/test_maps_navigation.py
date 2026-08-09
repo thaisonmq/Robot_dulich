@@ -5,17 +5,40 @@ import tarfile
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 from app.api.maps import _mapping_action_reached, _posegraph_basename
+from app.api.navigation import _robot_by_public_id
 from app.api.websockets import persist_robot_runtime_event
-from app.models.database import SessionLocal
-from app.models.entities import MapRecord, MappingSession, MapVersion
+from app.models.database import Base, SessionLocal
+from app.models.entities import MapRecord, MappingSession, MapVersion, Robot
 from app.services.map_storage import InvalidMapBundle, MapBundleStore
 from app.services.state_machines import (
     InvalidTransition,
     mapping_transition,
     navigation_transition,
 )
+
+
+def test_navigation_resolves_robot_by_public_robot_id() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as database:
+        database.add(
+            Robot(
+                id="internal-robot-uuid",
+                robot_id="ROBOT-001",
+                name="Navigation test robot",
+                site_id="test",
+                map_id="MAP-OLD",
+            )
+        )
+        database.commit()
+        robot = _robot_by_public_id(database, "ROBOT-001")
+        assert robot is not None
+        assert robot.robot_id == "ROBOT-001"
+        assert robot.id == "internal-robot-uuid"
 
 
 def bundle_bytes(*, unsafe: bool = False) -> bytes:

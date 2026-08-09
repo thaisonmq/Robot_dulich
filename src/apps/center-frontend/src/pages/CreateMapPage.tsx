@@ -157,7 +157,7 @@ function MappingCanvas({
 export function CreateMapPage() {
   const { t } = useI18n();
   const navigate = useNavigate();
-  const { control, manager, screen, inputState } = useTeleoperation();
+  const { control, manager, screen, inputState, speedLevel, setSpeedLevel } = useTeleoperation();
   const [robotId, setRobotId] = useState("");
   const [name, setName] = useState("");
   const [siteId, setSiteId] = useState("");
@@ -352,7 +352,7 @@ export function CreateMapPage() {
       <section className="mapping-stage"><header><div><p className="eyebrow">{mapping.map_id} · v{mapping.version}</p><h2>{mapping.metadata.name}</h2></div><strong className={`map-status map-status--${mapping.status.toLowerCase()}`}>{mapping.status}</strong></header>
         <div className="mapping-canvas"><MappingCanvas snapshot={snapshot} pose={pose} scan={scan} /><span className="mapping-canvas__meta">{snapshot ? `${(snapshot.width * snapshot.resolution).toFixed(1)} × ${(snapshot.height * snapshot.resolution).toFixed(1)} m · ${snapshot.source_width ?? snapshot.width}×${snapshot.source_height ?? snapshot.height} cells · rev ${snapshot.revision}` : t("Đang chờ full map snapshot…")}</span></div>
         <footer><span><Wifi size={15} /> {selectedRobot?.status === "online" ? "Online" : "Offline"}</span><span><Battery size={15} /> {Math.round(health?.battery_percent ?? selectedRobot?.battery_percent ?? 0)}%</span><span><RadioTower size={15} /> {health?.scan_fresh ? "/scan fresh" : "/scan unknown"}</span><span><ShieldAlert size={15} /> Cliff: N/A</span></footer></section>
-      <aside className="mapping-console"><div><p className="eyebrow">MANUAL EXPLORATION</p><h3>{t("Điều khiển mapping")}</h3><ControlPad adapter={screen} input={inputState} disabled={!controlReady || Boolean(terminal) || mapping.status === "PAUSED"} /></div>
+      <aside className="mapping-console"><div><p className="eyebrow">MANUAL EXPLORATION</p><h3>{t("Điều khiển mapping")}</h3><ControlPad adapter={screen} input={inputState} disabled={!controlReady || Boolean(terminal) || mapping.status === "PAUSED"} speedLevel={speedLevel} onSpeedLevelChange={setSpeedLevel} /></div>
         <section className={`mapping-camera${cameraVisible ? "" : " is-collapsed"}`} aria-label={t("Camera hỗ trợ quan sát")}>
           <header><span><Camera size={14} /> {t("Camera hỗ trợ")}</span><button type="button" onClick={() => setCameraVisible((current) => !current)} aria-label={cameraVisible ? t("Ẩn camera") : t("Hiện camera")}>{cameraVisible ? <EyeOff /> : <Eye />}</button></header>
           <div className="mapping-camera__viewport">

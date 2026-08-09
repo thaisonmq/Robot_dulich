@@ -82,6 +82,25 @@ describe("API authentication", () => {
     );
   });
 
+  it("shows the backend message for structured navigation failures", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: vi.fn().mockResolvedValue({
+        detail: { code: "MODE_SWITCH_TIMEOUT", message: "Không thể chuyển sang Nav2" },
+      }),
+    }));
+
+    await expect(api.loadNavigationMap({
+      request_id: "request-123",
+      robot_id: "ROBOT-1",
+      session_id: "session-123",
+      expected_state: "FINISHED",
+      map_id: "MAP-1",
+      version: 1,
+    })).rejects.toThrow("Không thể chuyển sang Nav2");
+  });
+
   it("updates and deletes a draft map through the registry API", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true, status: 200, json: vi.fn().mockResolvedValue({ map_id: "MAP-DRAFT", name: "Renamed" }) })

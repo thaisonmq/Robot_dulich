@@ -1,12 +1,14 @@
-FROM microros/micro-ros-agent:humble
+FROM yahboomtechnology/ros-humble:4.1.2
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# The vendor image still contains the retired 2023 ROS repository key. Use
+# the pinned official Jammy source package so image builds remain verifiable.
 ADD https://github.com/ros-infrastructure/ros-apt-source/releases/download/1.2.0/ros2-apt-source_1.2.0.jammy_all.deb /tmp/ros2-apt-source.deb
 
-# The upstream Humble image is based on an old 2023 Fast DDS patch release.
-# Upgrade only the ABI-compatible Humble middleware packages; the serial Agent
-# executable and XRCE protocol stay unchanged.
+# The vendor image ships Fast DDS 2.6.6 from 2023. Keep the vendor ROS
+# workspace, but update the Humble DDS runtime to the current patch release so
+# discovery from newer Fast DDS peers cannot trigger the old deserializer leak.
 RUN unlink /etc/apt/sources.list.d/ros2-latest.list \
     && dpkg -i /tmp/ros2-apt-source.deb \
     && apt-get update \
@@ -19,9 +21,3 @@ RUN unlink /etc/apt/sources.list.d/ros2-latest.list \
         ros-humble-rosidl-typesupport-fastrtps-c \
         ros-humble-rosidl-typesupport-fastrtps-cpp \
     && rm -rf /var/lib/apt/lists/* /tmp/ros2-apt-source.deb
-
-COPY guarded-entrypoint.sh /opt/rovera/guarded-entrypoint.sh
-RUN chmod 0555 /opt/rovera/guarded-entrypoint.sh
-
-ENTRYPOINT ["/opt/rovera/guarded-entrypoint.sh"]
-CMD ["--help"]

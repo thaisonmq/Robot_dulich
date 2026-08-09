@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -10,6 +11,7 @@ import socket
 import tarfile
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -54,8 +56,9 @@ class NavigationAdapter(Node):
         )
         self.map_root = Path(os.getenv("ROVERA_MAP_ROOT", "/var/lib/rovera/maps"))
         self.state_lock = threading.Lock()
-        self.current_state = "IDLE" if self.mode == "MAPPING" else "READY"
+        self.current_state = "IDLE" if self.mode == "MAPPING" else "STARTING"
         self.localized = False
+        self.initial_pose_requested = False
         self.map_id = ""
         self.map_version = 0
         self.mapping_payload: dict[str, Any] = {}
@@ -70,6 +73,8 @@ class NavigationAdapter(Node):
             1_000, int(os.getenv("MAPPING_PREVIEW_MAX_CELLS", "20000"))
         )
         self.last_scan_monotonic = 0.0
+        self.scan_clock_skew_seconds = 0.0
+        self.last_scan_clock_warning_monotonic = 0.0
         self.safety_health = "UNKNOWN"
         self.pose: dict[str, float] | None = None
         self.trail: list[dict[str, float]] = []
@@ -90,6 +95,9 @@ class NavigationAdapter(Node):
         )
         self.mapping_scan = self.create_publisher(
             LaserScan, "/scan_mapping", qos_profile_sensor_data
+        )
+        self.navigation_scan = self.create_publisher(
+            LaserScan, "/scan_navigation", qos_profile_sensor_data
         )
         self.initial_pose = self.create_publisher(
             PoseWithCovarianceStamped, "/initialpose", 1
@@ -146,7 +154,13 @@ class NavigationAdapter(Node):
                         if not chunk:
                             break
                         raw += chunk
-                    request = json.loads(raw.split(b"\n", 1)[0])
+                    request_line = raw.split(b"\n", 1)[0]
+                    if not request_line:
+                        self.get_logger().warning(
+                            "adapter client disconnected before sending a request"
+                        )
+                        continue
+                    request = json.loads(request_line)
                     response = self._dispatch(
                         str(request["command"]), dict(request.get("payload") or {})
                     )
@@ -159,7 +173,12 @@ class NavigationAdapter(Node):
                         "state": self._state(),
                     }
                 except Exception as exc:
-                    self.get_logger().exception(f"adapter request failed: {exc}")
+                    # RcutilsLogger in ROS 2 Humble has no ``exception`` method.
+                    # Logging an invalid/abandoned request must never terminate
+                    # the only JSON-RPC server thread.
+                    self.get_logger().error(
+                        f"adapter request failed: {exc}\n{traceback.format_exc()}"
+                    )
                     response = {
                         "status": "rejected",
                         "current_state": "FAULT",
@@ -179,15 +198,30 @@ class NavigationAdapter(Node):
 
     def _state(self) -> dict[str, Any]:
         with self.state_lock:
+            navigation_runtime_ready = (
+                self.mode == "NAVIGATION"
+                and self.map_load_client.service_is_ready()
+                and self.compute_path_client.server_is_ready()
+                and self.navigate_client.server_is_ready()
+            )
+            if self.mode == "MAPPING":
+                nav2_state = "MAPPING"
+            elif navigation_runtime_ready:
+                nav2_state = "READY"
+            elif self.current_state == "FAULT":
+                nav2_state = "FAULT"
+            else:
+                nav2_state = "STARTING"
             return {
                 "state": self.current_state,
                 "mode": self.mode,
                 "map_id": self.map_id,
                 "map_version": self.map_version,
                 "localized": self.localized,
-                "nav2": "READY" if self.current_state not in {"FAULT", "LOCALIZING"} else self.current_state,
+                "nav2": nav2_state,
                 "feedback": dict(self.latest_feedback),
                 "scan_fresh": time.monotonic() - self.last_scan_monotonic <= 0.30,
+                "scan_clock_skew_seconds": round(self.scan_clock_skew_seconds, 3),
                 "odometry_ready": self.tf_buffer.can_transform(
                     "odom", "base_footprint", Time()
                 ),
@@ -256,6 +290,26 @@ class NavigationAdapter(Node):
                 "pose": self.pose,
             }
         raise AdapterError("UNSUPPORTED_COMMAND", f"Unsupported command: {command}")
+
+    def _foreign_mapping_authorities(self) -> list[str]:
+        """Return ROS nodes that could publish a second map authority."""
+        conflicts: set[str] = set()
+        map_publishers = self.get_publishers_info_by_topic("/map")
+        own_slam_publishers = 0
+        for publisher in map_publishers:
+            node_name = str(publisher.node_name).lstrip("/")
+            qualified = f"{publisher.node_namespace.rstrip('/')}/{node_name}"
+            if node_name == "slam_toolbox":
+                own_slam_publishers += 1
+            else:
+                conflicts.add(qualified or f"/{node_name}")
+        if own_slam_publishers > 1:
+            conflicts.add(f"duplicate /slam_toolbox ({own_slam_publishers})")
+        for node_name, namespace in self.get_node_names_and_namespaces():
+            normalized = str(node_name).lstrip("/")
+            if normalized in {"slam_gmapping", "gmapping"}:
+                conflicts.add(f"{str(namespace).rstrip('/')}/{normalized}")
+        return sorted(conflicts)
 
     def _map_callback(self, message: OccupancyGrid) -> None:
         width = int(message.info.width)
@@ -326,8 +380,38 @@ class NavigationAdapter(Node):
 
     def _scan_callback(self, message: LaserScan) -> None:
         self.last_scan_monotonic = time.monotonic()
+        # The Yahboom micro-ROS firmware can retain an old epoch offset after
+        # the Agent reconnects without an MCU reboot. Messages then arrive at
+        # the correct rate but are minutes behind the host TF clock, causing
+        # SLAM Toolbox and AMCL to discard or misplace every scan. Normalize
+        # only Rovera's private per-mode copy. The shared /scan topic remains
+        # byte-for-byte untouched for legacy programs on this ROS domain.
+        now = self.get_clock().now()
+        source_stamp = Time.from_msg(message.header.stamp)
+        self.scan_clock_skew_seconds = (
+            now.nanoseconds - source_stamp.nanoseconds
+        ) / 1_000_000_000
+        normalized_message = message
+        if (
+            source_stamp.nanoseconds == 0
+            or abs(self.scan_clock_skew_seconds) > 0.5
+        ):
+            normalized_message = deepcopy(message)
+            normalized_message.header.stamp = now.to_msg()
+            monotonic_now = time.monotonic()
+            if monotonic_now - self.last_scan_clock_warning_monotonic >= 60.0:
+                destination = (
+                    "/scan_mapping" if self.mode == "MAPPING" else "/scan_navigation"
+                )
+                self.get_logger().warning(
+                    f"normalizing stale LiDAR timestamp for {destination} "
+                    f"skew={self.scan_clock_skew_seconds:.3f}s"
+                )
+                self.last_scan_clock_warning_monotonic = monotonic_now
         if self.mode == "MAPPING" and self.current_state == "MAPPING":
-            self.mapping_scan.publish(message)
+            self.mapping_scan.publish(normalized_message)
+        elif self.mode == "NAVIGATION":
+            self.navigation_scan.publish(normalized_message)
         points: list[dict[str, float]] = []
         stride = max(1, len(message.ranges) // 90)
         for index in range(0, len(message.ranges), stride):
@@ -360,6 +444,15 @@ class NavigationAdapter(Node):
                 self.get_logger().error(f"manual takeover cancel failed: {exc}")
 
     def _update_pose(self) -> None:
+        if (
+            self.mode == "NAVIGATION"
+            and self.current_state == "STARTING"
+            and self.map_load_client.service_is_ready()
+            and self.compute_path_client.server_is_ready()
+            and self.navigate_client.server_is_ready()
+        ):
+            with self.state_lock:
+                self.current_state = "READY"
         try:
             transform = self.tf_buffer.lookup_transform(
                 "map", "base_footprint", Time()
@@ -390,7 +483,11 @@ class NavigationAdapter(Node):
             self.trail.append({"x": pose["x"], "y": pose["y"]})
             self.trail = self.trail[-2000:]
         self.pose = pose
-        if self.mode == "NAVIGATION" and self.current_state == "LOCALIZING":
+        if (
+            self.mode == "NAVIGATION"
+            and self.current_state == "LOCALIZING"
+            and self.initial_pose_requested
+        ):
             with self.state_lock:
                 self.localized = True
                 self.current_state = "READY"
@@ -412,6 +509,7 @@ class NavigationAdapter(Node):
             self.map_id = str(payload["map_id"])
             self.map_version = int(payload["version"])
             self.localized = False
+            self.initial_pose_requested = False
             self.current_state = "LOCALIZING"
         return {
             "status": "completed",
@@ -432,6 +530,7 @@ class NavigationAdapter(Node):
         message.pose.covariance[7] = 0.25
         message.pose.covariance[35] = 0.0685
         self.initial_pose.publish(message)
+        self.initial_pose_requested = True
         # Do not claim localization from publish success. _update_pose changes
         # to READY only after map -> base_footprint is actually available.
         return {
@@ -553,6 +652,13 @@ class NavigationAdapter(Node):
             raise AdapterError("WRONG_MODE", "Navigation stack is not in MAPPING mode")
         if command == "mapping.start":
             readiness = self._state()
+            mapping_conflicts = self._foreign_mapping_authorities()
+            if mapping_conflicts:
+                raise AdapterError(
+                    "MAPPING_AUTHORITY_CONFLICT",
+                    "Another ROS mapping authority is active: "
+                    + ", ".join(mapping_conflicts),
+                )
             if not readiness["scan_fresh"]:
                 raise AdapterError("SCAN_STALE", "LiDAR /scan has no fresh publisher")
             if not readiness["odometry_ready"]:

@@ -19,6 +19,7 @@ from app.models.entities import (
     MapVersion,
     NavigationMission,
     POI,
+    Robot,
     RobotMapCache,
 )
 from app.schemas.messages import (
@@ -114,6 +115,10 @@ def _active_version(database: Session, map_id: str, version: int) -> MapVersion 
     )
 
 
+def _robot_by_public_id(database: Session, robot_id: str) -> Robot | None:
+    return database.scalar(select(Robot).where(Robot.robot_id == robot_id))
+
+
 async def _command(
     database: Session,
     settings: Settings,
@@ -123,6 +128,7 @@ async def _command(
     command_type: str,
     expected_state: str,
     payload: dict,
+    timeout_seconds: float | None = None,
 ) -> dict:
     receipt = database.get(CommandReceipt, request_id)
     if receipt is not None:
@@ -144,7 +150,7 @@ async def _command(
             robot_id,
             command_type,
             {**payload, "expected_state": expected_state},
-            timeout_seconds=settings.robot_command_timeout_seconds,
+            timeout_seconds=timeout_seconds or settings.robot_command_timeout_seconds,
             request_id=request_id,
         )
     except ConnectionError as exc:
@@ -217,7 +223,17 @@ async def load_map(
             "checksum": version.checksum,
             "download_url": f"/api/maps/{body.map_id}/versions/{body.version}/download",
         },
+        timeout_seconds=settings.mapping_command_timeout_seconds,
     )
+    if result.get("status") not in {"accepted", "completed"}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": result.get("error_code", "MAP_LOAD_REJECTED"),
+                "message": result.get("error_message", "Robot từ chối nạp map"),
+                "current_state": result.get("current_state"),
+            },
+        )
     cache = database.scalar(
         select(RobotMapCache).where(
             RobotMapCache.robot_id == body.robot_id,
@@ -236,6 +252,13 @@ async def load_map(
     cache.status = str(result.get("current_state", "LOADING_MAP"))
     cache.progress_percent = float(result.get("progress_percent", 0))
     cache.error_message = result.get("error_message")
+    # Robot.id is the internal UUID; navigation commands carry the public
+    # robot_id. Looking it up through Session.get silently returned None and
+    # left the dashboard on the previous map even after the edge loaded the
+    # requested bundle successfully.
+    robot_record = _robot_by_public_id(database, body.robot_id)
+    if robot_record is not None:
+        robot_record.map_id = body.map_id
     database.commit()
     return {**result, "map_id": body.map_id, "version": body.version}
 

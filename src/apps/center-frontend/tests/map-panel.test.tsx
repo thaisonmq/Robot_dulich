@@ -104,4 +104,14 @@ describe("MapPanel navigation controls", () => {
     expect(onSetInitialPose).toHaveBeenCalledOnce();
     expect(screen.queryByRole("button", { name: "Bắt đầu" })).not.toBeInTheDocument();
   });
+
+  it("blocks destination changes while a Nav2 request is pending", () => {
+    const onMapChange = vi.fn();
+    const onSelect = vi.fn();
+    panel({ loading: true, onMapChange, onSelect, errorMessage: "Nav2 chưa sẵn sàng" });
+
+    expect(screen.getByLabelText("Map ACTIVE")).toBeDisabled();
+    expect(screen.getByLabelText("Điểm cần đến")).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Nav2 chưa sẵn sàng");
+  });
 });

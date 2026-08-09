@@ -6,14 +6,33 @@ services:
     build:
       context: ./motion-safety
     network_mode: host
+    ipc: host
     restart: unless-stopped
     stop_grace_period: 3s
+    user: "${ROBOT_UID:-1000}:${ROBOT_GID:-1000}"
     environment:
+      HOME: /tmp/rovera-safety
+      ROS_LOG_DIR: /tmp/rovera-safety/ros-log
       ROVERA_CMD_VEL_MODE: ${ROVERA_CMD_VEL_MODE:-}
       ROVERA_EXCLUSIVE_CMD_VEL_ACK: ${ROVERA_EXCLUSIVE_CMD_VEL_ACK:-}
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
-      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
+    volumes:
+      # Mount cấu hình từ project để đổi chế độ/tốc độ chỉ cần recreate riêng
+      # motion-safety, không phải build lại image và không đụng USB Agent.
+      - type: bind
+        source: ./motion-safety/config/safety.yaml
+        target: /opt/rovera/config/safety.yaml
+        read_only: true
+      - type: bind
+        source: ./motion-safety/config/velocity_smoother.yaml
+        target: /opt/rovera/config/velocity_smoother.yaml
+        read_only: true
+      - type: bind
+        source: ./micro_ros_fastdds.xml
+        target: /etc/rovera/micro_ros_fastdds.xml
+        read_only: true
     healthcheck:
       # CMD-SHELL uses /bin/sh (which has no `source`). Avoid spawning a DDS
       # probe every five seconds; verify the actual safety node process that
@@ -36,6 +55,7 @@ services:
     build:
       context: ./navigation-stack
     network_mode: host
+    ipc: host
     restart: unless-stopped
     stop_grace_period: 10s
     # Run with the same uid/gid as the edge agent so map bundles, autosaves and
@@ -45,8 +65,8 @@ services:
       HOME: /tmp/rovera-navigation
       ROS_LOG_DIR: /tmp/rovera-navigation/ros-log
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
-      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
       ROBOT_ID: ${ROBOT_ID:-ROBOT-001}
       NAVIGATION_MODE: ${NAVIGATION_MODE:-NAVIGATION}
       ROVERA_USE_VENDOR_BASE_RUNTIME: ${ROVERA_USE_VENDOR_BASE_RUNTIME:-0}
@@ -60,6 +80,10 @@ services:
       - type: bind
         source: ${ROBOT_STATE_DIR:-./state}
         target: /var/lib/rovera
+      - type: bind
+        source: ./micro_ros_fastdds.xml
+        target: /etc/rovera/micro_ros_fastdds.xml
+        read_only: true
     depends_on:
       motion-safety:
         condition: service_healthy

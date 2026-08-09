@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { DEFAULT_MOTION_SPEED_LEVEL, type MotionSpeedLevel } from "../config/control";
 import { useAppStore } from "../state/appStore";
 import { WebSocketControlTransport } from "../transports/ControlTransport";
 import { KeyboardInputAdapter, InputManager, OnScreenControlAdapter, type InputState, EMPTY_INPUT } from "../utils/input";
@@ -7,6 +8,7 @@ export function useTeleoperation() {
   const setCommandStatus = useAppStore((state) => state.setCommandStatus);
   const setControlState = useAppStore((state) => state.setControlState);
   const [inputState, setInputState] = useState<InputState>(EMPTY_INPUT);
+  const [speedLevel, setSpeedLevelState] = useState<MotionSpeedLevel>(DEFAULT_MOTION_SPEED_LEVEL);
 
   const control = useMemo(
     () => new WebSocketControlTransport(
@@ -52,6 +54,10 @@ export function useTeleoperation() {
     [control, setCommandStatus, setControlState],
   );
   const screen = useMemo(() => new OnScreenControlAdapter(manager), [manager]);
+  const setSpeedLevel = useCallback((level: MotionSpeedLevel) => {
+    manager.setSpeedLevel(level);
+    setSpeedLevelState(level);
+  }, [manager]);
 
   useEffect(() => {
     const unsubscribe = manager.subscribe(setInputState);
@@ -64,5 +70,5 @@ export function useTeleoperation() {
     };
   }, [control, manager]);
 
-  return { control, manager, screen, inputState };
+  return { control, manager, screen, inputState, speedLevel, setSpeedLevel };
 }

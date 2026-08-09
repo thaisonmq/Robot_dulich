@@ -160,6 +160,21 @@ def user_or_robot(
     return "robot", robot_id
 
 
+def operator_or_robot(
+    principal: tuple[str, str] = Depends(user_or_robot),
+    database: Session = Depends(get_db),
+) -> tuple[str, str]:
+    """Allow enrolled robots and technical users, but never guest accounts."""
+    if principal[0] == "user":
+        user = database.get(User, principal[1])
+        if user is None or user.role not in {"admin", "operator"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Tài khoản hành khách không có quyền truy cập dữ liệu Maps kỹ thuật",
+            )
+    return principal
+
+
 def require_roles(*roles: str):
     allowed = frozenset(roles)
 

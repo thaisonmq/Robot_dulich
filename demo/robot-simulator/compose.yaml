@@ -28,6 +28,8 @@ services:
       NAVIGATION_BACKEND: ${NAVIGATION_BACKEND:-simulator}
       MOTION_SOCKET_PATH: /var/lib/rovera/control/motion.sock
       NAVIGATION_SOCKET_PATH: /var/lib/rovera/navigation/navigation.sock
+      NAVIGATION_MODE_REQUEST_PATH: /var/lib/rovera/navigation/mode-request.json
+      NAVIGATION_MODE_SWITCH_TIMEOUT_SECONDS: ${NAVIGATION_MODE_SWITCH_TIMEOUT_SECONDS:-60}
       MAP_CACHE_DIR: /var/lib/rovera/maps/cache
       MOTION_WATCHDOG_MS: ${MOTION_WATCHDOG_MS:-250}
       # Cho phép FFmpeg/pactl trong container thấy nguồn thu PipeWire/PulseAudio
@@ -93,6 +95,7 @@ services:
       context: .
       dockerfile: ros_bridge/Dockerfile
     network_mode: host
+    ipc: host
     restart: unless-stopped
     stop_grace_period: 5s
     user: "${ROBOT_UID:-1000}:${ROBOT_GID:-1000}"
@@ -100,7 +103,8 @@ services:
       ROVERA_CONTROL_MODE: ${ROVERA_CONTROL_MODE:-disabled}
       ROVERA_EXCLUSIVE_CMD_VEL_ACK: ${ROVERA_EXCLUSIVE_CMD_VEL_ACK:-}
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
-      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
       MOTION_SOCKET_PATH: /var/lib/rovera/control/motion.sock
       MOTION_WATCHDOG_MS: ${MOTION_WATCHDOG_MS:-250}
       ROS_COMMAND_RATE_HZ: ${ROS_COMMAND_RATE_HZ:-30}
@@ -128,6 +132,10 @@ services:
       - type: bind
         source: ${ROBOT_STATE_DIR:-./state}
         target: /var/lib/rovera
+      - type: bind
+        source: ./micro_ros_fastdds.xml
+        target: /etc/rovera/micro_ros_fastdds.xml
+        read_only: true
     healthcheck:
       test: ["CMD-SHELL", "test -S /var/lib/rovera/control/motion.sock"]
       interval: 5s
@@ -148,6 +156,7 @@ services:
       context: ./micro-ros-agent-guard
     image: rovera-micro-ros-agent-guard:humble
     network_mode: host
+    ipc: host
     pid: host
     # Managed ownership must be acknowledged explicitly and never survives a
     # host reboot by default. This prevents a legacy Agent and this service
@@ -159,13 +168,12 @@ services:
       MICRO_ROS_SERIAL_DEVICE: /dev/ttyUSB0
       ROVERA_SERIAL_LOCK_FILE: /var/lock/rovera-micro-ros/ttyUSB0.lock
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
-      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
       MICRO_ROS_AGENT_VERBOSITY: ${MICRO_ROS_AGENT_VERBOSITY:-2}
       MICRO_ROS_AGENT_VMEM_KB: ${MICRO_ROS_AGENT_VMEM_KB:-1572864}
-      # Keep XRCE on serial and the ROS-side DDS leg on loopback UDPv4. This
-      # prevents incompatible ROS distributions elsewhere on the LAN (and
-      # cross-container shared memory) from crashing Humble Agent in FastCDR.
+      # The Agent runs as root for serial access while the application ROS
+      # containers run as ROBOT_UID. Use LAN-capable UDP to cross that UID
+      # boundary without relying on Fast DDS shared-memory file permissions.
       FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
     devices:
       - /dev/ttyUSB0:/dev/ttyUSB0
@@ -190,19 +198,22 @@ services:
 
   yahboom-joystick:
     profiles: ["ros2-managed-stack", "managed-motion"]
-    image: yahboomtechnology/ros-humble:4.1.2
+    build:
+      context: .
+      dockerfile: ros_bridge/Dockerfile.yahboom-managed
+    image: rovera-yahboom-managed:humble
     network_mode: host
+    ipc: host
     restart: unless-stopped
     privileged: true
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
-      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
       FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
-      # Fast DDS nodes reserve more than 1 GiB of virtual address space during
-      # bringup even while RSS remains modest. Keep this below the historical
-      # 2.2 GiB runaway size; the 900 MiB combined-RSS guard is the hard stop.
-      YAHBOOM_PROCESS_VMEM_KB: ${YAHBOOM_PROCESS_VMEM_KB:-1572864}
+      # Fast DDS reserves several GiB of virtual address space even while RSS
+      # remains modest. Do not cap address space; the independent 900 MiB
+      # combined-RSS guard below bounds real Pi memory consumption.
+      YAHBOOM_PROCESS_VMEM_KB: ${YAHBOOM_PROCESS_VMEM_KB:-0}
       YAHBOOM_CONTAINER_RSS_KB: ${YAHBOOM_CONTAINER_RSS_KB:-921600}
     volumes:
       - /dev/input:/dev/input
@@ -221,6 +232,13 @@ services:
     command:
       - /bin/bash
       - /opt/rovera/yahboom_managed_entrypoint.sh
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - test ! -e /tmp/rovera-yahboom-memory-fault && pgrep -f yahboom_joy >/dev/null && pgrep -f robot_state_publisher >/dev/null
+      interval: 10s
+      timeout: 2s
+      retries: 2
     # The vendor bringup has previously grown beyond 3 GiB after a Fast DDS
     # failure. Keep that failure inside this replaceable container.
     mem_limit: 1200m

@@ -10,6 +10,7 @@ import { useNavigate, usePathname } from "../router";
 import { useAppStore } from "../state/appStore";
 import type { MapData } from "../types";
 import { createUuid } from "../utils/uuid";
+import { hasPermission } from "../utils/permissions";
 
 export function MapManagementPage() {
   const { t } = useI18n();
@@ -71,7 +72,7 @@ export function MapManagementPage() {
       navigate("/maps");
     },
   });
-  const canOperate = user?.role === "admin" || user?.role === "operator";
+  const canOperate = hasPermission(user, "maps.manage");
   const maps = mapsQuery.data ?? [];
   const detail = detailQuery.data;
   const activeMapping = detail?.mapping_session;

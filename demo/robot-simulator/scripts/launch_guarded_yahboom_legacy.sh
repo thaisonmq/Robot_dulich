@@ -27,13 +27,13 @@ docker run -d \
   --label rovera.runtime=legacy-yahboom \
   --privileged=true \
   --net=host \
+  --ipc=host \
   --env="DISPLAY" \
   --env="QT_X11_NO_MITSHM=1" \
   --env="ROS_DOMAIN_ID=20" \
-  --env="ROS_LOCALHOST_ONLY=1" \
   --env="RMW_IMPLEMENTATION=rmw_fastrtps_cpp" \
   --env="FASTRTPS_DEFAULT_PROFILES_FILE=/etc/rovera/micro_ros_fastdds.xml" \
-  --env="YAHBOOM_PROCESS_VMEM_KB=1048576" \
+  --env="YAHBOOM_PROCESS_VMEM_KB=0" \
   --env="YAHBOOM_CONTAINER_RSS_KB=921600" \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   --security-opt apparmor:unconfined \

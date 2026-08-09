@@ -1,11 +1,14 @@
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Square } from "lucide-react";
 import { useI18n } from "../i18n/I18nProvider";
+import type { MotionSpeedLevel } from "../config/control";
 import type { InputState, InputAction, OnScreenControlAdapter } from "../utils/input";
 
 interface Props {
   adapter: OnScreenControlAdapter;
   input: InputState;
   disabled: boolean;
+  speedLevel: MotionSpeedLevel;
+  onSpeedLevelChange: (level: MotionSpeedLevel) => void;
 }
 
 const controls: { action: InputAction; label: string; icon: typeof ArrowUp; className: string }[] = [
@@ -15,7 +18,13 @@ const controls: { action: InputAction; label: string; icon: typeof ArrowUp; clas
   { action: "backward", label: "Lùi", icon: ArrowDown, className: "control-pad__down" },
 ];
 
-export function ControlPad({ adapter, input, disabled }: Props) {
+const speedLevels: { value: MotionSpeedLevel; label: string }[] = [
+  { value: "slow", label: "Chậm" },
+  { value: "medium", label: "Vừa" },
+  { value: "fast", label: "Nhanh" },
+];
+
+export function ControlPad({ adapter, input, disabled, speedLevel, onSpeedLevelChange }: Props) {
   const { t } = useI18n();
   const pointerDown = (event: React.PointerEvent<HTMLButtonElement>, action: InputAction) => {
     event.preventDefault();
@@ -30,7 +39,17 @@ export function ControlPad({ adapter, input, disabled }: Props) {
     adapter.release(action);
   };
   const direction = controls.find(({ action }) => input[action as keyof InputState])?.action ?? "idle";
-  return (
+  return <div className="drive-controls">
+    <div className="drive-speed" role="group" aria-label={t("Tốc độ di chuyển")}>
+      {speedLevels.map(({ value, label }) => <button
+        type="button"
+        key={value}
+        className={speedLevel === value ? "is-active" : ""}
+        aria-pressed={speedLevel === value}
+        disabled={disabled}
+        onClick={() => onSpeedLevelChange(value)}
+      >{t(label)}</button>)}
+    </div>
     <div className={`control-pad control-pad--${direction}`} aria-label={t("Điều khiển robot")}>
       <div className="control-pad__orbit" aria-hidden="true">
         <i /><i /><i /><i />
@@ -67,5 +86,5 @@ export function ControlPad({ adapter, input, disabled }: Props) {
         <span>{t("DỪNG")}</span>
       </button>
     </div>
-  );
+  </div>;
 }

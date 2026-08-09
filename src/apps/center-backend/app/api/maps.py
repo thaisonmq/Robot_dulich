@@ -23,7 +23,11 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
-from app.core.security import current_user, operator_user_id, user_or_robot
+from app.core.security import (
+    authenticated_user,
+    operator_or_robot,
+    operator_user_id,
+)
 from app.models.database import get_db
 from app.models.entities import (
     CommandReceipt,
@@ -38,6 +42,7 @@ from app.models.entities import (
     Robot,
     RobotMapCache,
     SpeedZone,
+    User,
 )
 from app.services.hub import hub
 from app.services.map_storage import InvalidMapBundle, MapBundleStore
@@ -45,6 +50,7 @@ from app.services.state_machines import InvalidTransition, mapping_transition
 
 router = APIRouter(prefix="/api/maps", tags=["maps"])
 SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+MAPS_FORBIDDEN_DETAIL = "Tài khoản hành khách không có quyền truy cập chức năng Maps"
 
 
 class MapCreateRequest(BaseModel):
@@ -194,6 +200,12 @@ def _session_view(session: MappingSession) -> dict:
     }
 
 
+def _require_guest_operational_map(record: MapRecord, user: User) -> None:
+    """Guests may consume an active map while driving, but cannot browse Maps."""
+    if user.role == "guest" and record.status != "ACTIVE":
+        raise HTTPException(status_code=403, detail=MAPS_FORBIDDEN_DETAIL)
+
+
 async def _dispatch_idempotent(
     database: Session,
     *,
@@ -260,10 +272,15 @@ async def _dispatch_idempotent(
 @router.get("")
 async def list_maps(
     status: str | None = Query(default=None),
-    _: str = Depends(current_user),
+    user: User = Depends(authenticated_user),
     database: Session = Depends(get_db),
 ) -> list[dict]:
     statement = select(MapRecord).order_by(MapRecord.updated_at.desc())
+    if user.role == "guest":
+        if (status or "").upper() != "ACTIVE":
+            raise HTTPException(status_code=403, detail=MAPS_FORBIDDEN_DETAIL)
+        statement = statement.where(MapRecord.status == "ACTIVE")
+        return [_map_view(database, item) for item in database.scalars(statement)]
     if status:
         statement = statement.where(MapRecord.status == status.upper())
     return [_map_view(database, item) for item in database.scalars(statement)]
@@ -528,7 +545,7 @@ async def start_mapping(
 @router.get("/mapping-sessions/{mapping_session_id}")
 async def mapping_session(
     mapping_session_id: str,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
     database: Session = Depends(get_db),
 ) -> dict:
     session = database.get(MappingSession, mapping_session_id)
@@ -643,7 +660,7 @@ async def upload_version(
     robot_id: str = Form(min_length=3, max_length=64),
     checksum: str = Form(min_length=64, max_length=64),
     bundle: UploadFile = File(),
-    principal: tuple[str, str] = Depends(user_or_robot),
+    principal: tuple[str, str] = Depends(operator_or_robot),
     database: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> dict:
@@ -707,7 +724,7 @@ async def upload_version(
 async def download_version(
     map_id: str,
     version: int,
-    _: tuple[str, str] = Depends(user_or_robot),
+    _: tuple[str, str] = Depends(operator_or_robot),
     database: Session = Depends(get_db),
 ) -> FileResponse:
     item = database.scalar(
@@ -727,9 +744,15 @@ async def download_version(
 async def version_preview(
     map_id: str,
     version: int,
-    _: str = Depends(current_user),
+    user: User = Depends(authenticated_user),
     database: Session = Depends(get_db),
 ) -> Response:
+    record = database.get(MapRecord, map_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bản đồ")
+    _require_guest_operational_map(record, user)
+    if user.role == "guest" and record.active_version != version:
+        raise HTTPException(status_code=403, detail=MAPS_FORBIDDEN_DETAIL)
     item = database.scalar(
         select(MapVersion).where(MapVersion.map_id == map_id, MapVersion.version == version)
     )
@@ -807,7 +830,7 @@ async def archive_map(
 async def map_cache(
     map_id: str,
     robot_id: str,
-    _: str = Depends(current_user),
+    _: str = Depends(operator_user_id),
     database: Session = Depends(get_db),
 ) -> dict:
     items = database.scalars(
@@ -834,24 +857,26 @@ async def map_cache(
 @router.get("/{map_id}")
 async def get_map(
     map_id: str,
-    _: str = Depends(current_user),
+    user: User = Depends(authenticated_user),
     database: Session = Depends(get_db),
 ) -> dict:
     record = database.get(MapRecord, map_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy bản đồ")
-    return _map_view(database, record, details=True)
+    _require_guest_operational_map(record, user)
+    return _map_view(database, record, details=user.role != "guest")
 
 
 @router.get("/{map_id}/destinations")
 async def get_destinations(
     map_id: str,
-    _: str = Depends(current_user),
+    user: User = Depends(authenticated_user),
     database: Session = Depends(get_db),
 ) -> list[dict]:
     record = database.get(MapRecord, map_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy bản đồ")
+    _require_guest_operational_map(record, user)
     destinations = [
         {
             "destination_id": item.destination_id,

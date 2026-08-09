@@ -25,15 +25,18 @@ trap 'rm -f "$tmp_file"' EXIT
 
 awk '
 BEGIN {
-  count = 8
+  count = 10
+  remove["ROS_LOCALHOST_ONLY"] = 1
   keys[1] = "MOTION_BACKEND"; values[keys[1]] = "ros2"
   keys[2] = "NAVIGATION_BACKEND"; values[keys[2]] = "ros2"
-  keys[3] = "ROS_LOCALHOST_ONLY"; values[keys[3]] = "1"
-  keys[4] = "ROS_WEB_CMD_VEL_TOPIC"; values[keys[4]] = "/cmd_vel_web"
-  keys[5] = "ROS_USE_TWIST_MUX"; values[keys[5]] = "false"
-  keys[6] = "ROVERA_CONTROL_MODE"; values[keys[6]] = "managed-motion"
-  keys[7] = "ROVERA_CMD_VEL_MODE"; values[keys[7]] = "exclusive"
-  keys[8] = "ROVERA_EXCLUSIVE_CMD_VEL_ACK"; values[keys[8]] = "I_ACCEPT_EXCLUSIVE_CMD_VEL_OWNERSHIP"
+  keys[3] = "ROS_WEB_CMD_VEL_TOPIC"; values[keys[3]] = "/cmd_vel_web"
+  keys[4] = "ROS_USE_TWIST_MUX"; values[keys[4]] = "false"
+  keys[5] = "ROVERA_CONTROL_MODE"; values[keys[5]] = "managed-motion"
+  keys[6] = "ROVERA_CMD_VEL_MODE"; values[keys[6]] = "exclusive"
+  keys[7] = "ROVERA_EXCLUSIVE_CMD_VEL_ACK"; values[keys[7]] = "I_ACCEPT_EXCLUSIVE_CMD_VEL_OWNERSHIP"
+  keys[8] = "MAPPING_MAX_FORWARD_SPEED"; values[keys[8]] = "0.18"
+  keys[9] = "MAPPING_MAX_REVERSE_SPEED"; values[keys[9]] = "0.14"
+  keys[10] = "MAPPING_MAX_ANGULAR_SPEED"; values[keys[10]] = "0.40"
 }
 {
   separator = index($0, "=")
@@ -41,6 +44,8 @@ BEGIN {
   if (key in values) {
     print key "=" values[key]
     seen[key] = 1
+  } else if (key in remove) {
+    next
   } else {
     print
   }

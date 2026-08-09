@@ -30,10 +30,12 @@ Obstacle detector -> /rovera/obstacle_* -> motion-safety (mọi nguồn)
   `/joint_states`, `/robot_description`, `/tf` và `/tf_static`; mapping-stack
   tái sử dụng các node này thay vì publish TF/EKF trùng. Agent legacy và toàn
   bộ topic cảm biến không bị thay thế.
-- ROS graph trên Pi mặc định cô lập bằng `ROS_LOCALHOST_ONLY=1`; Web, Agent,
-  mapping và safety vẫn liên lạc qua host loopback. Entry point Yahboom có
-  memory guard 900 MiB và giới hạn virtual memory để bảo vệ cả các kernel bỏ
-  qua Docker `mem_limit`.
+- Các service ROS dùng `network_mode: host` và `ipc: host`; những service cùng
+  UID truyền shared memory xuyên container. Yahboom/Agent chạy root cho phần
+  cứng và dùng UDPv4 LAN để nối với service UID 1000. RViz2 cùng domain ở máy
+  LAN nhìn được graph. Chỉ chạy một runtime Yahboom/Agent trên domain 20.
+  Entry point Yahboom có memory guard 900 MiB và giới hạn virtual memory để
+  bảo vệ cả các kernel bỏ qua Docker `mem_limit`.
 - `motion-safety` là publisher duy nhất của `/cmd_vel`. Bridge bị entrypoint
   từ chối nếu Web không ra `/cmd_vel_web` hoặc nếu cố tự bật mux thứ hai.
 - Giới hạn tốc độ được kẹp ở cả edge và bridge.
@@ -57,11 +59,11 @@ Chương trình cảm biến không publish trực tiếp vào `/cmd_vel`. Nó p
 
 ```bash
 # Có vật cản: giữ khóa cho tới khi vùng an toàn thực sự thông thoáng.
-ROS_DOMAIN_ID=20 ROS_LOCALHOST_ONLY=1 ros2 topic pub \
+ROS_DOMAIN_ID=20 ros2 topic pub \
   /rovera/obstacle_stop std_msgs/msg/Bool '{data: true}' -r 10
 
 # Hết vật cản: tiếp tục heartbeat an toàn nếu watchdog đang bật.
-ROS_DOMAIN_ID=20 ROS_LOCALHOST_ONLY=1 ros2 topic pub \
+ROS_DOMAIN_ID=20 ros2 topic pub \
   /rovera/obstacle_stop std_msgs/msg/Bool '{data: false}' -r 10
 ```
 
@@ -69,15 +71,15 @@ Khóa theo hướng dùng bitmask:
 
 ```bash
 # Cản phía trước (1): chặn tiến, vẫn cho lùi/quay.
-ROS_DOMAIN_ID=20 ROS_LOCALHOST_ONLY=1 ros2 topic pub \
+ROS_DOMAIN_ID=20 ros2 topic pub \
   /rovera/obstacle_directions std_msgs/msg/UInt8 '{data: 1}' -r 10
 
 # Cản trước + trái (1 + 4 = 5): chặn tiến và quay trái.
-ROS_DOMAIN_ID=20 ROS_LOCALHOST_ONLY=1 ros2 topic pub \
+ROS_DOMAIN_ID=20 ros2 topic pub \
   /rovera/obstacle_directions std_msgs/msg/UInt8 '{data: 5}' -r 10
 
 # Không có hướng bị chặn.
-ROS_DOMAIN_ID=20 ROS_LOCALHOST_ONLY=1 ros2 topic pub \
+ROS_DOMAIN_ID=20 ros2 topic pub \
   /rovera/obstacle_directions std_msgs/msg/UInt8 '{data: 0}' -r 10
 ```
 

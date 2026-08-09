@@ -62,6 +62,17 @@ def rectangle_clearance(
     return math.hypot(outside_x, outside_y)
 
 
+def point_inside_footprint(x: float, y: float, config: SafetyConfig) -> bool:
+    """Return whether a scan return is physically inside the robot body.
+
+    A 2D lidar can see the rear cover, cable loom, or mounting hardware. Those
+    self-returns cannot be external obstacles and must not become an all-way
+    stop. Points exactly on the footprint boundary remain safety inputs.
+    """
+
+    return abs(x) < config.half_length and abs(y) < config.half_width
+
+
 def point_direction(x: float, y: float, config: SafetyConfig) -> Direction:
     # Corners intentionally block both adjacent directions. This keeps turns
     # from sweeping a physical corner into an obstacle.
@@ -105,6 +116,8 @@ def evaluate_scan(
     slow_scale = 1.0
     valid = 0
     for x, y in valid_scan_points(scan):
+        if point_inside_footprint(x, y, config):
+            continue
         valid += 1
         clearance = rectangle_clearance(
             x,
@@ -116,7 +129,14 @@ def evaluate_scan(
         direction = point_direction(x, y, config)
         if clearance <= required:
             blocked |= direction
-        elif clearance < slow_distance:
+        elif clearance < slow_distance and motion_blocked_by_mask(
+            linear_x,
+            angular_z,
+            direction,
+        ):
+            # Slow only for geometry in the commanded direction. A close
+            # wall beside or behind the robot must not make clear forward
+            # motion pulse as unrelated scan points move between frames.
             slow_scale = min(
                 slow_scale,
                 max(0.05, (clearance - required) / config.slow_extra),

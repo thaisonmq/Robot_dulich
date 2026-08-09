@@ -9,7 +9,7 @@ describe("CommandComposer", () => {
     const command = new CommandComposer().compose({
       ...EMPTY_INPUT, forward: true, left: true,
     });
-    expect(command).toEqual({ linear_x: 0.4, angular_z: 0.8 });
+    expect(command).toEqual({ linear_x: 0.24, angular_z: 0.6 });
   });
 
   it("cancels opposing axes", () => {
@@ -32,7 +32,7 @@ describe("KeyboardInputAdapter", () => {
     cleanups.push(detach, () => manager.destroy());
     fireEvent.keyDown(window, { key: "ArrowUp", code: "ArrowUp" });
     expect(manager.state().forward).toBe(true);
-    expect(velocity).toHaveBeenCalledWith({ linear_x: 0.14, angular_z: 0 });
+    expect(velocity).toHaveBeenCalledWith({ linear_x: 0.132, angular_z: 0 });
     fireEvent.keyUp(window, { key: "ArrowUp", code: "ArrowUp" });
     expect(manager.state().forward).toBe(false);
     expect(stop).toHaveBeenCalledWith("input_released");
@@ -74,5 +74,23 @@ describe("KeyboardInputAdapter", () => {
     fireEvent.keyDown(window, { key: "ArrowUp", code: "ArrowUp" });
     fireEvent.keyDown(window, { key: "ArrowUp", code: "ArrowUp", repeat: true });
     expect(velocity).toHaveBeenCalledTimes(1);
+  });
+
+  it("applies all three drive speed levels", () => {
+    const velocity = vi.fn();
+    const manager = new InputManager(velocity, vi.fn());
+    cleanups.push(() => manager.destroy());
+
+    manager.setSpeedLevel("slow");
+    manager.setAction("screen", "forward", true);
+    const slow = velocity.mock.lastCall?.[0].linear_x ?? 0;
+
+    manager.setSpeedLevel("medium");
+    const medium = velocity.mock.lastCall?.[0].linear_x ?? 0;
+
+    manager.setSpeedLevel("fast");
+    const fast = velocity.mock.lastCall?.[0].linear_x ?? 0;
+    expect(slow).toBeLessThan(medium);
+    expect(medium).toBeLessThan(fast);
   });
 });

@@ -42,14 +42,37 @@ def generate_launch_description() -> LaunchDescription:
     # robot_state_publisher and static transforms. Reuse them instead of
     # creating duplicate TF authorities. The Rovera adapter itself is always
     # isolated and remains the only process that owns its Unix socket.
-    common = [
-        Node(
-            package="rovera_navigation_adapter",
-            executable="adapter_node",
-            name="rovera_navigation_adapter",
-            output="screen",
-        )
-    ] if use_vendor_base_runtime else owned_base_runtime
+    if use_vendor_base_runtime:
+        common = [
+            Node(
+                package="rovera_navigation_adapter",
+                executable="adapter_node",
+                name="rovera_navigation_adapter",
+                output="screen",
+            ),
+            # Yahboom publishes the base and IMU transforms, but its standalone
+            # bringup omits the LiDAR transform that its own mapping launch
+            # normally supplies. Reuse the calibrated vendor offset without
+            # starting a second robot_state_publisher or EKF authority.
+            Node(
+                package="tf2_ros",
+                executable="static_transform_publisher",
+                name="rovera_base_to_laser",
+                arguments=[
+                    "--x", "-0.0046412",
+                    "--y", "0",
+                    "--z", "0.094079",
+                    "--roll", "0",
+                    "--pitch", "0",
+                    "--yaw", "0",
+                    "--frame-id", "base_link",
+                    "--child-frame-id", "laser_frame",
+                ],
+                output="screen",
+            ),
+        ]
+    else:
+        common = owned_base_runtime
     if mode == "MAPPING":
         # Keep SLAM Toolbox as a separately respawnable child. The navigation
         # adapter restarts only this child between map sessions, which clears

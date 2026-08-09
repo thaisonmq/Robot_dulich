@@ -1,4 +1,8 @@
-import { CONTROL_CONFIG } from "../config/control";
+import {
+  CONTROL_CONFIG,
+  DEFAULT_MOTION_SPEED_LEVEL,
+  type MotionSpeedLevel,
+} from "../config/control";
 import type { VelocityCommand } from "../transports/ControlTransport";
 
 export type DirectionAction = "forward" | "backward" | "left" | "right";
@@ -16,18 +20,25 @@ export const EMPTY_INPUT: InputState = {
 };
 
 export class CommandComposer {
+  constructor(private speedLevel: MotionSpeedLevel = DEFAULT_MOTION_SPEED_LEVEL) {}
+
+  setSpeedLevel(speedLevel: MotionSpeedLevel): void {
+    this.speedLevel = speedLevel;
+  }
+
   compose(state: InputState): VelocityCommand {
+    const profile = CONTROL_CONFIG.speedProfiles[this.speedLevel];
     let linear_x = 0;
     let angular_z = 0;
     if (state.forward !== state.backward) {
       linear_x = state.forward
-        ? CONTROL_CONFIG.maxForwardSpeed
-        : -CONTROL_CONFIG.maxReverseSpeed;
+        ? profile.forward
+        : -profile.reverse;
     }
     if (state.left !== state.right) {
       angular_z = state.left
-        ? CONTROL_CONFIG.maxAngularSpeed
-        : -CONTROL_CONFIG.maxAngularSpeed;
+        ? profile.angular
+        : -profile.angular;
     }
     return { linear_x, angular_z };
   }
@@ -51,6 +62,14 @@ export class InputManager {
     this.listeners.add(listener);
     listener(this.state());
     return () => this.listeners.delete(listener);
+  }
+
+  setSpeedLevel(speedLevel: MotionSpeedLevel): void {
+    this.composer.setSpeedLevel(speedLevel);
+    const state = this.state();
+    if (this.hasDirectionalInput(state)) {
+      this.sendVelocity(this.smoothedCommand(state));
+    }
   }
 
   setAction(source: string, action: InputAction, pressed: boolean): void {
@@ -127,7 +146,8 @@ export class InputManager {
   private smoothedCommand(state: InputState): VelocityCommand {
     const command = this.composer.compose(state);
     const elapsed = Math.max(0, performance.now() - this.activeSince);
-    const intensity = Math.min(1, 0.35 + (elapsed / CONTROL_CONFIG.accelerationMs) * 0.65);
+    const initial = CONTROL_CONFIG.initialCommandIntensity;
+    const intensity = Math.min(1, initial + (elapsed / CONTROL_CONFIG.accelerationMs) * (1 - initial));
     return {
       linear_x: Number((command.linear_x * intensity).toFixed(3)),
       angular_z: Number((command.angular_z * intensity).toFixed(3)),

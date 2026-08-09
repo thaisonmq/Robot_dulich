@@ -1302,6 +1302,11 @@ class RobotConnectionClient:
     async def _execute_navigation_command(
         self, command: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
+        if command in {"mapping.start", "mapping.finish", "map.load"}:
+            # Mode changes and map replacement are stationary operations. Send
+            # an immediate zero through the existing motion owner before the
+            # host supervisor replaces any ROS stack.
+            self._stop_motion(f"safe_{command.replace('.', '_')}")
         if (
             self.config.motion_backend == "ros2"
             and self.config.navigation_backend != "ros2"

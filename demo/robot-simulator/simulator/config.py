@@ -34,14 +34,19 @@ class SimulatorConfig(BaseSettings):
     motion_backend: Literal["disabled", "simulator", "ros2"] = "simulator"
     navigation_backend: Literal["simulator", "ros2"] = "simulator"
     navigation_socket_path: str = "/var/lib/rovera/navigation/navigation.sock"
+    navigation_mode_request_path: str = "/var/lib/rovera/navigation/mode-request.json"
+    navigation_mode_switch_timeout_seconds: float = Field(default=60.0, ge=15.0, le=120.0)
     map_cache_dir: str = "/var/lib/rovera/maps"
     motion_socket_path: str = "/var/lib/rovera/control/motion.sock"
     motion_watchdog_ms: int = Field(default=250, ge=150, le=500)
     ros_max_forward_speed: float = Field(default=0.33, gt=0, le=1.0)
     ros_max_reverse_speed: float = Field(default=0.25, gt=0, le=1.0)
     ros_max_angular_speed: float = Field(default=0.8, gt=0, le=3.0)
-    mapping_max_forward_speed: float = Field(default=0.12, gt=0, le=0.15)
-    mapping_max_reverse_speed: float = Field(default=0.10, gt=0, le=0.15)
+    # Mapping needs slower chassis motion than teleoperation. Wheel slip while
+    # turning is otherwise interpreted as laser pose motion and produces the
+    # characteristic fan-shaped duplicate walls in the occupancy grid.
+    mapping_max_forward_speed: float = Field(default=0.18, gt=0, le=0.4)
+    mapping_max_reverse_speed: float = Field(default=0.14, gt=0, le=0.25)
     mapping_max_angular_speed: float = Field(default=0.40, gt=0, le=0.8)
     heartbeat_seconds: float = 2.0
     livekit_url: str = "ws://localhost:7880"

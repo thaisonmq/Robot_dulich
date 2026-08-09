@@ -78,7 +78,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       ? detail
       : Array.isArray(detail)
         ? detail.map((item) => item?.msg ?? String(item)).join("; ")
-        : `HTTP ${response.status}`;
+        : detail && typeof detail === "object" && typeof detail.message === "string"
+          ? detail.message
+          : `HTTP ${response.status}`;
     throw new Error(message);
   }
   if (response.status === 204) return undefined as T;

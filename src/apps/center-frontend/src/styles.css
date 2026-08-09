@@ -589,6 +589,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .checkbox { display: flex; align-items: center; gap: 8px; color: #3a4860; font-size: 12px; }
 .checkbox input { width: 16px; height: 16px; accent-color: var(--blue); }
 .form-error { margin: -7px 0 0; color: var(--red); font-size: 12px; }
+.navigation-inline-error { margin: 0; color: var(--red); font-size: 11px; line-height: 1.35; }
 .demo-credentials { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 9px; }
 .demo-credentials::before, .demo-credentials::after { content: ""; height: 1px; flex: 1; background: var(--line); }
 .demo-credentials code { color: var(--ink); background: #edf1f6; border-radius: 5px; padding: 4px 6px; white-space: nowrap; }
@@ -2604,6 +2605,29 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .spectator-control-state strong { margin-top: 12px; font-size: 13px; }
 .spectator-control-state small { margin-top: 3px; color: var(--muted); font-size: 8px; }
 .spectator-control-state p { max-width: 29ch; margin: 13px 0 0; color: #667389; font-size: 8px; line-height: 1.55; }
+.drive-controls { display: grid; justify-items: center; }
+.drive-speed {
+  padding: 3px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(46px, 1fr));
+  gap: 3px;
+  background: #eef2f7;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.drive-speed button {
+  min-height: 24px;
+  padding: 0 8px;
+  color: #647287;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  font-size: 7px;
+  font-weight: 750;
+  cursor: pointer;
+}
+.drive-speed button.is-active { color: #fff; background: var(--blue); box-shadow: 0 3px 8px rgba(23,89,214,.2); }
+.drive-speed button:disabled { opacity: .4; cursor: not-allowed; }
 .control-pad {
   position: relative;
   width: 168px;
@@ -2726,7 +2750,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   margin: 0;
   padding: 9px 10px 10px;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   background: rgba(255,255,255,.82);
   border: 1px solid var(--line);
   border-radius: 13px;
@@ -2737,6 +2761,44 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .map-legend { display: flex; align-items: center; gap: 0; color: var(--muted); font-size: 9px; }
 .map-legend > span { display: none; }
 .map-legend button { display: flex; align-items: center; gap: 6px; color: var(--ink); background: none; border: 0; cursor: pointer; }
+.navigation-steps {
+  margin: 0 0 6px;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(3,minmax(0,1fr));
+  gap: 4px;
+  list-style: none;
+}
+.navigation-steps li {
+  min-width: 0;
+  padding: 4px 5px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  color: #7a8598;
+  background: #f2f4f7;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 7px;
+  font-weight: 700;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.navigation-steps li span {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  display: grid;
+  place-items: center;
+  background: #dfe4eb;
+  border-radius: 50%;
+  font-size: 7px;
+}
+.navigation-steps li.is-active { color: var(--blue); background: #edf3fd; border-color: #b8cdf1; }
+.navigation-steps li.is-active span { color: #fff; background: var(--blue); }
+.navigation-steps li.is-complete { color: #287a59; background: #edf8f3; }
+.navigation-steps li.is-complete span { color: #fff; background: #35a477; }
 .legend-dot { width: 7px; height: 7px; border-radius: 50%; }
 .legend-dot--robot { background: var(--blue); }
 .legend-dot--route { background: none; border: 2px solid var(--blue); }
@@ -2838,6 +2900,22 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 
 /* Versioned maps and Canvas Nav2 overlays */
 .map-render-canvas { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+.map-image-state {
+  position: absolute;
+  z-index: 5;
+  inset: 0;
+  padding: 18px;
+  display: grid;
+  place-content: center;
+  gap: 4px;
+  text-align: center;
+  color: #59667a;
+  background: rgba(247,248,250,.94);
+  pointer-events: none;
+}
+.map-image-state strong { font-size: 10px; }
+.map-image-state span { max-width: 260px; font-size: 8px; line-height: 1.4; }
+.map-image-state--error { color: #a13732; background: rgba(255,245,244,.96); }
 .destination-panel { grid-template-columns: minmax(0,1fr) minmax(0,1fr) 96px; }
 .destination-panel > div:first-child { grid-column: 1 / -1; }
 .navigation-actions { min-width: 0; display: flex; align-items: stretch; gap: 5px; }
@@ -2939,7 +3017,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .mapping-stage > footer span { display: flex; align-items: center; gap: 5px; }
 .mapping-console { min-height: 0; padding: 14px; display: flex; flex-direction: column; background: #fff; border: 1px solid var(--line); border-radius: 14px; }
 .mapping-console h3 { margin: 3px 0 0; }
-.mapping-console .control-pad { margin: 14px auto; }
+.mapping-console .drive-controls { margin-top: 10px; }
+.mapping-console .control-pad { margin: 10px auto 14px; }
 .mapping-camera { margin: 0 0 12px; overflow: hidden; background: #0d1c30; border: 1px solid #203650; border-radius: 10px; }
 .mapping-camera > header { height: 32px; padding: 0 9px 0 11px; display: flex; align-items: center; justify-content: space-between; color: #dce8f6; }
 .mapping-camera > header span { display: flex; align-items: center; gap: 6px; font-size: 8px; font-weight: 750; letter-spacing: .04em; text-transform: uppercase; }

@@ -55,7 +55,8 @@ export function DashboardPage() {
   const disconnectingRef = useRef(false);
   const activePtzRef = useRef<PtzCommand | null>(null);
   const ptzRepeatRef = useRef<number | null>(null);
-  const { control, manager, screen, inputState } = useTeleoperation();
+  const navigationRequestInFlightRef = useRef(false);
+  const { control, manager, screen, inputState, speedLevel, setSpeedLevel } = useTeleoperation();
   const [micEnabled, setMicEnabled] = useState(false);
   const [speakerMuted, setSpeakerMuted] = useState(false);
   const translationEnabled = false;
@@ -66,7 +67,9 @@ export function DashboardPage() {
   const [selectedDestination, setSelectedDestination] = useState<Destination | null>(null);
   const [selectedMapId, setSelectedMapId] = useState(selectedRobot?.map_id ?? "");
   const [mapState, setMapState] = useState("READY");
+  const [mapLocalized, setMapLocalized] = useState(false);
   const [connectionError, setConnectionError] = useState("");
+  const [navigationError, setNavigationError] = useState("");
   const [sessionEndedReason, setSessionEndedReason] = useState("");
   const accountLanguageOption = getLanguage(language);
   const robotLanguageOption = getLanguage(ROBOT_LANGUAGE_CODE);
@@ -76,7 +79,12 @@ export function DashboardPage() {
 
   const telemetry = useMemo(() => new WebSocketTelemetryTransport({
     onPose: setPose,
-    onHealth: setHealth,
+    onHealth: (nextHealth) => {
+      setHealth(nextHealth);
+      const runtimeMapState = String(nextHealth.map_state ?? "").toUpperCase();
+      if (runtimeMapState) setMapState(runtimeMapState);
+      setMapLocalized(Boolean(nextHealth.localized));
+    },
     onNavigation: (status) => {
       const normalized = status.toUpperCase();
       const states = {
@@ -184,24 +192,34 @@ export function DashboardPage() {
     onSettled: () => setRequestedVideoProfile(null),
   });
   const loadMap = useMutation({
-    mutationFn: (selectedMap: typeof map) => api.loadNavigationMap({
+    mutationFn: ({ selectedMap, expectedState }: { selectedMap: NonNullable<typeof map>; expectedState: string }) => api.loadNavigationMap({
       request_id: createUuid(),
       robot_id: robotId,
       session_id: session!.session_id,
-      expected_state: mapState,
-      map_id: selectedMap!.map_id,
-      version: selectedMap!.active_version!,
+      expected_state: expectedState,
+      map_id: selectedMap.map_id,
+      version: selectedMap.active_version!,
     }),
     onMutate: () => {
+      navigationRequestInFlightRef.current = true;
+      setNavigationError("");
       setMapState("LOADING_MAP");
+      setMapLocalized(false);
       setNavigationState("loading_map");
       setRoute(null);
     },
-    onSuccess: (result) => setMapState(String(result.current_state ?? "LOCALIZING")),
-    onError: () => {
+    onSuccess: (result) => {
+      const state = String(result.current_state ?? "LOCALIZING");
+      setMapState(state);
+      setMapLocalized(Boolean((result.state as { localized?: boolean } | undefined)?.localized));
+      setNavigationState(state === "LOCALIZING" ? "localizing" : "ready");
+    },
+    onError: (reason) => {
       setMapState("FAULT");
       setNavigationState("failed");
+      setNavigationError(reason instanceof Error ? reason.message : t("Không thể chuyển sang Nav2"));
     },
+    onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
   const preview = useMutation({
     mutationFn: (destination: Destination) => (
@@ -217,12 +235,20 @@ export function DashboardPage() {
         })
         : api.previewRoute(robotId, destination.destination_id)
     ),
-    onMutate: () => setNavigationState("previewing"),
+    onMutate: () => {
+      navigationRequestInFlightRef.current = true;
+      setNavigationError("");
+      setNavigationState("previewing");
+    },
     onSuccess: (newRoute) => {
       setRoute(newRoute);
       setNavigationState("route_ready");
     },
-    onError: () => setNavigationState("failed"),
+    onError: (reason) => {
+      setNavigationState("failed");
+      setNavigationError(reason instanceof Error ? reason.message : t("Không thể tạo đường đi"));
+    },
+    onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
   const setInitialPose = useMutation({
     mutationFn: (destination: Destination) => api.setInitialPose({
@@ -230,13 +256,22 @@ export function DashboardPage() {
       expected_state: mapState, map_id: map!.map_id, version: map!.active_version!,
       pose: { x: destination.x, y: destination.y, yaw: destination.yaw },
     }),
+    onMutate: () => {
+      navigationRequestInFlightRef.current = true;
+      setNavigationError("");
+    },
     onSuccess: (result) => {
       const state = String(result.current_state ?? "LOCALIZING");
       setMapState(state);
+      setMapLocalized(state === "READY");
       setNavigationState(state === "READY" ? "ready" : "localizing");
       if (state === "READY") setSelectedDestination(null);
     },
-    onError: () => setNavigationState("failed"),
+    onError: (reason) => {
+      setNavigationState("failed");
+      setNavigationError(reason instanceof Error ? reason.message : t("Không thể đặt vị trí ban đầu"));
+    },
+    onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
   const sendGoal = useMutation({
     mutationFn: () => route?.mission_id
@@ -245,9 +280,17 @@ export function DashboardPage() {
         expected_state: mapState, mission_id: route.mission_id,
       })
       : api.sendGoal(robotId, session!.session_id, route!.route_id),
-    onMutate: () => setNavigationState("sending_goal"),
+    onMutate: () => {
+      navigationRequestInFlightRef.current = true;
+      setNavigationError("");
+      setNavigationState("sending_goal");
+    },
     onSuccess: () => setNavigationState("moving"),
-    onError: () => setNavigationState("failed"),
+    onError: (reason) => {
+      setNavigationState("failed");
+      setNavigationError(reason instanceof Error ? reason.message : t("Không thể bắt đầu tự hành"));
+    },
+    onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
 
   const missionAction = useMutation({
@@ -878,7 +921,7 @@ export function DashboardPage() {
                 </div>
               ) : (
                 <>
-                  <ControlPad adapter={screen} input={inputState} disabled={controlState === "disabled" || controlState === "robot_offline"} />
+                  <ControlPad adapter={screen} input={inputState} disabled={controlState === "disabled" || controlState === "robot_offline"} speedLevel={speedLevel} onSpeedLevelChange={setSpeedLevel} />
                   <div className="command-readout">
                     <span className="command-readout__icon"><Speaker size={20} /></span>
                     <span><small>{t("Trạng thái lệnh hiện tại")}</small><strong>{t(commandStatus)}</strong></span>
@@ -901,15 +944,21 @@ export function DashboardPage() {
                 mapState={mapState}
                 canStart={Boolean(route && preflightFailures.length === 0)}
                 preflightFailures={preflightFailures}
+                errorMessage={navigationError}
+                localized={mapLocalized}
                 readOnly={isSpectator}
                 onMapChange={(mapId) => {
+                  if (navigationRequestInFlightRef.current) return;
                   const nextMap = activeMaps.find((item) => item.map_id === mapId);
+                  if (!nextMap?.active_version) return;
+                  const expectedState = mapState;
                   setSelectedMapId(mapId);
                   setSelectedDestination(null);
                   setRoute(null);
-                  if (nextMap?.active_version) loadMap.mutate(nextMap);
+                  loadMap.mutate({ selectedMap: nextMap, expectedState });
                 }}
                 onSelect={(destination) => {
+                  if (navigationRequestInFlightRef.current) return;
                   setSelectedDestination(destination);
                   if (mapState !== "LOCALIZING") preview.mutate(destination);
                 }}

@@ -61,10 +61,12 @@ Agent legacy ổn định được quản lý riêng trong dự án:
 docker compose -f compose.legacy-hardware.yml up -d --build
 ```
 
-Trên Pi, graph điều khiển dùng `ROS_DOMAIN_ID=20` và
-`ROS_LOCALHOST_ONLY=1`. Các container `network_mode: host` vẫn thấy nhau qua
-loopback, nhưng participant ROS 2 ngoài Wi-Fi không thể làm Fast DDS của
-Yahboom phình RAM. Lệnh ROS CLI chạy ngay trên Pi phải dùng cùng hai biến này.
+Trên Pi, graph điều khiển dùng `ROS_DOMAIN_ID=20`. Các container ROS dùng
+`network_mode: host` và `ipc: host` để Fast DDS truyền shared memory xuyên
+container có cùng UID; graph cũng được phép discovery từ máy ROS 2 khác trong
+LAN. Yahboom và Agent cần chạy root cho phần cứng nên dùng UDPv4 trên các giao
+diện LAN để giao tiếp với container ứng dụng UID 1000. Chỉ chạy một runtime
+Yahboom/Agent trên domain này. Lệnh ROS CLI phải dùng cùng `ROS_DOMAIN_ID`.
 Agent mặc định log `-v2`; `-v4` chỉ dùng tạm thời khi chẩn đoán. Giới hạn
 virtual memory của Agent là 1,5 GiB: Fast DDS cần vùng địa chỉ lớn để tạo
 thread/participant dù RSS thực tế chỉ vài chục MiB, nên không được hạ xuống
@@ -197,11 +199,11 @@ External obstacle interlock chạy trên domain 20 và nằm trong lớp safety 
 
 ```bash
 # Chặn tiến cho Web/joystick/Nav2
-ROS_DOMAIN_ID=20 ROS_LOCALHOST_ONLY=1 ros2 topic pub \
+ROS_DOMAIN_ID=20 ros2 topic pub \
   /rovera/obstacle_directions std_msgs/msg/UInt8 '{data: 1}' -r 10
 
 # Dừng publisher trên bằng Ctrl+C, sau đó mở lại hướng tiến
-ROS_DOMAIN_ID=20 ROS_LOCALHOST_ONLY=1 ros2 topic pub \
+ROS_DOMAIN_ID=20 ros2 topic pub \
   /rovera/obstacle_directions std_msgs/msg/UInt8 '{data: 0}' -r 10
 ```
 

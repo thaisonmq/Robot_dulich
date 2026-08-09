@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -150,9 +152,18 @@ class SimulatorNavigationBackend:
 class Ros2NavigationBackend:
     """JSON request/response gateway to the isolated rclpy navigation adapter."""
 
-    def __init__(self, socket_path: str, *, timeout_seconds: float = 20.0) -> None:
+    def __init__(
+        self,
+        socket_path: str,
+        *,
+        timeout_seconds: float = 20.0,
+        mode_request_path: str = "/var/lib/rovera/navigation/mode-request.json",
+        mode_switch_timeout_seconds: float = 60.0,
+    ) -> None:
         self.socket_path = Path(socket_path)
+        self.mode_request_path = Path(mode_request_path)
         self.timeout_seconds = timeout_seconds
+        self.mode_switch_timeout_seconds = mode_switch_timeout_seconds
         self._state: dict[str, Any] = {
             "state": "FAULT",
             "localized": False,
@@ -165,39 +176,119 @@ class Ros2NavigationBackend:
             return max(self.timeout_seconds, 90.0)
         return self.timeout_seconds
 
-    async def execute(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _required_mode(command: str) -> str | None:
+        if command.startswith("mapping."):
+            return "MAPPING"
+        if command.startswith("map.") or command.startswith("navigation."):
+            return "NAVIGATION"
+        return None
+
+    def _write_mode_request(self, mode: str, command: str) -> None:
+        self.mode_request_path.parent.mkdir(parents=True, exist_ok=True)
+        request = {
+            "mode": mode,
+            "command": command,
+            "requested_at_unix": time.time(),
+            "request_id": f"{os.getpid()}-{time.monotonic_ns()}",
+        }
+        temporary = self.mode_request_path.with_name(
+            f".{self.mode_request_path.name}.{os.getpid()}.tmp"
+        )
+        temporary.write_text(json.dumps(request, separators=(",", ":")))
+        os.replace(temporary, self.mode_request_path)
+
+    async def _call_adapter(self, command: str, payload: dict, timeout: float) -> dict:
         request = {"command": command, "payload": payload}
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(self.socket_path)), timeout=2.0
+        )
+        try:
+            writer.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+            await writer.drain()
+            raw = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        if not raw:
+            raise OSError("navigation adapter closed without a response")
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise NavigationBackendError(
+                "INVALID_ADAPTER_RESPONSE", "ROS adapter returned invalid JSON"
+            ) from exc
+        if not isinstance(result, dict):
+            raise NavigationBackendError(
+                "INVALID_ADAPTER_RESPONSE", "ROS adapter returned invalid payload"
+            )
+        self._state.update(dict(result.get("state") or {}))
+        return result
+
+    async def _ensure_mode(self, command: str) -> bool:
+        required = self._required_mode(command)
+        if required is None:
+            return False
+        try:
+            status = await self._call_adapter("system.status", {}, 3.0)
+            current_mode = str((status.get("state") or {}).get("mode", "")).upper()
+            nav2 = str((status.get("state") or {}).get("nav2", "")).upper()
+            if current_mode == required and (required != "NAVIGATION" or nav2 == "READY"):
+                return False
+        except (OSError, asyncio.TimeoutError, NavigationBackendError):
+            current_mode = ""
+        await asyncio.to_thread(self._write_mode_request, required, command)
+        deadline = time.monotonic() + self.mode_switch_timeout_seconds
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            try:
+                status = await self._call_adapter("system.status", {}, 3.0)
+            except (OSError, asyncio.TimeoutError, NavigationBackendError):
+                continue
+            state = dict(status.get("state") or {})
+            current_mode = str(state.get("mode", "")).upper()
+            nav2 = str(state.get("nav2", "")).upper()
+            if current_mode == required and (required != "NAVIGATION" or nav2 == "READY"):
+                return True
+        self._state.update({"state": "FAULT", "nav2": "UNAVAILABLE"})
+        raise NavigationBackendError(
+            "MODE_SWITCH_TIMEOUT",
+            f"Timed out switching ROS runtime to {required}",
+            current_state=str(self._state.get("state", "FAULT")),
+        )
+
+    async def execute(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             async with self._lock:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_unix_connection(str(self.socket_path)), timeout=2.0
+                switched = await self._ensure_mode(command)
+                command_payload = dict(payload)
+                if switched:
+                    # A newly started adapter is authoritative. Do not send the
+                    # optimistic browser state from the stack that was stopped.
+                    command_payload["expected_state"] = str(
+                        self._state.get("state")
+                        or ("IDLE" if self._required_mode(command) == "MAPPING" else "READY")
+                    ).upper()
+                result = await self._call_adapter(
+                    command, command_payload, self._response_timeout(command)
                 )
-                writer.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")
-                await writer.drain()
-                raw = await asyncio.wait_for(
-                    reader.readline(), timeout=self._response_timeout(command)
-                )
-                writer.close()
-                await writer.wait_closed()
         except (OSError, asyncio.TimeoutError) as exc:
             self._state.update({"state": "FAULT", "nav2": "UNAVAILABLE"})
             raise NavigationBackendError(
                 "NAVIGATION_ADAPTER_UNAVAILABLE",
                 "ROS 2 navigation adapter is unavailable",
             ) from exc
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise NavigationBackendError("INVALID_ADAPTER_RESPONSE", "ROS adapter returned invalid JSON") from exc
-        if not isinstance(result, dict):
-            raise NavigationBackendError("INVALID_ADAPTER_RESPONSE", "ROS adapter returned invalid payload")
-        self._state.update(dict(result.get("state") or {}))
         if result.get("status") == "rejected":
             raise NavigationBackendError(
                 str(result.get("error_code", "ROS_COMMAND_REJECTED")),
                 str(result.get("error_message", "ROS command rejected")),
                 current_state=str(result.get("current_state", self._state.get("state", "FAULT"))),
             )
+        if command == "mapping.finish":
+            # Returning the ACK and uploading the bundle stay in the edge
+            # process. The host supervisor switches SLAM -> Nav2 immediately
+            # afterwards without granting either container Docker access.
+            await asyncio.to_thread(self._write_mode_request, "NAVIGATION", command)
         return result
 
     def state(self) -> dict[str, Any]:
@@ -231,5 +322,14 @@ def build_navigation_backend(
     socket_path: str,
 ) -> NavigationBackend:
     if backend == "ros2":
-        return Ros2NavigationBackend(socket_path)
+        return Ros2NavigationBackend(
+            socket_path,
+            mode_request_path=os.getenv(
+                "NAVIGATION_MODE_REQUEST_PATH",
+                "/var/lib/rovera/navigation/mode-request.json",
+            ),
+            mode_switch_timeout_seconds=float(
+                os.getenv("NAVIGATION_MODE_SWITCH_TIMEOUT_SECONDS", "60")
+            ),
+        )
     return SimulatorNavigationBackend(navigation, motion)

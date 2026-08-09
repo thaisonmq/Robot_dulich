@@ -162,7 +162,6 @@ docker stop "$legacy_joystick" >/dev/null
 
 ROVERA_CMD_VEL_MODE=exclusive \
   ROVERA_EXCLUSIVE_CMD_VEL_ACK="$required_ack" \
-  ROS_LOCALHOST_ONLY=1 \
   "${navigation_compose[@]}" --profile managed-motion up -d motion-safety
 
 MOTION_BACKEND=ros2 \
@@ -170,15 +169,13 @@ MOTION_BACKEND=ros2 \
   ROVERA_CONTROL_MODE=managed-motion \
   ROVERA_EXCLUSIVE_CMD_VEL_ACK="$required_ack" \
   ROS_DOMAIN_ID=20 \
-  ROS_LOCALHOST_ONLY=1 \
   ROS_USE_TWIST_MUX=false \
   ROS_WEB_CMD_VEL_TOPIC=/cmd_vel_web \
   ROS_SAFETY_CMD_VEL_TOPIC=/cmd_vel_safety \
   "${edge_compose[@]}" --profile managed-motion up -d \
     yahboom-joystick ros-control-bridge robot-simulator
 
-ROS_LOCALHOST_ONLY=1 \
-  ROVERA_USE_VENDOR_BASE_RUNTIME=1 \
+ROVERA_USE_VENDOR_BASE_RUNTIME=1 \
   "${mapping_compose[@]}" up -d mapping-stack
 
 sleep 6
@@ -191,7 +188,6 @@ fi
 graph_result=""
 if ! graph_result="$(docker exec -i \
     -e ROS_DOMAIN_ID=20 \
-    -e ROS_LOCALHOST_ONLY=1 \
     "$safety_id" bash -lc \
     'source /opt/ros/humble/setup.bash >/dev/null 2>&1; source /ws/install/setup.bash >/dev/null 2>&1; python3 -' <<'PY'
 import time

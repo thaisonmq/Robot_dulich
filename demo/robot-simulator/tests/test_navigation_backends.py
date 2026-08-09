@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from simulator.config import SimulatorConfig
@@ -105,3 +107,70 @@ def test_ros2_mapping_commands_allow_slow_posegraph_io() -> None:
     assert backend._response_timeout("mapping.save_draft") == 90
     assert backend._response_timeout("mapping.finish") == 90
     assert backend._response_timeout("mapping.start") == 90
+
+
+@pytest.mark.asyncio
+async def test_ros2_backend_requests_safe_mode_switch_before_map_load(
+    tmp_path, monkeypatch
+) -> None:
+    marker = tmp_path / "mode-request.json"
+    backend = Ros2NavigationBackend(
+        str(tmp_path / "navigation.sock"),
+        mode_request_path=str(marker),
+        mode_switch_timeout_seconds=2,
+    )
+    seen_payload: dict = {}
+
+    async def fake_call(command: str, payload: dict, timeout: float) -> dict:
+        del timeout
+        if command == "system.status":
+            mode = "NAVIGATION" if marker.exists() else "MAPPING"
+            state = {
+                "mode": mode,
+                "state": "READY" if mode == "NAVIGATION" else "FINISHED",
+                "nav2": "READY" if mode == "NAVIGATION" else "MAPPING",
+            }
+            backend._state.update(state)
+            return {"status": "completed", "state": state}
+        seen_payload.update(payload)
+        return {
+            "status": "completed",
+            "current_state": "LOCALIZING",
+            "state": {"mode": "NAVIGATION"},
+        }
+
+    monkeypatch.setattr(backend, "_call_adapter", fake_call)
+    result = await backend.execute(
+        "map.load",
+        {"map_id": "MAP-NEW", "version": 1, "expected_state": "FINISHED"},
+    )
+
+    assert json.loads(marker.read_text())["mode"] == "NAVIGATION"
+    assert seen_payload["expected_state"] == "READY"
+    assert result["current_state"] == "LOCALIZING"
+
+
+@pytest.mark.asyncio
+async def test_mapping_finish_requests_navigation_without_waiting(
+    tmp_path, monkeypatch
+) -> None:
+    marker = tmp_path / "mode-request.json"
+    backend = Ros2NavigationBackend(
+        str(tmp_path / "navigation.sock"), mode_request_path=str(marker)
+    )
+
+    async def fake_call(command: str, payload: dict, timeout: float) -> dict:
+        del payload, timeout
+        state = {"mode": "MAPPING", "state": "MAPPING", "nav2": "MAPPING"}
+        if command == "system.status":
+            return {"status": "completed", "state": state}
+        return {
+            "status": "completed",
+            "current_state": "FINISHED",
+            "state": state,
+        }
+
+    monkeypatch.setattr(backend, "_call_adapter", fake_call)
+    await backend.execute("mapping.finish", {"expected_state": "MAPPING"})
+
+    assert json.loads(marker.read_text())["mode"] == "NAVIGATION"

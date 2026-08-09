@@ -55,6 +55,46 @@ def test_slow_zone_scales_without_stopping() -> None:
     assert 0 < result.speed_scale < 1
 
 
+def test_slow_zone_only_applies_to_commanded_direction() -> None:
+    rear_close = scan_with_points([(-0.38, 0.0)])
+    forward = evaluate_scan(
+        rear_close,
+        linear_x=0.1,
+        angular_z=0,
+        config=CONFIG,
+    )
+    reverse = evaluate_scan(
+        rear_close,
+        linear_x=-0.1,
+        angular_z=0,
+        config=CONFIG,
+    )
+    assert forward.speed_scale == 1.0
+    assert 0 < reverse.speed_scale < 1.0
+
+
+def test_lidar_self_return_inside_footprint_is_ignored() -> None:
+    # The real robot intermittently reports its rear cover at about 0.12 m.
+    # A clear external return keeps the scan valid while the self-hit is
+    # removed from obstacle evaluation.
+    scan = scan_with_points([(-0.12, -0.02), (1.0, 0.0)])
+    result = evaluate_scan(scan, linear_x=0.1, angular_z=0, config=CONFIG)
+    assert not result.stop
+    assert result.blocked == Direction.NONE
+    assert result.nearest_clearance > 0.5
+
+
+def test_scan_with_only_self_returns_still_fails_closed() -> None:
+    result = evaluate_scan(
+        scan_with_points([(-0.12, -0.02)]),
+        linear_x=0.1,
+        angular_z=0,
+        config=CONFIG,
+    )
+    assert result.stop
+    assert result.reason == "empty_scan"
+
+
 def test_clear_hysteresis_rejects_chatter() -> None:
     gate = StopHysteresis(0.4)
     assert gate.update(True, 1.0)

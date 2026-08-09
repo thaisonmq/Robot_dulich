@@ -14,6 +14,7 @@ import { UserManagementPage } from "./pages/UserManagementPage";
 import { useI18n } from "./i18n/I18nProvider";
 import { navigate, usePathname } from "./router";
 import { useAppStore } from "./state/appStore";
+import { hasPermission } from "./utils/permissions";
 
 export function App() {
   const { t } = useI18n();
@@ -71,11 +72,15 @@ export function App() {
   }
   if (pathname === "/robots") return <RobotListPage />;
   if (pathname === "/maps/create") {
-    if (user.role === "admin" || user.role === "operator") return <CreateMapPage />;
-    queueMicrotask(() => navigate("/maps", { replace: true }));
+    if (hasPermission(user, "maps.manage")) return <CreateMapPage />;
+    queueMicrotask(() => navigate("/robots", { replace: true }));
     return null;
   }
-  if (pathname === "/maps" || /^\/maps\/[^/]+$/.test(pathname)) return <MapManagementPage />;
+  if (pathname === "/maps" || /^\/maps\/[^/]+$/.test(pathname)) {
+    if (hasPermission(user, "maps.view")) return <MapManagementPage />;
+    queueMicrotask(() => navigate("/robots", { replace: true }));
+    return null;
+  }
   if (
     user.role === "guest"
     && (

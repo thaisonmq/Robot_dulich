@@ -13,6 +13,7 @@ import { useI18n } from "../i18n/I18nProvider";
 import { useNavigate } from "../router";
 import { useAppStore } from "../state/appStore";
 import type { Robot } from "../types";
+import { hasPermission } from "../utils/permissions";
 
 export function RobotListPage() {
   const navigate = useNavigate();
@@ -29,6 +30,7 @@ export function RobotListPage() {
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
   const canOperate = user?.role === "admin" || user?.role === "operator";
+  const canAccessMaps = hasPermission(user, "maps.view");
 
   function statusLabel(robot: Robot) {
     if (robot.enrollment_status === "pending") return t("Chờ robot chạy");
@@ -132,7 +134,7 @@ export function RobotListPage() {
           <span><Server size={20} /><small>{t("Đang online")}</small><strong>{summary.online} / {summary.total}</strong></span>
           <span><RadioTower size={20} /><small>{t("Chờ kết nối")}</small><strong>{summary.pending}</strong></span>
         </div>
-        <button type="button" className="header-action" onClick={() => navigate("/maps")}><MapIcon size={17} /> Maps</button>
+        {canAccessMaps && <button type="button" className="header-action" onClick={() => navigate("/maps")}><MapIcon size={17} /> Maps</button>}
         <GlobalLanguageSelect />
         <AccountMenu />
       </header>

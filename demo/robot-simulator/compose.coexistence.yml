@@ -2,11 +2,12 @@ name: rovera-robot-edge
 
 # Read-only integration for a Pi that is still running the vendor Yahboom
 # joystick and the guarded legacy micro-ROS Agent. This file deliberately has
-# no service that opens /dev/ttyUSB0 or publishes a chassis velocity.
+# no service that opens /dev/ttyUSB0. Web motion stays disabled by default,
+# but an explicitly configured managed bridge may enable the ROS 2 backend.
 services:
   robot-simulator:
     environment:
-      MOTION_BACKEND: disabled
+      MOTION_BACKEND: ${MOTION_BACKEND:-disabled}
       NAVIGATION_BACKEND: ros2
 
   mapping-stack:
@@ -14,6 +15,7 @@ services:
     build:
       context: ./navigation-stack
     network_mode: host
+    ipc: host
     restart: unless-stopped
     stop_grace_period: 10s
     user: "${ROBOT_UID:-1000}:${ROBOT_GID:-1000}"
@@ -21,11 +23,17 @@ services:
       HOME: /tmp/rovera-mapping
       ROS_LOG_DIR: /tmp/rovera-mapping/ros-log
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
-      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-1}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      # The vendor/micro-ROS graph runs as root while this service runs as
+      # ROBOT_UID. UDP-only avoids cross-UID Fast DDS SHM corruption while
+      # preserving multicast discovery for RViz on the LAN.
+      FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
       ROBOT_ID: ${ROBOT_ID:-ROBOT-001}
       NAVIGATION_MODE: MAPPING
-      ROVERA_USE_VENDOR_BASE_RUNTIME: ${ROVERA_USE_VENDOR_BASE_RUNTIME:-0}
+      # Coexistence always reuses Yahboom's EKF/robot_state_publisher. Starting
+      # a second base runtime creates duplicate TF authorities and corrupts
+      # SLAM sensor discovery.
+      ROVERA_USE_VENDOR_BASE_RUNTIME: "1"
       NAVIGATION_SOCKET_PATH: /var/lib/rovera/navigation/navigation.sock
       NAVIGATION_SOCKET_GID: ${ROBOT_GID:-1000}
       ROVERA_MAP_ROOT: /var/lib/rovera/maps
@@ -35,6 +43,10 @@ services:
       - type: bind
         source: ${ROBOT_STATE_DIR:-./state}
         target: /var/lib/rovera
+      - type: bind
+        source: ./micro_ros_fastdds.xml
+        target: /etc/rovera/micro_ros_fastdds.xml
+        read_only: true
     healthcheck:
       test: ["CMD", "/opt/rovera/scripts/healthcheck.sh"]
       interval: 8s

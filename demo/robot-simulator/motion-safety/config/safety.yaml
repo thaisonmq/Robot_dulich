@@ -1,5 +1,9 @@
 rovera_motion_safety:
   ros__parameters:
+    # Chỉ bật/tắt lớp tránh vật cản hình học dùng dữ liệu /scan. Khi tắt,
+    # E-stop, cliff/bumper/range, watchdog lệnh và các topic chặn bên ngoài
+    # /rovera/obstacle_stop + /rovera/obstacle_directions vẫn hoạt động.
+    lidar_obstacle_avoidance_enabled: false
     half_length: 0.15
     half_width: 0.05
     clearance: 0.10
