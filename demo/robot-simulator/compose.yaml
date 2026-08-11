@@ -50,6 +50,16 @@ services:
       - type: bind
         source: ${ROBOT_STATE_DIR:-./state}
         target: /var/lib/rovera
+      # Keep Python-only edge fixes deployable without rebuilding the media
+      # image. These read-only overlays survive future compose recreations.
+      - type: bind
+        source: ./simulator/client.py
+        target: /app/simulator/client.py
+        read_only: true
+      - type: bind
+        source: ./simulator/map_cache.py
+        target: /app/simulator/map_cache.py
+        read_only: true
       - type: bind
         source: /etc/machine-id
         target: /etc/machine-id

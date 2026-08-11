@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Activity, ArrowLeft, Camera, Check, CircleDot, Cpu, EthernetPort, Mic2,
-  KeyRound, Play, Radar, RadioTower, RefreshCw, Save, ServerCog, Square, Video,
+  Activity, ArrowLeft, Camera, Check, EthernetPort, MapPinned, Mic2,
+  KeyRound, Play, Radar, RefreshCw, Save, ServerCog, Square,
   Volume2, WifiOff, X,
 } from "lucide-react";
 import { api } from "../api/client";
-import { Brand } from "../components/Brand";
-import { GlobalLanguageSelect } from "../components/GlobalLanguageSelect";
+import { OperationsShell } from "../components/OperationsShell";
+import { showToast } from "../components/ToastViewport";
 import { useI18n } from "../i18n/I18nProvider";
 import { useNavigate, useParams } from "../router";
 import type {
@@ -51,11 +51,13 @@ function configurationForm(
 export function RobotConfigurationPage() {
   const navigate = useNavigate();
   const { t } = useI18n();
+  const queryClient = useQueryClient();
   const { robotId = "" } = useParams();
   const [form, setForm] = useState<RobotConfigurationUpdate>(EMPTY_CONFIGURATION);
-  const [saved, setSaved] = useState(false);
-  const [tab, setTab] = useState<"connection" | "video" | "audio">("video");
+  const [assignedMapId, setAssignedMapId] = useState("");
+  const [tab, setTab] = useState<"connection" | "video" | "audio">("connection");
   const [previewState, setPreviewState] = useState("idle");
+  const [previewOpen, setPreviewOpen] = useState(false);
   const [videoSources, setVideoSources] = useState<MediaSource[]>([]);
   const [audioSources, setAudioSources] = useState<MediaSource[]>([]);
   const [speakerSources, setSpeakerSources] = useState<MediaSource[]>([]);
@@ -79,6 +81,7 @@ export function RobotConfigurationPage() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const previewTransport = useRef<LiveKitMediaTransport | null>(null);
   const previewLeaseId = useRef<string | null>(null);
+  const previewRequested = useRef(false);
 
   const robotQuery = useQuery({
     queryKey: ["robot", robotId],
@@ -91,6 +94,16 @@ export function RobotConfigurationPage() {
     enabled: Boolean(robotId),
     retry: false,
   });
+  const mapsQuery = useQuery({
+    queryKey: ["maps"],
+    queryFn: () => api.maps(),
+  });
+  const assignableMaps = (mapsQuery.data ?? []).filter(
+    (item) => item.status !== "DELETED" && item.active_version != null,
+  );
+  useEffect(() => {
+    if (robotQuery.data) setAssignedMapId(robotQuery.data.map_id);
+  }, [robotQuery.data]);
   useEffect(() => {
     if (!configurationQuery.data) return;
     setForm(configurationForm(configurationQuery.data));
@@ -135,8 +148,22 @@ export function RobotConfigurationPage() {
     mutationFn: () => api.updateRobotConfiguration(robotId, form),
     onSuccess: (configuration) => {
       setForm(configurationForm(configuration));
-      setSaved(true);
-      window.setTimeout(() => setSaved(false), 2200);
+      showToast(t("Đã lưu cấu hình"));
+    },
+  });
+  const assignMap = useMutation({
+    mutationFn: () => api.updateRobot(robotId, {
+      name: robotQuery.data!.name,
+      site_id: robotQuery.data!.site_id,
+      map_id: assignedMapId,
+      enabled: robotQuery.data!.enabled,
+      management_address: robotQuery.data!.management_address ?? undefined,
+      management_username: robotQuery.data!.management_username ?? undefined,
+    }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["robot", robotId] });
+      void queryClient.invalidateQueries({ queryKey: ["robots"] });
+      showToast(t("Đã lưu thay đổi"));
     },
   });
   const connectionTest = useMutation({
@@ -232,24 +259,28 @@ export function RobotConfigurationPage() {
     (device) => device.host === onvifSelectedHost,
   );
 
-  async function togglePreview() {
-    if (previewTransport.current) {
-      await previewTransport.current.disconnect();
-      previewTransport.current = null;
-      const leaseId = previewLeaseId.current;
-      previewLeaseId.current = null;
-      if (leaseId) {
-        await api.stopRobotPreview(robotId, leaseId).catch(() => undefined);
-      }
-      setPreviewState("idle");
-      return;
-    }
+  async function stopPreview() {
+    previewRequested.current = false;
+    await previewTransport.current?.disconnect();
+    previewTransport.current = null;
+    const leaseId = previewLeaseId.current;
+    previewLeaseId.current = null;
+    if (leaseId) await api.stopRobotPreview(robotId, leaseId).catch(() => undefined);
+    setPreviewState("idle");
+  }
+
+  async function startPreview() {
     if (!videoRef.current || !audioRef.current) return;
     setPreviewState("connecting");
     let leaseId: string | null = null;
     try {
       const access = await api.robotPreviewToken(robotId);
       leaseId = access.lease_id;
+      if (!previewRequested.current || !videoRef.current || !audioRef.current) {
+        await api.stopRobotPreview(robotId, leaseId).catch(() => undefined);
+        setPreviewState("idle");
+        return;
+      }
       previewLeaseId.current = leaseId;
       const { LiveKitMediaTransport } = await import("../transports/MediaTransport");
       const transport = new LiveKitMediaTransport(
@@ -265,58 +296,36 @@ export function RobotConfigurationPage() {
       if (leaseId) {
         await api.stopRobotPreview(robotId, leaseId).catch(() => undefined);
       }
-      setPreviewState(reason instanceof Error ? reason.message : "failed");
+      setPreviewState(previewRequested.current
+        ? reason instanceof Error ? reason.message : "failed"
+        : "idle");
     }
   }
 
+  useEffect(() => {
+    if (previewOpen && previewState === "idle" && !previewTransport.current) {
+      previewRequested.current = true;
+      void startPreview();
+    }
+  }, [previewOpen, previewState]);
+
+  useEffect(() => {
+    if (!previewOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setPreviewOpen(false);
+      void stopPreview();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [previewOpen, robotId]);
+
   const robot = robotQuery.data;
-  const configuration = configurationQuery.data;
   const loading = robotQuery.isLoading || configurationQuery.isLoading;
 
   return (
-    <main className="configuration-page">
-      <header className="app-header">
-        <Brand compact />
-        <div className="app-header__context">
-          <span>{t("Cấu hình thiết bị")}</span>
-          <strong>{robot?.name ?? robotId}</strong>
-        </div>
-        <GlobalLanguageSelect />
-        <button type="button" className="header-action" onClick={() => navigate("/robots")}>
-          <ArrowLeft size={18} /> {t("Danh sách robot")}
-        </button>
-      </header>
-
-      <section className="configuration-shell">
-        <aside className="configuration-summary">
-          <div className="device-orbit"><RadioTower size={36} /></div>
-          <div>
-            <p className="eyebrow">{t("THIẾT BỊ ĐANG CHỌN")}</p>
-            <h1>{robot?.name ?? t("Đang tải robot")}</h1>
-            <p>{robotId}</p>
-          </div>
-          <div className="configuration-health">
-            <span><CircleDot size={17} /><small>{t("Kết nối")}</small><strong>{robot?.status === "online" ? t("Trực tuyến") : t("Ngoại tuyến")}</strong></span>
-            <span><Cpu size={17} /><small>{t("Phiên bản")}</small><strong>{configuration?.software_version ?? "—"}</strong></span>
-            <span><Video size={17} /><small>{t("Hồ sơ")}</small><strong>{form.video_profile === "full_hd" ? "Full HD" : form.video_profile === "balanced" ? t("Cân bằng") : t("Băng thông thấp")}</strong></span>
-          </div>
-          <div className={`config-preview ${previewState === "connected" ? "is-live" : ""}`}>
-            <video ref={videoRef} autoPlay playsInline aria-label={t("Xem trước camera robot")} />
-            <audio ref={audioRef} autoPlay />
-            <span>
-              <Camera size={18} />
-              {previewState === "connected"
-                ? t("Camera trực tiếp")
-                : previewState === "connecting"
-                  ? t("Đang mở camera…")
-                  : t("Chưa xem trước")}
-            </span>
-          </div>
-          <p className="configuration-note">
-            {t("Cấu hình được đọc và áp dụng trực tiếp tại simulator. Thông tin đăng nhập RTSP luôn được ẩn khỏi trình duyệt.")}
-          </p>
-        </aside>
-
+    <OperationsShell title={robot?.name ? `${t("Cấu hình")}: ${robot.name}` : "Cấu hình thiết bị"} className="robot-configuration-operations">
+      <section className="configuration-shell configuration-shell--single">
         <form
           className="configuration-form"
           onSubmit={(event) => {
@@ -382,6 +391,39 @@ export function RobotConfigurationPage() {
             <div className="configuration-fields">
               {tab === "connection" && (
                 <>
+                  <section className="robot-map-assignment config-field--wide">
+                    <span className="robot-map-assignment__icon"><MapPinned size={20} /></span>
+                    <div className="robot-map-assignment__copy">
+                      <strong>{t("Bản đồ điều hướng")}</strong>
+                      <small>{t("Chọn bản đồ đã kích hoạt để gắn cho robot này.")}</small>
+                    </div>
+                    <select
+                      value={assignedMapId}
+                      aria-label={t("Bản đồ")}
+                      disabled={mapsQuery.isLoading || !assignableMaps.length || assignMap.isPending}
+                      onChange={(event) => setAssignedMapId(event.target.value)}
+                    >
+                      {mapsQuery.isLoading && <option value={assignedMapId}>{t("Đang tải danh sách bản đồ…")}</option>}
+                      {!mapsQuery.isLoading && !assignableMaps.length && <option value={assignedMapId}>{t("Chưa có bản đồ đã kích hoạt")}</option>}
+                      {assignedMapId && !assignableMaps.some((item) => item.map_id === assignedMapId) && (
+                        <option value={assignedMapId}>{assignedMapId} · {t("Bản đồ hiện tại")}</option>
+                      )}
+                      {assignableMaps.map((item) => <option value={item.map_id} key={item.map_id}>
+                        {item.name} · {item.site_id || "—"} / {item.floor_id || "—"} · v{item.active_version}
+                      </option>)}
+                    </select>
+                    <button
+                      type="button"
+                      className="button button--outline"
+                      disabled={!robot || !assignedMapId || assignedMapId === robot.map_id || assignMap.isPending}
+                      onClick={() => assignMap.mutate()}
+                    >
+                      <Save size={16} /> {assignMap.isPending ? t("Đang lưu…") : t("Gắn bản đồ")}
+                    </button>
+                    {(mapsQuery.isError || assignMap.isError) && <p role="alert" className="robot-map-assignment__error">
+                      {assignMap.error instanceof Error ? t(assignMap.error.message) : t("Không tải được danh sách bản đồ")}
+                    </p>}
+                  </section>
                   <label className="config-field config-field--wide">
                     <span><EthernetPort size={17} /> {t("Địa chỉ IP robot")}</span>
                     <input
@@ -591,9 +633,8 @@ export function RobotConfigurationPage() {
                     <button type="button" className="button button--outline" disabled={mediaTest.isPending} onClick={() => mediaTest.mutate("video")}>
                       <Activity size={16} /> {t("Kiểm tra nguồn camera")}
                     </button>
-                    <button type="button" className="button button--outline" onClick={() => void togglePreview()}>
-                      {previewTransport.current ? <Square size={15} /> : <Play size={15} />}
-                      {previewTransport.current ? t("Dừng xem trước") : t("Xem trước camera")}
+                    <button type="button" className="button button--outline" onClick={() => setPreviewOpen(true)}>
+                      <Play size={15} /> {t("Xem trước camera")}
                     </button>
                     {mediaTest.data?.diagnostic === "video" && (
                       <span className={mediaTest.data.ok ? "is-ok" : ""}>
@@ -846,7 +887,7 @@ export function RobotConfigurationPage() {
             </p>
           )}
           <div className="configuration-actions">
-            <span>{saved && <><Check size={17} /> {t("Đã lưu cấu hình")}</>}</span>
+            <span />
             <button type="button" className="button button--outline" onClick={() => navigate("/robots")}>{t("Huỷ")}</button>
             <button
               type="submit"
@@ -858,6 +899,51 @@ export function RobotConfigurationPage() {
           </div>
         </form>
       </section>
+
+      {previewOpen && (
+        <div className="video-preview-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target !== event.currentTarget) return;
+          setPreviewOpen(false);
+          void stopPreview();
+        }}>
+          <section className="video-preview-modal" role="dialog" aria-modal="true" aria-labelledby="video-preview-title">
+            <header>
+              <span className="video-preview-modal__icon"><Camera size={19} /></span>
+              <div>
+                <h2 id="video-preview-title">{t("Xem trước camera robot")}</h2>
+                <p>{robot?.name ?? robotId} · {form.camera_label}</p>
+              </div>
+              <span className={`video-preview-modal__status${previewState === "connected" ? " is-live" : ""}`}>
+                <i /> {previewState === "connected" ? t("Camera trực tiếp") : previewState === "connecting" ? t("Đang mở camera…") : t("Chưa có tín hiệu video")}
+              </span>
+              <button type="button" autoFocus aria-label={t("Đóng")} onClick={() => {
+                setPreviewOpen(false);
+                void stopPreview();
+              }}><X size={18} /></button>
+            </header>
+            <div className={`video-preview-modal__stage${previewState === "connected" ? " is-live" : ""}`}>
+              <video ref={videoRef} autoPlay playsInline aria-label={t("Xem trước camera robot")} />
+              <audio ref={audioRef} autoPlay />
+              {previewState !== "connected" && <div className="video-preview-modal__empty">
+                <Camera size={32} />
+                <strong>{previewState === "connecting" ? t("Đang kết nối camera…") : t("Không nhận được hình ảnh")}</strong>
+                <small>{previewState === "idle" || previewState === "connecting" ? t("Vui lòng chờ trong giây lát.") : t(previewState)}</small>
+                {previewState !== "idle" && previewState !== "connecting" && <button type="button" onClick={() => {
+                  previewRequested.current = true;
+                  setPreviewState("idle");
+                }}>{t("Thử lại")}</button>}
+              </div>}
+            </div>
+            <footer>
+              <span>{form.video_profile === "full_hd" ? "Full HD · 1080p" : form.video_profile === "balanced" ? `${t("Cân bằng")} · 720p` : `${t("Băng thông thấp")} · 480p`}</span>
+              <button type="button" className="button button--outline" onClick={() => {
+                setPreviewOpen(false);
+                void stopPreview();
+              }}><Square size={15} /> {t("Dừng xem trước")}</button>
+            </footer>
+          </section>
+        </div>
+      )}
 
       {form.video_source_type === "rtsp" && onvifDialogOpen && (
         <div
@@ -1112,6 +1198,6 @@ export function RobotConfigurationPage() {
           </section>
         </div>
       )}
-    </main>
+    </OperationsShell>
   );
 }

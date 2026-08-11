@@ -1,11 +1,9 @@
 import { useState } from "react";
-import { ArrowLeft, AtSign, KeyRound, ShieldCheck, UserRound } from "lucide-react";
+import { AtSign, KeyRound, ShieldCheck, UserRound } from "lucide-react";
 import { api, userStorage } from "../api/client";
-import { AccountMenu } from "../components/AccountMenu";
-import { Brand } from "../components/Brand";
-import { GlobalLanguageSelect } from "../components/GlobalLanguageSelect";
+import { OperationsShell } from "../components/OperationsShell";
+import { showToast } from "../components/ToastViewport";
 import { useI18n } from "../i18n/I18nProvider";
-import { useNavigate } from "../router";
 import { useAppStore } from "../state/appStore";
 
 const ROLE_LABELS = {
@@ -16,7 +14,6 @@ const ROLE_LABELS = {
 
 export function AccountPage() {
   const { t } = useI18n();
-  const navigate = useNavigate();
   const user = useAppStore((state) => state.user)!;
   const setUser = useAppStore((state) => state.setUser);
   const [fullName, setFullName] = useState(user.full_name);
@@ -36,7 +33,7 @@ export function AccountPage() {
       const updated = await api.updateProfile(fullName);
       setUser(updated);
       userStorage.set(updated);
-      setProfileMessage(t("Đã lưu hồ sơ"));
+      showToast(t("Đã lưu hồ sơ"));
     } catch (reason) {
       setProfileMessage(reason instanceof Error ? reason.message : t("Không thể lưu hồ sơ"));
     } finally {
@@ -60,7 +57,7 @@ export function AccountPage() {
       setCurrentPassword("");
       setNewPassword("");
       setConfirmation("");
-      setPasswordMessage(t("Đã đổi mật khẩu"));
+      showToast(t("Đã đổi mật khẩu"));
     } catch (reason) {
       setPasswordMessage(reason instanceof Error ? reason.message : t("Không thể đổi mật khẩu"));
     } finally {
@@ -69,23 +66,11 @@ export function AccountPage() {
   }
 
   return (
-    <main className="account-page">
-      <header className="account-header">
-        <div>
-          <Brand compact />
-          <span className="header-divider" />
-          <button type="button" onClick={() => navigate("/robots")}><ArrowLeft size={18} /> {t("Quản lý robot")}</button>
-        </div>
-        <GlobalLanguageSelect />
-        <AccountMenu />
-      </header>
-
+    <OperationsShell title="Cài đặt tài khoản" className="account-operations">
       <div className="account-page__content">
         <section className="account-hero">
           <div>
-            <p className="eyebrow">{t("DANH TÍNH · QUYỀN TRUY CẬP")}</p>
             <h1>{t("Tài khoản của tôi")}</h1>
-            <p>{t("Cập nhật thông tin cá nhân và kiểm soát phương thức đăng nhập.")}</p>
           </div>
           <div className="account-role-card">
             <span><ShieldCheck size={21} /></span>
@@ -104,7 +89,7 @@ export function AccountPage() {
           <section className="account-setting-panel">
             <div className="account-setting-panel__title">
               <span><UserRound size={20} /></span>
-              <div><h2>{t("Hồ sơ cá nhân")}</h2><p>{t("Thông tin hiển thị trong trung tâm vận hành.")}</p></div>
+              <div><h2>{t("Hồ sơ cá nhân")}</h2></div>
             </div>
             <form onSubmit={saveProfile}>
               <label className="form-field"><span>{t("Họ và tên")}</span><input value={fullName} onChange={(event) => setFullName(event.target.value)} required minLength={2} /></label>
@@ -118,7 +103,7 @@ export function AccountPage() {
           <section className="account-setting-panel">
             <div className="account-setting-panel__title">
               <span><KeyRound size={20} /></span>
-              <div><h2>{t("Bảo mật đăng nhập")}</h2><p>{t("Mật khẩu được lưu bằng hash PBKDF2 trong PostgreSQL.")}</p></div>
+              <div><h2>{t("Bảo mật đăng nhập")}</h2></div>
             </div>
             <form onSubmit={savePassword}>
               {user.password_enabled && <label className="form-field"><span>{t("Mật khẩu hiện tại")}</span><input type="password" value={currentPassword} autoComplete="current-password" onChange={(event) => setCurrentPassword(event.target.value)} required /></label>}
@@ -135,6 +120,6 @@ export function AccountPage() {
           </section>
         </div>
       </div>
-    </main>
+    </OperationsShell>
   );
 }

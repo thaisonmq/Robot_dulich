@@ -64,6 +64,11 @@ class InitialPoseRequest(NavigationCommandBase):
     pose: GoalPose
 
 
+class RelocalizeRequest(NavigationCommandBase):
+    map_id: str = Field(min_length=2, max_length=64)
+    version: int = Field(ge=1)
+
+
 class ComputePathRequest(NavigationCommandBase):
     map_id: str = Field(min_length=2, max_length=64)
     version: int = Field(ge=1)
@@ -88,7 +93,7 @@ def _mission_view(mission: NavigationMission) -> dict:
         "goal": mission.goal,
         "points": mission.path,
         "distance_m": mission.distance_m,
-        "estimated_seconds": max(1, round(mission.distance_m / 0.1)),
+        "estimated_seconds": max(1, round(mission.distance_m / 0.15)),
         "error_code": mission.error_code,
         "error_message": mission.error_message,
         "created_at": mission.created_at.isoformat(),
@@ -117,6 +122,16 @@ def _active_version(database: Session, map_id: str, version: int) -> MapVersion 
 
 def _robot_by_public_id(database: Session, robot_id: str) -> Robot | None:
     return database.scalar(select(Robot).where(Robot.robot_id == robot_id))
+
+
+def _goal_in_map(version: MapVersion, goal: GoalPose) -> bool:
+    origin = dict(version.origin or {})
+    delta_x = goal.x - float(origin.get("x", 0))
+    delta_y = goal.y - float(origin.get("y", 0))
+    yaw = float(origin.get("yaw", 0))
+    local_x = math.cos(yaw) * delta_x + math.sin(yaw) * delta_y
+    local_y = -math.sin(yaw) * delta_x + math.cos(yaw) * delta_y
+    return 0 <= local_x < version.width * version.resolution and 0 <= local_y < version.height * version.resolution
 
 
 async def _command(
@@ -188,7 +203,7 @@ def _navigation_preflight(robot_id: str) -> list[str]:
     health = robot.health
     checks = {
         "MAP_NOT_READY": health.get("map_state") == "READY",
-        "NOT_LOCALIZED": bool(health.get("localized")),
+        "NOT_LOCALIZED": bool(health.get("localized")) and health.get("localization_state", "READY") == "READY",
         "NAV2_NOT_READY": health.get("nav2") == "READY",
         "SAFETY_UNHEALTHY": health.get("safety") == "HEALTHY",
         "SCAN_STALE": bool(health.get("scan_fresh")),
@@ -210,13 +225,36 @@ async def load_map(
     version = _active_version(database, body.map_id, body.version)
     if version is None:
         raise HTTPException(status_code=409, detail="Map/version chưa ACTIVE")
+    runtime = hub.robots.get(body.robot_id)
+    expected_state = body.expected_state
+    runtime_state = str((runtime.health if runtime else {}).get("map_state") or expected_state).upper()
+    if runtime_state in {"NAVIGATING", "PAUSED", "BLOCKED", "RECOVERY"}:
+        canceled = await _command(
+            database,
+            settings,
+            request_id=str(uuid4()),
+            robot_id=body.robot_id,
+            command_type="navigation.cancel",
+            expected_state=runtime_state,
+            payload={"reason": "activate_map"},
+        )
+        if canceled.get("status") not in {"accepted", "completed"}:
+            raise HTTPException(status_code=409, detail="Không thể dừng Navigation cũ để kích hoạt map")
+        expected_state = str(canceled.get("current_state") or "CANCELED")
+        for mission in database.scalars(
+            select(NavigationMission).where(
+                NavigationMission.robot_id == body.robot_id,
+                NavigationMission.status.not_in(("SUCCEEDED", "ARRIVED", "CANCELED", "FAILED", "FAULT")),
+            )
+        ):
+            mission.status = "CANCELED"
     result = await _command(
         database,
         settings,
         request_id=body.request_id,
         robot_id=body.robot_id,
         command_type="map.load",
-        expected_state=body.expected_state,
+        expected_state=expected_state,
         payload={
             "map_id": body.map_id,
             "version": body.version,
@@ -250,6 +288,12 @@ async def load_map(
         )
         database.add(cache)
     cache.status = str(result.get("current_state", "LOADING_MAP"))
+    cache.local_status = "AVAILABLE"
+    cache.sync_status = "SYNCED"
+    for previous in database.scalars(
+        select(RobotMapCache).where(RobotMapCache.robot_id == body.robot_id)
+    ):
+        previous.active = previous.map_id == body.map_id and previous.version == body.version
     cache.progress_percent = float(result.get("progress_percent", 0))
     cache.error_message = result.get("error_message")
     # Robot.id is the internal UUID; navigation commands carry the public
@@ -259,11 +303,14 @@ async def load_map(
     robot_record = _robot_by_public_id(database, body.robot_id)
     if robot_record is not None:
         robot_record.map_id = body.map_id
+        robot_record.active_map_version = body.version
+    if runtime is not None:
+        runtime.map_id = body.map_id
     database.commit()
     return {**result, "map_id": body.map_id, "version": body.version}
 
 
-@router.post("/map/initial-pose")
+@router.post("/map/approximate-pose")
 async def set_initial_pose(
     body: InitialPoseRequest,
     user_id: str = Depends(current_user),
@@ -284,6 +331,65 @@ async def set_initial_pose(
     )
 
 
+@router.post("/map/relocalize")
+async def relocalize(
+    body: RelocalizeRequest,
+    user_id: str = Depends(current_user),
+    database: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    _valid_lease(body.robot_id, body.session_id, user_id)
+    if _active_version(database, body.map_id, body.version) is None:
+        raise HTTPException(status_code=409, detail="Map/version chưa ACTIVE")
+    return await _command(
+        database,
+        settings,
+        request_id=body.request_id,
+        robot_id=body.robot_id,
+        command_type="map.relocalize",
+        expected_state=body.expected_state,
+        payload={"map_id": body.map_id, "version": body.version},
+    )
+
+
+@router.get("/health/{robot_id}")
+async def navigation_health(
+    robot_id: str,
+    _: str = Depends(current_user),
+) -> dict:
+    robot = hub.robots.get(robot_id)
+    if robot is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy robot")
+    health = dict(robot.health)
+    mode = str(health.get("mode") or (
+        "MAPPING" if str(health.get("map_state", "")).startswith("MAPPING_") else "NAVIGATION"
+    ))
+    return {
+        "mode": mode,
+        "mapping": health.get("mapping") if mode == "MAPPING" else None,
+        "navigation": {
+            "state": health.get("map_state", "NO_ACTIVE_MAP"),
+            "mapId": robot.map_id,
+            "mapVersion": health.get("map_version", 0),
+            "localized": bool(health.get("localized")),
+            "localizationState": health.get("localization_state", "IDLE"),
+            "localizationConfidence": float(health.get("localization_confidence", 0)),
+            "nav2Healthy": health.get("nav2") == "READY",
+        } if mode == "NAVIGATION" else None,
+        "mapRegistry": health.get("map_registry", {"localCount": 0, "pendingSync": 0}),
+    }
+
+
+# Compatibility for older Center builds. The product UI calls this only as an
+# approximate-pose fallback after automatic localization has failed.
+router.add_api_route(
+    "/map/initial-pose",
+    set_initial_pose,
+    methods=["POST"],
+    include_in_schema=False,
+)
+
+
 @router.post("/compute-path")
 async def compute_path(
     body: ComputePathRequest,
@@ -292,8 +398,14 @@ async def compute_path(
     settings: Settings = Depends(get_settings),
 ) -> dict:
     _valid_lease(body.robot_id, body.session_id, user_id)
-    if _active_version(database, body.map_id, body.version) is None:
+    version = _active_version(database, body.map_id, body.version)
+    if version is None:
         raise HTTPException(status_code=409, detail="Map/version chưa ACTIVE")
+    robot = _robot_by_public_id(database, body.robot_id)
+    if robot is None or robot.map_id != body.map_id or robot.active_map_version != body.version:
+        raise HTTPException(status_code=409, detail="Map hiển thị không khớp active map của robot")
+    if not _goal_in_map(version, body.goal):
+        raise HTTPException(status_code=422, detail="Điểm đến nằm ngoài bản đồ.")
     existing = database.scalar(
         select(NavigationMission).where(NavigationMission.request_id == body.request_id)
     )
@@ -314,6 +426,7 @@ async def compute_path(
     )
     points = list(result.get("points") or result.get("path") or [])
     status = "READY" if result.get("status") in {"accepted", "completed"} and points else "BLOCKED"
+    resolved_goal = dict(result.get("goal") or body.goal.model_dump())
     mission = NavigationMission(
         request_id=body.request_id,
         robot_id=body.robot_id,
@@ -321,7 +434,9 @@ async def compute_path(
         map_id=body.map_id,
         map_version=body.version,
         status=status,
-        goal=body.goal.model_dump(),
+        # Persist the bounded, safe snapped goal. navigation.start must send
+        # exactly the destination that Nav2 successfully planned.
+        goal=resolved_goal,
         path=points,
         distance_m=float(result.get("distance_m", 0)),
         error_code=result.get("error_code"),
@@ -344,6 +459,9 @@ async def start_navigation(
     mission = database.get(NavigationMission, body.mission_id)
     if mission is None or mission.robot_id != body.robot_id:
         raise HTTPException(status_code=404, detail="Không tìm thấy mission")
+    robot = _robot_by_public_id(database, body.robot_id)
+    if robot is None or robot.map_id != mission.map_id or robot.active_map_version != mission.map_version:
+        raise HTTPException(status_code=409, detail="Map mission không còn là active map của robot")
     failures = _navigation_preflight(body.robot_id)
     if failures:
         raise HTTPException(status_code=409, detail={"code": "PREFLIGHT_FAILED", "failures": failures})
@@ -399,6 +517,13 @@ async def mission_action(
     if mission is None or mission.robot_id != body.robot_id:
         raise HTTPException(status_code=404, detail="Không tìm thấy mission")
     command_type, target = selected
+    robot = _robot_by_public_id(database, body.robot_id)
+    if action in {"pause", "resume"} and (
+        robot is None
+        or robot.map_id != mission.map_id
+        or robot.active_map_version != mission.map_version
+    ):
+        raise HTTPException(status_code=409, detail="Map mission không còn là active map của robot")
     if database.get(CommandReceipt, body.request_id) is None:
         try:
             navigation_transition(mission.status, target)
@@ -411,7 +536,11 @@ async def mission_action(
         robot_id=body.robot_id,
         command_type=command_type,
         expected_state=body.expected_state,
-        payload={"mission_id": mission.mission_id},
+        payload={
+            "mission_id": mission.mission_id,
+            "map_id": mission.map_id,
+            "version": mission.map_version,
+        },
     )
     if result.get("status") in {"accepted", "completed"}:
         mission.status = target

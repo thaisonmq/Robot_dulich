@@ -101,6 +101,7 @@ class Robot(Base):
     name: Mapped[str] = mapped_column(String(120))
     site_id: Mapped[str] = mapped_column(String(64))
     map_id: Mapped[str] = mapped_column(String(64))
+    active_map_version: Mapped[int | None] = mapped_column(default=None)
     status: Mapped[str] = mapped_column(String(32), default="offline")
     availability: Mapped[str] = mapped_column(String(32), default="available")
     software_version: Mapped[str] = mapped_column(String(32), default="sim-1.0")
@@ -159,6 +160,8 @@ class MapRecord(Base):
     notes: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(32), default="ACTIVE", index=True)
     active_version: Mapped[int | None] = mapped_column(default=None)
+    deletion_status: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now, onupdate=now
@@ -186,8 +189,13 @@ class MapVersion(Base):
     height: Mapped[int]
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_by_robot: Mapped[str] = mapped_column(String(64), index=True)
+    sync_status: Mapped[str] = mapped_column(String(32), default="SYNCED", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now, onupdate=now
+    )
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class MappingSession(Base):
@@ -225,11 +233,26 @@ class RobotMapCache(Base):
     version: Mapped[int]
     checksum: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="MISSING", index=True)
+    local_status: Mapped[str] = mapped_column(String(32), default="MISSING")
+    sync_status: Mapped[str] = mapped_column(String(32), default="SYNC_PENDING", index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
     progress_percent: Mapped[float] = mapped_column(Float, default=0)
     error_message: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now, onupdate=now
     )
+
+
+class MapDeletionAck(Base):
+    __tablename__ = "map_deletion_acks"
+    __table_args__ = (
+        UniqueConstraint("map_id", "robot_id", name="uq_map_deletion_robot"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    map_id: Mapped[str] = mapped_column(String(64), index=True)
+    robot_id: Mapped[str] = mapped_column(String(64), index=True)
+    acknowledged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class POI(Base):

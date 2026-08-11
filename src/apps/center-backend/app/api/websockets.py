@@ -25,20 +25,32 @@ MAX_MESSAGE_BYTES = 65_536
 def runtime_capabilities_from_health(payload: dict) -> dict:
     motion_backend = str(payload.get("motion_backend", ""))
     navigation_backend = str(payload.get("navigation_backend", ""))
+    runtime_mode = str(payload.get("mode", "")).upper()
     simulated = motion_backend == "simulator" and navigation_backend == "simulator"
-    blockers: list[str] = []
+    sensor_blockers: list[str] = []
     if navigation_backend == "ros2":
-        if not payload.get("scan_fresh", False):
-            blockers.append("SCAN_STALE")
-        if not payload.get("odometry_ready", False):
-            blockers.append("ODOMETRY_UNAVAILABLE")
-        if not payload.get("lidar_tf_ready", False):
-            blockers.append("LIDAR_TF_UNAVAILABLE")
-        if str(payload.get("nav2", "UNAVAILABLE")).upper() in {"UNAVAILABLE", "FAULT"}:
-            blockers.append("NAV2_UNAVAILABLE")
+        # IDLE deliberately has neither Nav2 nor SLAM running. The mapping.start
+        # command owns the safe transition to SLAM and its adapter performs the
+        # authoritative scan/TF/safety preflight after startup. Treating the
+        # expected absence of an adapter as a mapping blocker creates a deadlock.
+        if runtime_mode != "IDLE":
+            if not payload.get("scan_fresh", False):
+                sensor_blockers.append("SCAN_STALE")
+            if not payload.get("odometry_ready", False):
+                sensor_blockers.append("ODOMETRY_UNAVAILABLE")
+            if not payload.get("lidar_tf_ready", False):
+                sensor_blockers.append("LIDAR_TF_UNAVAILABLE")
     elif not simulated:
-        blockers.append("NAVIGATION_BACKEND_UNAVAILABLE")
-    ready = simulated or (navigation_backend == "ros2" and not blockers)
+        sensor_blockers.append("NAVIGATION_BACKEND_UNAVAILABLE")
+    nav2_ready = str(payload.get("nav2", "UNAVAILABLE")).upper() == "READY"
+    mapping_ready = simulated or (
+        navigation_backend == "ros2" and not sensor_blockers
+    )
+    navigation_ready = simulated or (
+        navigation_backend == "ros2"
+        and not sensor_blockers
+        and nav2_ready
+    )
     source = (
         "simulator"
         if simulated
@@ -49,9 +61,9 @@ def runtime_capabilities_from_health(payload: dict) -> dict:
     return {
         "motion_backend": motion_backend or "unknown",
         "navigation_backend": navigation_backend or "unknown",
-        "mapping": ready,
-        "navigation": ready,
-        "mapping_blockers": blockers,
+        "mapping": mapping_ready,
+        "navigation": navigation_ready,
+        "mapping_blockers": sensor_blockers,
         "source": source,
     }
 
@@ -83,6 +95,11 @@ def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict)
             runtime_state = str(payload.get("state") or payload.get("status") or "").upper()
             if runtime_mode == "MAPPING" and runtime_state in {
                 "IDLE",
+                "MAPPING_STARTING",
+                "MAPPING_RUNNING",
+                "MAPPING_STOPPED_UNSAVED",
+                "MAPPING_SAVING",
+                "MAPPING_ERROR",
                 "MAPPING",
                 "PAUSED",
                 "FINISHED",
@@ -93,7 +110,7 @@ def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict)
                     database.query(MappingSession)
                     .filter(
                         MappingSession.robot_id == robot_id,
-                        MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT")),
+                        MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT", "MAPPING_ERROR")),
                     )
                     .order_by(MappingSession.created_at.desc())
                     .first()
@@ -117,7 +134,10 @@ def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict)
                         mapping.error_message = "SLAM runtime đã reset trước khi phiên mapping kết thúc"
                     elif runtime_state != "IDLE":
                         mapping.status = runtime_state
-                        if runtime_state in {"MAPPING", "PAUSED", "FINISHED", "CANCELED"}:
+                        if runtime_state in {
+                            "MAPPING", "MAPPING_RUNNING", "MAPPING_STOPPED_UNSAVED",
+                            "MAPPING_SAVING", "PAUSED", "FINISHED", "CANCELED",
+                        }:
                             mapping.error_code = None
                             mapping.error_message = None
                     if runtime_state == "FAULT":
@@ -129,12 +149,16 @@ def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict)
                 status_value = str(payload.get("state") or payload.get("status") or mission.status).upper()
                 status_value = {
                     "MOVING": "NAVIGATING",
-                    "FAILED": "FAULT",
                     "CANCELLED": "CANCELED",
                 }.get(status_value, status_value)
-                mission.status = status_value
-                mission.error_code = payload.get("error_code")
-                mission.error_message = payload.get("error_message")
+                if status_value in {
+                    "READY", "PLANNING", "NAVIGATING", "PAUSED", "BLOCKED",
+                    "RECOVERY", "LOCALIZATION_LOST", "SUCCEEDED", "ARRIVED",
+                    "CANCELED", "FAILED", "FAULT",
+                }:
+                    mission.status = status_value
+                    mission.error_code = payload.get("error_code")
+                    mission.error_message = payload.get("error_message")
 
 
 async def ws_error(socket: WebSocket, code: int, reason: str) -> None:
@@ -229,8 +253,6 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
                 hub.robots[robot_id].capabilities.update(
                     runtime_capabilities_from_health(message.payload)
                 )
-            elif message.message_type == "mapping.snapshot":
-                hub.robots[robot_id].mapping_snapshot = dict(message.payload)
             elif message.message_type in {
                 "command.ack",
                 "configuration.state",
@@ -496,21 +518,6 @@ async def user_mapping(
             "payload": initial,
         }
     )
-    snapshot = hub.robots.get(robot_id).mapping_snapshot if hub.robots.get(robot_id) else None
-    if snapshot is not None:
-        await socket.send_json(
-            {
-                "message_id": str(uuid4()),
-                "schema_version": "1.0",
-                "message_type": "mapping.snapshot",
-                "robot_id": robot_id,
-                "session_id": mapping_session_id,
-                "sequence": 0,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "ttl_ms": 0,
-                "payload": snapshot,
-            }
-        )
     try:
         while True:
             await socket.receive_text()

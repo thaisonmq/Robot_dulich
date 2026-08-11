@@ -1,0 +1,103 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Background Color: 238; 241; 246
+    Fixed Frame: map
+    Frame Rate: 20
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Metric Grid
+      Enabled: true
+      Cell Size: 1
+    - Class: rviz_default_plugins/Map
+      Name: Saved Map
+      Enabled: true
+      Topic:
+        Value: /map
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+      Alpha: 0.75
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Axes: true
+      Show Names: false
+    - Class: rviz_default_plugins/RobotModel
+      Name: Robot Model
+      Enabled: false
+      Description Topic:
+        Value: /robot_description
+    - Class: rviz_default_plugins/PoseWithCovariance
+      Name: AMCL Pose
+      Enabled: true
+      Topic:
+        Value: /amcl_pose
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Path
+      Name: Global Path
+      Enabled: true
+      Topic:
+        Value: /plan
+        Reliability Policy: Reliable
+      Line Style: Lines
+      Line Width: 0.04
+      Color: 23; 89; 214
+    - Class: rviz_default_plugins/Path
+      Name: Local Path
+      Enabled: true
+      Topic:
+        Value: /local_plan
+        Reliability Policy: Reliable
+      Line Style: Lines
+      Line Width: 0.03
+      Color: 238; 135; 30
+    - Class: rviz_default_plugins/Map
+      Name: Global Costmap
+      Enabled: false
+      Topic:
+        Value: /global_costmap/costmap
+        Reliability Policy: Reliable
+      Alpha: 0.35
+      Color Scheme: costmap
+    - Class: rviz_default_plugins/Map
+      Name: Local Costmap
+      Enabled: true
+      Topic:
+        Value: /local_costmap/costmap
+        Reliability Policy: Reliable
+      Alpha: 0.45
+      Color Scheme: costmap
+    - Class: rviz_default_plugins/Odometry
+      Name: Odometry
+      Enabled: false
+      Topic:
+        Value: /odom
+        Reliability Policy: Best Effort
+      Keep: 100
+    - Class: rviz_default_plugins/Pose
+      Name: Goal
+      Enabled: true
+      Topic:
+        Value: /goal_pose
+        Reliability Policy: Reliable
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Navigation Top Down
+      Scale: 40
+Window Geometry:
+  Width: 1440
+  Height: 900

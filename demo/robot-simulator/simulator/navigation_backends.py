@@ -42,9 +42,15 @@ class SimulatorNavigationBackend:
         compatible_mapping_start = (
             command == "mapping.start"
             and expected_state == "IDLE"
-            and self.current_state in {"READY", "CANCELED", "FINISHED", "FAULT"}
+            and self.current_state in {"READY", "CANCELED", "FINISHED", "FAULT", "MAPPING_ERROR"}
         )
-        if expected_state and expected_state != self.current_state and not compatible_mapping_start:
+        unconditional_safety_command = command in {"navigation.cancel", "map.deactivate"}
+        if (
+            expected_state
+            and expected_state != self.current_state
+            and not compatible_mapping_start
+            and not unconditional_safety_command
+        ):
             raise NavigationBackendError(
                 "STATE_CONFLICT",
                 f"Expected {expected_state}, robot is {self.current_state}",
@@ -54,7 +60,17 @@ class SimulatorNavigationBackend:
             self.loaded_map_id = str(payload["map_id"])
             self.loaded_version = int(payload["version"])
             self.current_state = "READY"
-            return {"status": "completed", "current_state": "READY", "progress_percent": 100}
+            return {
+                "status": "completed", "current_state": "READY", "progress_percent": 100,
+                "state": {"localized": True, "localization_state": "READY", "localization_confidence": 1.0},
+            }
+        if command == "map.deactivate":
+            self.navigation.cancel()
+            self.motion.stop("map_deactivated")
+            self.loaded_map_id = ""
+            self.loaded_version = 0
+            self.current_state = "NO_ACTIVE_MAP"
+            return {"status": "completed", "current_state": "NO_ACTIVE_MAP"}
         if command == "map.set_initial_pose":
             pose = dict(payload["pose"])
             self.motion.pose.x = float(pose["x"])
@@ -63,6 +79,7 @@ class SimulatorNavigationBackend:
             self.current_state = "READY"
             return {"status": "completed", "current_state": "READY", "localized": True}
         if command == "navigation.compute_path":
+            self._validate_map_identity(payload)
             goal = dict(payload["goal"])
             start = {"x": self.motion.pose.x, "y": self.motion.pose.y}
             end = {"x": float(goal["x"]), "y": float(goal["y"])}
@@ -83,6 +100,7 @@ class SimulatorNavigationBackend:
                 "distance_m": round(distance, 3),
             }
         if command in {"navigation.start", "navigation.goal"}:
+            self._validate_map_identity(payload)
             if command == "navigation.start":
                 goal = dict(payload["goal"])
                 points = [
@@ -119,16 +137,28 @@ class SimulatorNavigationBackend:
             return {"status": "completed", "current_state": "CANCELED"}
         if command.startswith("mapping."):
             transitions = {
-                "mapping.start": "MAPPING",
+                "mapping.start": "MAPPING_RUNNING",
+                "mapping.stop": "MAPPING_STOPPED_UNSAVED",
                 "mapping.pause": "PAUSED",
-                "mapping.resume": "MAPPING",
-                "mapping.save_draft": "SAVED_DRAFT",
+                "mapping.resume": "MAPPING_RUNNING",
+                "mapping.save": "FINISHED",
+                "mapping.save_draft": "MAPPING_RUNNING",
                 "mapping.finish": "FINISHED",
+                "mapping.discard": "CANCELED",
                 "mapping.cancel": "CANCELED",
             }
             self.current_state = transitions[command]
             return {"status": "completed", "current_state": self.current_state}
         raise NavigationBackendError("UNSUPPORTED_COMMAND", f"Unsupported command: {command}")
+
+    def _validate_map_identity(self, payload: dict[str, Any]) -> None:
+        map_id = str(payload.get("map_id") or self.loaded_map_id)
+        version = int(payload.get("version") or self.loaded_version)
+        if map_id != self.loaded_map_id or version != self.loaded_version:
+            raise NavigationBackendError(
+                "MAP_MISMATCH", "Map/version does not match the active saved map",
+                current_state=self.current_state,
+            )
 
     def state(self) -> dict[str, Any]:
         if self.navigation.status == "arrived":
@@ -138,7 +168,10 @@ class SimulatorNavigationBackend:
             "map_id": self.loaded_map_id,
             "map_version": self.loaded_version,
             "localized": True,
+            "localization_state": "READY",
+            "localization_confidence": 1.0,
             "nav2": "READY",
+            "mode": "MAPPING" if self.current_state.startswith("MAPPING_") else "NAVIGATION",
         }
 
     async def manual_takeover(self) -> None:
@@ -172,9 +205,20 @@ class Ros2NavigationBackend:
         self._lock = asyncio.Lock()
 
     def _response_timeout(self, command: str) -> float:
-        if command in {"mapping.start", "mapping.save_draft", "mapping.finish"}:
+        if command in {"mapping.start", "mapping.save", "mapping.save_draft", "mapping.finish"}:
             return max(self.timeout_seconds, 90.0)
         return self.timeout_seconds
+
+    @staticmethod
+    def _retryable_mapping_start(result: dict[str, Any]) -> bool:
+        """Identify short-lived failures while a fresh SLAM runtime joins DDS."""
+        code = str(result.get("error_code", "")).upper()
+        if code in {"SCAN_STALE", "ODOMETRY_UNAVAILABLE", "LIDAR_TF_UNAVAILABLE"}:
+            return True
+        return (
+            code == "MAPPING_AUTHORITY_CONFLICT"
+            and "_NODE_NAME_UNKNOWN_" in str(result.get("error_message", ""))
+        )
 
     @staticmethod
     def _required_mode(command: str) -> str | None:
@@ -184,7 +228,7 @@ class Ros2NavigationBackend:
             return "NAVIGATION"
         return None
 
-    def _write_mode_request(self, mode: str, command: str) -> None:
+    def _write_mode_request(self, mode: str, command: str) -> str:
         self.mode_request_path.parent.mkdir(parents=True, exist_ok=True)
         request = {
             "mode": mode,
@@ -197,6 +241,34 @@ class Ros2NavigationBackend:
         )
         temporary.write_text(json.dumps(request, separators=(",", ":")))
         os.replace(temporary, self.mode_request_path)
+        return str(request["request_id"])
+
+    async def _wait_for_idle(self, command: str) -> None:
+        request_id = await asyncio.to_thread(self._write_mode_request, "IDLE", command)
+        status_path = self.mode_request_path.with_name("mode-status.json")
+        deadline = time.monotonic() + self.mode_switch_timeout_seconds
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.25)
+            try:
+                status = json.loads(status_path.read_text())
+            except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+                continue
+            if str(status.get("request_id")) != request_id:
+                continue
+            if status.get("status") == "READY" and str(status.get("mode", "")).upper() == "IDLE":
+                self._state.update(dict(status.get("state") or {}))
+                return
+            if status.get("status") == "FAULT":
+                raise NavigationBackendError(
+                    "MODE_SWITCH_FAILED",
+                    str(status.get("error") or "Failed to stop navigation runtime"),
+                    current_state=str(self._state.get("state", "FAULT")),
+                )
+        raise NavigationBackendError(
+            "MODE_SWITCH_TIMEOUT",
+            "Timed out stopping localization and Nav2 after map deactivation",
+            current_state=str(self._state.get("state", "FAULT")),
+        )
 
     async def _call_adapter(self, command: str, payload: dict, timeout: float) -> dict:
         request = {"command": command, "payload": payload}
@@ -272,6 +344,33 @@ class Ros2NavigationBackend:
                 result = await self._call_adapter(
                     command, command_payload, self._response_timeout(command)
                 )
+                # A stopped ROS participant can remain visible in the DDS graph
+                # for a few seconds, while scan/TF callbacks also need time to
+                # warm up. Retry only these known transient failures after this
+                # request actually switched to a fresh mapping runtime. A real,
+                # named second map publisher is still rejected immediately.
+                if switched and command == "mapping.start":
+                    retry_deadline = time.monotonic() + min(
+                        8.0, self.mode_switch_timeout_seconds
+                    )
+                    while (
+                        result.get("status") == "rejected"
+                        and self._retryable_mapping_start(result)
+                        and time.monotonic() < retry_deadline
+                    ):
+                        await asyncio.sleep(0.5)
+                        command_payload["expected_state"] = str(
+                            result.get("current_state") or "IDLE"
+                        ).upper()
+                        result = await self._call_adapter(
+                            command,
+                            command_payload,
+                            self._response_timeout(command),
+                        )
+                if command == "map.deactivate":
+                    # The adapter first cancels motion and drops map state;
+                    # then the host supervisor stops AMCL, map_server and Nav2.
+                    await self._wait_for_idle(command)
         except (OSError, asyncio.TimeoutError) as exc:
             self._state.update({"state": "FAULT", "nav2": "UNAVAILABLE"})
             raise NavigationBackendError(
@@ -284,7 +383,7 @@ class Ros2NavigationBackend:
                 str(result.get("error_message", "ROS command rejected")),
                 current_state=str(result.get("current_state", self._state.get("state", "FAULT"))),
             )
-        if command == "mapping.finish":
+        if command in {"mapping.save", "mapping.finish"}:
             # Returning the ACK and uploading the bundle stay in the edge
             # process. The host supervisor switches SLAM -> Nav2 immediately
             # afterwards without granting either container Docker access.

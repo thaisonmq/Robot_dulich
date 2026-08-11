@@ -1,0 +1,73 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { describe, expect, it } from "vitest";
+
+describe("Control saved-map architecture", () => {
+  it("allows a new destination after every terminal navigation state", () => {
+    const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
+    for (const state of ["SUCCEEDED", "ARRIVED", "CANCELED", "CANCELLED", "FAILED", "BLOCKED"]) {
+      expect(dashboard).toContain(`"${state}"`);
+    }
+  });
+
+  it("keeps camera, mapping, mini-map and modal in the same Dashboard tree", () => {
+    const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
+    expect(dashboard.match(/<video\b/g)).toHaveLength(1);
+    expect(dashboard).toContain("<MappingControlPanel");
+    expect(dashboard).toContain("<MapPanel");
+    expect(dashboard).not.toMatch(/navigate\([^)]*navigation/i);
+    expect(dashboard).not.toContain("setSelectedMapId(mapId)");
+    expect(dashboard).toMatch(/onSuccess:[\s\S]*setSelectedMapId\(selectedMap\.map_id\)/);
+  });
+
+  it("loads the navigable map catalogue and recovers from a stale robot map id", () => {
+    const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
+    expect(dashboard).toContain('api.maps(user?.role === "guest" ? "ACTIVE" : undefined)');
+    expect(dashboard).toContain('activeMaps.find((item) => item.map_id === selectedRobot?.map_id)');
+    expect(dashboard).toContain("?? activeMaps[0]");
+    expect(dashboard).toContain('className="map-section map-section--empty map-selection-empty"');
+    expect(dashboard).toContain("selectedRobot?.active_map_version");
+    expect(dashboard).toContain('setActiveMapId("")');
+  });
+
+  it("does not expose raw LaserScan or live SLAM map messages to Web", () => {
+    const mappingTransport = readFileSync(resolve("src/transports/MappingTransport.ts"), "utf8");
+    const contracts = readFileSync(resolve("../../packages/contracts/index.ts"), "utf8");
+    expect(mappingTransport).not.toMatch(/mapping\.(scan|snapshot)/);
+    expect(contracts).not.toMatch(/mapping\.(scan|snapshot)/);
+    expect(contracts).toContain("navigation.visualization");
+  });
+
+  it("owns active-map deletion in the lifecycle API and uses an in-app confirmation", () => {
+    const management = readFileSync(resolve("src/pages/MapManagementPage.tsx"), "utf8");
+    expect(management).toContain("Dừng và xóa bản đồ đang kích hoạt");
+    expect(management).toContain('map.active_status === "ACTIVE"');
+    expect(management).toContain("map-delete-dialog");
+    expect(management).toContain("api.deleteMap(map.map_id)");
+    expect(management).not.toContain("window.confirm");
+  });
+
+  it("splits map details into compact overview, version and settings tabs", () => {
+    const management = readFileSync(resolve("src/pages/MapManagementPage.tsx"), "utf8");
+    expect(management).toContain('type MapDetailTab = "OVERVIEW" | "VERSIONS" | "SETTINGS"');
+    expect(management).toContain('role="tablist"');
+    expect(management).toContain('role="tabpanel"');
+    expect(management).toContain('setDetailTab("SETTINGS")');
+  });
+
+  it("does not proxy React map routes to Center in Vite development", () => {
+    const viteConfig = readFileSync(resolve("vite.config.ts"), "utf8");
+    expect(viteConfig).not.toContain('"/maps": backendHttpUrl');
+    expect(viteConfig).toContain('"^/maps/.+\\\\.[^/]+$": backendHttpUrl');
+  });
+
+  it("uses a guided create-map route instead of dropping users in the robot list", () => {
+    const management = readFileSync(resolve("src/pages/MapManagementPage.tsx"), "utf8");
+    const createMap = readFileSync(resolve("src/pages/CreateMapPage.tsx"), "utf8");
+    expect(management).toContain('navigate("/maps/create")');
+    expect(management).not.toContain('/robots?intent=mapping');
+    expect(createMap).toContain('api.robots({ page: 1, pageSize: 50, status: "all" })');
+    expect(createMap).toContain("api.createSession(selectedRobot.robot_id)");
+    expect(createMap).toContain("Mở Control để mapping");
+  });
+});

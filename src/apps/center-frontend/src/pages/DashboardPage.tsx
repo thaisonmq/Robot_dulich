@@ -3,7 +3,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Battery, Camera, CameraOff, Gauge,
   ChevronDown, Eye, LogOut, Mic, MicOff, Move, RadioTower, Languages,
-  LockKeyhole, MessageCircleMore, Settings, Signal, Speaker, Volume2, VolumeX,
+  LockKeyhole, MapPinned, MessageCircleMore, Settings, Signal, Speaker, Volume2, VolumeX,
   ZoomIn, ZoomOut,
 } from "lucide-react";
 import { api } from "../api/client";
@@ -11,6 +11,7 @@ import { Brand } from "../components/Brand";
 import { ControlPad } from "../components/ControlPad";
 import { GlobalLanguageSelect } from "../components/GlobalLanguageSelect";
 import { MapPanel } from "../components/MapPanel";
+import { MappingControlPanel } from "../components/MappingControlPanel";
 import { getLanguage } from "../data/languages";
 import { useTeleoperation } from "../hooks/useTeleoperation";
 import { useI18n } from "../i18n/I18nProvider";
@@ -19,7 +20,9 @@ import { useAppStore } from "../state/appStore";
 import type { LiveKitMediaTransport } from "../transports/MediaTransport";
 import type { PtzCommand, PtzSpeed } from "../transports/ControlTransport";
 import { WebSocketTelemetryTransport } from "../transports/TelemetryTransport";
-import type { Destination, MediaState, VideoProfile } from "../types";
+import type {
+  Destination, MediaState, NavigationFeedback, NavigationVisualization, VideoProfile,
+} from "../types";
 import { createUuid } from "../utils/uuid";
 
 const ROBOT_LANGUAGE_CODE = "vi";
@@ -66,10 +69,26 @@ export function DashboardPage() {
   const [ptzSpeed, setPtzSpeed] = useState<PtzSpeed>("medium");
   const [selectedDestination, setSelectedDestination] = useState<Destination | null>(null);
   const [selectedMapId, setSelectedMapId] = useState(selectedRobot?.map_id ?? "");
-  const [mapState, setMapState] = useState("READY");
+  const [activeMapId, setActiveMapId] = useState(
+    selectedRobot?.active_map_version
+      && selectedRobot.map_id
+      && selectedRobot.map_id !== "NO_ACTIVE_MAP"
+      ? selectedRobot.map_id
+      : "",
+  );
+  const [mapState, setMapState] = useState(
+    selectedRobot?.active_map_version ? "READY" : "NO_ACTIVE_MAP",
+  );
   const [mapLocalized, setMapLocalized] = useState(false);
+  const [visualization, setVisualization] = useState<NavigationVisualization | null>(null);
+  const [navigationFeedback, setNavigationFeedback] = useState<NavigationFeedback>({});
+  const [operationMode, setOperationMode] = useState<"navigation" | "mapping">(() => (
+    sessionStorage.getItem("rovera:mapping-intent") ? "mapping" : "navigation"
+  ));
   const [connectionError, setConnectionError] = useState("");
   const [navigationError, setNavigationError] = useState("");
+  const [navigationNotice, setNavigationNotice] = useState("");
+  const [mapActivationError, setMapActivationError] = useState("");
   const [sessionEndedReason, setSessionEndedReason] = useState("");
   const accountLanguageOption = getLanguage(language);
   const robotLanguageOption = getLanguage(ROBOT_LANGUAGE_CODE);
@@ -84,18 +103,50 @@ export function DashboardPage() {
       const runtimeMapState = String(nextHealth.map_state ?? "").toUpperCase();
       if (runtimeMapState) setMapState(runtimeMapState);
       setMapLocalized(Boolean(nextHealth.localized));
+      if (nextHealth.mode === "NAVIGATION") {
+        if (
+          nextHealth.map_id
+          && nextHealth.map_id !== "NO_ACTIVE_MAP"
+          && Number(nextHealth.map_version ?? 0) > 0
+        ) {
+          setActiveMapId(nextHealth.map_id);
+        } else {
+          // The registry may still assign this robot to a map while the
+          // restarted Nav2 adapter has no loaded map. Keep Activate enabled
+          // and reflect the edge runtime instead of that stale assignment.
+          setActiveMapId("");
+        }
+      } else if (runtimeMapState === "NO_ACTIVE_MAP") {
+        setActiveMapId("");
+      }
     },
-    onNavigation: (status) => {
+    onNavigation: (status, payload) => {
       const normalized = status.toUpperCase();
+      const feedback = payload.feedback;
+      if (feedback && typeof feedback === "object") {
+        setNavigationFeedback(feedback as NavigationFeedback);
+      }
       const states = {
         NAVIGATING: "moving", MOVING: "moving", PAUSED: "paused", BLOCKED: "blocked",
-        ARRIVED: "arrived", CANCELED: "cancelled", CANCELLED: "cancelled", FAULT: "failed", FAILED: "failed",
-        READY: "ready", LOCALIZING: "localizing", LOADING_MAP: "loading_map", PLANNING: "planning",
+        ARRIVED: "arrived", SUCCEEDED: "arrived", CANCELED: "cancelled", CANCELLED: "cancelled",
+        FAULT: "failed", FAILED: "failed", LOCALIZATION_FAILED: "failed",
+        READY: "ready", LOCALIZING: "localizing", LOCALIZING_LAST_POSE: "localizing",
+        LOCALIZING_GLOBAL: "localizing", LOCALIZING_ROTATING: "localizing",
+        MAP_LOADING: "loading_map", LOADING_MAP: "loading_map", PLANNING: "planning",
+        RECOVERY: "recovery", LOCALIZATION_LOST: "recovery", LOW_CONFIDENCE: "localizing",
       } as const;
       const next = states[normalized as keyof typeof states];
       if (next) setNavigationState(next);
       setMapState(normalized);
     },
+    onVisualization: (next) => setVisualization((previous) => {
+      const sameMap = previous?.map_id === next.map_id && previous.map_version === next.map_version;
+      return {
+        ...next,
+        global_path: next.global_path ?? (sameMap ? previous?.global_path : []) ?? [],
+        dynamic_obstacles: next.dynamic_obstacles ?? (sameMap ? previous?.dynamic_obstacles : []) ?? [],
+      };
+    }),
     onDisconnect: () => {
       if (sessionEndedRef.current) return;
       manager.clear("telemetry_disconnected", false);
@@ -114,17 +165,28 @@ export function DashboardPage() {
     },
   }), [manager, setConnectionState, setControlState, setHealth, setNavigationState, setPose]);
 
-  const { data: activeMaps = [] } = useQuery({
-    queryKey: ["maps", "ACTIVE"],
-    queryFn: () => api.maps("ACTIVE"),
+  const mapsQuery = useQuery({
+    queryKey: ["maps", "navigation", user?.role],
+    queryFn: () => api.maps(user?.role === "guest" ? "ACTIVE" : undefined),
     enabled: Boolean(selectedRobot),
     staleTime: 5000,
   });
-  const { data: map } = useQuery({
+  const activeMaps = useMemo(() => (mapsQuery.data ?? []).filter(
+    (item) => item.active_version != null && !["ARCHIVED", "DELETED"].includes(item.status ?? ""),
+  ), [mapsQuery.data]);
+  useEffect(() => {
+    if (!mapsQuery.isSuccess || !activeMaps.length) return;
+    const preferred = activeMaps.find((item) => item.map_id === selectedMapId)
+      ?? activeMaps.find((item) => item.map_id === selectedRobot?.map_id)
+      ?? activeMaps[0];
+    if (selectedMapId !== preferred.map_id) setSelectedMapId(preferred.map_id);
+  }, [activeMaps, mapsQuery.isSuccess, selectedMapId, selectedRobot?.map_id]);
+  const mapQuery = useQuery({
     queryKey: ["map", selectedMapId],
     queryFn: () => api.map(selectedMapId),
     enabled: Boolean(selectedMapId),
   });
+  const map = mapQuery.data;
   const { data: destinations = [] } = useQuery({
     queryKey: ["destinations", selectedMapId],
     queryFn: () => api.destinations(selectedMapId),
@@ -203,21 +265,43 @@ export function DashboardPage() {
     onMutate: () => {
       navigationRequestInFlightRef.current = true;
       setNavigationError("");
+      setMapActivationError("");
       setMapState("LOADING_MAP");
       setMapLocalized(false);
       setNavigationState("loading_map");
       setRoute(null);
+      setVisualization(null);
+      return {
+        previousMapState: mapState,
+        previousLocalized: mapLocalized,
+        previousNavigationState: navigationState,
+      };
     },
-    onSuccess: (result) => {
-      const state = String(result.current_state ?? "LOCALIZING");
+    onSuccess: (result, { selectedMap }) => {
+      setMapActivationError("");
+      setSelectedMapId(selectedMap.map_id);
+      setActiveMapId(selectedMap.map_id);
+      const state = String(result.current_state ?? "LOCALIZING_GLOBAL");
       setMapState(state);
       setMapLocalized(Boolean((result.state as { localized?: boolean } | undefined)?.localized));
-      setNavigationState(state === "LOCALIZING" ? "localizing" : "ready");
+      setNavigationState(state === "READY" ? "ready" : "localizing");
     },
-    onError: (reason) => {
-      setMapState("FAULT");
-      setNavigationState("failed");
-      setNavigationError(reason instanceof Error ? reason.message : t("Không thể chuyển sang Nav2"));
+    onError: (reason, _variables, context) => {
+      // Center/edge keep or rollback the previous map. Keep rendering that
+      // map as well, restore its usable localization state, and leave the
+      // selector unlocked so another candidate can be tried immediately.
+      const wasLocalized = Boolean(context?.previousLocalized);
+      setMapState(wasLocalized ? "READY" : context?.previousMapState ?? "NO_ACTIVE_MAP");
+      setMapLocalized(wasLocalized);
+      setNavigationState(
+        wasLocalized
+          ? "ready"
+          : context?.previousNavigationState === "loading_map"
+            ? "idle"
+            : context?.previousNavigationState ?? "idle",
+      );
+      const message = reason instanceof Error ? reason.message : t("Không thể chuyển sang Nav2");
+      setMapActivationError(message);
     },
     onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
@@ -238,10 +322,26 @@ export function DashboardPage() {
     onMutate: () => {
       navigationRequestInFlightRef.current = true;
       setNavigationError("");
+      setNavigationNotice("");
       setNavigationState("previewing");
     },
-    onSuccess: (newRoute) => {
+    onSuccess: (newRoute, requestedDestination) => {
       setRoute(newRoute);
+      if (newRoute.goal) {
+        const adjustment = Math.hypot(
+          newRoute.goal.x - requestedDestination.x,
+          newRoute.goal.y - requestedDestination.y,
+        );
+        setSelectedDestination({
+          ...requestedDestination,
+          x: newRoute.goal.x,
+          y: newRoute.goal.y,
+          yaw: newRoute.goal.yaw,
+        });
+        if (adjustment > 0.02) {
+          setNavigationNotice(t("Điểm gần vật cản đã được chuyển sang vị trí an toàn gần nhất."));
+        }
+      }
       setNavigationState("route_ready");
     },
     onError: (reason) => {
@@ -250,8 +350,8 @@ export function DashboardPage() {
     },
     onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
-  const setInitialPose = useMutation({
-    mutationFn: (destination: Destination) => api.setInitialPose({
+  const setApproximatePose = useMutation({
+    mutationFn: (destination: Destination) => api.setApproximatePose({
       request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
       expected_state: mapState, map_id: map!.map_id, version: map!.active_version!,
       pose: { x: destination.x, y: destination.y, yaw: destination.yaw },
@@ -271,6 +371,23 @@ export function DashboardPage() {
       setNavigationState("failed");
       setNavigationError(reason instanceof Error ? reason.message : t("Không thể đặt vị trí ban đầu"));
     },
+    onSettled: () => { navigationRequestInFlightRef.current = false; },
+  });
+  const relocalize = useMutation({
+    mutationFn: () => api.relocalize({
+      request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
+      expected_state: mapState, map_id: map!.map_id, version: map!.active_version!,
+    }),
+    onMutate: () => {
+      navigationRequestInFlightRef.current = true;
+      setNavigationError("");
+      setMapLocalized(false);
+      setNavigationState("localizing");
+    },
+    onSuccess: (result) => setMapState(String(result.current_state ?? "LOCALIZING_GLOBAL")),
+    onError: (reason) => setNavigationError(
+      reason instanceof Error ? reason.message : t("Không thể tự định vị lại"),
+    ),
     onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
   const sendGoal = useMutation({
@@ -324,6 +441,9 @@ export function DashboardPage() {
     ...(health.battery_percent >= 15 ? [] : ["BATTERY_LOW"]),
     ...(controlState === "ready" || controlState === "active" || isSpectator ? [] : ["NO_CONTROL_LEASE"]),
   ];
+  const canRequestNewPath = [
+    "READY", "SUCCEEDED", "ARRIVED", "CANCELED", "CANCELLED", "FAILED", "BLOCKED",
+  ].includes(mapState);
 
   function stopPtz() {
     if (ptzRepeatRef.current !== null) {
@@ -930,21 +1050,41 @@ export function DashboardPage() {
                 </>
               )}
             </aside>
-            {map && (
-              <MapPanel
+            <div className="operation-panel">
+              {!isSpectator && <div className="operation-tabs" role="tablist" aria-label={t("Chế độ vận hành")}>
+                <button type="button" role="tab" aria-selected={operationMode === "navigation"}
+                  className={operationMode === "navigation" ? "is-active" : ""}
+                  onClick={() => setOperationMode("navigation")}>{t("Hành trình")}</button>
+                <button type="button" role="tab" aria-selected={operationMode === "mapping"}
+                  className={operationMode === "mapping" ? "is-active" : ""}
+                  onClick={() => setOperationMode("mapping")}>{t("Tạo bản đồ")}</button>
+              </div>}
+              {operationMode === "mapping" && !isSpectator ? (
+                <MappingControlPanel robotId={robotId} health={health} expectedState={mapState}
+                  disabled={connectionState !== "connected" || controlState === "disabled"} />
+              ) : map ? (
+                <MapPanel
                 map={map}
                 maps={activeMaps}
-                selectedMapId={selectedMapId}
+                selectedMapId={activeMapId || undefined}
                 destinations={destinations}
                 pose={pose}
                 route={route}
                 selected={selectedDestination}
-                loading={preview.isPending || loadMap.isPending || setInitialPose.isPending}
+                loading={preview.isPending || loadMap.isPending || setApproximatePose.isPending || relocalize.isPending}
                 navigationStatus={navigationState}
                 mapState={mapState}
+                localizationState={health.localization_state ?? mapState}
+                localizationConfidence={Number(health.localization_confidence ?? pose.confidence ?? 0)}
+                health={health}
+                visualization={visualization}
+                feedback={navigationFeedback}
+                footprint={health.footprint}
                 canStart={Boolean(route && preflightFailures.length === 0)}
                 preflightFailures={preflightFailures}
                 errorMessage={navigationError}
+                noticeMessage={navigationNotice}
+                mapActivationError={mapActivationError}
                 localized={mapLocalized}
                 readOnly={isSpectator}
                 onMapChange={(mapId) => {
@@ -952,7 +1092,6 @@ export function DashboardPage() {
                   const nextMap = activeMaps.find((item) => item.map_id === mapId);
                   if (!nextMap?.active_version) return;
                   const expectedState = mapState;
-                  setSelectedMapId(mapId);
                   setSelectedDestination(null);
                   setRoute(null);
                   loadMap.mutate({ selectedMap: nextMap, expectedState });
@@ -960,10 +1099,17 @@ export function DashboardPage() {
                 onSelect={(destination) => {
                   if (navigationRequestInFlightRef.current) return;
                   setSelectedDestination(destination);
-                  if (mapState !== "LOCALIZING") preview.mutate(destination);
+                  setRoute(null);
+                  if (canRequestNewPath && mapLocalized) preview.mutate(destination);
                 }}
                 onSetInitialPose={() => {
-                  if (selectedDestination && map?.active_version) setInitialPose.mutate(selectedDestination);
+                  if (selectedDestination && map?.active_version) setApproximatePose.mutate(selectedDestination);
+                }}
+                onRetryLocalization={() => relocalize.mutate()}
+                onClearSelection={() => {
+                  setSelectedDestination(null);
+                  setRoute(null);
+                  setNavigationNotice("");
                 }}
                 onGo={() => sendGoal.mutate()}
                 onPause={() => {
@@ -979,8 +1125,31 @@ export function DashboardPage() {
                     setNavigationState("cancelled");
                   }
                 }}
-              />
-            )}
+                />
+              ) : mapsQuery.isLoading || mapQuery.isLoading ? (
+                <section className="map-section map-section--empty map-section--loading" aria-live="polite">
+                  <span className="map-list-loading" />
+                  <h2>{t("Đang tải danh sách bản đồ…")}</h2>
+                </section>
+              ) : activeMaps.length ? (
+                <section className="map-section map-section--empty map-selection-empty">
+                  <MapPinned size={28} />
+                  <h2>{t("Chọn bản đồ điều hướng")}</h2>
+                  <select value={selectedMapId} aria-label={t("Bản đồ")} onChange={(event) => setSelectedMapId(event.target.value)}>
+                    {activeMaps.map((item) => <option value={item.map_id} key={item.map_id}>
+                      {item.name} · {item.site_id || "—"} / {item.floor_id || "—"} · v{item.active_version}
+                    </option>)}
+                  </select>
+                </section>
+              ) : (
+                <section className="map-section map-section--empty">
+                  <MapPinned size={28} />
+                  <h2>{t(mapsQuery.isError ? "Không tải được danh sách bản đồ" : "Chưa có map được kích hoạt")}</h2>
+                  <p>{t(mapsQuery.isError ? "Kiểm tra kết nối Center rồi thử lại." : "Kích hoạt một bản đồ trong thư viện để bắt đầu Nav2.")}</p>
+                  {mapsQuery.isError && <button type="button" onClick={() => void mapsQuery.refetch()}>{t("Thử lại")}</button>}
+                </section>
+              )}
+            </div>
           </div>
         </section>
       </div>

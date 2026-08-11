@@ -6,6 +6,16 @@ class InvalidTransition(ValueError):
 
 
 MAPPING_TRANSITIONS: dict[str, frozenset[str]] = {
+    "MAPPING_STARTING": frozenset({"MAPPING_RUNNING", "MAPPING_ERROR", "CANCELED"}),
+    "MAPPING_RUNNING": frozenset({
+        "MAPPING_STOPPED_UNSAVED", "MAPPING_SAVING", "CANCELED", "MAPPING_ERROR",
+    }),
+    "MAPPING_STOPPED_UNSAVED": frozenset({
+        "MAPPING_RUNNING", "MAPPING_SAVING", "CANCELED", "MAPPING_ERROR",
+    }),
+    "MAPPING_SAVING": frozenset({"FINISHED", "MAPPING_STOPPED_UNSAVED", "MAPPING_ERROR"}),
+    "MAPPING_ERROR": frozenset({"CANCELED"}),
+    # Legacy states are retained for sessions created before migration 0007.
     "STARTING": frozenset({"MAPPING", "FAULT", "CANCELED"}),
     "MAPPING": frozenset({"PAUSED", "SAVING", "FINISHING", "CANCELED", "FAULT"}),
     "PAUSED": frozenset({"MAPPING", "SAVING", "FINISHING", "CANCELED", "FAULT"}),
@@ -18,13 +28,45 @@ MAPPING_TRANSITIONS: dict[str, frozenset[str]] = {
 }
 
 NAVIGATION_TRANSITIONS: dict[str, frozenset[str]] = {
+    "MAP_LOADING": frozenset({
+        "LOCALIZATION_INITIALIZING", "LOCALIZING_LAST_POSE", "LOCALIZING_GLOBAL",
+        "FAILED", "CANCELED",
+    }),
+    "LOCALIZATION_INITIALIZING": frozenset({
+        "LOCALIZING_LAST_POSE", "LOCALIZING_GLOBAL", "LOCALIZATION_FAILED", "CANCELED",
+    }),
+    "LOCALIZING_LAST_POSE": frozenset({
+        "READY", "LOW_CONFIDENCE", "LOCALIZING_GLOBAL", "LOCALIZATION_FAILED", "CANCELED",
+    }),
+    "LOCALIZING_GLOBAL": frozenset({
+        "READY", "LOW_CONFIDENCE", "LOCALIZING_ROTATING", "LOCALIZATION_FAILED", "CANCELED",
+    }),
+    "LOCALIZING_ROTATING": frozenset({
+        "READY", "LOW_CONFIDENCE", "LOCALIZATION_FAILED", "CANCELED",
+    }),
+    "LOW_CONFIDENCE": frozenset({
+        "LOCALIZING_GLOBAL", "LOCALIZING_ROTATING", "READY", "LOCALIZATION_FAILED", "CANCELED",
+    }),
+    "LOCALIZATION_FAILED": frozenset({
+        "LOCALIZATION_INITIALIZING", "LOCALIZING_GLOBAL", "CANCELED",
+    }),
+    "LOCALIZATION_LOST": frozenset({
+        "LOCALIZING_GLOBAL", "LOCALIZING_ROTATING", "READY", "LOCALIZATION_FAILED", "CANCELED",
+    }),
+    # Legacy aliases remain valid while old edge agents roll forward.
     "LOADING_MAP": frozenset({"LOCALIZING", "FAULT", "CANCELED"}),
     "LOCALIZING": frozenset({"READY", "FAULT", "CANCELED"}),
     "READY": frozenset({"PLANNING", "NAVIGATING", "FAULT", "CANCELED"}),
-    "PLANNING": frozenset({"READY", "NAVIGATING", "BLOCKED", "FAULT", "CANCELED"}),
-    "NAVIGATING": frozenset({"PAUSED", "BLOCKED", "ARRIVED", "CANCELED", "FAULT"}),
+    "PLANNING": frozenset({"READY", "NAVIGATING", "BLOCKED", "RECOVERY", "FAILED", "FAULT", "CANCELED"}),
+    "NAVIGATING": frozenset({
+        "PAUSED", "BLOCKED", "RECOVERY", "LOCALIZATION_LOST", "SUCCEEDED",
+        "ARRIVED", "CANCELED", "FAILED", "FAULT",
+    }),
     "PAUSED": frozenset({"NAVIGATING", "CANCELED", "FAULT"}),
-    "BLOCKED": frozenset({"NAVIGATING", "PAUSED", "CANCELED", "FAULT"}),
+    "BLOCKED": frozenset({"NAVIGATING", "PAUSED", "RECOVERY", "CANCELED", "FAILED", "FAULT"}),
+    "RECOVERY": frozenset({"NAVIGATING", "BLOCKED", "CANCELED", "FAILED", "FAULT"}),
+    "SUCCEEDED": frozenset(),
+    "FAILED": frozenset({"CANCELED"}),
     "ARRIVED": frozenset(),
     "CANCELED": frozenset(),
     "FAULT": frozenset({"CANCELED"}),

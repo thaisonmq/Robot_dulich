@@ -6,6 +6,7 @@ import korean from "./locales/ko.json";
 import russian from "./locales/ru.json";
 import thai from "./locales/th.json";
 import chinese from "./locales/zh.json";
+import { MAP_TRANSLATIONS } from "./mapTranslations";
 
 export type TranslationVariables = Record<string, string | number>;
 
@@ -838,16 +839,18 @@ const JAPANESE: Record<string, string> = {
   "Ảnh kiểm thử tự động": "自動テストパターン",
 };
 
+const ENGLISH_CATALOGUE = { ...MAP_TRANSLATIONS.en, ...ENGLISH };
+
 const CATALOGUES: Record<string, Record<string, string>> = {
-  de: german,
-  en: ENGLISH,
-  es: spanish,
-  fr: french,
-  ja: { ...generatedJapanese, ...JAPANESE },
-  ko: korean,
-  ru: russian,
-  th: thai,
-  zh: chinese,
+  de: { ...MAP_TRANSLATIONS.de, ...german },
+  en: ENGLISH_CATALOGUE,
+  es: { ...MAP_TRANSLATIONS.es, ...spanish },
+  fr: { ...MAP_TRANSLATIONS.fr, ...french },
+  ja: { ...MAP_TRANSLATIONS.ja, ...generatedJapanese, ...JAPANESE },
+  ko: { ...MAP_TRANSLATIONS.ko, ...korean },
+  ru: { ...MAP_TRANSLATIONS.ru, ...russian },
+  th: { ...MAP_TRANSLATIONS.th, ...thai },
+  zh: { ...MAP_TRANSLATIONS.zh, ...chinese },
 };
 
 export function translate(
@@ -861,8 +864,8 @@ export function translate(
   if (source.includes(" + ")) {
     return source.split(" + ").map((part) => translate(language, part)).join(" + ");
   }
-  const catalogue = CATALOGUES[language] ?? ENGLISH;
-  const template = language === "vi" ? source : catalogue[source] ?? ENGLISH[source] ?? source;
+  const catalogue = CATALOGUES[language] ?? ENGLISH_CATALOGUE;
+  const template = language === "vi" ? source : catalogue[source] ?? ENGLISH_CATALOGUE[source] ?? source;
   return Object.entries(variables).reduce(
     (result, [key, value]) => result.replaceAll(`{${key}}`, String(value)),
     template,

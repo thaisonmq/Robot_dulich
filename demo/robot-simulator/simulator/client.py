@@ -470,6 +470,7 @@ class RobotConnectionClient:
             asyncio.create_task(self._heartbeat_loop(socket)),
             asyncio.create_task(self._media_loop()),
             asyncio.create_task(self._mapping_upload_retry_loop()),
+            asyncio.create_task(self._map_registry_sync_loop()),
             asyncio.create_task(self._navigation_runtime_loop(socket)),
         ]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -1302,7 +1303,37 @@ class RobotConnectionClient:
     async def _execute_navigation_command(
         self, command: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        if command in {"mapping.start", "mapping.finish", "map.load"}:
+        if command == "map.resync":
+            map_id = str(payload.get("map_id", ""))
+            version = int(payload.get("version", 0))
+            self.map_cache._validate_identity(map_id, version)
+            bundle = (
+                Path(self.config.map_cache_dir) / "created" / map_id
+                / f"v{version}" / "map-bundle.tar.gz"
+            )
+            if not bundle.is_file():
+                raise NavigationBackendError(
+                    "LOCAL_MAP_MISSING",
+                    "Pi không còn bundle local để đồng bộ lại",
+                    current_state=str(self.navigation_backend.state().get("state", "FAULT")),
+                )
+            upload = {
+                "map_id": map_id,
+                "version": version,
+                "robot_id": self.config.robot_id,
+                "bundle_path": str(bundle),
+            }
+            self._queue_mapping_upload(upload)
+            self._spawn_background(self._upload_mapping_bundle_safely(upload))
+            return {
+                "status": "accepted",
+                "current_state": str(self.navigation_backend.state().get("state", "IDLE")),
+                "sync_status": "SYNC_PENDING",
+            }
+        if command in {
+            "mapping.start", "mapping.stop", "mapping.finish", "mapping.save",
+            "map.load", "map.deactivate", "navigation.cancel",
+        }:
             # Mode changes and map replacement are stationary operations. Send
             # an immediate zero through the existing motion owner before the
             # host supervisor replaces any ROS stack.
@@ -1317,6 +1348,13 @@ class RobotConnectionClient:
                 current_state="FAULT",
             )
         command_payload = dict(payload)
+        if command == "mapping.start":
+            state = self.navigation_backend.state()
+            current = str(state.get("state", "")).upper()
+            if current in {"NAVIGATING", "PAUSED", "BLOCKED", "RECOVERY"}:
+                await self.navigation_backend.execute(
+                    "navigation.cancel", {"expected_state": current, "reason": "mapping_start"}
+                )
         if command == "map.load" and self.config.navigation_backend == "ros2":
             destination = await self.map_cache.ensure(
                 map_id=str(payload["map_id"]),
@@ -1325,6 +1363,9 @@ class RobotConnectionClient:
                 download_url=str(payload["download_url"]),
             )
             command_payload["map_path"] = str(destination)
+            command_payload["last_known_pose"] = self.map_cache.activation_pose(
+                str(payload["map_id"]), int(payload["version"]), destination
+            )
         if (
             command == "mapping.start"
             and self.config.navigation_backend == "ros2"
@@ -1344,8 +1385,20 @@ class RobotConnectionClient:
                 raise MapCacheError("downloaded map has no serialized pose-graph")
             command_payload["posegraph_path"] = str(posegraph)
         result = await self.navigation_backend.execute(command, command_payload)
+        if command == "map.load" and result.get("status") in {"accepted", "completed"}:
+            self.map_cache.mark_active(
+                str(payload["map_id"]),
+                int(payload["version"]),
+                str(payload["checksum"]),
+                Path(str(command_payload["map_path"])),
+            )
+        if command == "map.deactivate" and payload.get("delete_local"):
+            self.map_cache.delete_local(
+                str(payload["map_id"]),
+                deleted_at=float(payload.get("deleted_at") or time.time()),
+            )
         bundle_path = str(result.get("bundle_path", ""))
-        if command in {"mapping.save_draft", "mapping.finish"} and bundle_path:
+        if command in {"mapping.save", "mapping.save_draft", "mapping.finish"} and bundle_path:
             upload = {
                 "map_id": str(payload["map_id"]),
                 "version": int(payload["version"]),
@@ -1435,8 +1488,14 @@ class RobotConnectionClient:
                     files={"bundle": (path.name, source, "application/gzip")},
                 )
                 response.raise_for_status()
+                remote_checksum = str(response.json().get("checksum", "")).lower()
+                if remote_checksum != checksum.lower():
+                    raise MapCacheError("Center acknowledged a different map checksum")
 
         await asyncio.to_thread(send)
+        self.map_cache.mark_synced(
+            str(upload["map_id"]), int(upload["version"]), checksum
+        )
         path.with_name(".upload-pending.json").unlink(missing_ok=True)
 
     async def _upload_mapping_bundle_safely(self, upload: dict[str, Any]) -> None:
@@ -1456,9 +1515,16 @@ class RobotConnectionClient:
     def _queue_mapping_upload(self, upload: dict[str, Any]) -> None:
         marker = Path(str(upload["bundle_path"])).with_name(".upload-pending.json")
         marker.write_text(json.dumps(upload))
+        try:
+            checksum = self._file_sha256(Path(str(upload["bundle_path"])))
+            self.map_cache.mark_local(
+                str(upload["map_id"]), int(upload["version"]), checksum, "SYNC_PENDING"
+            )
+        except (OSError, MapCacheError) as exc:
+            logger.warning("cannot update local map registry error=%s", exc)
 
     async def _mapping_upload_retry_loop(self) -> None:
-        root = Path(self.config.map_cache_dir).parent / "created"
+        root = Path(self.config.map_cache_dir) / "created"
         while True:
             for marker in (root.glob("*/*/.upload-pending.json") if root.exists() else ()):
                 try:
@@ -1471,12 +1537,101 @@ class RobotConnectionClient:
                     logger.warning("mapping bundle retry pending marker=%s error=%s", marker, exc)
             await asyncio.sleep(10)
 
+    async def _map_registry_sync_loop(self) -> None:
+        """Apply Center tombstones after reconnect so deleted maps never resurrect."""
+        while True:
+            try:
+                token = await self._robot_bearer_token()
+                async with httpx.AsyncClient(
+                    base_url=self.config.center_api_url.rstrip("/"),
+                    verify=self.http_verify,
+                    timeout=20,
+                ) as client:
+                    response = await client.get(
+                        "/api/maps/tombstones",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    response.raise_for_status()
+                    for item in response.json().get("items", []):
+                        map_id = str(item.get("map_id", ""))
+                        if not map_id:
+                            continue
+                        active = self.map_cache.active()
+                        backend_state = self.navigation_backend.state()
+                        runtime_has_map = str(backend_state.get("map_id") or "") == map_id
+                        if runtime_has_map or (active and active.get("map_id") == map_id):
+                            try:
+                                await self.navigation_backend.execute(
+                                    "map.deactivate",
+                                    {"expected_state": backend_state.get("state", "")},
+                                )
+                            except NavigationBackendError as exc:
+                                self._stop_motion("map_tombstone_deactivate_failed")
+                                # Persist the tombstone immediately so a reboot
+                                # cannot resurrect the map, but do not ACK
+                                # Center until the ROS runtime is confirmed IDLE.
+                                self.map_cache.delete_local(
+                                    map_id,
+                                    deleted_at=float(item.get("deleted_at_unix") or time.time()),
+                                )
+                                logger.warning(
+                                    "map tombstone waiting for runtime deactivation map_id=%s error=%s",
+                                    map_id,
+                                    exc,
+                                )
+                                continue
+                        self.map_cache.delete_local(
+                            map_id, deleted_at=float(item.get("deleted_at_unix") or time.time())
+                        )
+                        ack = await client.post(
+                            f"/api/maps/tombstones/{map_id}/ack",
+                            headers={"Authorization": f"Bearer {token}"},
+                            json={"robot_id": self.config.robot_id},
+                        )
+                        ack.raise_for_status()
+                        self.map_cache.acknowledge_tombstone(map_id)
+            except asyncio.CancelledError:
+                raise
+            except (httpx.HTTPError, OSError, ValueError, MapCacheError) as exc:
+                logger.debug("map registry sync pending error=%s", exc)
+            await asyncio.sleep(30)
+
+    async def _restore_active_navigation_map(
+        self, state: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Restore the verified active map after a Nav2/adapter restart.
+
+        The active assignment and bundle survive container and Web session
+        restarts, while the map_server process does not. Waiting for an
+        operator to click Activate again left later Control sessions without
+        a map->base pose even though the exact map was already cached.
+        """
+        if str(state.get("state", "")).upper() != "NO_ACTIVE_MAP":
+            return None
+        if str(state.get("mode", "NAVIGATION")).upper() != "NAVIGATION":
+            return None
+        payload = self.map_cache.active_load_payload(expected_state="NO_ACTIVE_MAP")
+        if payload is None:
+            return None
+        self._stop_motion("restore_active_navigation_map")
+        result = await self.navigation_backend.execute("map.load", payload)
+        logger.info(
+            "restored active navigation map map_id=%s version=%s",
+            payload["map_id"],
+            payload["version"],
+        )
+        return result
+
     async def _navigation_runtime_loop(self, socket: Any) -> None:
         if self.config.navigation_backend != "ros2":
             return
-        last_map_revision = -1
-        last_scan: list[dict[str, float]] | None = None
+        last_visualization_revision = -1
+        last_visualization_identity: tuple[str, int] | None = None
+        last_global_path: list[dict[str, Any]] | None = None
+        last_dynamic_obstacles: list[dict[str, Any]] | None = None
+        last_pose_save = 0.0
         last_poll_warning = 0.0
+        last_restore_attempt = 0.0
         adapter_was_unavailable = False
         while True:
             try:
@@ -1485,6 +1640,18 @@ class RobotConnectionClient:
                     logger.info("ROS 2 navigation adapter connection recovered")
                     adapter_was_unavailable = False
                 state = dict(result.get("state") or {})
+                if (
+                    str(state.get("state", "")).upper() == "NO_ACTIVE_MAP"
+                    and time.monotonic() - last_restore_attempt >= 10.0
+                ):
+                    last_restore_attempt = time.monotonic()
+                    try:
+                        restored = await self._restore_active_navigation_map(state)
+                        if restored is not None:
+                            result = restored
+                            state = dict(restored.get("state") or state)
+                    except (NavigationBackendError, MapCacheError, OSError, ValueError) as exc:
+                        logger.warning("active map restore pending error=%s", exc)
                 await socket.send(
                     json.dumps(
                         make_message(
@@ -1495,34 +1662,39 @@ class RobotConnectionClient:
                         )
                     )
                 )
-                snapshot = result.get("mapping_snapshot")
-                if isinstance(snapshot, dict):
-                    revision = int(snapshot.get("revision", -1))
-                    if revision != last_map_revision:
-                        last_map_revision = revision
+                visualization = result.get("visualization")
+                if isinstance(visualization, dict):
+                    revision = int(visualization.get("revision", -1))
+                    if revision != last_visualization_revision:
+                        last_visualization_revision = revision
+                        identity = (
+                            str(visualization.get("map_id", "")),
+                            int(visualization.get("map_version", 0) or 0),
+                        )
+                        path = list(visualization.get("global_path") or [])
+                        obstacles = list(visualization.get("dynamic_obstacles") or [])
+                        changed: dict[str, Any] = {
+                            "revision": revision,
+                            "map_id": identity[0],
+                            "map_version": identity[1],
+                        }
+                        if identity != last_visualization_identity or path != last_global_path:
+                            changed["global_path"] = path
+                            last_global_path = path
+                        if identity != last_visualization_identity or obstacles != last_dynamic_obstacles:
+                            changed["dynamic_obstacles"] = obstacles
+                            last_dynamic_obstacles = obstacles
+                        last_visualization_identity = identity
                         await socket.send(
                             json.dumps(
                                 make_message(
-                                    "mapping.snapshot",
+                                    "navigation.visualization",
                                     self.config.robot_id,
                                     self._next_sequence(),
-                                    snapshot,
+                                    changed,
                                 )
                             )
                         )
-                scan = result.get("scan")
-                if isinstance(scan, list) and scan != last_scan:
-                    last_scan = scan
-                    await socket.send(
-                        json.dumps(
-                            make_message(
-                                "mapping.scan",
-                                self.config.robot_id,
-                                self._next_sequence(),
-                                {"points": scan},
-                            )
-                        )
-                    )
                 pose = result.get("pose")
                 if isinstance(pose, dict):
                     await socket.send(
@@ -1533,15 +1705,37 @@ class RobotConnectionClient:
                                 self._next_sequence(),
                                 {
                                     "map_id": state.get("map_id", self.config.map_id),
+                                    "map_version": int(state.get("map_version", 0) or 0),
                                     "x": pose.get("x", 0),
                                     "y": pose.get("y", 0),
                                     "yaw": pose.get("yaw", 0),
                                     "linear_velocity": 0,
                                     "angular_velocity": 0,
+                                    "timestamp": time.time(),
+                                    "localized": bool(state.get("localized")),
+                                    "confidence": float(state.get("localization_confidence", 0)),
                                 },
                             )
                         )
                     )
+                    if (
+                        state.get("localized")
+                        and state.get("map_id")
+                        and int(state.get("map_version", 0) or 0) > 0
+                        and time.monotonic() - last_pose_save >= 5.0
+                    ):
+                        last_pose_save = time.monotonic()
+                        self.map_cache.save_last_pose(
+                            str(state["map_id"]),
+                            int(state["map_version"]),
+                            {
+                                **pose,
+                                "covariance": max(
+                                    0.01,
+                                    1.0 - float(state.get("localization_confidence", 0)),
+                                ),
+                            },
+                        )
             except asyncio.CancelledError:
                 raise
             except NavigationBackendError as exc:
@@ -1606,6 +1800,7 @@ class RobotConnectionClient:
                     )
                 )
             backend_state = self.navigation_backend.state()
+            registry_health = self.map_cache.health()
             await socket.send(
                 json.dumps(
                     make_message(
@@ -1637,7 +1832,12 @@ class RobotConnectionClient:
                             "motion_backend": self.config.motion_backend,
                             "navigation_backend": self.config.navigation_backend,
                             "map_state": backend_state.get("state"),
+                            "map_id": backend_state.get("map_id", ""),
+                            "mode": backend_state.get("mode"),
+                            "map_version": backend_state.get("map_version", 0),
                             "localized": backend_state.get("localized", False),
+                            "localization_state": backend_state.get("localization_state", "IDLE"),
+                            "localization_confidence": backend_state.get("localization_confidence", 0),
                             "nav2": backend_state.get("nav2", "UNAVAILABLE"),
                             "safety": (
                                 "HEALTHY"
@@ -1661,6 +1861,9 @@ class RobotConnectionClient:
                             ),
                             "estop": False,
                             "collision_fault": False,
+                            "mapping": backend_state.get("mapping"),
+                            "map_registry": registry_health,
+                            "footprint": backend_state.get("footprint"),
                         },
                     )
                 )

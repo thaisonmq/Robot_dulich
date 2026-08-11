@@ -1,5 +1,7 @@
 # Mapping, Nav2 và Motion Safety
 
+> Tài liệu triển khai hiện hành: [Mapping và Navigation](MAPPING_AND_NAVIGATION.md), [Map Registry](MAP_REGISTRY.md) và [RViz2](RVIZ_MAPPING_GUIDE.md). Các mô tả cũ về raw scan/live-map trên Web hoặc yêu cầu đặt initial pose mặc định không còn áp dụng.
+
 Tài liệu này mô tả kiến trúc production, thao tác vận hành và cổng an toàn cho tính năng tạo/phân phối map và điều hướng. Không dùng các lệnh `NavigateToPose`, `/cmd_vel*` hoặc test motor trong tài liệu này nếu chưa có xác nhận thử chuyển động vật lý.
 
 ## Kiến trúc và data flow

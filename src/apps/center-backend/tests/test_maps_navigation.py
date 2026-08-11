@@ -8,11 +8,15 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app.api.maps import _mapping_action_reached, _posegraph_basename
+from app.api.maps import (
+    _mapping_action_reached,
+    _mapping_start_health_failures,
+    _posegraph_basename,
+)
 from app.api.navigation import _robot_by_public_id
 from app.api.websockets import persist_robot_runtime_event
 from app.models.database import Base, SessionLocal
-from app.models.entities import MapRecord, MappingSession, MapVersion, Robot
+from app.models.entities import MapRecord, MappingSession, MapVersion, NavigationMission, Robot
 from app.services.map_storage import InvalidMapBundle, MapBundleStore
 from app.services.state_machines import (
     InvalidTransition,
@@ -43,18 +47,33 @@ def test_navigation_resolves_robot_by_public_robot_id() -> None:
 
 def bundle_bytes(*, unsafe: bool = False) -> bytes:
     output = io.BytesIO()
+    artifacts = {
+        "map.yaml": b"image: map.pgm\nresolution: 0.05\norigin: [-1, -2, 0.1]\n",
+        "map.pgm": b"P2\n2 2\n255\n254 0 254 0\n",
+    }
     metadata = {
         "map_id": "MAP-TEST",
+        "name": "Test map",
         "version": 1,
+        "robot_id": "ROBOT-001",
+        "created_at": 1.0,
+        "updated_at": 1.0,
         "resolution": 0.05,
         "origin": {"x": -1.0, "y": -2.0, "yaw": 0.1},
         "width": 2,
         "height": 2,
+        "frame_id": "map",
+        "checksum": hashlib.sha256(artifacts["map.pgm"]).hexdigest(),
+        "has_posegraph": False,
+        "slam_mode": "slam_toolbox_online_async",
+        "files": {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in artifacts.items()
+        },
     }
     with tarfile.open(fileobj=output, mode="w:gz") as archive:
         for name, payload in {
-            "map.yaml": b"image: map.pgm\nresolution: 0.05\norigin: [-1, -2, 0.1]\n",
-            "map.pgm": b"P2\n2 2\n255\n254 0 254 0\n",
+            **artifacts,
             "metadata.json": json.dumps(metadata).encode(),
             "../escape": b"unsafe",
         }.items():
@@ -99,6 +118,10 @@ def test_map_bundle_rejects_path_traversal(tmp_path: Path) -> None:
 
 
 def test_mapping_and_navigation_state_machines_are_idempotent_and_strict() -> None:
+    assert mapping_transition("MAPPING_STARTING", "MAPPING_RUNNING") == "MAPPING_RUNNING"
+    assert mapping_transition("MAPPING_RUNNING", "MAPPING_STOPPED_UNSAVED") == "MAPPING_STOPPED_UNSAVED"
+    assert mapping_transition("MAPPING_STOPPED_UNSAVED", "MAPPING_SAVING") == "MAPPING_SAVING"
+    assert mapping_transition("MAPPING_SAVING", "FINISHED") == "FINISHED"
     assert mapping_transition("MAPPING", "PAUSED") == "PAUSED"
     assert mapping_transition("MAPPING", "MAPPING") == "MAPPING"
     assert mapping_transition("MAPPING", "FINISHING") == "FINISHING"
@@ -106,6 +129,10 @@ def test_mapping_and_navigation_state_machines_are_idempotent_and_strict() -> No
     with pytest.raises(InvalidTransition):
         mapping_transition("FINISHED", "MAPPING")
     assert navigation_transition("READY", "PLANNING") == "PLANNING"
+    assert navigation_transition("MAP_LOADING", "LOCALIZING_LAST_POSE") == "LOCALIZING_LAST_POSE"
+    assert navigation_transition("LOCALIZING_LAST_POSE", "LOCALIZING_GLOBAL") == "LOCALIZING_GLOBAL"
+    assert navigation_transition("LOCALIZING_GLOBAL", "LOCALIZING_ROTATING") == "LOCALIZING_ROTATING"
+    assert navigation_transition("LOCALIZING_ROTATING", "READY") == "READY"
     assert navigation_transition("NAVIGATING", "PAUSED") == "PAUSED"
     with pytest.raises(InvalidTransition):
         navigation_transition("ARRIVED", "NAVIGATING")
@@ -125,6 +152,35 @@ def test_mapping_action_accepts_authoritative_idempotent_terminal_state() -> Non
         "save-draft",
         "MAPPING",
     ) is False
+
+
+def test_mapping_start_from_idle_defers_health_gate_to_started_slam_adapter() -> None:
+    assert _mapping_start_health_failures(
+        {"source": "robot"},
+        {
+            "mode": "IDLE",
+            "scan_fresh": False,
+            "odometry_ready": False,
+            "lidar_tf_ready": False,
+            "safety": "UNKNOWN",
+        },
+    ) == []
+
+
+def test_mapping_start_keeps_strict_gate_when_ros_runtime_is_active() -> None:
+    failures = _mapping_start_health_failures(
+        {"source": "robot"},
+        {
+            "mode": "NAVIGATION",
+            "scan_fresh": True,
+            "odometry_ready": True,
+            "lidar_tf_ready": True,
+            "safety": "UNKNOWN",
+            "estop": False,
+        },
+    )
+
+    assert failures == ["Motion safety chưa sẵn sàng."]
 
 
 def test_map_version_only_continues_with_complete_posegraph_pair() -> None:
@@ -269,3 +325,46 @@ def test_idle_runtime_does_not_fault_mapping_while_start_command_is_pending() ->
         assert session.status == "MAPPING"
         assert session.error_code is None
         assert session.error_message is None
+
+
+def test_navigation_runtime_preserves_failed_and_ignores_map_only_states() -> None:
+    map_id = "MAP-MISSION-RUNTIME"
+    mission_id = "mission-runtime-state"
+    with SessionLocal.begin() as database:
+        database.add(MapRecord(
+            map_id=map_id,
+            name="Mission state map",
+            image_url="",
+            width_pixels=1,
+            height_pixels=1,
+            resolution_m_per_pixel=0.05,
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            status="ACTIVE",
+        ))
+        database.add(NavigationMission(
+            mission_id=mission_id,
+            request_id="request-runtime-state",
+            robot_id="ROBOT-MISSION-STATE",
+            control_session_id="session-runtime-state",
+            map_id=map_id,
+            map_version=1,
+            status="NAVIGATING",
+            goal={"x": 0.5, "y": 0.5, "yaw": 0.0},
+            path=[],
+        ))
+
+    persist_robot_runtime_event(
+        "ROBOT-MISSION-STATE",
+        "navigation.status",
+        {"mission_id": mission_id, "state": "FAILED"},
+    )
+    with SessionLocal() as database:
+        assert database.get(NavigationMission, mission_id).status == "FAILED"
+
+    persist_robot_runtime_event(
+        "ROBOT-MISSION-STATE",
+        "navigation.status",
+        {"mission_id": mission_id, "state": "NO_ACTIVE_MAP"},
+    )
+    with SessionLocal() as database:
+        assert database.get(NavigationMission, mission_id).status == "FAILED"

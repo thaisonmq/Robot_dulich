@@ -40,6 +40,10 @@ def sync_robot(entity: Robot, *, detailed: bool = True) -> dict:
     )
     return {
         **hub.robot_view(runtime),
+        # map_id is the map assigned in the registry. A version is only set
+        # after the edge has actually acknowledged map.load, so clients must
+        # not treat an assignment by itself as an active Nav2 runtime map.
+        "active_map_version": entity.active_map_version,
         "management_address": entity.management_address if detailed else None,
         "management_username": entity.management_username if detailed else None,
         "connection_method": entity.connection_method if detailed else "token",

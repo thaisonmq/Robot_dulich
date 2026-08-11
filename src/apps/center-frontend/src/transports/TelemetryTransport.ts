@@ -1,10 +1,11 @@
 import { authStorage } from "../api/client";
-import type { Health, MessageEnvelope, Pose } from "../types";
+import type { Health, MessageEnvelope, NavigationVisualization, Pose } from "../types";
 
 interface TelemetryCallbacks {
   onPose: (pose: Pose) => void;
   onHealth: (health: Health) => void;
-  onNavigation: (status: string) => void;
+  onNavigation: (status: string, payload: Record<string, unknown>) => void;
+  onVisualization?: (visualization: NavigationVisualization) => void;
   onSessionEnded: (reason: string) => void;
   onDisconnect: () => void;
   onReconnect: () => void;
@@ -74,7 +75,14 @@ export class WebSocketTelemetryTransport {
         } else if (message.message_type === "robot.health") {
           this.callbacks.onHealth(message.payload as unknown as Health);
         } else if (message.message_type === "navigation.status") {
-          this.callbacks.onNavigation(String(message.payload.state ?? message.payload.status));
+          this.callbacks.onNavigation(
+            String(message.payload.state ?? message.payload.status),
+            message.payload,
+          );
+        } else if (message.message_type === "navigation.visualization") {
+          this.callbacks.onVisualization?.(
+            message.payload as unknown as NavigationVisualization,
+          );
         } else if (message.message_type === "session.ended") {
           this.manualDisconnect = true;
           this.clearReconnectTimer();

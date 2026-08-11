@@ -74,12 +74,25 @@ services:
       NAVIGATION_SOCKET_GID: ${ROBOT_GID:-1000}
       ROVERA_MAP_ROOT: /var/lib/rovera/maps
       NAV2_MAP_YAML: ${NAV2_MAP_YAML:-/opt/rovera/config/bootstrap-map.yaml}
-      MAPPING_PREVIEW_MAX_CELLS: ${MAPPING_PREVIEW_MAX_CELLS:-20000}
       REQUIRE_SENSOR_HEALTH: ${REQUIRE_SENSOR_HEALTH:-1}
     volumes:
       - type: bind
         source: ${ROBOT_STATE_DIR:-./state}
         target: /var/lib/rovera
+      # The adapter is pure Python. Overlay the deployed source so mode
+      # switches keep fixes without rebuilding the ROS/Nav2 base image.
+      - type: bind
+        source: ./navigation-stack/adapter_node.py
+        target: /ws/install/rovera_navigation_adapter/lib/python3.10/site-packages/adapter_node.py
+        read_only: true
+      - type: bind
+        source: ./navigation-stack/navigation_core.py
+        target: /ws/install/rovera_navigation_adapter/lib/python3.10/site-packages/navigation_core.py
+        read_only: true
+      - type: bind
+        source: ./navigation-stack/config/nav2_params.yaml
+        target: /opt/rovera/config/nav2_params.yaml
+        read_only: true
       - type: bind
         source: ./micro_ros_fastdds.xml
         target: /etc/rovera/micro_ros_fastdds.xml

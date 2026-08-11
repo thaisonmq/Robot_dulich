@@ -5,11 +5,13 @@ from uuid import uuid4
 
 import jwt
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from starlette.websockets import WebSocketDisconnect
 
 from app.main import app
+from app.api import maps as maps_api
 from app.models.database import SessionLocal
-from app.models.entities import ControlSession, Robot
+from app.models.entities import ControlSession, MapRecord, Robot
 from app.services.hub import hub
 
 
@@ -56,8 +58,77 @@ def test_draft_map_metadata_can_be_edited_and_deleted() -> None:
         assert removed.status_code == 204
         assert client.get(f"/api/maps/{map_id}", headers=headers).status_code == 404
 
-        active = client.delete("/api/maps/MAP-001", headers=headers)
-        assert active.status_code == 409
+        active_map_id = "MAP-ACTIVE-DELETE-TEST"
+        active_robot_id = "ROBOT-ACTIVE-DELETE-TEST"
+        with SessionLocal.begin() as database:
+            database.add(MapRecord(
+                map_id=active_map_id, name="Active delete", image_url="",
+                width_pixels=10, height_pixels=10, resolution_m_per_pixel=0.05,
+                origin={"x": 0.0, "y": 0.0, "yaw": 0.0}, status="ACTIVE",
+                active_version=1,
+            ))
+            database.add(Robot(
+                robot_id=active_robot_id, name="Offline active robot", site_id="A",
+                map_id=active_map_id, active_map_version=1, status="offline",
+            ))
+        active = client.delete(f"/api/maps/{active_map_id}", headers=headers)
+        assert active.status_code == 204
+        assert client.get(f"/api/maps/{active_map_id}", headers=headers).status_code == 404
+        with SessionLocal() as database:
+            robot = database.scalar(select(Robot).where(Robot.robot_id == active_robot_id))
+            assert robot.map_id == "NO_ACTIVE_MAP"
+            assert robot.active_map_version is None
+            database.delete(robot)
+            database.commit()
+
+
+def test_online_active_map_delete_waits_for_runtime_deactivation(monkeypatch) -> None:
+    map_id = "MAP-ONLINE-ACTIVE-DELETE"
+    robot_id = "ROBOT-ONLINE-ACTIVE-DELETE"
+    calls: list[dict] = []
+
+    async def fake_dispatch(database, **kwargs):
+        del database
+        calls.append(kwargs)
+        return {"status": "completed", "current_state": "NO_ACTIVE_MAP"}
+
+    monkeypatch.setattr(maps_api, "_dispatch_idempotent", fake_dispatch)
+    with SessionLocal.begin() as database:
+        database.add(MapRecord(
+            map_id=map_id, name="Online active delete", image_url="",
+            width_pixels=10, height_pixels=10, resolution_m_per_pixel=0.05,
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0}, status="ACTIVE",
+            active_version=1,
+        ))
+        database.add(Robot(
+            robot_id=robot_id, name="Online active robot", site_id="A",
+            map_id=map_id, active_map_version=1, status="online",
+        ))
+    try:
+        with TestClient(app) as client:
+            login = client.post(
+                "/api/auth/login",
+                json={"email": "demo@rovera.local", "password": "demo123"},
+            )
+            headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+            runtime = hub.robots[robot_id]
+            runtime.status = "online"
+            runtime.health["map_state"] = "SUCCEEDED"
+            response = client.delete(f"/api/maps/{map_id}", headers=headers)
+
+        assert response.status_code == 204
+        assert len(calls) == 1
+        assert calls[0]["command_type"] == "map.deactivate"
+        assert calls[0]["expected_state"] == "SUCCEEDED"
+        assert calls[0]["timeout_seconds"] == 90.0
+        with SessionLocal() as database:
+            robot = database.scalar(select(Robot).where(Robot.robot_id == robot_id))
+            assert robot.map_id == "NO_ACTIVE_MAP"
+            assert robot.active_map_version is None
+            database.delete(robot)
+            database.commit()
+    finally:
+        hub.robots.pop(robot_id, None)
 
 
 def test_gateway_session_command_and_telemetry_flow() -> None:

@@ -1,4 +1,7 @@
+import asyncio
+import importlib.util
 import json
+from pathlib import Path
 
 import pytest
 
@@ -62,21 +65,35 @@ async def test_expected_state_rejects_stale_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_map_deactivate_is_unconditional_when_health_state_is_stale() -> None:
+    motion = MotionSimulator(SimulatorConfig())
+    backend = SimulatorNavigationBackend(NavigationSimulator(motion), motion)
+
+    result = await backend.execute(
+        "map.deactivate",
+        {"map_id": "MAP-001", "version": 1, "expected_state": "NAVIGATING"},
+    )
+
+    assert result["current_state"] == "NO_ACTIVE_MAP"
+    assert backend.state()["map_id"] == ""
+
+
+@pytest.mark.asyncio
 async def test_new_mapping_can_start_after_terminal_session() -> None:
     motion = MotionSimulator(SimulatorConfig())
     backend = SimulatorNavigationBackend(NavigationSimulator(motion), motion)
     await backend.execute("mapping.start", {"expected_state": "IDLE"})
-    await backend.execute("mapping.cancel", {"expected_state": "MAPPING"})
+    await backend.execute("mapping.discard", {"expected_state": "MAPPING_RUNNING"})
 
     restarted = await backend.execute("mapping.start", {"expected_state": "IDLE"})
 
-    assert restarted["current_state"] == "MAPPING"
+    assert restarted["current_state"] == "MAPPING_RUNNING"
 
 
 @pytest.mark.asyncio
 async def test_ros2_manual_control_does_not_cancel_mapping(monkeypatch) -> None:
     backend = Ros2NavigationBackend("/tmp/navigation.sock")
-    backend._state = {"mode": "MAPPING", "state": "MAPPING"}
+    backend._state = {"mode": "MAPPING", "state": "MAPPING_RUNNING"}
 
     async def unexpected_execute(command: str, payload: dict) -> dict:
         raise AssertionError(f"unexpected command: {command} {payload}")
@@ -105,8 +122,74 @@ def test_ros2_mapping_commands_allow_slow_posegraph_io() -> None:
 
     assert backend._response_timeout("navigation.cancel") == 20
     assert backend._response_timeout("mapping.save_draft") == 90
+    assert backend._response_timeout("mapping.save") == 90
     assert backend._response_timeout("mapping.finish") == 90
     assert backend._response_timeout("mapping.start") == 90
+
+
+def test_ros2_mapping_start_retry_filter_only_accepts_startup_races() -> None:
+    assert Ros2NavigationBackend._retryable_mapping_start({
+        "error_code": "MAPPING_AUTHORITY_CONFLICT",
+        "error_message": "Another ROS mapping authority is active: _NODE_NAMESPACE_UNKNOWN_/_NODE_NAME_UNKNOWN_",
+    })
+    assert Ros2NavigationBackend._retryable_mapping_start({
+        "error_code": "SCAN_STALE",
+    })
+    assert not Ros2NavigationBackend._retryable_mapping_start({
+        "error_code": "MAPPING_AUTHORITY_CONFLICT",
+        "error_message": "Another ROS mapping authority is active: /other/slam_toolbox",
+    })
+
+
+@pytest.mark.asyncio
+async def test_ros2_mapping_start_retries_transient_dds_authority_after_switch(
+    tmp_path, monkeypatch
+) -> None:
+    marker = tmp_path / "mode-request.json"
+    backend = Ros2NavigationBackend(
+        str(tmp_path / "navigation.sock"),
+        mode_request_path=str(marker),
+        mode_switch_timeout_seconds=2,
+    )
+    status_calls = 0
+    start_calls = 0
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    async def fake_call(command: str, payload: dict, timeout: float) -> dict:
+        nonlocal status_calls, start_calls
+        del timeout
+        if command == "system.status":
+            status_calls += 1
+            if status_calls == 1:
+                raise OSError("old adapter stopped")
+            state = {"mode": "MAPPING", "state": "IDLE", "nav2": "MAPPING"}
+            backend._state.update(state)
+            return {"status": "completed", "state": state}
+        start_calls += 1
+        assert payload["expected_state"] == "IDLE"
+        if start_calls == 1:
+            return {
+                "status": "rejected",
+                "current_state": "IDLE",
+                "error_code": "MAPPING_AUTHORITY_CONFLICT",
+                "error_message": "Another ROS mapping authority is active: _NODE_NAMESPACE_UNKNOWN_/_NODE_NAME_UNKNOWN_",
+                "state": {"mode": "MAPPING", "state": "IDLE"},
+            }
+        return {
+            "status": "completed",
+            "current_state": "MAPPING_RUNNING",
+            "state": {"mode": "MAPPING", "state": "MAPPING_RUNNING"},
+        }
+
+    monkeypatch.setattr(backend, "_call_adapter", fake_call)
+    monkeypatch.setattr("simulator.navigation_backends.asyncio.sleep", no_sleep)
+
+    result = await backend.execute("mapping.start", {"expected_state": "IDLE"})
+
+    assert result["current_state"] == "MAPPING_RUNNING"
+    assert start_calls == 2
 
 
 @pytest.mark.asyncio
@@ -174,3 +257,89 @@ async def test_mapping_finish_requests_navigation_without_waiting(
     await backend.execute("mapping.finish", {"expected_state": "MAPPING"})
 
     assert json.loads(marker.read_text())["mode"] == "NAVIGATION"
+
+
+@pytest.mark.asyncio
+async def test_ros2_map_deactivate_waits_until_idle_runtime(tmp_path, monkeypatch) -> None:
+    marker = tmp_path / "mode-request.json"
+    backend = Ros2NavigationBackend(
+        str(tmp_path / "navigation.sock"),
+        mode_request_path=str(marker),
+        mode_switch_timeout_seconds=2,
+    )
+
+    async def fake_call(command: str, payload: dict, timeout: float) -> dict:
+        del payload, timeout
+        if command == "system.status":
+            return {
+                "status": "completed",
+                "state": {"mode": "NAVIGATION", "state": "READY", "nav2": "READY"},
+            }
+        return {
+            "status": "completed",
+            "current_state": "NO_ACTIVE_MAP",
+            "state": {"mode": "NAVIGATION", "state": "NO_ACTIVE_MAP"},
+        }
+
+    async def fake_supervisor() -> None:
+        while not marker.exists():
+            await asyncio.sleep(0.01)
+        while json.loads(marker.read_text()).get("mode") != "IDLE":
+            await asyncio.sleep(0.01)
+        request = json.loads(marker.read_text())
+        marker.with_name("mode-status.json").write_text(json.dumps({
+            "request_id": request["request_id"],
+            "mode": "IDLE",
+            "status": "READY",
+            "state": {
+                "mode": "IDLE",
+                "state": "NO_ACTIVE_MAP",
+                "nav2": "STOPPED",
+                "localized": False,
+            },
+        }))
+
+    monkeypatch.setattr(backend, "_call_adapter", fake_call)
+    _, result = await asyncio.gather(
+        fake_supervisor(),
+        backend.execute("map.deactivate", {"expected_state": "READY"}),
+    )
+
+    assert result["current_state"] == "NO_ACTIVE_MAP"
+    assert backend.state()["mode"] == "IDLE"
+    assert backend.state()["nav2"] == "STOPPED"
+
+
+def test_mode_supervisor_idle_stops_both_ros_authorities(tmp_path, monkeypatch) -> None:
+    project_dir = Path(__file__).parents[1]
+    monkeypatch.setenv("ROVERA_PROJECT_DIR", str(project_dir))
+    monkeypatch.setenv("ROVERA_STATE_DIR", str(tmp_path))
+    script = project_dir / "scripts" / "mode_supervisor.py"
+    spec = importlib.util.spec_from_file_location("test_mode_supervisor", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls: list[tuple[tuple[str, ...], str]] = []
+
+    monkeypatch.setattr(module, "vendor_base_runtime_count", lambda: 1)
+    monkeypatch.setattr(module, "adapter_status", lambda: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(
+        module,
+        "compose",
+        lambda files, profile, *args, **kwargs: calls.append((tuple(args), profile)),
+    )
+    monkeypatch.setattr(module, "remove_stale_socket", lambda: None)
+
+    state = module.switch_mode({"mode": "IDLE"})
+
+    assert state == {
+        "mode": "IDLE",
+        "state": "NO_ACTIVE_MAP",
+        "nav2": "STOPPED",
+        "localized": False,
+        "localization_state": "IDLE",
+    }
+    assert calls == [
+        (("stop", "navigation-stack"), "navigation"),
+        (("stop", "mapping-stack"), "legacy-coexistence"),
+    ]

@@ -10,7 +10,7 @@ export type ControlState =
 export type NavigationState =
   | "idle" | "previewing" | "route_ready" | "sending_goal"
   | "loading_map" | "localizing" | "ready" | "planning"
-  | "moving" | "paused" | "blocked" | "arrived" | "cancelled" | "failed";
+  | "moving" | "paused" | "blocked" | "recovery" | "arrived" | "cancelled" | "failed";
 
 export interface User {
   id: string;
@@ -64,6 +64,7 @@ export interface Robot {
   name: string;
   site_id: string;
   map_id: string;
+  active_map_version?: number | null;
   status: "online" | "offline" | "error";
   availability: "available" | "busy" | "offline" | "error";
   battery_percent: number;
@@ -273,11 +274,15 @@ export interface CameraPtzCapabilities {
 
 export interface Pose {
   map_id: string;
+  map_version?: number;
   x: number;
   y: number;
   yaw: number;
   linear_velocity: number;
   angular_velocity: number;
+  timestamp?: number;
+  localized?: boolean;
+  confidence?: number;
 }
 
 export interface Health {
@@ -291,12 +296,29 @@ export interface Health {
   motion_backend?: string;
   navigation_backend?: string;
   map_state?: string;
+  map_id?: string;
   localized?: boolean;
   nav2?: string;
   safety?: string;
   scan_fresh?: boolean;
+  odometry_ready?: boolean;
+  lidar_tf_ready?: boolean;
   estop?: boolean;
   collision_fault?: boolean;
+  localization_state?: string;
+  localization_confidence?: number;
+  map_version?: number;
+  mode?: "IDLE" | "MAPPING" | "NAVIGATION";
+  footprint?: Point[];
+  mapping?: {
+    state: string;
+    scanHealthy: boolean;
+    odomHealthy: boolean;
+    tfHealthy: boolean;
+    slamHealthy: boolean;
+    elapsedSeconds: number;
+  } | null;
+  map_registry?: { localCount: number; pendingSync: number; pendingDeletion?: number };
 }
 
 export interface MessageEnvelope<T = Record<string, unknown>> {
@@ -323,7 +345,7 @@ export interface MapData {
   site_id?: string;
   floor_id?: string;
   notes?: string;
-  status?: "DRAFT" | "VALIDATING" | "ACTIVE" | "ARCHIVED";
+  status?: "DRAFT" | "SYNC_PENDING" | "VALIDATING" | "ACTIVE" | "ARCHIVED" | "DELETED";
   active_version?: number | null;
   checksum?: string;
   versions?: MapVersion[];
@@ -331,11 +353,19 @@ export interface MapData {
   pois?: Destination[];
   keepout_zones?: { zone_id: string; name: string; points: Point[] }[];
   speed_zones?: { zone_id: string; name: string; points: Point[]; max_speed_mps: number }[];
+  local_status?: string;
+  sync_status?: string;
+  active_status?: string;
+  posegraph_available?: boolean;
+  deletion_status?: string | null;
+  deleted_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface MapVersion {
   version: number;
-  status: "DRAFT" | "VALIDATING" | "ACTIVE" | "ARCHIVED";
+  status: "DRAFT" | "VALIDATING" | "ACTIVE" | "ARCHIVED" | "DELETED";
   checksum: string;
   resolution: number;
   origin: { x: number; y: number; yaw: number };
@@ -346,6 +376,10 @@ export interface MapVersion {
   download_url: string;
   preview_url: string;
   can_continue?: boolean;
+  updated_at?: string;
+  local_status?: string;
+  sync_status?: string;
+  has_posegraph?: boolean;
 }
 
 export interface MappingSession {
@@ -353,12 +387,14 @@ export interface MappingSession {
   map_id: string;
   version: number;
   robot_id: string;
-  status: "STARTING" | "MAPPING" | "PAUSED" | "SAVED_DRAFT" | "FINISHED" | "CANCELED" | "FAULT";
+  status: "MAPPING_STARTING" | "MAPPING_RUNNING" | "MAPPING_STOPPED_UNSAVED" | "MAPPING_SAVING" | "MAPPING_ERROR" | "STARTING" | "MAPPING" | "PAUSED" | "SAVED_DRAFT" | "FINISHED" | "CANCELED" | "FAULT";
   metadata: { name: string; site_id: string; floor_id: string; notes: string };
   error_code?: string | null;
   error_message?: string | null;
   created_at: string;
   updated_at: string;
+  local_status: string;
+  sync_status: string;
 }
 
 export interface Point { x: number; y: number }
@@ -381,4 +417,18 @@ export interface Route {
   goal?: { x: number; y: number; yaw: number };
   map_id?: string;
   map_version?: number;
+}
+
+export interface NavigationFeedback {
+  distance_remaining?: number;
+  navigation_time_seconds?: number;
+  recoveries?: number;
+}
+
+export interface NavigationVisualization {
+  revision: number;
+  map_id: string;
+  map_version: number;
+  global_path?: Point[];
+  dynamic_obstacles?: Point[];
 }

@@ -37,7 +37,6 @@ services:
       NAVIGATION_SOCKET_PATH: /var/lib/rovera/navigation/navigation.sock
       NAVIGATION_SOCKET_GID: ${ROBOT_GID:-1000}
       ROVERA_MAP_ROOT: /var/lib/rovera/maps
-      MAPPING_PREVIEW_MAX_CELLS: ${MAPPING_PREVIEW_MAX_CELLS:-20000}
       REQUIRE_SENSOR_HEALTH: ${REQUIRE_SENSOR_HEALTH:-1}
     volumes:
       - type: bind

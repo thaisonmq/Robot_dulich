@@ -1,15 +1,13 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  ArrowLeft, Ban, Check, ChevronLeft, ChevronRight, KeyRound, Plus,
+  Ban, Check, ChevronLeft, ChevronRight, KeyRound, Plus,
   Search, ShieldCheck, UserCog, UserRound, UsersRound, X,
 } from "lucide-react";
 import { api } from "../api/client";
-import { AccountMenu } from "../components/AccountMenu";
-import { Brand } from "../components/Brand";
-import { GlobalLanguageSelect } from "../components/GlobalLanguageSelect";
+import { OperationsShell } from "../components/OperationsShell";
+import { showToast } from "../components/ToastViewport";
 import { useI18n } from "../i18n/I18nProvider";
-import { useNavigate } from "../router";
 import { useAppStore } from "../state/appStore";
 import type { AdminUserCreateInput, User } from "../types";
 
@@ -30,7 +28,6 @@ const EMPTY_FORM: AdminUserCreateInput = {
 
 export function UserManagementPage() {
   const { language, t } = useI18n();
-  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const currentUser = useAppStore((state) => state.user);
   const isAdmin = currentUser?.role === "admin";
@@ -63,7 +60,8 @@ export function UserManagementPage() {
       setForm({ ...EMPTY_FORM, role: isAdmin ? "operator" : "guest" });
       setShowCreate(false);
       setFormError("");
-      setActionMessage(t(isAdmin ? "Đã tạo tài khoản nhân viên" : "Đã tạo tài khoản khách"));
+      setActionMessage("");
+      showToast(t(isAdmin ? "Đã tạo tài khoản nhân viên" : "Đã tạo tài khoản khách"));
       refreshUsers();
     },
     onError: (reason) => {
@@ -77,7 +75,8 @@ export function UserManagementPage() {
       input: { role?: "operator" | "guest"; active?: boolean };
     }) => api.updateUser(userId, input),
     onSuccess: () => {
-      setActionMessage(t("Đã cập nhật quyền tài khoản"));
+      setActionMessage("");
+      showToast(t("Đã cập nhật quyền tài khoản"));
       refreshUsers();
     },
     onError: (reason) => {
@@ -89,7 +88,8 @@ export function UserManagementPage() {
     mutationFn: ({ userId, password }: { userId: string; password: string }) =>
       api.resetUserPassword(userId, password),
     onSuccess: () => {
-      setActionMessage(t("Đã đặt mật khẩu tạm thời"));
+      setActionMessage("");
+      showToast(t("Đã đặt mật khẩu tạm thời"));
       setResetTarget(null);
       setResetPassword("");
       refreshUsers();
@@ -115,25 +115,11 @@ export function UserManagementPage() {
   }
 
   return (
-    <main className="account-page user-admin-page">
-      <header className="account-header">
-        <div>
-          <Brand compact />
-          <span className="header-divider" />
-          <button type="button" onClick={() => navigate("/robots")}><ArrowLeft size={18} /> {t("Quản lý robot")}</button>
-        </div>
-        <GlobalLanguageSelect />
-        <AccountMenu />
-      </header>
-
+    <OperationsShell title="Quản lý tài khoản" className="account-operations user-admin-page">
       <div className="user-admin-page__content">
         <section className="user-admin-heading">
           <div>
-            <p className="eyebrow">{t("CON NGƯỜI · VAI TRÒ · QUYỀN TRUY CẬP")}</p>
             <h1>{t("Quản lý tài khoản")}</h1>
-            <p>{t(isAdmin
-              ? "Tạo tài khoản vận hành, phân quyền và kiểm soát trạng thái truy cập."
-              : "Tạo, khoá và đặt lại mật khẩu cho các tài khoản khách.")}</p>
           </div>
           <button type="button" className="button button--primary" onClick={() => setShowCreate((value) => !value)}>
             {showCreate ? <X size={18} /> : <Plus size={18} />}
@@ -311,13 +297,13 @@ export function UserManagementPage() {
           <footer className="user-directory__pagination">
             <span>{t("{total} tài khoản", { total: usersQuery.data?.total ?? 0 })}</span>
             <div>
-              <button type="button" disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}><ChevronLeft size={18} /></button>
+              <button type="button" aria-label={t("Trang trước")} disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}><ChevronLeft size={18} /></button>
               <strong>{page} / {usersQuery.data?.total_pages ?? 1}</strong>
-              <button type="button" disabled={page >= (usersQuery.data?.total_pages ?? 1)} onClick={() => setPage((value) => value + 1)}><ChevronRight size={18} /></button>
+              <button type="button" aria-label={t("Trang sau")} disabled={page >= (usersQuery.data?.total_pages ?? 1)} onClick={() => setPage((value) => value + 1)}><ChevronRight size={18} /></button>
             </div>
           </footer>
         </section>
       </div>
-    </main>
+    </OperationsShell>
   );
 }

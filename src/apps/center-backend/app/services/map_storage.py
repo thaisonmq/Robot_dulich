@@ -11,6 +11,11 @@ from typing import BinaryIO, Any
 
 
 REQUIRED_BUNDLE_FILES = frozenset({"map.yaml", "metadata.json"})
+REQUIRED_METADATA_FIELDS = frozenset({
+    "map_id", "name", "version", "robot_id", "created_at", "updated_at",
+    "resolution", "width", "height", "origin", "frame_id", "checksum",
+    "has_posegraph", "slam_mode",
+})
 
 
 class InvalidMapBundle(ValueError):
@@ -25,6 +30,12 @@ def _safe_member(name: str) -> bool:
 def inspect_map_bundle(path: Path) -> dict[str, Any]:
     try:
         with tarfile.open(path, "r:*") as archive:
+            if any(
+                member.issym() or member.islnk()
+                or not (member.isfile() or member.isdir())
+                for member in archive.getmembers()
+            ):
+                raise InvalidMapBundle("bundle contains an unsafe member type")
             files = {member.name.lstrip("./") for member in archive.getmembers() if member.isfile()}
             if not all(_safe_member(member.name) for member in archive.getmembers()):
                 raise InvalidMapBundle("bundle contains an unsafe path")
@@ -41,8 +52,49 @@ def inspect_map_bundle(path: Path) -> dict[str, Any]:
             metadata = json.loads(extracted.read(1_048_577))
             if not isinstance(metadata, dict):
                 raise InvalidMapBundle("metadata.json must contain an object")
+            missing_metadata = REQUIRED_METADATA_FIELDS - metadata.keys()
+            if missing_metadata:
+                raise InvalidMapBundle(
+                    f"metadata.json is missing: {', '.join(sorted(missing_metadata))}"
+                )
+            if metadata.get("frame_id") != "map":
+                raise InvalidMapBundle("metadata frame_id must be map")
             if not ({"map.pgm", "map.png"} & files):
                 raise InvalidMapBundle("bundle must contain map.pgm or map.png")
+            declared_files = metadata.get("files")
+            if not isinstance(declared_files, dict):
+                raise InvalidMapBundle("metadata files must contain SHA-256 entries")
+            undeclared = (files - {"metadata.json"}) - set(declared_files)
+            if undeclared:
+                raise InvalidMapBundle(
+                    f"metadata files is missing: {', '.join(sorted(undeclared))}"
+                )
+            members = {
+                member.name.lstrip("./"): member
+                for member in archive.getmembers() if member.isfile()
+            }
+            for filename, expected in declared_files.items():
+                if filename not in members or not isinstance(expected, str) or len(expected) != 64:
+                    raise InvalidMapBundle(f"invalid checksum entry for {filename}")
+                source = archive.extractfile(members[filename])
+                if source is None:
+                    raise InvalidMapBundle(f"cannot read {filename}")
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                if digest.hexdigest() != expected.lower():
+                    raise InvalidMapBundle(f"artifact checksum mismatch: {filename}")
+            primary_images = {name for name in ("map.pgm", "map.png") if name in declared_files}
+            metadata_checksum = str(metadata.get("checksum", "")).lower()
+            if (
+                len(metadata_checksum) != 64
+                or not primary_images
+                or not any(
+                    str(declared_files[name]).lower() == metadata_checksum
+                    for name in primary_images
+                )
+            ):
+                raise InvalidMapBundle("metadata checksum must identify the occupancy image")
             return metadata
     except (tarfile.TarError, json.JSONDecodeError, OSError) as exc:
         raise InvalidMapBundle("invalid map bundle") from exc
@@ -87,7 +139,11 @@ class MapBundleStore:
         if checksum != expected_checksum.lower():
             temporary_path.unlink(missing_ok=True)
             raise InvalidMapBundle("map bundle checksum mismatch")
-        metadata = inspect_map_bundle(temporary_path)
+        try:
+            metadata = inspect_map_bundle(temporary_path)
+        except InvalidMapBundle:
+            temporary_path.unlink(missing_ok=True)
+            raise
         destination = target_directory / "map-bundle.tar.gz"
         os.replace(temporary_path, destination)
         return destination, checksum, metadata

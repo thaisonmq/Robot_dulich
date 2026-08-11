@@ -1,19 +1,16 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Battery, Bot, ChevronLeft, ChevronRight, Clock3, Map as MapIcon, MapPin,
+  Battery, Bot, ChevronLeft, ChevronRight, Clock3, MapPin,
   MonitorPlay, OctagonX, Plus, PlugZap, RadioTower, Search, Server,
   Settings2, SlidersHorizontal, UserRound, Wifi,
 } from "lucide-react";
 import { api } from "../api/client";
-import { AccountMenu } from "../components/AccountMenu";
-import { Brand } from "../components/Brand";
-import { GlobalLanguageSelect } from "../components/GlobalLanguageSelect";
+import { OperationsShell } from "../components/OperationsShell";
 import { useI18n } from "../i18n/I18nProvider";
 import { useNavigate } from "../router";
 import { useAppStore } from "../state/appStore";
 import type { Robot } from "../types";
-import { hasPermission } from "../utils/permissions";
 
 export function RobotListPage() {
   const navigate = useNavigate();
@@ -30,7 +27,6 @@ export function RobotListPage() {
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
   const canOperate = user?.role === "admin" || user?.role === "operator";
-  const canAccessMaps = hasPermission(user, "maps.view");
 
   function statusLabel(robot: Robot) {
     if (robot.enrollment_status === "pending") return t("Chờ robot chạy");
@@ -122,29 +118,18 @@ export function RobotListPage() {
   }
 
   return (
-    <main className="roster-page fleet-manager">
-      <header className="roster-header">
-        <div className="roster-header__title">
-          <Brand compact />
-          <span className="header-divider" />
-          <h1>{t("Quản lý robot")}</h1>
-        </div>
+    <OperationsShell title="Danh sách robot" className="fleet-manager" headerStatus={
         <div className="system-summary">
           <span><i className="status-dot online" /><small>Gateway</small><strong>{t("Hoạt động")}</strong></span>
           <span><Server size={20} /><small>{t("Đang online")}</small><strong>{summary.online} / {summary.total}</strong></span>
           <span><RadioTower size={20} /><small>{t("Chờ kết nối")}</small><strong>{summary.pending}</strong></span>
         </div>
-        {canAccessMaps && <button type="button" className="header-action" onClick={() => navigate("/maps")}><MapIcon size={17} /> Maps</button>}
-        <GlobalLanguageSelect />
-        <AccountMenu />
-      </header>
+      }>
 
       <div className="fleet-manager__content">
         <section className="fleet-manager__heading">
           <div>
-            <p className="eyebrow">{t("ĐĂNG KÝ THIẾT BỊ · TRẠNG THÁI TRỰC TIẾP")}</p>
             <h2>{t("Danh sách robot")}</h2>
-            <p>{t("Đăng ký thiết bị, theo dõi kết nối và mở phiên điều khiển.")}</p>
           </div>
           {canOperate && (
             <button type="button" className="button button--primary" onClick={() => navigate("/robots/new")}>
@@ -365,6 +350,6 @@ export function RobotListPage() {
           </div>
         </footer>
       </div>
-    </main>
+    </OperationsShell>
   );
 }

@@ -34,6 +34,7 @@ from app.models.entities import (
     Destination,
     KeepoutZone,
     MapRecord,
+    MapDeletionAck,
     MappingSession,
     MapVersion,
     NavigationMission,
@@ -84,6 +85,10 @@ class MapLifecycleRequest(BaseModel):
     version: int = Field(ge=1)
 
 
+class TombstoneAckRequest(BaseModel):
+    robot_id: str = Field(min_length=3, max_length=64)
+
+
 def _posegraph_basename(version: MapVersion) -> str | None:
     files = set(dict(version.metadata_json or {}).get("files") or {})
     for name in files:
@@ -103,9 +108,13 @@ def _version_view(version: MapVersion) -> dict:
         "height_pixels": version.height,
         "created_by_robot": version.created_by_robot,
         "created_at": version.created_at.isoformat(),
+        "updated_at": version.updated_at.isoformat(),
+        "local_status": "AVAILABLE" if version.storage_path and Path(version.storage_path).is_file() else "MISSING",
+        "sync_status": version.sync_status,
+        "has_posegraph": _posegraph_basename(version) is not None,
         "download_url": f"/api/maps/{version.map_id}/versions/{version.version}/download",
         "preview_url": f"/api/maps/{version.map_id}/versions/{version.version}/preview",
-        "can_continue": _posegraph_basename(version) is not None,
+        "can_continue": version.deleted_at is None and _posegraph_basename(version) is not None,
     }
 
 
@@ -125,6 +134,12 @@ def _map_view(database: Session, map_record: MapRecord, *, details: bool = False
         "floor_id": map_record.floor_id,
         "notes": map_record.notes,
         "status": map_record.status,
+        "local_status": "AVAILABLE" if active and active.storage_path and Path(active.storage_path).is_file() else "MISSING",
+        "sync_status": active.sync_status if active else "LOCAL_ONLY",
+        "active_status": "ACTIVE" if map_record.active_version is not None else "INACTIVE",
+        "posegraph_available": bool(active and _posegraph_basename(active)),
+        "deletion_status": map_record.deletion_status,
+        "deleted_at": map_record.deleted_at.isoformat() if map_record.deleted_at else None,
         "active_version": map_record.active_version,
         "image_url": active and f"/api/maps/{map_record.map_id}/versions/{active.version}/preview" or map_record.image_url,
         "width_pixels": active.width if active else map_record.width_pixels,
@@ -146,7 +161,7 @@ def _map_view(database: Session, map_record: MapRecord, *, details: bool = False
             select(MappingSession)
             .where(
                 MappingSession.map_id == map_record.map_id,
-                MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT")),
+                MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT", "MAPPING_ERROR")),
             )
             .order_by(MappingSession.created_at.desc())
         )
@@ -193,6 +208,8 @@ def _session_view(session: MappingSession) -> dict:
         "robot_id": session.robot_id,
         "status": session.status,
         "metadata": session.metadata_json,
+        "local_status": dict(session.metadata_json or {}).get("local_status", "LOCAL_ONLY"),
+        "sync_status": dict(session.metadata_json or {}).get("sync_status", "LOCAL_ONLY"),
         "error_code": session.error_code,
         "error_message": session.error_message,
         "created_at": session.created_at.isoformat(),
@@ -204,6 +221,24 @@ def _require_guest_operational_map(record: MapRecord, user: User) -> None:
     """Guests may consume an active map while driving, but cannot browse Maps."""
     if user.role == "guest" and record.status != "ACTIVE":
         raise HTTPException(status_code=403, detail=MAPS_FORBIDDEN_DETAIL)
+
+
+def _mapping_start_health_failures(capabilities: dict, health: dict) -> list[str]:
+    """Return preflight failures available before a SLAM runtime is started."""
+    if capabilities.get("source") == "simulator":
+        return []
+    if str(health.get("mode") or "").upper() == "IDLE":
+        # No ROS authority exists by design. The edge will start SLAM and its
+        # adapter performs the authoritative sensor/safety gate.
+        return []
+    checks = (
+        (bool(health.get("scan_fresh")), "Không nhận được LiDAR."),
+        (bool(health.get("odometry_ready")), "Odometry không hoạt động."),
+        (bool(health.get("lidar_tf_ready")), "TF không hợp lệ."),
+        (health.get("safety") == "HEALTHY", "Motion safety chưa sẵn sàng."),
+        (not bool(health.get("estop")), "E-stop đang bật."),
+    )
+    return [message for healthy, message in checks if not healthy]
 
 
 async def _dispatch_idempotent(
@@ -275,7 +310,7 @@ async def list_maps(
     user: User = Depends(authenticated_user),
     database: Session = Depends(get_db),
 ) -> list[dict]:
-    statement = select(MapRecord).order_by(MapRecord.updated_at.desc())
+    statement = select(MapRecord).where(MapRecord.deleted_at.is_(None)).order_by(MapRecord.updated_at.desc())
     if user.role == "guest":
         if (status or "").upper() != "ACTIVE":
             raise HTTPException(status_code=403, detail=MAPS_FORBIDDEN_DETAIL)
@@ -286,13 +321,95 @@ async def list_maps(
     return [_map_view(database, item) for item in database.scalars(statement)]
 
 
+@router.get("/registry/health")
+async def registry_health(
+    _: tuple[str, str] = Depends(operator_or_robot),
+    database: Session = Depends(get_db),
+) -> dict:
+    return {
+        "localCount": database.scalar(
+            select(func.count()).select_from(MapVersion).where(MapVersion.deleted_at.is_(None))
+        ) or 0,
+        "pendingSync": database.scalar(
+            select(func.count()).select_from(MapVersion).where(
+                MapVersion.deleted_at.is_(None), MapVersion.sync_status == "SYNC_PENDING"
+            )
+        ) or 0,
+        "pendingDeletion": database.scalar(
+            select(func.count()).select_from(MapRecord).where(
+                MapRecord.deletion_status == "DELETION_PENDING"
+            )
+        ) or 0,
+    }
+
+
+@router.get("/tombstones")
+async def map_tombstones(
+    _: tuple[str, str] = Depends(operator_or_robot),
+    database: Session = Depends(get_db),
+) -> dict:
+    records = database.scalars(
+        select(MapRecord).where(MapRecord.deleted_at.is_not(None))
+    ).all()
+    return {
+        "items": [
+            {
+                "map_id": item.map_id,
+                "deleted_at": item.deleted_at.isoformat(),
+                "deleted_at_unix": item.deleted_at.timestamp(),
+                "status": item.deletion_status or "DELETION_PENDING",
+            }
+            for item in records if item.deleted_at is not None
+        ]
+    }
+
+
+@router.post("/tombstones/{map_id}/ack")
+async def acknowledge_tombstone(
+    map_id: str,
+    body: TombstoneAckRequest,
+    principal: tuple[str, str] = Depends(operator_or_robot),
+    database: Session = Depends(get_db),
+) -> dict:
+    if principal[0] == "robot" and principal[1] != body.robot_id:
+        raise HTTPException(status_code=403, detail="Robot không được ACK thay robot khác")
+    record = database.get(MapRecord, map_id)
+    if record is None or record.deleted_at is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tombstone")
+    existing = database.scalar(
+        select(MapDeletionAck).where(
+            MapDeletionAck.map_id == map_id, MapDeletionAck.robot_id == body.robot_id
+        )
+    )
+    if existing is None:
+        database.add(MapDeletionAck(map_id=map_id, robot_id=body.robot_id))
+    for cache in database.scalars(
+        select(RobotMapCache).where(
+            RobotMapCache.map_id == map_id, RobotMapCache.robot_id == body.robot_id
+        )
+    ):
+        cache.active = False
+        cache.local_status = "MISSING"
+        cache.sync_status = "DELETED"
+    pending = database.scalar(
+        select(RobotMapCache.id).where(
+            RobotMapCache.map_id == map_id,
+            RobotMapCache.sync_status == "DELETION_PENDING",
+        )
+    )
+    if pending is None:
+        record.deletion_status = "DELETED"
+    database.commit()
+    return {"map_id": map_id, "robot_id": body.robot_id, "status": "DELETED"}
+
+
 @router.post("", status_code=201)
 async def create_map(
     body: MapCreateRequest,
     _: str = Depends(operator_user_id),
     database: Session = Depends(get_db),
 ) -> dict:
-    map_id = f"MAP-{uuid4().hex[:12].upper()}"
+    map_id = str(uuid4())
     record = MapRecord(
         map_id=map_id,
         name=body.name.strip(),
@@ -342,51 +459,108 @@ async def delete_map(
     record = database.get(MapRecord, map_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy map")
-    if record.status == "ACTIVE" or record.active_version is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="Không thể xóa map ACTIVE; hãy chuyển robot sang map khác và Archive trước",
-        )
-    if database.scalar(select(Robot.robot_id).where(Robot.map_id == map_id)):
-        raise HTTPException(status_code=409, detail="Map đang được gán cho robot")
+    if record.deleted_at is not None:
+        return Response(status_code=204)
     active_mapping = database.scalar(
         select(MappingSession.session_id).where(
             MappingSession.map_id == map_id,
-            MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT")),
+            MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT", "MAPPING_ERROR")),
         )
     )
     if active_mapping:
-        raise HTTPException(status_code=409, detail="Map đang có phiên mapping chưa kết thúc")
+        mapping = database.get(MappingSession, active_mapping)
+        if mapping and hub.robots.get(mapping.robot_id, None) and hub.robots[mapping.robot_id].status == "online":
+            result = await _dispatch_idempotent(
+                database,
+                request_id=str(uuid4()),
+                robot_id=mapping.robot_id,
+                command_type="mapping.discard",
+                expected_state=mapping.status,
+                payload={"mapping_session_id": mapping.session_id, "map_id": map_id, "version": mapping.version},
+                timeout_seconds=settings.robot_command_timeout_seconds,
+            )
+            if result.get("status") not in {"accepted", "completed"}:
+                raise HTTPException(status_code=409, detail="Không thể dừng phiên mapping trước khi xóa map")
+        if mapping:
+            mapping.status = "CANCELED"
     active_mission = database.scalar(
         select(NavigationMission.mission_id).where(
             NavigationMission.map_id == map_id,
             NavigationMission.status.not_in(("ARRIVED", "CANCELED", "FAULT")),
         )
     )
+    affected_robots = database.scalars(
+        select(Robot).where(Robot.map_id == map_id)
+    ).all()
+    deleted_at = datetime.now(timezone.utc)
+    acknowledged: set[str] = set()
+    for robot in affected_robots:
+        runtime = hub.robots.get(robot.robot_id)
+        if runtime is not None and runtime.status == "online":
+            try:
+                result = await _dispatch_idempotent(
+                    database,
+                    request_id=str(uuid4()),
+                    robot_id=robot.robot_id,
+                    command_type="map.deactivate",
+                    expected_state=str(runtime.health.get("map_state") or "READY"),
+                    payload={
+                        "map_id": map_id,
+                        "version": robot.active_map_version or record.active_version or 0,
+                        "delete_local": True,
+                        "deleted_at": deleted_at.timestamp(),
+                    },
+                    # Deactivation waits for the host supervisor to stop AMCL,
+                    # map_server and Nav2. This can exceed an interactive
+                    # motion command timeout on a Pi under load.
+                    timeout_seconds=settings.mapping_command_timeout_seconds,
+                )
+                if result.get("status") in {"accepted", "completed"}:
+                    acknowledged.add(robot.robot_id)
+            except HTTPException as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Không thể dừng robot {robot.robot_id} trước khi xóa active map",
+                ) from exc
+        robot.map_id = "NO_ACTIVE_MAP"
+        robot.active_map_version = None
+        if runtime is not None:
+            runtime.map_id = "NO_ACTIVE_MAP"
     if active_mission:
-        raise HTTPException(status_code=409, detail="Map đang có nhiệm vụ navigation chưa kết thúc")
-
-    destination_ids = list(
-        database.scalars(select(Destination.destination_id).where(Destination.map_id == map_id))
-    )
-    if destination_ids:
-        database.execute(
-            delete(NavigationRoute).where(NavigationRoute.destination_id.in_(destination_ids))
-        )
-    for entity in (
-        NavigationMission,
-        Destination,
-        POI,
-        KeepoutZone,
-        SpeedZone,
-        RobotMapCache,
-        MappingSession,
-        MapVersion,
-    ):
-        database.execute(delete(entity).where(entity.map_id == map_id))
-    database.delete(record)
+        for mission in database.scalars(
+            select(NavigationMission).where(
+                NavigationMission.map_id == map_id,
+                NavigationMission.status.not_in(("SUCCEEDED", "ARRIVED", "CANCELED", "FAILED", "FAULT")),
+            )
+        ):
+            mission.status = "CANCELED"
+            mission.error_code = "MAP_DELETED"
+            mission.error_message = "Map đang điều hướng đã bị xóa"
+    record.status = "DELETED"
+    record.active_version = None
+    record.deleted_at = deleted_at
+    record.deletion_status = "DELETED" if len(acknowledged) == len(affected_robots) else "DELETION_PENDING"
+    for version in database.scalars(select(MapVersion).where(MapVersion.map_id == map_id)):
+        version.status = "DELETED"
+        version.deleted_at = deleted_at
+    for cache in database.scalars(select(RobotMapCache).where(RobotMapCache.map_id == map_id)):
+        cache.active = False
+        cache.local_status = "MISSING" if cache.robot_id in acknowledged else cache.local_status
+        cache.sync_status = "DELETED" if cache.robot_id in acknowledged else "DELETION_PENDING"
+    for robot_id in acknowledged:
+        database.add(MapDeletionAck(map_id=map_id, robot_id=robot_id))
     database.commit()
     MapBundleStore(settings.map_storage_dir, settings.map_bundle_max_bytes).delete_map(map_id)
+    for robot in affected_robots:
+        await hub.broadcast_telemetry(
+            robot.robot_id,
+            {
+            "message_id": str(uuid4()), "schema_version": "1.0",
+            "message_type": "map.registry.changed", "robot_id": robot.robot_id, "session_id": "",
+            "sequence": 0, "timestamp": deleted_at.isoformat(), "ttl_ms": 0,
+            "payload": {"map_id": map_id, "status": record.deletion_status},
+            },
+        )
     return Response(status_code=204)
 
 
@@ -414,10 +588,13 @@ async def start_mapping(
             status_code=409,
             detail="Robot chưa sẵn sàng mapping: " + ", ".join(map(str, blockers)),
         )
+    failures = _mapping_start_health_failures(runtime.capabilities, runtime.health)
+    if failures:
+        raise HTTPException(status_code=409, detail=" ".join(failures))
     active_session = database.scalar(
         select(MappingSession).where(
             MappingSession.robot_id == body.robot_id,
-            MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT")),
+            MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT", "MAPPING_ERROR")),
         )
     )
     if active_session is not None:
@@ -430,7 +607,7 @@ async def start_mapping(
         active_map_session = database.scalar(
             select(MappingSession).where(
                 MappingSession.map_id == body.map_id,
-                MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT")),
+                MappingSession.status.not_in(("FINISHED", "CANCELED", "FAULT", "MAPPING_ERROR")),
             )
         )
         if active_map_session is not None:
@@ -439,6 +616,7 @@ async def start_mapping(
                 detail=f"Map đang có phiên mapping chưa kết thúc: {active_map_session.session_id}",
             )
         source_statement = select(MapVersion).where(MapVersion.map_id == body.map_id)
+        source_statement = source_statement.where(MapVersion.deleted_at.is_(None))
         if body.source_version is not None:
             source_statement = source_statement.where(MapVersion.version == body.source_version)
         source = database.scalar(source_statement.order_by(MapVersion.version.desc()))
@@ -471,7 +649,7 @@ async def start_mapping(
             "initial_pose": dict(source.metadata_json or {}).get("terminal_pose"),
         }
     else:
-        map_id = f"MAP-{uuid4().hex[:12].upper()}"
+        map_id = str(uuid4())
         version = 1
         metadata = {
             "name": body.name,
@@ -497,7 +675,7 @@ async def start_mapping(
         version=version,
         robot_id=body.robot_id,
         user_id=user_id,
-        status="STARTING",
+        status="MAPPING_STARTING",
         last_request_id=body.request_id,
         metadata_json=metadata,
     )
@@ -525,7 +703,7 @@ async def start_mapping(
     except HTTPException:
         receipt = database.get(CommandReceipt, body.request_id)
         receipt_response = dict(receipt.response or {}) if receipt else {}
-        mapping.status = "FAULT"
+        mapping.status = "MAPPING_ERROR"
         mapping.error_code = str(receipt_response.get("error_code") or "MAPPING_START_FAILED")
         mapping.error_message = str(
             receipt_response.get("error_message") or "Không thể khởi động phiên mapping"
@@ -533,9 +711,9 @@ async def start_mapping(
         database.commit()
         raise
     if response.get("status") in {"accepted", "completed"}:
-        mapping.status = "MAPPING"
+        mapping.status = "MAPPING_RUNNING"
     else:
-        mapping.status = "FAULT"
+        mapping.status = "MAPPING_ERROR"
         mapping.error_code = str(response.get("error_code", "REJECTED"))
         mapping.error_message = str(response.get("error_message", "Robot từ chối lệnh"))
     database.commit()
@@ -555,8 +733,12 @@ async def mapping_session(
 
 
 _MAPPING_ACTIONS = {
+    "stop": ("mapping.stop", "MAPPING_STOPPED_UNSAVED"),
+    "save": ("mapping.save", "FINISHED"),
+    "discard": ("mapping.discard", "CANCELED"),
+    # Compatibility with mapping sessions created before the Control-screen UI.
     "pause": ("mapping.pause", "PAUSED"),
-    "resume": ("mapping.resume", "MAPPING"),
+    "resume": ("mapping.resume", "MAPPING_RUNNING"),
     # Save Draft persists an immutable version but does not pause/finish SLAM.
     "save-draft": ("mapping.save_draft", None),
     "finish": ("mapping.finish", "FINISHED"),
@@ -595,13 +777,21 @@ async def mapping_action(
     if existing is None:
         try:
             if action == "save-draft":
-                if session.status not in {"MAPPING", "PAUSED"}:
+                if session.status not in {"MAPPING", "MAPPING_RUNNING", "PAUSED"}:
                     raise InvalidTransition(
                         f"invalid transition {session.status} -> SAVING"
                     )
-            elif action == "finish":
-                mapping_transition(session.status, "FINISHING")
-                mapping_transition("FINISHING", "FINISHED")
+            elif action in {"save", "finish"}:
+                if action == "save" and session.status != "MAPPING_STOPPED_UNSAVED":
+                    raise InvalidTransition(
+                        f"invalid transition {session.status} -> MAPPING_SAVING"
+                    )
+                if action == "finish":
+                    mapping_transition(session.status, "FINISHING")
+                    mapping_transition("FINISHING", "FINISHED")
+                else:
+                    mapping_transition(session.status, "MAPPING_SAVING")
+                    mapping_transition("MAPPING_SAVING", "FINISHED")
             else:
                 mapping_transition(session.status, target)
         except InvalidTransition as exc:
@@ -619,7 +809,7 @@ async def mapping_action(
         },
         timeout_seconds=(
             settings.mapping_command_timeout_seconds
-            if action in {"save-draft", "finish"}
+            if action in {"save", "save-draft", "finish"}
             else settings.robot_command_timeout_seconds
         ),
     )
@@ -634,15 +824,23 @@ async def mapping_action(
         session.last_request_id = body.request_id
         session.error_code = None
         session.error_message = None
+        metadata = dict(session.metadata_json or {})
+        if action in {"save", "save-draft", "finish"} and accepted:
+            metadata["local_status"] = "AVAILABLE"
+            metadata["sync_status"] = str(response.get("upload_status") or "SYNC_PENDING")
+            session.metadata_json = metadata
         if action == "save-draft" and existing is None and accepted:
             # The saved version is immutable; continue mapping into a new one.
             session.version += 1
         if target == "FINISHED":
             record = database.get(MapRecord, session.map_id)
             if record:
-                record.status = "VALIDATING"
+                record.status = "SYNC_PENDING"
     else:
-        if robot_state in {"MAPPING", "PAUSED", "FINISHED", "CANCELED", "FAULT"}:
+        if robot_state in {
+            "MAPPING", "MAPPING_RUNNING", "MAPPING_STOPPED_UNSAVED", "MAPPING_ERROR",
+            "PAUSED", "FINISHED", "CANCELED", "FAULT",
+        }:
             # The robot runtime is authoritative. Exposing its actual state
             # lets the UI recover instead of presenting buttons that can only
             # keep producing STATE_CONFLICT.
@@ -669,13 +867,24 @@ async def upload_version(
     if not SHA256_PATTERN.fullmatch(checksum):
         raise HTTPException(status_code=422, detail="Checksum SHA-256 không hợp lệ")
     record = database.get(MapRecord, map_id)
-    if record is None:
+    if record is None or record.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Không tìm thấy bản đồ")
     existing = database.scalar(
         select(MapVersion).where(MapVersion.map_id == map_id, MapVersion.version == version)
     )
     if existing is not None:
         if existing.checksum == checksum.lower():
+            existing.sync_status = "SYNCED"
+            for cache in database.scalars(
+                select(RobotMapCache).where(
+                    RobotMapCache.map_id == map_id,
+                    RobotMapCache.version == version,
+                    RobotMapCache.robot_id == robot_id,
+                )
+            ):
+                cache.local_status = "AVAILABLE"
+                cache.sync_status = "SYNCED"
+            database.commit()
             return _version_view(existing)
         raise HTTPException(status_code=409, detail="Version đã tồn tại và không được ghi đè")
     store = MapBundleStore(settings.map_storage_dir, settings.map_bundle_max_bytes)
@@ -715,9 +924,53 @@ async def upload_version(
     record.resolution_m_per_pixel = resolution
     record.origin = origin
     record.status = "VALIDATING"
+    mapping = database.scalar(
+        select(MappingSession).where(
+            MappingSession.map_id == map_id,
+            MappingSession.robot_id == robot_id,
+        ).order_by(MappingSession.created_at.desc())
+    )
+    if mapping is not None:
+        mapping_metadata = dict(mapping.metadata_json or {})
+        mapping_metadata["local_status"] = "AVAILABLE"
+        mapping_metadata["sync_status"] = "SYNCED"
+        mapping.metadata_json = mapping_metadata
     database.commit()
     database.refresh(map_version)
     return _version_view(map_version)
+
+
+@router.post("/{map_id}/versions/{version}/resync")
+async def resync_version(
+    map_id: str,
+    version: int,
+    _: str = Depends(operator_user_id),
+    database: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    item = database.scalar(
+        select(MapVersion).where(
+            MapVersion.map_id == map_id,
+            MapVersion.version == version,
+            MapVersion.deleted_at.is_(None),
+        )
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy version")
+    item.sync_status = "SYNC_PENDING"
+    database.commit()
+    runtime = hub.robots.get(item.created_by_robot)
+    expected_state = str((runtime.health if runtime else {}).get("map_state") or "IDLE")
+    result = await _dispatch_idempotent(
+        database,
+        request_id=str(uuid4()),
+        robot_id=item.created_by_robot,
+        command_type="map.resync",
+        expected_state=expected_state,
+        payload={"map_id": map_id, "version": version},
+        timeout_seconds=settings.robot_command_timeout_seconds,
+    )
+    return {"map_id": map_id, "version": version, "sync_status": "SYNC_PENDING", "robot": result}
 
 
 @router.get("/{map_id}/versions/{version}/download")
@@ -748,7 +1001,7 @@ async def version_preview(
     database: Session = Depends(get_db),
 ) -> Response:
     record = database.get(MapRecord, map_id)
-    if record is None:
+    if record is None or record.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Không tìm thấy bản đồ")
     _require_guest_operational_map(record, user)
     if user.role == "guest" and record.active_version != version:
@@ -760,12 +1013,14 @@ async def version_preview(
         raise HTTPException(status_code=404, detail="Không tìm thấy version bản đồ")
     try:
         with tarfile.open(item.storage_path, "r:*") as archive:
+            members = {
+                candidate.name.lstrip("./"): candidate
+                for candidate in archive.getmembers() if candidate.isfile()
+            }
+            # Browsers reliably decode PNG/WebP. map.pgm remains a valid map
+            # artifact, but is only a last-resort response for legacy bundles.
             member = next(
-                (
-                    candidate for candidate in archive.getmembers()
-                    if candidate.isfile()
-                    and candidate.name.lstrip("./") in {"preview.png", "preview.webp", "map.png", "map.pgm"}
-                ),
+                (members[name] for name in ("preview.png", "preview.webp", "map.png", "map.pgm") if name in members),
                 None,
             )
             if member is None:
@@ -815,7 +1070,7 @@ async def archive_map(
     database: Session = Depends(get_db),
 ) -> dict:
     record = database.get(MapRecord, map_id)
-    if record is None:
+    if record is None or record.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Không tìm thấy bản đồ")
     record.status = "ARCHIVED"
     for version in database.scalars(
@@ -861,7 +1116,7 @@ async def get_map(
     database: Session = Depends(get_db),
 ) -> dict:
     record = database.get(MapRecord, map_id)
-    if record is None:
+    if record is None or record.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Không tìm thấy bản đồ")
     _require_guest_operational_map(record, user)
     return _map_view(database, record, details=user.role != "guest")
@@ -874,7 +1129,7 @@ async def get_destinations(
     database: Session = Depends(get_db),
 ) -> list[dict]:
     record = database.get(MapRecord, map_id)
-    if record is None:
+    if record is None or record.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Không tìm thấy bản đồ")
     _require_guest_operational_map(record, user)
     destinations = [

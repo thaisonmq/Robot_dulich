@@ -12,7 +12,9 @@ export default defineConfig({
     proxy: {
       "/api": backendHttpUrl,
       "/health": backendHttpUrl,
-      "/maps": backendHttpUrl,
+      // Keep React's /maps, /maps/create and /maps/:id routes in Vite. Only
+      // legacy static artifacts such as /maps/map-001.svg belong to Center.
+      "^/maps/.+\\.[^/]+$": backendHttpUrl,
       "/ws": { target: backendWebSocketUrl, ws: true },
     },
   },

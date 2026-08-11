@@ -56,6 +56,37 @@ def test_real_mapping_capability_requires_scan_odometry_and_lidar_tf() -> None:
     ]
 
 
+def test_idle_runtime_can_start_mapping_without_running_nav2_or_slam() -> None:
+    capabilities = runtime_capabilities_from_health({
+        "motion_backend": "ros2",
+        "navigation_backend": "ros2",
+        "mode": "IDLE",
+        "nav2": "STOPPED",
+        "scan_fresh": False,
+        "odometry_ready": False,
+        "lidar_tf_ready": False,
+    })
+
+    assert capabilities["mapping"] is True
+    assert capabilities["mapping_blockers"] == []
+    assert capabilities["navigation"] is False
+
+
+def test_mapping_does_not_require_nav2_runtime() -> None:
+    capabilities = runtime_capabilities_from_health({
+        "motion_backend": "ros2",
+        "navigation_backend": "ros2",
+        "mode": "MAPPING",
+        "nav2": "MAPPING",
+        "scan_fresh": True,
+        "odometry_ready": True,
+        "lidar_tf_ready": True,
+    })
+
+    assert capabilities["mapping"] is True
+    assert capabilities["navigation"] is False
+
+
 def test_simulator_capability_remains_self_contained() -> None:
     capabilities = runtime_capabilities_from_health(
         {"motion_backend": "simulator", "navigation_backend": "simulator"}

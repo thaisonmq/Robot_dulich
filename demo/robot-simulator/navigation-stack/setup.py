@@ -3,7 +3,7 @@ from setuptools import setup
 setup(
     name="rovera_navigation_adapter",
     version="1.0.0",
-    py_modules=["adapter_node", "sensor_normalizer"],
+    py_modules=["adapter_node", "navigation_core", "sensor_normalizer"],
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/rovera_navigation_adapter"]),
         ("share/rovera_navigation_adapter", ["package.xml"]),

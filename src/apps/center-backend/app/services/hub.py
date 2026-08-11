@@ -50,7 +50,6 @@ class RobotRuntime:
             "navigation": "idle",
         }
     )
-    mapping_snapshot: dict[str, Any] | None = None
 @dataclass(slots=True)
 class SessionRuntime:
     session_id: str

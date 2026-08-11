@@ -1,5 +1,7 @@
 # ROVERA — Robot Telepresence
 
+Tài liệu subsystem mới: [Mapping/Auto Localization/Nav2](docs/MAPPING_AND_NAVIGATION.md), [Map Registry Pi ↔ Center](docs/MAP_REGISTRY.md), [RViz2 trên laptop Ubuntu](docs/RVIZ_MAPPING_GUIDE.md).
+
 ROVERA là hệ thống điều khiển robot từ xa qua trình duyệt, gồm giao diện quản
 lý, API trung tâm, kết nối thời gian thực và phần mềm chạy trên robot.
 

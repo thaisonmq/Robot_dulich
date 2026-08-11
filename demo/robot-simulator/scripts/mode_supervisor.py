@@ -88,6 +88,14 @@ def adapter_status(timeout: float = 2.0) -> dict[str, Any]:
 
 
 def wait_for_mode(mode: str, timeout: float = 75.0) -> dict[str, Any]:
+    if mode == "IDLE":
+        return {
+            "mode": "IDLE",
+            "state": "NO_ACTIVE_MAP",
+            "nav2": "STOPPED",
+            "localized": False,
+            "localization_state": "IDLE",
+        }
     deadline = time.monotonic() + timeout
     last_state: dict[str, Any] = {}
     while time.monotonic() < deadline:
@@ -117,7 +125,7 @@ def remove_stale_socket() -> None:
 
 def switch_mode(request: dict[str, Any]) -> dict[str, Any]:
     mode = str(request.get("mode", "")).upper()
-    if mode not in {"MAPPING", "NAVIGATION"}:
+    if mode not in {"IDLE", "MAPPING", "NAVIGATION"}:
         raise ValueError(f"unsupported mode: {mode}")
     vendor_count = vendor_base_runtime_count()
     if vendor_count != 1:
@@ -138,7 +146,14 @@ def switch_mode(request: dict[str, Any]) -> dict[str, Any]:
 
     navigation_files = ["compose.yaml", "compose.navigation.yml"]
     mapping_files = ["compose.yaml", "compose.coexistence.yml"]
-    if mode == "NAVIGATION":
+    if mode == "IDLE":
+        # A deleted/deactivated active map must leave no localization or map
+        # authority behind. The vendor base and motion-safety runtime remain
+        # alive, so manual control and E-stop are still available.
+        compose(navigation_files, "navigation", "stop", "navigation-stack")
+        compose(mapping_files, "legacy-coexistence", "stop", "mapping-stack")
+        remove_stale_socket()
+    elif mode == "NAVIGATION":
         compose(mapping_files, "legacy-coexistence", "stop", "mapping-stack")
         remove_stale_socket()
         compose(
