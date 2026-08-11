@@ -34,7 +34,12 @@ from std_msgs.msg import Bool, String, UInt8
 from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 
-from navigation_core import SavedOccupancyMap, compact_lethal_cells, localization_confidence
+from navigation_core import (
+    SavedOccupancyMap,
+    compact_lethal_cells,
+    localization_confidence,
+    navigation_abort_state,
+)
 
 
 def quaternion_from_yaw(yaw: float) -> Quaternion:
@@ -67,6 +72,7 @@ class NavigationAdapter(Node):
         self.map_version = 0
         self.mapping_payload: dict[str, Any] = {}
         self.current_goal_handle: Any = None
+        self.navigation_goal_generation = 0
         self.paused_goal: dict[str, float] | None = None
         self.current_mission_id = ""
         self.latest_feedback: dict[str, Any] = {}
@@ -302,8 +308,12 @@ class NavigationAdapter(Node):
                 "odometry_ready": self.tf_buffer.can_transform(
                     "odom", "base_footprint", Time()
                 ),
+                # Validate the complete navigation chain. Checking only
+                # base_link -> laser_frame hid a missing
+                # base_footprint -> base_link transform and let AMCL discard
+                # every scan while the container still reported healthy.
                 "lidar_tf_ready": self.tf_buffer.can_transform(
-                    "base_link", "laser_frame", Time()
+                    "base_footprint", "laser_frame", Time()
                 ),
                 "safety": "HEALTHY" if self.safety_health.startswith("HEALTHY") else self.safety_health,
                 "estop": self.estop_active,
@@ -313,7 +323,7 @@ class NavigationAdapter(Node):
                     "state": self.current_state,
                     "scanHealthy": time.monotonic() - self.last_scan_monotonic <= 0.30,
                     "odomHealthy": self.tf_buffer.can_transform("odom", "base_footprint", Time()),
-                    "tfHealthy": self.tf_buffer.can_transform("base_link", "laser_frame", Time()),
+                    "tfHealthy": self.tf_buffer.can_transform("base_footprint", "laser_frame", Time()),
                     "slamHealthy": self.slam_save_client.service_is_ready() if self.mode == "MAPPING" else False,
                     "elapsedSeconds": (
                         round(time.monotonic() - self.mapping_started_monotonic)
@@ -573,16 +583,23 @@ class NavigationAdapter(Node):
         if message.data:
             self.last_manual_takeover_monotonic = time.monotonic()
             self._stop_localization_rotation()
-        if (
+        active_navigation = (
             message.data
             and self.mode == "NAVIGATION"
             and self.current_state in {"NAVIGATING", "PAUSED", "BLOCKED"}
-        ):
+        )
+        if active_navigation:
             self.get_logger().warning("manual takeover: canceling Nav2 goal")
             try:
                 self._cancel_navigation("CANCELED")
             except AdapterError as exc:
                 self.get_logger().error(f"manual takeover cancel failed: {exc}")
+        elif message.data and self.mode == "NAVIGATION":
+            # A takeover can land in the short window while Nav2 is accepting
+            # a goal but before current_state becomes NAVIGATING. Invalidate
+            # that in-flight generation so _navigate cancels the late handle.
+            with self.state_lock:
+                self.navigation_goal_generation += 1
 
     def _update_pose(self) -> None:
         if (
@@ -728,6 +745,7 @@ class NavigationAdapter(Node):
         self.current_state = "LOCALIZATION_LOST"
         handle = self.current_goal_handle
         self.current_goal_handle = None
+        self.navigation_goal_generation += 1
         if handle is not None:
             handle.cancel_goal_async()
         self.localization_velocity.publish(Twist())
@@ -743,7 +761,12 @@ class NavigationAdapter(Node):
             return
         localizing_states = {
             "LOCALIZATION_INITIALIZING", "LOCALIZING_LAST_POSE", "LOCALIZING_GLOBAL",
-            "LOCALIZING_ROTATING", "LOW_CONFIDENCE", "LOCALIZATION_LOST",
+            "LOCALIZING_APPROXIMATE_POSE", "LOCALIZING_ROTATING", "LOW_CONFIDENCE",
+            "LOCALIZATION_LOST",
+            # A failed attempt is terminal for automatic rotation, but AMCL
+            # must still be allowed to recover after an operator moves the
+            # robot manually and supplies enough fresh, stable scans.
+            "LOCALIZATION_FAILED",
         }
         if self.localization_state not in localizing_states:
             return
@@ -757,7 +780,9 @@ class NavigationAdapter(Node):
         # multiple LiDAR scans instead of either trusting its first covariance
         # spike or timing out without enough samples.
         if (
-            self.localization_state == "LOCALIZING_LAST_POSE"
+            self.localization_state in {
+                "LOCALIZING_LAST_POSE", "LOCALIZING_APPROXIMATE_POSE",
+            }
             and now - self.last_nomotion_request_monotonic >= 0.5
             and self.nomotion_update_client.service_is_ready()
         ):
@@ -907,15 +932,29 @@ class NavigationAdapter(Node):
         self._validate_command_map(payload)
         if self.saved_map is None or self.saved_map.world_to_cell(float(pose["x"]), float(pose["y"])) is None:
             raise AdapterError("POSE_OUTSIDE_MAP", "Vị trí gần đúng nằm ngoài bản đồ")
-        self._publish_initial_pose(pose, approximate=True)
+        # Never let confidence accumulated around a false, locally stable AMCL
+        # hypothesis immediately validate an operator-supplied correction.
+        # Require fresh AMCL samples around the new pose before returning READY.
         self.localized = False
+        self.localization_confidence = 0.0
+        self.amcl_stable_samples = 0
+        self.last_amcl_pose = None
+        self.last_amcl_covariance = []
+        self.low_confidence_since = None
+        self.trusted_last_pose = False
+        self.last_nomotion_request_monotonic = 0.0
         self.localization_started_monotonic = time.monotonic()
         self.localization_phase_started_monotonic = self.localization_started_monotonic
-        self.localization_state = "LOCALIZING_GLOBAL"
-        self.current_state = "LOCALIZING_GLOBAL"
+        # The operator selected a concrete map point and heading. Seed a tight
+        # local AMCL cloud around it; a one-metre variance can overlap
+        # symmetric rooms and discard the operator's correction.
+        operator_pose = {**pose, "covariance": 0.04}
+        self._publish_initial_pose(operator_pose, approximate=False)
+        self.localization_state = "LOCALIZING_APPROXIMATE_POSE"
+        self.current_state = "LOCALIZING_APPROXIMATE_POSE"
         return {
             "status": "accepted",
-            "current_state": "LOCALIZING_GLOBAL",
+            "current_state": "LOCALIZING_APPROXIMATE_POSE",
             "localized": False,
             "state": self._state(),
         }
@@ -1055,29 +1094,56 @@ class NavigationAdapter(Node):
             raise AdapterError("NAV2_UNAVAILABLE", "NavigateToPose action unavailable")
         goal = NavigateToPose.Goal()
         goal.pose = self._goal_pose(goal_payload)
+        with self.state_lock:
+            self.navigation_goal_generation += 1
+            goal_generation = self.navigation_goal_generation
+            # A new Nav2 action owns a fresh, mission-local recovery count.
+            # Keeping feedback from the previous goal could misclassify an
+            # unrelated planner/controller failure as an obstacle blockage.
+            self.latest_feedback = {"recoveries": 0}
         future = self.navigate_client.send_goal_async(
-            goal, feedback_callback=self._navigation_feedback
+            goal,
+            feedback_callback=(
+                lambda feedback, generation=goal_generation:
+                self._navigation_feedback(feedback, generation)
+            ),
         )
         handle = self._wait(future, 5, "NAVIGATION_TIMEOUT")
         if not handle.accepted:
             raise AdapterError("GOAL_REJECTED", "Nav2 rejected goal")
         with self.state_lock:
-            self.current_goal_handle = handle
-            self.paused_goal = dict(goal_payload)
-            self.current_state = "NAVIGATING"
-        handle.get_result_async().add_done_callback(self._navigation_result)
+            superseded = goal_generation != self.navigation_goal_generation
+            if not superseded:
+                self.current_goal_handle = handle
+                self.paused_goal = dict(goal_payload)
+                self.current_state = "NAVIGATING"
+        if superseded:
+            # Manual takeover/cancel won the race while Nav2 was accepting the
+            # goal. Cancel the late handle; never resurrect autonomous motion.
+            handle.cancel_goal_async()
+            raise AdapterError(
+                "NAVIGATION_CANCELED",
+                "Navigation was canceled while Nav2 was accepting the goal",
+            )
+        handle.get_result_async().add_done_callback(
+            lambda result_future, generation=goal_generation: self._navigation_result(
+                result_future, generation
+            )
+        )
         return {"status": "accepted", "current_state": "NAVIGATING", "state": self._state()}
 
-    def _navigation_feedback(self, feedback: Any) -> None:
+    def _navigation_feedback(self, feedback: Any, goal_generation: int) -> None:
         data = feedback.feedback
         with self.state_lock:
+            if goal_generation != self.navigation_goal_generation:
+                return
             self.latest_feedback = {
                 "distance_remaining": float(data.distance_remaining),
                 "navigation_time_seconds": data.navigation_time.sec + data.navigation_time.nanosec / 1e9,
                 "recoveries": int(data.number_of_recoveries),
             }
 
-    def _navigation_result(self, future: Any) -> None:
+    def _navigation_result(self, future: Any, goal_generation: int) -> None:
         try:
             wrapped = future.result()
             status = int(wrapped.status)
@@ -1085,6 +1151,11 @@ class NavigationAdapter(Node):
             self.get_logger().error(f"NavigateToPose result failed: {exc}")
             status = GoalStatus.STATUS_ABORTED
         with self.state_lock:
+            # Pause/resume can start a replacement action before the canceled
+            # action's result callback arrives. Never let that stale callback
+            # cancel or fail the newer mission attempt.
+            if goal_generation != self.navigation_goal_generation:
+                return
             self.current_goal_handle = None
             if status == GoalStatus.STATUS_SUCCEEDED:
                 self.current_state = "SUCCEEDED"
@@ -1097,7 +1168,21 @@ class NavigationAdapter(Node):
                 self.current_state = "CANCELED"
                 self.paused_goal = None
             else:
-                self.current_state = "FAILED"
+                recoveries = int(self.latest_feedback.get("recoveries", 0) or 0)
+                # Humble's NavigateToPose result has no useful terminal error
+                # code. A nonzero recovery count proves Nav2 already exhausted
+                # its bounded clear/spin/wait/backup sequence, so expose the
+                # actionable, safe state instead of the generic FAILED state.
+                self.current_state = navigation_abort_state(recoveries)
+                blocked = self.current_state == "BLOCKED"
+                self.latest_feedback["terminal_reason"] = (
+                    "NO_SAFE_ROUTE_AFTER_RECOVERY"
+                    if blocked
+                    else "NAV2_ABORTED"
+                )
+                self.paused_goal = None
+                self.latest_global_path = []
+                self.visualization_revision += 1
 
     def _cancel_navigation(self, target: str) -> dict[str, Any]:
         with self.state_lock:
@@ -1105,10 +1190,16 @@ class NavigationAdapter(Node):
             self.current_state = target
         if handle is not None:
             self._wait(handle.cancel_goal_async(), 3, "CANCEL_TIMEOUT")
-        if target != "PAUSED":
-            self.paused_goal = None
-            self.latest_global_path = []
-            self.visualization_revision += 1
+        with self.state_lock:
+            # The requested terminal/paused state is already authoritative.
+            # Invalidate the asynchronous Nav2 result so it cannot overwrite a
+            # later resume, map deactivation, or manual takeover state.
+            self.current_goal_handle = None
+            self.navigation_goal_generation += 1
+            if target != "PAUSED":
+                self.paused_goal = None
+                self.latest_global_path = []
+                self.visualization_revision += 1
         return {"status": "completed", "current_state": target, "state": self._state()}
 
     def _pause_navigation(self) -> dict[str, Any]:
@@ -1138,7 +1229,7 @@ class NavigationAdapter(Node):
             if not readiness["lidar_tf_ready"]:
                 raise AdapterError(
                     "LIDAR_TF_UNAVAILABLE",
-                    "TF base_link -> laser_frame is unavailable",
+                    "TF base_footprint -> base_link -> laser_frame is unavailable",
                 )
             if readiness["safety"] != "HEALTHY":
                 raise AdapterError("SAFETY_UNHEALTHY", "Motion safety is not healthy")

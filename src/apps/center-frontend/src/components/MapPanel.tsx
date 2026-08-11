@@ -18,6 +18,7 @@ const NAVIGATION_STATE_LABELS: Record<string, string> = {
   LOADING_MAP: "Đang tải bản đồ",
   LOCALIZATION_INITIALIZING: "Đang khởi tạo định vị",
   LOCALIZING_LAST_POSE: "Đang dùng vị trí gần nhất",
+  LOCALIZING_APPROXIMATE_POSE: "Đang hiệu chỉnh vị trí",
   LOCALIZING_GLOBAL: "Đang tự định vị",
   LOCALIZING_ROTATING: "Đang xoay để định vị",
   LOCALIZING: "Đang xác định vị trí",
@@ -85,6 +86,7 @@ interface Props {
   onRetryLocalization?: () => void;
   onClearSelection?: () => void;
   onSelect: (destination: Destination) => void;
+  onSelectInitialPose?: (destination: Destination) => void;
   onGo: () => void;
   onPause?: () => void;
   onResume?: () => void;
@@ -97,18 +99,90 @@ interface CanvasProps {
   pose: Pose;
   route: Route | null;
   selected: Destination | null;
-  footprint: Point[];
   dynamicObstacles: Point[];
   readOnly: boolean;
   showRobot: boolean;
+  robotMoving: boolean;
   focus?: Point | null;
   zoom?: number;
+  requireHeading?: boolean;
   onSelect: (destination: Destination) => void;
 }
 
+export function drawRobotMapMarker(
+  context: CanvasRenderingContext2D,
+  center: { x: number; y: number },
+  canvasYaw: number,
+  moving: boolean,
+  radius: number,
+) {
+  context.save();
+  context.translate(center.x, center.y);
+  context.lineJoin = "round";
+  context.shadowColor = "rgba(19, 43, 82, .28)";
+  context.shadowBlur = Math.max(3, radius * .65);
+  context.shadowOffsetY = Math.max(1, radius * .24);
+
+  if (moving) {
+    // Google Maps-style navigation pointer: compact, directional and legible
+    // above both light and dark occupancy cells.
+    context.rotate(canvasYaw);
+    context.beginPath();
+    context.moveTo(radius * 1.32, 0);
+    context.lineTo(-radius * .76, -radius * .82);
+    context.lineTo(-radius * .34, 0);
+    context.lineTo(-radius * .76, radius * .82);
+    context.closePath();
+    context.fillStyle = "#1a73e8";
+    context.fill();
+    context.shadowColor = "transparent";
+    context.strokeStyle = "#ffffff";
+    context.lineWidth = Math.max(2, radius * .28);
+    context.stroke();
+  } else {
+    // The tip of the red place pin is anchored exactly at the robot pose.
+    context.beginPath();
+    context.moveTo(0, 0);
+    context.bezierCurveTo(
+      -radius * .18, -radius * .28,
+      -radius, -radius * .86,
+      -radius, -radius * 1.28,
+    );
+    context.bezierCurveTo(
+      -radius, -radius * 1.88,
+      -radius * .55, -radius * 2.25,
+      0, -radius * 2.25,
+    );
+    context.bezierCurveTo(
+      radius * .55, -radius * 2.25,
+      radius, -radius * 1.88,
+      radius, -radius * 1.28,
+    );
+    context.bezierCurveTo(
+      radius, -radius * .86,
+      radius * .18, -radius * .28,
+      0, 0,
+    );
+    context.closePath();
+    context.fillStyle = "#d93025";
+    context.fill();
+    context.shadowColor = "transparent";
+    context.strokeStyle = "#ffffff";
+    context.lineWidth = Math.max(1.8, radius * .25);
+    context.stroke();
+
+    context.beginPath();
+    context.arc(0, -radius * 1.31, radius * .32, 0, Math.PI * 2);
+    context.fillStyle = "#ffffff";
+    context.fill();
+  }
+  context.restore();
+}
+
 function MapCanvas({
-  map, destinations, pose, route, selected, footprint, dynamicObstacles,
-  readOnly, showRobot, focus = null, zoom = 1, onSelect,
+  map, destinations, pose, route, selected, dynamicObstacles,
+  readOnly, showRobot, robotMoving, focus = null, zoom = 1,
+  requireHeading = false, onSelect,
 }: CanvasProps) {
   const { t } = useI18n();
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -208,18 +282,17 @@ function MapCanvas({
       context.lineTo(-7, 7); context.lineTo(-4, 0); context.lineTo(-7, -7); context.closePath(); context.fill(); context.restore();
     }
     if (showRobot) {
-      const polygon = footprint.map((point) => ({
-        x: pose.x + point.x * Math.cos(pose.yaw) - point.y * Math.sin(pose.yaw),
-        y: pose.y + point.x * Math.sin(pose.yaw) + point.y * Math.cos(pose.yaw),
-      })).map(pointOnCanvas);
-      context.fillStyle = "rgba(23,89,214,.78)"; context.strokeStyle = "white"; context.lineWidth = 2;
-      context.beginPath(); polygon.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
-      context.closePath(); context.fill(); context.stroke();
       const center = pointOnCanvas(pose);
-      const heading = pointOnCanvas({ x: pose.x + Math.cos(pose.yaw) * .30, y: pose.y + Math.sin(pose.yaw) * .30 });
-      context.strokeStyle = "#0b2f74"; context.lineWidth = 3; context.beginPath(); context.moveTo(center.x, center.y); context.lineTo(heading.x, heading.y); context.stroke();
+      const markerRadius = Math.max(6.5, Math.min(9, viewport.width / 55));
+      drawRobotMapMarker(
+        context,
+        center,
+        -pose.yaw + map.origin.yaw,
+        robotMoving,
+        markerRadius,
+      );
     }
-  }, [dynamicObstacles, fitted, footprint, imageRevision, imageState, map, pose, route, selected, showRobot, viewport]);
+  }, [dynamicObstacles, fitted, imageRevision, imageState, map, pose, robotMoving, route, selected, showRobot, viewport]);
 
   const eventWorld = (clientX: number, clientY: number): Point | null => {
     const canvas = canvasRef.current;
@@ -247,6 +320,7 @@ function MapCanvas({
         if (!start || readOnly) return;
         const end = eventWorld(event.clientX, event.clientY) ?? start.point;
         const dragged = Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) > 6;
+        if (requireHeading && !dragged) return;
         onSelect({ destination_id: "CUSTOM-GOAL", map_id: map.map_id, name: t("Điểm tùy chọn"),
           x: start.point.x, y: start.point.y,
           yaw: dragged ? Math.atan2(end.y - start.point.y, end.x - start.point.x) : 0, enabled: true });
@@ -266,10 +340,10 @@ function MapCanvas({
 export function MapPanel({
   map, maps = [], selectedMapId, destinations, pose, route, selected, loading,
   navigationStatus, mapState = "READY", localizationState = mapState,
-  localizationConfidence = 0, health, visualization, feedback, footprint,
+  localizationConfidence = 0, health, visualization, feedback,
   canStart = true, preflightFailures = [], errorMessage = "", noticeMessage = "", localized = false,
   mapActivationError = "",
-  onMapChange, onSelect, onSetInitialPose, onRetryLocalization, onClearSelection, onGo, onPause,
+  onMapChange, onSelect, onSelectInitialPose, onSetInitialPose, onRetryLocalization, onClearSelection, onGo, onPause,
   onResume, onCancel, readOnly = false,
 }: Props) {
   const { t } = useI18n();
@@ -285,9 +359,6 @@ export function MapPanel({
   const ready = localized && localizationState === "READY" && pose.map_id === map.map_id
     && (pose.map_version == null || pose.map_version === map.active_version)
     && (health?.map_version == null || health.map_version === map.active_version);
-  const robotFootprint = footprint?.length ? footprint : [
-    { x: .15, y: .05 }, { x: .15, y: -.05 }, { x: -.15, y: -.05 }, { x: -.15, y: .05 },
-  ];
   const visualizationMatches = visualization?.map_id === map.map_id
     && visualization.map_version === map.active_version;
   const liveRoute = visualization?.global_path?.length && visualizationMatches
@@ -310,7 +381,7 @@ export function MapPanel({
       <button type="button" disabled={!ready} className={followRobot ? "is-active" : ""} onClick={() => { setCenterRobot(false); setFollowRobot((value) => !value); }}><Crosshair size={13} /> {t("Theo robot")}</button></div>
     <div className="map-canvas map-canvas--mini" onDoubleClick={() => ready && setExpanded(true)}>
       <MapCanvas map={map} destinations={[]} pose={pose} route={liveRoute} selected={selected}
-        footprint={robotFootprint} dynamicObstacles={obstacles} readOnly showRobot={ready}
+        dynamicObstacles={obstacles} readOnly showRobot={ready} robotMoving={moving}
         focus={followRobot || centerRobot ? pose : null} zoom={followRobot || centerRobot ? 2 : 1} onSelect={onSelect} />
       {!ready && <div className="localization-overlay"><Navigation />
         <strong>{localizationFailed ? t("Không thể tự xác định chính xác vị trí robot.") : t("Đang xác định vị trí robot…")}</strong>
@@ -336,16 +407,25 @@ export function MapPanel({
         <button type="button" onClick={() => { onClearSelection?.(); setApproximateMode(true); setExpanded(true); }}>{t("Chỉ vị trí robot gần đúng")}</button></>
         : moving ? <><button type="button" onClick={onPause}><Pause /> {t("Tạm dừng")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
         : paused ? <><button type="button" onClick={onResume}><Play /> {t("Tiếp tục")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
-        : <button type="button" className="button button--primary" disabled={!ready || readOnly}
-          onClick={() => { setApproximateMode(false); setExpanded(true); }}><Flag /> {t("Chọn điểm đến")}</button>}
+        : <><button type="button" className="button button--primary" disabled={!ready || readOnly}
+          onClick={() => { setApproximateMode(false); setExpanded(true); }}><Flag /> {t("Chọn điểm đến")}</button>
+          {ready && <button type="button" disabled={readOnly || loading}
+            onClick={() => { onClearSelection?.(); setApproximateMode(true); setExpanded(true); }}>
+            <LocateFixed /> {t("Chỉ vị trí robot gần đúng")}
+          </button>}</>}
     </div>
     {expanded && <div className="map-modal" role="dialog" aria-modal="true" aria-label={t(approximateMode ? "Chỉ vị trí robot gần đúng" : "Chọn điểm đến")}>
-      <div className="map-modal__panel"><header><div><small>{map.name} · v{map.active_version}</small>
+      <div className="map-modal__panel"><div className="map-modal__heading"><header><div><small>{map.name} · v{map.active_version}</small>
         <strong>{t(approximateMode ? "Chỉ vị trí robot gần đúng" : "Chọn điểm đến")}</strong></div>
         <button type="button" aria-label={t("Đóng bản đồ mở rộng")} onClick={() => { setExpanded(false); setApproximateMode(false); }}><X /></button></header>
+        {approximateMode && <p className="map-modal__hint">
+          {t("Nhấn tại vị trí robot rồi kéo theo hướng đầu robot để đặt cả vị trí và góc quay.")}
+        </p>}</div>
         <div className="map-modal__canvas"><MapCanvas map={map} destinations={approximateMode ? [] : destinations} pose={pose}
-          route={approximateMode ? null : liveRoute} selected={selected} footprint={robotFootprint} dynamicObstacles={obstacles}
-          readOnly={readOnly || loading} showRobot={ready && !approximateMode} onSelect={onSelect} /></div>
+          route={approximateMode ? null : liveRoute} selected={selected} dynamicObstacles={obstacles}
+          readOnly={readOnly || loading} showRobot={ready && !approximateMode} robotMoving={moving}
+          requireHeading={approximateMode}
+          onSelect={approximateMode ? onSelectInitialPose ?? onSelect : onSelect} /></div>
         <footer><button type="button" onClick={() => { setExpanded(false); setApproximateMode(false); }}>{t("Hủy")}</button>
           {approximateMode ? <button type="button" className="button button--primary" disabled={!selected || loading}
             onClick={() => { onSetInitialPose?.(); setExpanded(false); setApproximateMode(false); }}><Navigation /> {t("Xác nhận vị trí gần đúng")}</button>

@@ -48,7 +48,9 @@ Last Known Pose lưu 5 giây/lần gồm map/version, x/y/yaw, covariance và ti
 
 Camera luôn chiếm cột lớn. Mini-map bên phải render Saved Map với nearest-neighbor, footprint theo mét, heading, goal, `/plan` thật và lethal cells từ local costmap. **Expand** mở modal trong cùng Dashboard; LiveKit transport không bị remount.
 
-Click map chỉ chọn goal/heading và gọi `ComputePathToPose`. Nút **Đi đến đây** mới gửi `NavigateToPose`. Edge kiểm tra map/version active, localization `READY`, bounds theo origin có rotation, unknown/occupied, clearance footprint và obstacle động. Frontend không tự tính hoặc smooth path; `/plan` mới thay hoàn toàn path cũ.
+Click map chỉ chọn goal/heading và gọi `ComputePathToPose`. Nút **Đi đến đây** mới gửi `NavigateToPose`. Edge kiểm tra map/version active, localization `READY`, bounds theo origin có rotation, unknown/occupied, clearance footprint và obstacle động. Frontend không tự tính hoặc smooth path; SmacPlanner2D tạo path cost-aware đã làm mượt và `/plan` mới thay hoàn toàn path cũ.
+
+Trong khi đi, Nav2 tính lại global path 1 Hz trên costmap động. Trường inflation rộng khiến planner ưu tiên hành lang thoáng và đi vòng vật cản nếu tồn tại lối an toàn. Vật cản tạm thời được chờ/lập đường lại và recovery theo chuỗi hữu hạn của Nav2; khi chuỗi này hết mà vẫn không có lối, action dừng an toàn, adapter xóa path/goal có thể resume và báo `BLOCKED` thay vì tự chạy lại vô hạn hoặc báo `FAILED` chung chung.
 
 Manual Control gọi takeover: cancel Nav2 trước và không auto-resume. **Dừng điều hướng** cancel action và gửi stop. E-stop tiếp tục do motion-safety xử lý ở lớp cuối.
 

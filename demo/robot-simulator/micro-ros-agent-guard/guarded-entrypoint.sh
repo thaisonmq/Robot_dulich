@@ -4,11 +4,20 @@ set -eu
 device="${MICRO_ROS_SERIAL_DEVICE:-/dev/ttyUSB0}"
 mode="${ROVERA_HARDWARE_MODE:-}"
 lock_file="${ROVERA_SERIAL_LOCK_FILE:-/var/lock/rovera-micro-ros/ttyUSB0.lock}"
-agent_vmem_kb="${MICRO_ROS_AGENT_VMEM_KB:-1572864}"
+agent_vmem_kb="${MICRO_ROS_AGENT_VMEM_KB:-0}"
 
-# Some Raspberry Pi kernels do not mount the memory cgroup, so Docker ignores
-# mem_limit. Keep an Agent/DDS fault bounded without relying on the host.
-ulimit -v "$agent_vmem_kb"
+# A FastCDR abort can otherwise spend tens of seconds dumping a multi-GiB
+# virtual address space, keeping the serial owner wedged while the MCU waits.
+ulimit -c 0
+
+# Fast DDS can reserve several GiB of virtual address space while its resident
+# memory stays small. Capping address space makes the Agent throw std::bad_alloc
+# during a healthy MCU session; after that crash the Yahboom firmware does not
+# reconnect until it is reset. Keep the cap opt-in and rely on the container's
+# resident-memory limit on hosts where memory cgroups are available.
+if [ "$agent_vmem_kb" -gt 0 ]; then
+  ulimit -v "$agent_vmem_kb"
+fi
 
 case "$mode" in
   legacy)

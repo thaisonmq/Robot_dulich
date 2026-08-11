@@ -16,6 +16,11 @@ class GoalValidation:
     message: str = ""
 
 
+def navigation_abort_state(recoveries: int) -> str:
+    """Classify an exhausted Nav2 action without hiding technical failures."""
+    return "BLOCKED" if max(0, int(recoveries)) > 0 else "FAILED"
+
+
 @dataclass(slots=True)
 class SavedOccupancyMap:
     """Exact saved-map grid used for goal validation (never downsampled)."""

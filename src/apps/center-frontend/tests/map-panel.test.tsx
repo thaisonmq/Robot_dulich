@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { MapPanel } from "../src/components/MapPanel";
+import { drawRobotMapMarker, MapPanel } from "../src/components/MapPanel";
 import { I18nProvider } from "../src/i18n/I18nProvider";
 import type { Destination, MapData } from "../src/types";
 
@@ -30,7 +30,9 @@ const canvasContext = {
   clearRect: vi.fn(), fillRect: vi.fn(), drawImage: vi.fn(), beginPath: vi.fn(),
   moveTo: vi.fn(), lineTo: vi.fn(), stroke: vi.fn(), save: vi.fn(),
   translate: vi.fn(), rotate: vi.fn(), closePath: vi.fn(), fill: vi.fn(),
-  restore: vi.fn(), arc: vi.fn(),
+  restore: vi.fn(), arc: vi.fn(), bezierCurveTo: vi.fn(),
+  fillStyle: "", strokeStyle: "", lineWidth: 1, lineJoin: "miter",
+  shadowColor: "", shadowBlur: 0, shadowOffsetY: 0,
 };
 
 function panel(overrides: Partial<ComponentProps<typeof MapPanel>> = {}) {
@@ -54,6 +56,8 @@ function panel(overrides: Partial<ComponentProps<typeof MapPanel>> = {}) {
 
 describe("MapPanel navigation controls", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
+    canvasContext.fill.mockReset();
     localStorage.setItem("rovera:interface-language:guest", "vi");
     vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
       canvasContext as unknown as CanvasRenderingContext2D,
@@ -77,6 +81,43 @@ describe("MapPanel navigation controls", () => {
     fireEvent.click(screen.getByRole("button", { name: "Kích hoạt" }));
 
     expect(onMapChange).toHaveBeenCalledWith("MAP-B");
+  });
+
+  it("draws a compact red place pin while the robot is stationary", () => {
+    const fills: string[] = [];
+    canvasContext.fill.mockImplementation(() => fills.push(canvasContext.fillStyle));
+
+    drawRobotMapMarker(
+      canvasContext as unknown as CanvasRenderingContext2D,
+      { x: 42, y: 24 },
+      0,
+      false,
+      7,
+    );
+
+    expect(canvasContext.translate).toHaveBeenCalledWith(42, 24);
+    expect(canvasContext.bezierCurveTo).toHaveBeenCalled();
+    expect(fills).toContain("#d93025");
+    expect(fills).toContain("#ffffff");
+    expect(canvasContext.rotate).not.toHaveBeenCalled();
+  });
+
+  it("draws a blue directional arrow while the robot follows a route", () => {
+    const fills: string[] = [];
+    canvasContext.fill.mockImplementation(() => fills.push(canvasContext.fillStyle));
+
+    drawRobotMapMarker(
+      canvasContext as unknown as CanvasRenderingContext2D,
+      { x: 42, y: 24 },
+      -Math.PI / 2,
+      true,
+      7,
+    );
+
+    expect(canvasContext.rotate).toHaveBeenCalledWith(-Math.PI / 2);
+    expect(canvasContext.lineTo).toHaveBeenCalledTimes(3);
+    expect(fills).toContain("#1a73e8");
+    expect(fills).not.toContain("#d93025");
   });
 
   it("allows the displayed map to be loaded when Nav2 has no runtime map", () => {
@@ -123,6 +164,24 @@ describe("MapPanel navigation controls", () => {
     fireEvent.click(screen.getByRole("button", { name: "Chỉ vị trí robot gần đúng" }));
     fireEvent.click(screen.getByRole("button", { name: "Xác nhận vị trí gần đúng" }));
     expect(onSetInitialPose).toHaveBeenCalledOnce();
+  });
+
+  it("allows a ready robot to correct a false but confident localization", () => {
+    panel({
+      localized: true,
+      localizationState: "READY",
+      mapState: "READY",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Chỉ vị trí robot gần đúng" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Chỉ vị trí robot gần đúng" });
+    expect(dialog).toBeInTheDocument();
+    const panelElement = dialog.querySelector(".map-modal__panel");
+    expect(panelElement).toHaveClass("map-modal__panel");
+    expect(panelElement?.children).toHaveLength(3);
+    expect(panelElement?.children[1]).toHaveClass("map-modal__canvas");
+    expect(screen.getByRole("button", { name: "Xác nhận vị trí gần đúng" })).toBeDisabled();
   });
 
   it("localizes map accessibility and navigation action labels", () => {

@@ -1102,6 +1102,12 @@ export function DashboardPage() {
                   setRoute(null);
                   if (canRequestNewPath && mapLocalized) preview.mutate(destination);
                 }}
+                onSelectInitialPose={(destination) => {
+                  if (navigationRequestInFlightRef.current) return;
+                  setSelectedDestination(destination);
+                  setRoute(null);
+                  setNavigationNotice("");
+                }}
                 onSetInitialPose={() => {
                   if (selectedDestination && map?.active_version) setApproximatePose.mutate(selectedDestination);
                 }}

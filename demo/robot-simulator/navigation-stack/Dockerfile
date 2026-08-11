@@ -12,9 +12,9 @@ RUN apt-get update \
         ros-humble-nav2-controller \
         ros-humble-nav2-lifecycle-manager \
         ros-humble-nav2-map-server \
-        ros-humble-nav2-navfn-planner \
         ros-humble-nav2-planner \
         ros-humble-nav2-regulated-pure-pursuit-controller \
+        ros-humble-nav2-smac-planner \
         ros-humble-nav2-waypoint-follower \
         ros-humble-robot-localization \
         ros-humble-robot-state-publisher \

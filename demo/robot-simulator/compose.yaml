@@ -180,10 +180,12 @@ services:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
       MICRO_ROS_AGENT_VERBOSITY: ${MICRO_ROS_AGENT_VERBOSITY:-2}
-      MICRO_ROS_AGENT_VMEM_KB: ${MICRO_ROS_AGENT_VMEM_KB:-1572864}
-      # The Agent runs as root for serial access while the application ROS
-      # containers run as ROBOT_UID. Use LAN-capable UDP to cross that UID
-      # boundary without relying on Fast DDS shared-memory file permissions.
+      # Fast DDS reserves a large virtual address range; an AS limit causes
+      # std::bad_alloc even though the Agent RSS is only a few MiB.
+      MICRO_ROS_AGENT_VMEM_KB: ${MICRO_ROS_AGENT_VMEM_KB:-0}
+      # The Agent and application containers share host networking. Use the
+      # UDP-only Fast DDS profile to cross UID boundaries without relying on
+      # shared-memory permissions.
       FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
     devices:
       - /dev/ttyUSB0:/dev/ttyUSB0

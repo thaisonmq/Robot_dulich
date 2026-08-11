@@ -374,6 +374,16 @@
 .localization-overlay { gap: 7px; }
 .localization-overlay strong { font-size: 11px; }
 .localization-overlay span { font-size: 9px; }
+.map-modal__heading { min-width: 0; display: grid; gap: 8px; }
+.map-modal__hint {
+  margin: 0;
+  padding: 9px 14px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--blue) 7%, transparent);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.45;
+}
 .navigation-health-row { gap: 6px 11px; font-size: 9px; }
 .navigation-health-row i,
 .mapping-health-grid i { width: 7px; height: 7px; }

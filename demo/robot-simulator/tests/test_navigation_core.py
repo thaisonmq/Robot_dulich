@@ -12,6 +12,7 @@ from navigation_core import (  # noqa: E402
     SavedOccupancyMap,
     compact_lethal_cells,
     localization_confidence,
+    navigation_abort_state,
 )
 
 
@@ -114,6 +115,12 @@ def test_dynamic_obstacle_payload_is_metric_and_bounded() -> None:
     ]
 
 
+def test_navigation_abort_is_blocked_only_after_bounded_recovery() -> None:
+    assert navigation_abort_state(0) == "FAILED"
+    assert navigation_abort_state(1) == "BLOCKED"
+    assert navigation_abort_state(6) == "BLOCKED"
+
+
 def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     project = Path(__file__).parents[1]
     navigation = yaml.safe_load(
@@ -124,10 +131,26 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     )
     controller = navigation["controller_server"]["ros__parameters"]
     follow = controller["FollowPath"]
+    planner = navigation["planner_server"]["ros__parameters"]["GridBased"]
+    global_costmap = navigation["global_costmap"]["global_costmap"]["ros__parameters"]
     limits = smoother["velocity_smoother"]["ros__parameters"]
 
+    assert planner["plugin"] == "nav2_smac_planner/SmacPlanner2D"
+    assert planner["smooth_path"] is True
+    assert planner["allow_unknown"] is False
+    assert planner["cost_travel_multiplier"] >= 2.0
     assert 0.15 < follow["desired_linear_vel"] <= limits["max_velocity"][0]
     assert 0.55 < follow["rotate_to_heading_angular_vel"] <= limits["max_velocity"][2]
+    assert follow["lookahead_dist"] >= 0.35
     assert follow["regulated_linear_scaling_min_speed"] >= 0.07
     assert follow["max_allowed_time_to_collision_up_to_carrot"] >= 0.5
-    assert navigation["global_costmap"]["global_costmap"]["ros__parameters"]["update_frequency"] >= 3
+    assert controller["progress_checker"]["movement_time_allowance"] >= 10.0
+    assert global_costmap["update_frequency"] >= 3
+    assert global_costmap["inflation_layer"]["inflation_radius"] >= 0.4
+
+
+def test_navigation_image_installs_the_configured_planner() -> None:
+    project = Path(__file__).parents[1]
+    dockerfile = (project / "navigation-stack/Dockerfile").read_text()
+
+    assert "ros-humble-nav2-smac-planner" in dockerfile
