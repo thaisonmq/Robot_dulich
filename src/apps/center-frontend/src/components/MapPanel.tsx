@@ -17,6 +17,7 @@ const NAVIGATION_STATE_LABELS: Record<string, string> = {
   MAP_LOADING: "Đang tải bản đồ",
   LOADING_MAP: "Đang tải bản đồ",
   LOCALIZATION_INITIALIZING: "Đang khởi tạo định vị",
+  VERIFYING: "Đang xác minh định vị",
   LOCALIZING_LAST_POSE: "Đang dùng vị trí gần nhất",
   LOCALIZING_APPROXIMATE_POSE: "Đang hiệu chỉnh vị trí",
   LOCALIZING_GLOBAL: "Đang tự định vị",
@@ -25,6 +26,7 @@ const NAVIGATION_STATE_LABELS: Record<string, string> = {
   LOW_CONFIDENCE: "Độ tin cậy thấp",
   LOCALIZATION_LOST: "Mất định vị",
   LOCALIZATION_FAILED: "Định vị thất bại",
+  SENSOR_TIME_INVALID: "Lỗi thời gian cảm biến",
   READY: "Sẵn sàng",
   PLANNING: "Đang lập kế hoạch",
   NAVIGATING: "Đang di chuyển",
@@ -179,6 +181,25 @@ export function drawRobotMapMarker(
   context.restore();
 }
 
+export function worldYawToCanvas(worldYaw: number, mapOriginYaw: number): number {
+  // world -> map-local subtracts the origin yaw; canvas Y points downward.
+  return -worldYaw + mapOriginYaw;
+}
+
+export function goalApproachYaw(
+  pose: Pick<Pose, "x" | "y" | "yaw">,
+  goal: Point,
+): number {
+  const deltaX = goal.x - pose.x;
+  const deltaY = goal.y - pose.y;
+  // A click selects a position, not an arbitrary global heading.  Point the
+  // chassis along the direct approach so a nearby goal does not make the
+  // state-lattice planner draw a large loop merely to finish at yaw=0.
+  return Math.hypot(deltaX, deltaY) < 0.02
+    ? pose.yaw
+    : Math.atan2(deltaY, deltaX);
+}
+
 function MapCanvas({
   map, destinations, pose, route, selected, dynamicObstacles,
   readOnly, showRobot, robotMoving, focus = null, zoom = 1,
@@ -286,7 +307,7 @@ function MapCanvas({
         context.beginPath(); context.arc(0, 0, 11, 0, Math.PI * 2); context.stroke();
         context.beginPath(); context.arc(0, 0, 3, 0, Math.PI * 2); context.fillStyle = "#f59e0b"; context.fill();
       } else {
-        context.rotate(-selected.yaw - map.origin.yaw);
+        context.rotate(worldYawToCanvas(selected.yaw, map.origin.yaw));
         context.fillStyle = "#f59e0b"; context.beginPath(); context.moveTo(12, 0);
         context.lineTo(-7, 7); context.lineTo(-4, 0); context.lineTo(-7, -7); context.closePath(); context.fill();
       }
@@ -298,7 +319,7 @@ function MapCanvas({
       drawRobotMapMarker(
         context,
         center,
-        -pose.yaw + map.origin.yaw,
+        worldYawToCanvas(pose.yaw, map.origin.yaw),
         robotMoving,
         markerRadius,
       );
@@ -333,7 +354,12 @@ function MapCanvas({
         const dragged = Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) > 6;
         onSelect({ destination_id: "CUSTOM-GOAL", map_id: map.map_id, name: t("Điểm tùy chọn"),
           x: start.point.x, y: start.point.y,
-          yaw: !positionOnly && dragged ? Math.atan2(end.y - start.point.y, end.x - start.point.x) : 0, enabled: true });
+          yaw: positionOnly
+            ? 0
+            : dragged
+              ? Math.atan2(end.y - start.point.y, end.x - start.point.x)
+              : goalApproachYaw(pose, start.point),
+          enabled: true });
       }} />
     {destinations.map((destination) => {
       const marker = pointOnCanvas(destination);
@@ -366,6 +392,9 @@ export function MapPanel({
   const moving = navigationStatus === "moving";
   const paused = navigationStatus === "paused";
   const localizationFailed = localizationState === "LOCALIZATION_FAILED";
+  const localizationNeedsAssistance = localizationFailed || [
+    "LOCALIZING_GLOBAL", "LOW_CONFIDENCE", "LOCALIZATION_LOST",
+  ].includes(localizationState);
   const ready = localized && localizationState === "READY" && pose.map_id === map.map_id
     && (pose.map_version == null || pose.map_version === map.active_version)
     && (health?.map_version == null || health.map_version === map.active_version);
@@ -400,6 +429,7 @@ export function MapPanel({
     </div>
     <div className="navigation-health-row">
       <span>{t("LiDAR")} <i className={health?.scan_fresh ? "is-ok" : "is-fault"} /></span>
+      <span>{t("Đồng hồ sensor")} <i className={health?.sensor_time_healthy ? "is-ok" : "is-fault"} /></span>
       <span>{t("Odometry")} <i className={health?.odometry_ready ? "is-ok" : "is-fault"} /></span>
       <span>{t("TF")} <i className={health?.lidar_tf_ready ? "is-ok" : "is-fault"} /></span>
       <span>{t("Định vị")} <i className={ready ? "is-ok" : "is-pending"} /></span>
@@ -413,7 +443,7 @@ export function MapPanel({
       {t("Đường đi đang bị chặn. Robot đã dừng an toàn; hãy dời vật cản hoặc chọn điểm khác.")}
     </p>}
     <div className="navigation-actions">
-      {localizationFailed ? <><button type="button" onClick={onRetryLocalization}>{t("Thử lại")}</button>
+      {localizationNeedsAssistance ? <><button type="button" onClick={onRetryLocalization}>{t("Cho phép xoay để định vị")}</button>
         <button type="button" onClick={() => { onClearSelection?.(); setApproximateMode(true); setExpanded(true); }}>{t("Chỉ vị trí robot gần đúng")}</button></>
         : moving ? <><button type="button" onClick={onPause}><Pause /> {t("Tạm dừng")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
         : paused ? <><button type="button" onClick={onResume}><Play /> {t("Tiếp tục")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>

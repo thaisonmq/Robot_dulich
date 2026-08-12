@@ -93,12 +93,32 @@ services:
         target: /ws/install/rovera_navigation_adapter/lib/python3.10/site-packages/navigation_core.py
         read_only: true
       - type: bind
+        source: ./navigation-stack/sensor_normalizer.py
+        target: /ws/install/rovera_navigation_adapter/lib/python3.10/site-packages/sensor_normalizer.py
+        read_only: true
+      - type: bind
         source: ./navigation-stack/speed_profiles.py
         target: /ws/install/rovera_navigation_adapter/lib/python3.10/site-packages/speed_profiles.py
         read_only: true
       - type: bind
         source: ./navigation-stack/config/nav2_params.yaml
         target: /opt/rovera/config/nav2_params.yaml
+        read_only: true
+      - type: bind
+        source: ./navigation-stack/config/robot.urdf
+        target: /opt/rovera/config/robot.urdf
+        read_only: true
+      - type: bind
+        source: ./navigation-stack/config/ekf.yaml
+        target: /opt/rovera/config/ekf.yaml
+        read_only: true
+      - type: bind
+        source: ./navigation-stack/config/sensor_time.yaml
+        target: /opt/rovera/config/sensor_time.yaml
+        read_only: true
+      - type: bind
+        source: ./navigation-stack/launch/navigation_stack.launch.py
+        target: /opt/rovera/launch/navigation_stack.launch.py
         read_only: true
       - type: bind
         source: ./navigation-stack/config/auto_navigation_speed_profiles.yaml

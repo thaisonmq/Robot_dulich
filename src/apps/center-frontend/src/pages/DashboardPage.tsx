@@ -32,7 +32,7 @@ type PoseVerificationState = "required" | "requesting" | "localizing" | "confirm
 const LOCALIZATION_IN_PROGRESS_STATES = new Set([
   "LOCALIZATION_INITIALIZING", "LOCALIZING", "LOCALIZING_LAST_POSE",
   "LOCALIZING_APPROXIMATE_POSE", "LOCALIZING_GLOBAL", "LOCALIZING_ROTATING",
-  "LOW_CONFIDENCE", "LOCALIZATION_LOST",
+  "LOW_CONFIDENCE", "LOCALIZATION_LOST", "VERIFYING", "SENSOR_TIME_INVALID",
 ]);
 
 export function DashboardPage() {
@@ -179,6 +179,7 @@ export function DashboardPage() {
         FAULT: "failed", FAILED: "failed", LOCALIZATION_FAILED: "failed",
         READY: "ready", LOCALIZING: "localizing", LOCALIZING_LAST_POSE: "localizing",
         LOCALIZING_GLOBAL: "localizing", LOCALIZING_ROTATING: "localizing",
+        VERIFYING: "localizing", SENSOR_TIME_INVALID: "recovery",
         MAP_LOADING: "loading_map", LOADING_MAP: "loading_map", PLANNING: "planning",
         RECOVERY: "recovery", LOCALIZATION_LOST: "recovery", LOW_CONFIDENCE: "localizing",
       } as const;
@@ -502,10 +503,10 @@ export function DashboardPage() {
     onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
   const relocalize = useMutation({
-    mutationFn: ({ expectedState }: { expectedState: string; verificationKey?: string }) => api.relocalize({
+    mutationFn: ({ expectedState, allowRotation = true }: { expectedState: string; verificationKey?: string; allowRotation?: boolean }) => api.relocalize({
       request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
       expected_state: expectedState, map_id: map!.map_id, version: map!.active_version!,
-      allow_rotation: false,
+      allow_rotation: allowRotation,
     }),
     onMutate: ({ verificationKey }) => {
       navigationRequestInFlightRef.current = true;
@@ -551,6 +552,17 @@ export function DashboardPage() {
     const runtimeLocalizationState = String(
       health.localization_state ?? runtimeState,
     ).toUpperCase();
+    if (runtimeLocalizationState === "READY" && health.localized) {
+      // The adapter continuously verifies scan/map and sensor-time health.
+      // Reusing its READY state avoids destroying a good AMCL particle cloud
+      // merely because the browser opened a new Control session.
+      poseVerificationKeyRef.current = verificationKey;
+      poseVerificationSawLocalizingRef.current = true;
+      updatePoseVerification("confirmed");
+      setMapLocalized(true);
+      setNavigationState("ready");
+      return;
+    }
     if (LOCALIZATION_IN_PROGRESS_STATES.has(runtimeLocalizationState)) {
       poseVerificationKeyRef.current = verificationKey;
       poseVerificationSawLocalizingRef.current = true;
@@ -564,9 +576,9 @@ export function DashboardPage() {
       "READY", "SUCCEEDED", "ARRIVED", "CANCELED", "CANCELLED", "FAILED",
       "BLOCKED", "LOCALIZATION_FAILED",
     ].includes(runtimeState)) return;
-    relocalize.mutate({ expectedState: runtimeState, verificationKey });
+    relocalize.mutate({ expectedState: runtimeState, verificationKey, allowRotation: true });
   }, [
-    activeMapId, connectionState, health.localization_state, health.map_id,
+    activeMapId, connectionState, health.localized, health.localization_state, health.map_id,
     health.map_state, health.map_version, isSpectator, map, mapState, relocalize,
     session, sessionEndedReason, setRoute, updatePoseVerification,
   ]);
@@ -1337,7 +1349,7 @@ export function DashboardPage() {
                 onSetInitialPose={() => {
                   if (selectedDestination && map?.active_version) setApproximatePose.mutate(selectedDestination);
                 }}
-                onRetryLocalization={() => relocalize.mutate({ expectedState: mapState })}
+                onRetryLocalization={() => relocalize.mutate({ expectedState: mapState, allowRotation: true })}
                 onClearSelection={() => {
                   setSelectedDestination(null);
                   setRoute(null);

@@ -47,6 +47,27 @@ from simulator.map_cache import MapCacheError, RobotMapCacheManager
 logger = logging.getLogger("simulator.gateway")
 
 
+def localization_pose_safe_to_persist(state: dict[str, Any]) -> bool:
+    """Persist only a pose that survived sustained independent verification."""
+    diagnostics = state.get("localization_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return False
+    stability = diagnostics.get("pose_stability")
+    sensor_time = diagnostics.get("sensor_time")
+    if not isinstance(stability, dict) or not isinstance(sensor_time, dict):
+        return False
+    score = float(diagnostics.get("scan_map_score", 0.0))
+    threshold = float(diagnostics.get("scan_map_threshold", 1.0))
+    return (
+        bool(state.get("localized"))
+        and state.get("localization_state") == "READY"
+        and bool(stability.get("passed"))
+        and sensor_time.get("clock_state") == "SYNCED"
+        and score >= threshold
+        and float(diagnostics.get("ready_evidence_hold_ms") or 0.0) >= 30_000.0
+    )
+
+
 class RobotConnectionClient:
     def __init__(self, config: SimulatorConfig) -> None:
         self.config = config
@@ -1721,7 +1742,7 @@ class RobotConnectionClient:
                         )
                     )
                     if (
-                        state.get("localized")
+                        localization_pose_safe_to_persist(state)
                         and state.get("map_id")
                         and int(state.get("map_version", 0) or 0) > 0
                         and time.monotonic() - last_pose_save >= 5.0
@@ -1840,6 +1861,9 @@ class RobotConnectionClient:
                             "localized": backend_state.get("localized", False),
                             "localization_state": backend_state.get("localization_state", "IDLE"),
                             "localization_confidence": backend_state.get("localization_confidence", 0),
+                            "localization_diagnostics": backend_state.get(
+                                "localization_diagnostics"
+                            ),
                             "nav2": backend_state.get("nav2", "UNAVAILABLE"),
                             "auto_speed_mode": backend_state.get(
                                 "auto_speed_mode", "NORMAL"
@@ -1865,6 +1889,40 @@ class RobotConnectionClient:
                                 if self.config.motion_backend == "simulator"
                                 else backend_state.get("scan_fresh", False)
                             ),
+                            "sensor_clock_state": backend_state.get(
+                                "sensor_clock_state", "CLOCK_SYNCING"
+                            ),
+                            "sensor_time_healthy": backend_state.get(
+                                "sensor_time_healthy",
+                                self.config.motion_backend == "simulator",
+                            ),
+                            "scan_arrival_fresh": backend_state.get(
+                                "scan_arrival_fresh", False
+                            ),
+                            "scan_timestamp_valid": backend_state.get(
+                                "scan_timestamp_valid", False
+                            ),
+                            "scan_clock_skew_seconds": backend_state.get(
+                                "scan_clock_skew_seconds", 0.0
+                            ),
+                            "odom_arrival_fresh": backend_state.get(
+                                "odom_arrival_fresh", False
+                            ),
+                            "odom_timestamp_valid": backend_state.get(
+                                "odom_timestamp_valid", False
+                            ),
+                            "odom_clock_skew_seconds": backend_state.get(
+                                "odom_clock_skew_seconds", 0.0
+                            ),
+                            "imu_arrival_fresh": backend_state.get(
+                                "imu_arrival_fresh", False
+                            ),
+                            "imu_timestamp_valid": backend_state.get(
+                                "imu_timestamp_valid", False
+                            ),
+                            "imu_clock_skew_seconds": backend_state.get(
+                                "imu_clock_skew_seconds", 0.0
+                            ),
                             "odometry_ready": backend_state.get(
                                 "odometry_ready",
                                 self.config.motion_backend == "simulator",
@@ -1873,7 +1931,7 @@ class RobotConnectionClient:
                                 "lidar_tf_ready",
                                 self.config.motion_backend == "simulator",
                             ),
-                            "estop": False,
+                            "estop": bool(backend_state.get("estop", False)),
                             "collision_fault": False,
                             "mapping": backend_state.get("mapping"),
                             "map_registry": registry_health,

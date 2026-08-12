@@ -16,6 +16,57 @@ amcl:
     laser_min_range: 0.12
     set_initial_pose: false
 
+rovera_navigation_adapter:
+  ros__parameters:
+    # Verification preserves an already-good AMCL particle cloud. Global
+    # localization is entered only after this bounded evidence check fails.
+    localization_confidence_threshold: 0.72
+    localization_low_confidence_threshold: 0.30
+    localization_low_confidence_grace_seconds: 5.0
+    localization_ready_hold_seconds: 2.0
+    localization_verify_timeout_seconds: 3.0
+    localization_verify_min_scans: 3
+    # A verified pose with known heading normally passes five fresh stationary
+    # AMCL updates plus the evidence hold in under five seconds. If it cannot
+    # agree in eight seconds, expose global/assisted localization promptly.
+    localization_last_pose_timeout_seconds: 8.0
+    # An operator supplies only a nearby position and AMCL must search every
+    # heading. Do not discard a converging local cloud at the shorter timeout
+    # used for a persisted pose with a known heading.
+    localization_approximate_pose_timeout_seconds: 20.0
+    auto_localization_timeout_seconds: 45.0
+    global_localization_rotate_delay_seconds: 5.0
+    localization_pose_window_size: 8
+    localization_pose_minimum_samples: 5
+    localization_pose_minimum_duration_seconds: 1.0
+    localization_pose_maximum_xy_spread: 0.12
+    localization_pose_maximum_median_deviation: 0.06
+    localization_pose_maximum_yaw_variance: 0.025
+    localization_pose_maximum_yaw_spread: 0.20
+    # 90 beams bounds CPU. A 12 cm endpoint tolerance is 2.4 cells on the
+    # deployed 5 cm map and accommodates measured scan/map quantization. This
+    # is one evidence gate; the multi-heading global-search gate handles map
+    # ambiguity instead of pretending endpoint score alone proves uniqueness.
+    scan_map_score_window_size: 5
+    scan_map_maximum_beams: 90
+    scan_map_minimum_valid_beams: 25
+    scan_map_minimum_score: 0.35
+    scan_map_minimum_range: 0.20
+    scan_map_maximum_range: 6.0
+    scan_map_endpoint_tolerance: 0.12
+    scan_map_freshness_seconds: 0.60
+    sensor_time_invalid_grace_seconds: 1.0
+    auto_localization_rotation_degrees_per_second: 20.0
+    auto_localization_max_angle_degrees: 270.0
+    # A global particle search must observe at least two meaningfully
+    # different headings before an otherwise ambiguous static scan is trusted.
+    localization_global_minimum_rotation_degrees: 30.0
+    # Clearance beyond the complete swept circle of the 0.30 x 0.10 m body,
+    # not distance from its current axis-aligned rectangle.
+    localization_rotation_minimum_obstacle_distance: 0.08
+    footprint_half_length: 0.20
+    footprint_half_width: 0.18
+
 map_server:
   ros__parameters:
     use_sim_time: false
@@ -134,7 +185,7 @@ local_costmap:
       # A 2.5 cm rolling grid avoids a full 5 cm aliasing error when a scan
       # endpoint lands on different cells in the global and local grids.
       resolution: 0.025
-      footprint: "[[0.15, 0.05], [0.15, -0.05], [-0.15, -0.05], [-0.15, 0.05]]"
+      footprint: "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
       # The polygon is the physical body envelope. Keeping padding at zero is
       # deliberate: a finer 2.5 cm grid below handles scan quantization, while
       # inflation and motion-safety retain the approach/stop reserve.
@@ -182,7 +233,7 @@ global_costmap:
       robot_base_frame: base_footprint
       resolution: 0.05
       track_unknown_space: true
-      footprint: "[[0.15, 0.05], [0.15, -0.05], [-0.15, -0.05], [-0.15, 0.05]]"
+      footprint: "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
       # The polygon is already the measured chassis outline. One centimetre
       # provides a planning reserve without classifying a nearby but external
       # obstacle as part of the robot's start footprint; the finer local grid

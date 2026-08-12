@@ -1,0 +1,23 @@
+rovera_sensor_normalizer:
+  ros__parameters:
+    # /scan, /odom_raw and /imu are published by the same YB_Car_Node clock.
+    # Five interleaved samples synchronize in well under one second while a
+    # three-packet debounce tolerates one malformed XRCE sample.
+    minimum_sync_samples: 5
+    window_samples: 120
+    sync_spread_seconds: 0.08
+    jump_tolerance_seconds: 0.50
+    maximum_corrected_age_seconds: 0.25
+    future_tolerance_seconds: 0.02
+    invalid_debounce_samples: 3
+    scan_arrival_timeout_seconds: 0.30
+    odom_arrival_timeout_seconds: 0.25
+    imu_arrival_timeout_seconds: 0.25
+    # Live scan calibration found a stable 88-beam return from the robot's own
+    # rear/right body envelope. Mask only endpoints inside the measured body;
+    # every point outside remains available to AMCL, costmaps and safety.
+    scan_self_filter_half_length: 0.20
+    scan_self_filter_half_width: 0.18
+    scan_laser_x: -0.0046412
+    scan_laser_y: 0.0
+    scan_laser_yaw: 0.0

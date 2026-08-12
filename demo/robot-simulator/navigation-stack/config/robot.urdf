@@ -2,8 +2,8 @@
 <robot name="rovera_pi5">
   <link name="base_footprint"/>
   <link name="base_link">
-    <visual><geometry><box size="0.30 0.10 0.10"/></geometry></visual>
-    <collision><geometry><box size="0.30 0.10 0.10"/></geometry></collision>
+    <visual><geometry><box size="0.40 0.36 0.10"/></geometry></visual>
+    <collision><geometry><box size="0.40 0.36 0.10"/></geometry></collision>
   </link>
   <joint name="base_footprint_to_base_link" type="fixed">
     <parent link="base_footprint"/><child link="base_link"/>

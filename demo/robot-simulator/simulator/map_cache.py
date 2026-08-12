@@ -217,12 +217,17 @@ class RobotMapCacheManager:
         pose avoids throwing away the strongest localization hint immediately
         after a map is saved.
         """
-        # Only reuse a navigation pose while it is operationally recent, but
-        # keep it explicitly approximate: the chassis may have been carried
-        # without odometry while the navigation runtime was stopped.
+        # A navigation pose is persisted only after 30 seconds of independent
+        # covariance, rolling-stability, scan/map and clock verification. Keep
+        # that bounded covariance and heading for the fast local verification
+        # phase. The adapter still rejects it and falls back to a full global
+        # search when current LiDAR evidence does not agree (for example when
+        # the chassis was carried while powered off).
         pose = self.last_pose(map_id, version, max_age_seconds=3600)
         if pose is not None:
-            pose["covariance"] = 1.0
+            pose["covariance"] = max(
+                0.04, min(0.25, float(pose.get("covariance", 0.25)))
+            )
             pose["source"] = "recent_navigation_pose"
             return pose
         try:

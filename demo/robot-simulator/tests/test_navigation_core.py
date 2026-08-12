@@ -12,9 +12,14 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "navigation-stack"))
 
 from navigation_core import (  # noqa: E402
     SavedOccupancyMap,
+    SensorClockEstimator,
     compact_lethal_cells,
     localization_confidence,
+    mask_scan_self_returns,
     navigation_abort_state,
+    pose_stability,
+    rotation_swept_clearance,
+    scan_to_map_match,
 )
 from speed_profiles import (  # noqa: E402
     AutoNavigationProfiles,
@@ -98,14 +103,209 @@ def test_localization_requires_fresh_scan_tf_low_covariance_and_stability() -> N
     covariance[0] = covariance[7] = 0.01
     covariance[35] = 0.02
     assert localization_confidence(
-        covariance, stable_samples=5, scan_fresh=True, tf_stable=True
+        covariance,
+        stability_score=1.0,
+        scan_map_score=0.6,
+        scan_map_threshold=0.35,
+        scan_fresh=True,
+        tf_stable=True,
+        odometry_healthy=True,
+        sensor_time_valid=True,
     ) > 0.9
     assert localization_confidence(
-        covariance, stable_samples=1, scan_fresh=True, tf_stable=True
+        covariance,
+        stability_score=0.2,
+        scan_map_score=0.6,
+        scan_map_threshold=0.35,
+        scan_fresh=True,
+        tf_stable=True,
+        odometry_healthy=True,
+        sensor_time_valid=True,
     ) < 0.25
     assert localization_confidence(
-        covariance, stable_samples=5, scan_fresh=False, tf_stable=True
+        covariance,
+        stability_score=1.0,
+        scan_map_score=0.6,
+        scan_map_threshold=0.35,
+        scan_fresh=False,
+        tf_stable=True,
+        odometry_healthy=True,
+        sensor_time_valid=True,
     ) == 0
+
+
+def test_localization_confidence_rejects_stable_wrong_pose_and_bad_clock() -> None:
+    covariance = [0.0] * 36
+    covariance[0] = covariance[7] = covariance[35] = 0.001
+    common = {
+        "stability_score": 1.0,
+        "scan_map_threshold": 0.35,
+        "scan_fresh": True,
+        "tf_stable": True,
+        "odometry_healthy": True,
+        "sensor_time_valid": True,
+    }
+    assert localization_confidence(
+        covariance, scan_map_score=0.05, **common
+    ) < 0.2
+    assert localization_confidence(
+        covariance,
+        scan_map_score=0.8,
+        **{**common, "sensor_time_valid": False},
+    ) == 0
+
+
+def test_shared_sensor_clock_preserves_capture_intervals_with_large_offset() -> None:
+    clock = SensorClockEstimator(minimum_sync_samples=5)
+    offset = 1_019_650_000_000
+    accepted = []
+    for index, sensor in enumerate(("scan", "odom", "imu", "imu", "scan", "odom")):
+        source = 10_000_000_000 + index * 50_000_000
+        delay = (index % 3 + 1) * 2_000_000
+        result = clock.observe(
+            sensor,
+            source_nanoseconds=source,
+            arrival_nanoseconds=source + offset + delay,
+        )
+        if result.accepted:
+            accepted.append((source, result.corrected_nanoseconds))
+    assert clock.state == "SYNCED"
+    assert len(accepted) >= 2
+    assert accepted[-1][1] - accepted[-2][1] == accepted[-1][0] - accepted[-2][0]
+    assert abs(clock.offset_nanoseconds / 1e9 - 1019.652) < 0.001
+
+
+def test_one_bad_timestamp_is_dropped_without_invalidating_the_clock() -> None:
+    clock = SensorClockEstimator(minimum_sync_samples=3, invalid_debounce_samples=3)
+    for index in range(3):
+        source = 1_000_000_000 + index * 100_000_000
+        clock.observe(
+            "scan",
+            source_nanoseconds=source,
+            arrival_nanoseconds=source + 5_000_000_000,
+        )
+    bad = clock.observe(
+        "scan", source_nanoseconds=0, arrival_nanoseconds=7_000_000_000
+    )
+    recovered = clock.observe(
+        "scan",
+        source_nanoseconds=1_400_000_000,
+        arrival_nanoseconds=6_400_000_000,
+    )
+    assert not bad.accepted
+    assert bad.state == "SYNCED"
+    assert recovered.accepted
+    assert clock.state == "SYNCED"
+
+
+def test_persistent_clock_jump_becomes_invalid_and_relearns() -> None:
+    clock = SensorClockEstimator(minimum_sync_samples=3, invalid_debounce_samples=3)
+    source = 1_000_000_000
+    for index in range(3):
+        value = source + index * 100_000_000
+        clock.observe("odom", source_nanoseconds=value, arrival_nanoseconds=value + 5_000_000_000)
+    for index in range(3, 6):
+        value = source + index * 100_000_000
+        result = clock.observe("odom", source_nanoseconds=value, arrival_nanoseconds=value + 15_000_000_000)
+    assert result.state == "SENSOR_TIME_INVALID"
+    for index in range(6, 9):
+        value = source + index * 100_000_000
+        result = clock.observe("odom", source_nanoseconds=value, arrival_nanoseconds=value + 15_000_000_000)
+    assert result.accepted
+    assert clock.state == "SYNCED"
+
+
+def test_common_mcu_clock_reset_clears_monotonic_history_and_relearns() -> None:
+    clock = SensorClockEstimator(minimum_sync_samples=3, invalid_debounce_samples=3)
+    for index in range(6):
+        source = 50_000_000_000 + index * 20_000_000
+        clock.observe(
+            ("scan", "odom", "imu")[index % 3],
+            source_nanoseconds=source,
+            arrival_nanoseconds=source + 5_000_000_000,
+        )
+
+    for index in range(3):
+        result = clock.observe(
+            ("scan", "odom", "imu")[index],
+            source_nanoseconds=1_000_000_000 + index * 20_000_000,
+            arrival_nanoseconds=60_000_000_000 + index * 20_000_000,
+        )
+    assert not result.accepted
+    assert clock.state == "SENSOR_TIME_INVALID"
+
+    for index in range(4):
+        result = clock.observe(
+            ("scan", "odom", "imu")[index % 3],
+            source_nanoseconds=2_000_000_000 + index * 20_000_000,
+            arrival_nanoseconds=61_000_000_000 + index * 20_000_000,
+        )
+    assert result.accepted
+    assert clock.state == "SYNCED"
+
+
+def test_pose_stability_uses_window_median_and_circular_yaw() -> None:
+    stable = pose_stability([
+        (0.0, 1.00, 2.00, math.pi - 0.02),
+        (0.3, 1.01, 2.01, -math.pi + 0.01),
+        (0.6, 0.99, 2.00, math.pi - 0.01),
+        (0.9, 1.00, 1.99, -math.pi + 0.02),
+        (1.2, 1.01, 2.00, math.pi),
+    ])
+    assert stable.passes(
+        minimum_samples=5,
+        minimum_duration_seconds=1.0,
+        maximum_xy_spread=0.05,
+        maximum_median_deviation=0.03,
+        maximum_yaw_variance=0.01,
+        maximum_yaw_spread=0.05,
+    )
+    unstable = pose_stability([
+        (0.0, 1.0, 2.0, 0.0),
+        (0.3, 1.0, 2.0, 0.0),
+        (0.6, 2.0, 2.0, 1.0),
+        (0.9, 1.0, 2.0, 0.0),
+        (1.2, 1.0, 2.0, 0.0),
+    ])
+    assert unstable.xy_spread > 0.5
+    assert unstable.yaw_spread > 0.5
+
+
+def test_scan_map_match_distinguishes_correct_and_wrong_pose() -> None:
+    occupancy = [0] * (100 * 100)
+    saved = SavedOccupancyMap(100, 100, 0.1, 0.0, 0.0, 0.0, occupancy)
+    endpoints = [(7.0, 5.0), (5.0, 7.0), (3.0, 5.0), (5.0, 3.0)]
+    for x, y in endpoints:
+        column, row = saved.world_to_cell(x, y) or (-1, -1)
+        saved.occupancy[row * saved.width + column] = 100
+    correct = scan_to_map_match(
+        saved,
+        [2.0, 2.0, 2.0, 2.0],
+        angle_min=0.0,
+        angle_increment=math.pi / 2,
+        range_min=0.1,
+        range_max=8.0,
+        laser_x=5.0,
+        laser_y=5.0,
+        laser_yaw=0.0,
+        maximum_beams=4,
+        endpoint_tolerance=0.11,
+    )
+    wrong = scan_to_map_match(
+        saved,
+        [2.0, 2.0, 2.0, 2.0],
+        angle_min=0.0,
+        angle_increment=math.pi / 2,
+        range_min=0.1,
+        range_max=8.0,
+        laser_x=5.8,
+        laser_y=5.0,
+        laser_yaw=0.0,
+        maximum_beams=4,
+        endpoint_tolerance=0.11,
+    )
+    assert correct.score == 1.0
+    assert wrong.score == 0.0
 
 
 def test_dynamic_obstacle_payload_is_metric_and_bounded() -> None:
@@ -139,6 +339,38 @@ def test_navigation_abort_is_blocked_only_after_bounded_recovery() -> None:
     assert navigation_abort_state(6) == "BLOCKED"
 
 
+def test_rotation_clearance_uses_the_complete_rectangular_body_sweep() -> None:
+    corner_radius = math.hypot(0.15, 0.05)
+    assert rotation_swept_clearance(
+        0.15, 0.05, half_length=0.15, half_width=0.05
+    ) == pytest.approx(0.0)
+    assert rotation_swept_clearance(
+        0.0, 0.10, half_length=0.15, half_width=0.05
+    ) == pytest.approx(0.10 - corner_radius)
+    assert rotation_swept_clearance(
+        0.30, 0.0, half_length=0.15, half_width=0.05
+    ) == pytest.approx(0.30 - corner_radius)
+
+
+def test_scan_self_filter_masks_only_points_inside_calibrated_body() -> None:
+    ranges = [0.123, 0.30, 1.0, math.inf]
+    filtered, masked = mask_scan_self_returns(
+        ranges,
+        angle_min=-math.pi / 2,
+        angle_increment=math.pi / 2,
+        range_min=0.12,
+        range_max=8.0,
+        laser_x=-0.0046412,
+        laser_y=0.0,
+        laser_yaw=0.0,
+        half_length=0.20,
+        half_width=0.18,
+    )
+    assert masked == 1
+    assert math.isnan(filtered[0])
+    assert filtered[1:] == ranges[1:]
+
+
 def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     project = Path(__file__).parents[1]
     navigation = yaml.safe_load(
@@ -169,6 +401,7 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert controller["failure_tolerance"] >= 1.5
     assert follow["rotate_to_heading_min_angle"] <= 0.4
     assert global_costmap["update_frequency"] >= 5
+    assert local_costmap["update_frequency"] > global_costmap["update_frequency"]
     assert global_costmap["obstacle_layer"]["combination_method"] == 1
     assert global_costmap["footprint_padding"] > local_costmap["footprint_padding"]
     assert global_costmap["inflation_layer"]["inflation_radius"] >= 0.4
@@ -176,8 +409,40 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert local_costmap["resolution"] <= 0.025
     assert local_costmap["obstacle_layer"]["scan"]["observation_persistence"] == 0.0
     assert local_costmap["obstacle_layer"]["plugin"] == "nav2_costmap_2d::ObstacleLayer"
+    for costmap in (global_costmap, local_costmap):
+        scan = costmap["obstacle_layer"]["scan"]
+        assert scan["marking"] is True
+        assert scan["clearing"] is True
+        assert scan["obstacle_max_range"] >= 3.0
+        assert scan["raytrace_max_range"] >= scan["obstacle_max_range"]
+        assert scan["expected_update_rate"] <= 0.30
+    assert global_costmap["obstacle_layer"]["scan"]["observation_persistence"] <= 0.5
+    assert controller["controller_frequency"] >= 20.0
+    assert limits["smoothing_frequency"] >= controller["controller_frequency"]
+    assert abs(limits["max_decel"][0]) >= 0.5
+    localization = navigation["rovera_navigation_adapter"]["ros__parameters"]
+    assert localization["footprint_half_length"] == 0.20
+    assert localization["footprint_half_width"] == 0.18
+    expected_footprint = "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
+    assert local_costmap["footprint"] == expected_footprint
+    assert global_costmap["footprint"] == expected_footprint
+    assert localization["scan_map_maximum_beams"] <= 120
+    assert localization["scan_map_minimum_score"] > 0
+    assert localization["localization_verify_timeout_seconds"] <= 3.0
     # This stale block was never launched; motion-safety owns the one smoother source of truth.
     assert "velocity_smoother" not in navigation
+
+
+def test_ekf_uses_one_wheel_measurement_path_and_keeps_imu_unfused() -> None:
+    project = Path(__file__).parents[1]
+    ekf = yaml.safe_load(
+        (project / "navigation-stack/config/ekf.yaml").read_text()
+    )["ekf_filter_node"]["ros__parameters"]
+    assert 0.05 <= ekf["transform_time_offset"] <= 0.20
+
+    enabled = [index for index, value in enumerate(ekf["odom0_config"]) if value]
+    assert enabled == [6, 11]  # forward velocity and yaw rate only
+    assert "imu0" not in ekf
 
 
 def test_all_auto_speed_profiles_are_centralized_and_within_manual_fast() -> None:

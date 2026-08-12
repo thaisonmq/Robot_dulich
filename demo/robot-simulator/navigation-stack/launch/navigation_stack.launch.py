@@ -35,6 +35,7 @@ def generate_launch_description() -> LaunchDescription:
             package="rovera_navigation_adapter",
             executable="sensor_normalizer",
             name="rovera_sensor_normalizer",
+            parameters=["/opt/rovera/config/sensor_time.yaml"],
             output="screen",
         ),
         Node(
@@ -48,6 +49,7 @@ def generate_launch_description() -> LaunchDescription:
             package="rovera_navigation_adapter",
             executable="adapter_node",
             name="rovera_navigation_adapter",
+            parameters=["/opt/rovera/config/nav2_params.yaml"],
             output="screen",
         ),
     ]
@@ -69,6 +71,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="rovera_navigation_adapter",
                 executable="sensor_normalizer",
                 name="rovera_sensor_normalizer",
+                parameters=["/opt/rovera/config/sensor_time.yaml"],
                 output="screen",
             ),
             Node(
@@ -82,6 +85,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="rovera_navigation_adapter",
                 executable="adapter_node",
                 name="rovera_navigation_adapter",
+                parameters=["/opt/rovera/config/nav2_params.yaml"],
                 output="screen",
             ),
         ]

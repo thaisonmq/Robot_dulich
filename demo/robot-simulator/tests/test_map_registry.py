@@ -101,7 +101,7 @@ def test_new_map_activation_uses_terminal_pose_until_navigation_pose_exists(tmp_
     cache.save_last_pose("MAP-NEW", 1, {"x": 2, "y": 3, "yaw": 1.5})
     recent = cache.activation_pose("MAP-NEW", 1, destination)
     assert recent["x"] == 2
-    assert recent["covariance"] == 1.0
+    assert recent["covariance"] == 0.25
     assert recent["source"] == "recent_navigation_pose"
 
 
@@ -124,7 +124,7 @@ def test_runtime_restores_verified_active_map_after_adapter_restart(tmp_path: Pa
             "x": 1.0,
             "y": -2.0,
             "yaw": 0.5,
-            "covariance": 1.0,
+            "covariance": 0.25,
             "source": "recent_navigation_pose",
             "map_id": "MAP-A",
             "map_version": 2,

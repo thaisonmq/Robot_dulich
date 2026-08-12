@@ -192,7 +192,7 @@ vcgencmd measure_temp
   capability mapping và khóa nút Start thay vì tạo phiên lỗi.
 - `odom -> base_footprint` chỉ do EKF publish; vendor `/odom_raw` được normalize từ `odom_frame` sang `odom`.
 - `map -> odom` chỉ do SLAM Toolbox ở mode mapping hoặc AMCL ở mode navigation publish.
-- Footprint/phụ kiện và offset LiDAR/IMU đã được đo lại. Cấu hình hiện giả định base ở tâm, footprint 0,30 × 0,10 m, sensor gần tâm.
+- Footprint/phụ kiện và offset LiDAR/IMU đã được đo lại từ scan sống. Cấu hình dùng base ở tâm, envelope bảo thủ 0,40 × 0,36 m và LiDAR gần tâm. Sensor normalizer loại duy nhất các endpoint nằm bên trong envelope này; lần đo trên robot 170 loại 88 tia self-return phía sau/phải nhưng giữ nguyên mọi vật cản bên ngoài.
 - IMU đã được kiểm tra trục/yaw. Hiện orientation bị đánh dấu unavailable và chưa fusion yaw để tránh dùng covariance/axis sai.
 
 Không chạy đồng thời MAPPING và NAVIGATION. Không start motion-safety cạnh stack cũ còn ghi thẳng `/cmd_vel`.

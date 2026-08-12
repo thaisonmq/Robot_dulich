@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import statistics
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -16,9 +18,293 @@ class GoalValidation:
     message: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ClockCorrection:
+    accepted: bool
+    corrected_nanoseconds: int | None
+    raw_skew_seconds: float
+    state: str
+    reason: str = ""
+
+
+class SensorClockEstimator:
+    """Estimate one source-clock offset without replacing capture time.
+
+    The Yahboom MCU stamps scan, odometry and IMU from the same clock.  The
+    smallest arrival-minus-source sample in a rolling window is the best
+    available offset estimate because transport delay can only make a packet
+    arrive later.  Correcting by that offset preserves the relative capture
+    time between all three sensor streams.
+    """
+
+    def __init__(
+        self,
+        *,
+        minimum_sync_samples: int = 5,
+        window_samples: int = 120,
+        sync_spread_seconds: float = 0.08,
+        jump_tolerance_seconds: float = 0.50,
+        maximum_corrected_age_seconds: float = 0.25,
+        future_tolerance_seconds: float = 0.02,
+        invalid_debounce_samples: int = 3,
+    ) -> None:
+        self.minimum_sync_samples = max(2, int(minimum_sync_samples))
+        self.offset_samples: deque[int] = deque(maxlen=max(
+            self.minimum_sync_samples, int(window_samples)
+        ))
+        self.sync_spread_nanoseconds = int(max(0.001, sync_spread_seconds) * 1e9)
+        self.jump_tolerance_nanoseconds = int(max(0.01, jump_tolerance_seconds) * 1e9)
+        self.maximum_corrected_age_nanoseconds = int(
+            max(0.01, maximum_corrected_age_seconds) * 1e9
+        )
+        self.future_tolerance_nanoseconds = int(max(0.0, future_tolerance_seconds) * 1e9)
+        self.invalid_debounce_samples = max(1, int(invalid_debounce_samples))
+        self.offset_nanoseconds: int | None = None
+        self.invalid_streak = 0
+        self.time_invalid = False
+        self.rejected_packets = 0
+        self.last_source_nanoseconds: dict[str, int] = {}
+        self.last_corrected_nanoseconds: dict[str, int] = {}
+        self.last_raw_skew_seconds: dict[str, float] = {}
+        self.last_reason = ""
+
+    @property
+    def state(self) -> str:
+        if self.time_invalid:
+            return "SENSOR_TIME_INVALID"
+        if self.offset_nanoseconds is None:
+            return "CLOCK_SYNCING"
+        return "SYNCED"
+
+    def _reject(self, raw_skew_seconds: float, reason: str) -> ClockCorrection:
+        self.invalid_streak += 1
+        self.rejected_packets += 1
+        self.last_reason = reason
+        if self.invalid_streak >= self.invalid_debounce_samples:
+            # A persistent jump is normally an MCU reconnect. Relearn the
+            # common offset; never force those packets onto the host clock.
+            self.offset_nanoseconds = None
+            self.offset_samples.clear()
+            self.last_source_nanoseconds.clear()
+            self.last_corrected_nanoseconds.clear()
+            self.time_invalid = True
+        return ClockCorrection(False, None, raw_skew_seconds, self.state, reason)
+
+    def observe(
+        self,
+        sensor: str,
+        *,
+        source_nanoseconds: int,
+        arrival_nanoseconds: int,
+    ) -> ClockCorrection:
+        source_nanoseconds = int(source_nanoseconds)
+        arrival_nanoseconds = int(arrival_nanoseconds)
+        raw_skew_seconds = (arrival_nanoseconds - source_nanoseconds) / 1e9
+        self.last_raw_skew_seconds[sensor] = raw_skew_seconds
+        if source_nanoseconds <= 0:
+            return self._reject(raw_skew_seconds, "ZERO_TIMESTAMP")
+        previous_source = self.last_source_nanoseconds.get(sensor)
+        if previous_source is not None and source_nanoseconds <= previous_source:
+            return self._reject(raw_skew_seconds, "NON_MONOTONIC_TIMESTAMP")
+        self.last_source_nanoseconds[sensor] = source_nanoseconds
+
+        candidate_offset = arrival_nanoseconds - source_nanoseconds
+        if self.offset_nanoseconds is None:
+            self.offset_samples.append(candidate_offset)
+            if len(self.offset_samples) < self.minimum_sync_samples:
+                return ClockCorrection(
+                    False, None, raw_skew_seconds, self.state, "CLOCK_SYNCING"
+                )
+            recent = list(self.offset_samples)[-self.minimum_sync_samples:]
+            if max(recent) - min(recent) > self.sync_spread_nanoseconds:
+                self.rejected_packets += 1
+                self.last_reason = "CLOCK_OFFSET_UNSTABLE"
+                return ClockCorrection(
+                    False, None, raw_skew_seconds, self.state, self.last_reason
+                )
+            self.offset_nanoseconds = min(recent)
+
+        residual = candidate_offset - self.offset_nanoseconds
+        if residual < -self.sync_spread_nanoseconds or residual > self.jump_tolerance_nanoseconds:
+            return self._reject(raw_skew_seconds, "CLOCK_OFFSET_JUMP")
+
+        self.offset_samples.append(candidate_offset)
+        # Track slow clock drift using the lower envelope, without allowing a
+        # delayed packet to drag capture time toward callback time.
+        self.offset_nanoseconds = min(self.offset_samples)
+        corrected = source_nanoseconds + self.offset_nanoseconds
+        corrected_age = arrival_nanoseconds - corrected
+        if corrected_age > self.maximum_corrected_age_nanoseconds:
+            return self._reject(raw_skew_seconds, "CORRECTED_TIMESTAMP_STALE")
+        if corrected_age < -self.future_tolerance_nanoseconds:
+            return self._reject(raw_skew_seconds, "CORRECTED_TIMESTAMP_FUTURE")
+        previous_corrected = self.last_corrected_nanoseconds.get(sensor)
+        if previous_corrected is not None and corrected <= previous_corrected:
+            return self._reject(raw_skew_seconds, "NON_MONOTONIC_CORRECTED_TIMESTAMP")
+
+        self.invalid_streak = 0
+        self.time_invalid = False
+        self.last_reason = ""
+        self.last_corrected_nanoseconds[sensor] = corrected
+        return ClockCorrection(True, corrected, raw_skew_seconds, self.state)
+
+
+@dataclass(frozen=True, slots=True)
+class PoseStability:
+    sample_count: int
+    duration_seconds: float
+    xy_spread: float
+    median_deviation: float
+    yaw_circular_variance: float
+    yaw_spread: float
+
+    def passes(
+        self,
+        *,
+        minimum_samples: int,
+        minimum_duration_seconds: float,
+        maximum_xy_spread: float,
+        maximum_median_deviation: float,
+        maximum_yaw_variance: float,
+        maximum_yaw_spread: float,
+    ) -> bool:
+        return (
+            self.sample_count >= minimum_samples
+            and self.duration_seconds >= minimum_duration_seconds
+            and self.xy_spread <= maximum_xy_spread
+            and self.median_deviation <= maximum_median_deviation
+            and self.yaw_circular_variance <= maximum_yaw_variance
+            and self.yaw_spread <= maximum_yaw_spread
+        )
+
+
+def pose_stability(samples: Iterable[tuple[float, float, float, float]]) -> PoseStability:
+    values = list(samples)
+    if not values:
+        return PoseStability(0, 0.0, math.inf, math.inf, 1.0, math.inf)
+    x_values = [sample[1] for sample in values]
+    y_values = [sample[2] for sample in values]
+    yaws = [sample[3] for sample in values]
+    median_x = statistics.median(x_values)
+    median_y = statistics.median(y_values)
+    deviations = [
+        math.hypot(x - median_x, y - median_y)
+        for x, y in zip(x_values, y_values)
+    ]
+    cosine = sum(math.cos(yaw) for yaw in yaws) / len(yaws)
+    sine = sum(math.sin(yaw) for yaw in yaws) / len(yaws)
+    resultant = math.hypot(cosine, sine)
+    mean_yaw = math.atan2(sine, cosine)
+    yaw_deviations = [
+        abs(math.atan2(math.sin(yaw - mean_yaw), math.cos(yaw - mean_yaw)))
+        for yaw in yaws
+    ]
+    return PoseStability(
+        sample_count=len(values),
+        duration_seconds=max(0.0, values[-1][0] - values[0][0]),
+        xy_spread=max(deviations),
+        median_deviation=statistics.median(deviations),
+        yaw_circular_variance=max(0.0, min(1.0, 1.0 - resultant)),
+        yaw_spread=max(yaw_deviations),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ScanMapMatch:
+    score: float
+    matched_beams: int
+    valid_beams: int
+
+
+def scan_to_map_match(
+    saved_map: "SavedOccupancyMap",
+    ranges: Iterable[float],
+    *,
+    angle_min: float,
+    angle_increment: float,
+    range_min: float,
+    range_max: float,
+    laser_x: float,
+    laser_y: float,
+    laser_yaw: float,
+    maximum_beams: int = 90,
+    minimum_usable_range: float = 0.20,
+    maximum_usable_range: float = 6.0,
+    endpoint_tolerance: float = 0.12,
+) -> ScanMapMatch:
+    """Compare a bounded sample of scan endpoints with occupied map cells."""
+    measurements = list(ranges)
+    if not measurements:
+        return ScanMapMatch(0.0, 0, 0)
+    step = max(1, math.ceil(len(measurements) / max(1, int(maximum_beams))))
+    lower = max(float(range_min), float(minimum_usable_range))
+    upper = min(float(range_max), float(maximum_usable_range))
+    matched = 0
+    valid = 0
+    for index in range(0, len(measurements), step):
+        distance = float(measurements[index])
+        if not math.isfinite(distance) or distance < lower or distance > upper:
+            continue
+        angle = laser_yaw + angle_min + index * angle_increment
+        endpoint_x = laser_x + distance * math.cos(angle)
+        endpoint_y = laser_y + distance * math.sin(angle)
+        valid += 1
+        if saved_map.occupied_within(endpoint_x, endpoint_y, endpoint_tolerance):
+            matched += 1
+    return ScanMapMatch(
+        score=0.0 if valid == 0 else round(matched / valid, 4),
+        matched_beams=matched,
+        valid_beams=valid,
+    )
+
+
 def navigation_abort_state(recoveries: int) -> str:
     """Classify an exhausted Nav2 action without hiding technical failures."""
     return "BLOCKED" if max(0, int(recoveries)) > 0 else "FAILED"
+
+
+def rotation_swept_clearance(
+    point_x: float,
+    point_y: float,
+    *,
+    half_length: float,
+    half_width: float,
+) -> float:
+    """Distance from a scan point to the chassis' complete rotation sweep."""
+    swept_radius = math.hypot(float(half_length), float(half_width))
+    return math.hypot(float(point_x), float(point_y)) - swept_radius
+
+
+def mask_scan_self_returns(
+    ranges: Iterable[float],
+    *,
+    angle_min: float,
+    angle_increment: float,
+    range_min: float,
+    range_max: float,
+    laser_x: float,
+    laser_y: float,
+    laser_yaw: float,
+    half_length: float,
+    half_width: float,
+) -> tuple[list[float], int]:
+    """Mask only LiDAR endpoints physically inside the calibrated chassis."""
+    output = [float(value) for value in ranges]
+    masked = 0
+    for index, distance in enumerate(output):
+        if (
+            not math.isfinite(distance)
+            or distance < float(range_min)
+            or distance > float(range_max)
+        ):
+            continue
+        angle = float(laser_yaw) + float(angle_min) + index * float(angle_increment)
+        point_x = float(laser_x) + distance * math.cos(angle)
+        point_y = float(laser_y) + distance * math.sin(angle)
+        if abs(point_x) < float(half_length) and abs(point_y) < float(half_width):
+            output[index] = math.nan
+            masked += 1
+    return output, masked
 
 
 @dataclass(slots=True)
@@ -226,18 +512,32 @@ class SavedOccupancyMap:
 def localization_confidence(
     covariance: list[float] | tuple[float, ...],
     *,
-    stable_samples: int,
+    stability_score: float,
+    scan_map_score: float,
+    scan_map_threshold: float,
     scan_fresh: bool,
     tf_stable: bool,
+    odometry_healthy: bool,
+    sensor_time_valid: bool,
 ) -> float:
     """Normalize AMCL uncertainty and independent health gates to [0, 1]."""
-    if len(covariance) < 36 or not scan_fresh or not tf_stable:
+    if (
+        len(covariance) < 36
+        or not scan_fresh
+        or not tf_stable
+        or not odometry_healthy
+        or not sensor_time_valid
+        or scan_map_threshold <= 0
+    ):
         return 0.0
     variance = max(0.0, float(covariance[0])) + max(0.0, float(covariance[7]))
     variance += max(0.0, float(covariance[35])) * 0.5
     covariance_score = math.exp(-variance * 2.0)
-    stability_score = min(1.0, max(0, stable_samples) / 5.0)
-    return round(max(0.0, min(1.0, covariance_score * stability_score)), 4)
+    stability = max(0.0, min(1.0, float(stability_score)))
+    map_score = max(0.0, min(1.0, float(scan_map_score) / scan_map_threshold))
+    return round(
+        max(0.0, min(1.0, covariance_score * stability * map_score)), 4
+    )
 
 
 def compact_lethal_cells(

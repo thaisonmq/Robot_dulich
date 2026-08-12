@@ -1,6 +1,8 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { drawRobotMapMarker, MapPanel } from "../src/components/MapPanel";
+import {
+  drawRobotMapMarker, goalApproachYaw, MapPanel, worldYawToCanvas,
+} from "../src/components/MapPanel";
 import { I18nProvider } from "../src/i18n/I18nProvider";
 import type { Destination, MapData } from "../src/types";
 
@@ -70,6 +72,17 @@ describe("MapPanel navigation controls", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     localStorage.clear();
+  });
+
+  it("uses the same rotated-map heading convention for robot and goal", () => {
+    expect(worldYawToCanvas(Math.PI / 2, Math.PI / 4)).toBeCloseTo(-Math.PI / 4);
+  });
+
+  it("gives a click-only goal the direct approach heading instead of global yaw zero", () => {
+    expect(goalApproachYaw({ x: -0.45, y: 1.82, yaw: 1.1 }, { x: -1.81, y: 2.37 }))
+      .toBeCloseTo(Math.atan2(0.55, -1.36));
+    expect(goalApproachYaw({ x: 1, y: 2, yaw: -0.7 }, { x: 1.005, y: 2.005 }))
+      .toBeCloseTo(-0.7);
   });
 
   it("changes candidate without loading it until Activate is confirmed", () => {
@@ -146,11 +159,17 @@ describe("MapPanel navigation controls", () => {
     expect(onMapChange).toHaveBeenCalledWith("MAP-B");
   });
 
-  it("does not ask for an initial pose while auto localization is running", () => {
-    panel({ mapState: "LOCALIZING_GLOBAL", localizationState: "LOCALIZING_GLOBAL" });
+  it("offers assisted localization immediately when passive global search needs another view", () => {
+    const onRetryLocalization = vi.fn();
+    panel({
+      mapState: "LOCALIZING_GLOBAL", localizationState: "LOCALIZING_GLOBAL",
+      onRetryLocalization,
+    });
     expect(screen.getByText(/Đang xác định vị trí robot/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Chỉ vị trí robot gần đúng" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Chọn điểm đến" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Chỉ vị trí robot gần đúng" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cho phép xoay để định vị" }));
+    expect(onRetryLocalization).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "Chọn điểm đến" })).not.toBeInTheDocument();
   });
 
   it("only offers approximate pose after auto localization fails", () => {

@@ -47,8 +47,9 @@ describe("Control saved-map architecture", () => {
 
     expect(dashboard).toContain('type PoseVerificationState = "required"');
     expect(dashboard).toContain('mapLocalized && poseVerificationState === "confirmed"');
-    expect(dashboard).toContain("relocalize.mutate({ expectedState: runtimeState, verificationKey })");
-    expect(dashboard).toContain("allow_rotation: false");
+    expect(dashboard).toContain("runtimeLocalizationState === \"READY\" && health.localized");
+    expect(dashboard).toContain("relocalize.mutate({ expectedState: runtimeState, verificationKey, allowRotation: true })");
+    expect(dashboard).toContain("allow_rotation: allowRotation");
     expect(dashboard.match(/if \(!poseVerified\)/g)).toHaveLength(2);
     expect(dashboard).toContain("setSelectedDestination(null)");
   });
