@@ -2610,6 +2610,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .spectator-control-state small { margin-top: 3px; color: var(--muted); font-size: 8px; }
 .spectator-control-state p { max-width: 29ch; margin: 13px 0 0; color: #667389; font-size: 8px; line-height: 1.55; }
 .drive-controls { display: grid; justify-items: center; }
+.drive-speed-stack { display: flex; gap: 7px; align-items: end; }
+.drive-speed-stack > div { display: grid; gap: 3px; }
+.drive-speed-stack > div > span {
+  color: var(--muted);
+  font-size: 7px;
+  font-weight: 750;
+  letter-spacing: .02em;
+  text-align: center;
+}
 .drive-speed {
   padding: 3px;
   display: grid;
@@ -2631,6 +2640,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   cursor: pointer;
 }
 .drive-speed button.is-active { color: #fff; background: var(--blue); box-shadow: 0 3px 8px rgba(23,89,214,.2); }
+.drive-speed--auto button.is-active { background: #0f8a68; box-shadow: 0 3px 8px rgba(15,138,104,.2); }
 .drive-speed button:disabled { opacity: .4; cursor: not-allowed; }
 .control-pad {
   position: relative;

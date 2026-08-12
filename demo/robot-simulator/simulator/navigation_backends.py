@@ -13,6 +13,9 @@ from simulator.motion import MotionSimulator
 from simulator.navigation import NavigationSimulator
 
 
+AUTO_SPEED_MODES = {"SLOW", "NORMAL", "FAST"}
+
+
 class NavigationBackendError(RuntimeError):
     def __init__(self, code: str, message: str, *, current_state: str = "FAULT") -> None:
         super().__init__(message)
@@ -36,6 +39,7 @@ class SimulatorNavigationBackend:
     loaded_map_id: str = "MAP-001"
     loaded_version: int = 1
     paused_points: list[dict[str, float]] | None = None
+    auto_speed_mode: str = "NORMAL"
 
     async def execute(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
         expected_state = str(payload.get("expected_state", "")).upper()
@@ -44,7 +48,9 @@ class SimulatorNavigationBackend:
             and expected_state == "IDLE"
             and self.current_state in {"READY", "CANCELED", "FINISHED", "FAULT", "MAPPING_ERROR"}
         )
-        unconditional_safety_command = command in {"navigation.cancel", "map.deactivate"}
+        unconditional_safety_command = command in {
+            "navigation.cancel", "navigation.speed_mode", "map.deactivate"
+        }
         if (
             expected_state
             and expected_state != self.current_state
@@ -135,6 +141,20 @@ class SimulatorNavigationBackend:
             self.paused_points = None
             self.current_state = "CANCELED"
             return {"status": "completed", "current_state": "CANCELED"}
+        if command == "navigation.speed_mode":
+            mode = str(payload.get("mode", "")).upper()
+            if mode not in AUTO_SPEED_MODES:
+                raise NavigationBackendError(
+                    "INVALID_SPEED_MODE",
+                    "Auto navigation speed mode must be SLOW, NORMAL or FAST",
+                    current_state=self.current_state,
+                )
+            self.auto_speed_mode = mode
+            return {
+                "status": "completed",
+                "current_state": self.current_state,
+                "mode": mode,
+            }
         if command.startswith("mapping."):
             transitions = {
                 "mapping.start": "MAPPING_RUNNING",
@@ -171,6 +191,7 @@ class SimulatorNavigationBackend:
             "localization_state": "READY",
             "localization_confidence": 1.0,
             "nav2": "READY",
+            "auto_speed_mode": self.auto_speed_mode,
             "mode": "MAPPING" if self.current_state.startswith("MAPPING_") else "NAVIGATION",
         }
 
@@ -222,6 +243,10 @@ class Ros2NavigationBackend:
 
     @staticmethod
     def _required_mode(command: str) -> str | None:
+        if command == "navigation.speed_mode":
+            # Persist/apply through whichever adapter is already active. A
+            # speed selection must never restart Nav2 or interrupt SLAM.
+            return None
         if command.startswith("mapping."):
             return "MAPPING"
         if command.startswith("map.") or command.startswith("navigation."):

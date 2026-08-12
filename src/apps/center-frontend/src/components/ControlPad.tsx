@@ -1,6 +1,7 @@
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Square } from "lucide-react";
 import { useI18n } from "../i18n/I18nProvider";
 import type { MotionSpeedLevel } from "../config/control";
+import type { AutoNavigationSpeedMode } from "../types";
 import type { InputState, InputAction, OnScreenControlAdapter } from "../utils/input";
 
 interface Props {
@@ -9,6 +10,9 @@ interface Props {
   disabled: boolean;
   speedLevel: MotionSpeedLevel;
   onSpeedLevelChange: (level: MotionSpeedLevel) => void;
+  autoSpeedMode: AutoNavigationSpeedMode;
+  autoSpeedDisabled: boolean;
+  onAutoSpeedModeChange: (mode: AutoNavigationSpeedMode) => void;
 }
 
 const controls: { action: InputAction; label: string; icon: typeof ArrowUp; className: string }[] = [
@@ -24,7 +28,22 @@ const speedLevels: { value: MotionSpeedLevel; label: string }[] = [
   { value: "fast", label: "Nhanh" },
 ];
 
-export function ControlPad({ adapter, input, disabled, speedLevel, onSpeedLevelChange }: Props) {
+const autoSpeedModes: { value: AutoNavigationSpeedMode; label: string }[] = [
+  { value: "SLOW", label: "Chậm" },
+  { value: "NORMAL", label: "Vừa" },
+  { value: "FAST", label: "Nhanh" },
+];
+
+export function ControlPad({
+  adapter,
+  input,
+  disabled,
+  speedLevel,
+  onSpeedLevelChange,
+  autoSpeedMode,
+  autoSpeedDisabled,
+  onAutoSpeedModeChange,
+}: Props) {
   const { t } = useI18n();
   const pointerDown = (event: React.PointerEvent<HTMLButtonElement>, action: InputAction) => {
     event.preventDefault();
@@ -40,15 +59,33 @@ export function ControlPad({ adapter, input, disabled, speedLevel, onSpeedLevelC
   };
   const direction = controls.find(({ action }) => input[action as keyof InputState])?.action ?? "idle";
   return <div className="drive-controls">
-    <div className="drive-speed" role="group" aria-label={t("Tốc độ di chuyển")}>
-      {speedLevels.map(({ value, label }) => <button
-        type="button"
-        key={value}
-        className={speedLevel === value ? "is-active" : ""}
-        aria-pressed={speedLevel === value}
-        disabled={disabled}
-        onClick={() => onSpeedLevelChange(value)}
-      >{t(label)}</button>)}
+    <div className="drive-speed-stack">
+      <div>
+        <span>{t("Tốc độ thủ công")}</span>
+        <div className="drive-speed" role="group" aria-label={t("Tốc độ thủ công")}>
+          {speedLevels.map(({ value, label }) => <button
+            type="button"
+            key={value}
+            className={speedLevel === value ? "is-active" : ""}
+            aria-pressed={speedLevel === value}
+            disabled={disabled}
+            onClick={() => onSpeedLevelChange(value)}
+          >{t(label)}</button>)}
+        </div>
+      </div>
+      <div>
+        <span>{t("Tốc độ tự động")}</span>
+        <div className="drive-speed drive-speed--auto" role="group" aria-label={t("Tốc độ tự động")}>
+          {autoSpeedModes.map(({ value, label }) => <button
+            type="button"
+            key={value}
+            className={autoSpeedMode === value ? "is-active" : ""}
+            aria-pressed={autoSpeedMode === value}
+            disabled={autoSpeedDisabled}
+            onClick={() => onAutoSpeedModeChange(value)}
+          >{t(label)}</button>)}
+        </div>
+      </div>
     </div>
     <div className={`control-pad control-pad--${direction}`} aria-label={t("Điều khiển robot")}>
       <div className="control-pad__orbit" aria-hidden="true">

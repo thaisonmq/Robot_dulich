@@ -1,5 +1,5 @@
 import type {
-  Destination, MapData, Robot, RobotConfiguration, RobotConfigurationUpdate,
+  AutoNavigationSpeedMode, Destination, MapData, Robot, RobotConfiguration, RobotConfigurationUpdate,
   DiagnosticResult, MediaSources, RobotCreateInput, RobotEnrollment, RobotPage,
   OnvifScanResult,
   OnvifScanRequest,
@@ -330,6 +330,17 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ robot_id: robotId, session_id: sessionId }),
     }),
+  autoNavigationSpeedMode: (robotId: string, sessionId: string) =>
+    request<{ mode: AutoNavigationSpeedMode; profile?: Record<string, unknown> }>(
+      `/api/navigation/speed-mode/${robotId}?session_id=${encodeURIComponent(sessionId)}`,
+    ),
+  setAutoNavigationSpeedMode: (input: {
+    request_id: string; robot_id: string; session_id: string; expected_state: string;
+    mode: AutoNavigationSpeedMode;
+  }) => request<{ mode: AutoNavigationSpeedMode; profile?: Record<string, unknown> }>(
+    "/api/navigation/speed-mode",
+    { method: "POST", body: JSON.stringify(input) },
+  ),
   loadNavigationMap: (input: {
     request_id: string; robot_id: string; session_id: string; expected_state: string;
     map_id: string; version: number;
@@ -344,7 +355,7 @@ export const api = {
   }),
   relocalize: (input: {
     request_id: string; robot_id: string; session_id: string; expected_state: string;
-    map_id: string; version: number;
+    map_id: string; version: number; allow_rotation?: boolean;
   }) => request<Record<string, unknown>>("/api/navigation/map/relocalize", {
     method: "POST", body: JSON.stringify(input),
   }),

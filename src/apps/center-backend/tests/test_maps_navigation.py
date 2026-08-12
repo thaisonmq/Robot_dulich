@@ -13,7 +13,7 @@ from app.api.maps import (
     _mapping_start_health_failures,
     _posegraph_basename,
 )
-from app.api.navigation import _robot_by_public_id
+from app.api.navigation import RelocalizeRequest, _mission_start_rejection, _robot_by_public_id
 from app.api.websockets import persist_robot_runtime_event
 from app.models.database import Base, SessionLocal
 from app.models.entities import MapRecord, MappingSession, MapVersion, NavigationMission, Robot
@@ -43,6 +43,43 @@ def test_navigation_resolves_robot_by_public_robot_id() -> None:
         assert robot is not None
         assert robot.robot_id == "ROBOT-001"
         assert robot.id == "internal-robot-uuid"
+
+
+def test_relocalization_rotation_requires_explicit_authorization() -> None:
+    request = RelocalizeRequest(
+        request_id="request-passive-localization",
+        robot_id="ROBOT-001",
+        session_id="session-passive-localization",
+        expected_state="READY",
+        map_id="MAP-001",
+        version=1,
+    )
+
+    assert request.allow_rotation is False
+
+
+def test_blocked_or_empty_navigation_mission_cannot_start() -> None:
+    blocked = NavigationMission(
+        mission_id="mission-blocked-route",
+        request_id="request-blocked-route",
+        robot_id="ROBOT-001",
+        control_session_id="session-blocked-route",
+        map_id="MAP-TEST",
+        map_version=1,
+        status="BLOCKED",
+        goal={"x": 1.0, "y": 2.0, "yaw": 0.0},
+        path=[],
+        error_code="NO_PATH",
+        error_message="Nav2 returned an empty path",
+    )
+    rejection = _mission_start_rejection(blocked)
+    assert rejection is not None
+    assert rejection["code"] == "NO_PATH"
+    assert "lộ trình an toàn" in rejection["message"]
+
+    blocked.status = "READY"
+    blocked.path = [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 2.0}]
+    assert _mission_start_rejection(blocked) is None
 
 
 def bundle_bytes(*, unsafe: bool = False) -> bytes:

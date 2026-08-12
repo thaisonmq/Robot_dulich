@@ -115,6 +115,30 @@ class SavedOccupancyMap:
             self.origin_y + sine * local_x + cosine * local_y,
         )
 
+    def occupied_within(self, x: float, y: float, distance_m: float) -> bool:
+        """Return whether a saved occupied cell already explains a live hit."""
+        cell = self.world_to_cell(x, y)
+        if cell is None or distance_m < 0:
+            return False
+        column, row = cell
+        radius = math.ceil(distance_m / self.resolution)
+        for offset_y in range(-radius, radius + 1):
+            for offset_x in range(-radius, radius + 1):
+                check_column = column + offset_x
+                check_row = row + offset_y
+                if not (
+                    0 <= check_column < self.width
+                    and 0 <= check_row < self.height
+                ):
+                    continue
+                center_x, center_y = self.cell_center(check_column, check_row)
+                if (
+                    math.hypot(center_x - x, center_y - y) <= distance_m
+                    and self.value_at(check_column, check_row) >= 65
+                ):
+                    return True
+        return False
+
     def validate_goal(
         self,
         x: float,
@@ -219,10 +243,10 @@ def localization_confidence(
 def compact_lethal_cells(
     message: Any,
     *,
-    threshold: int = 90,
+    threshold: int = 100,
     max_cells: int = 600,
 ) -> list[dict[str, float]]:
-    """Return a bounded metric overlay; never serializes a complete costmap."""
+    """Return only lethal cells, not the broad inflation-cost gradient."""
     output: list[dict[str, float]] = []
     width = int(message.info.width)
     origin = message.info.origin.position

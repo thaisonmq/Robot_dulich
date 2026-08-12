@@ -105,7 +105,7 @@ interface CanvasProps {
   robotMoving: boolean;
   focus?: Point | null;
   zoom?: number;
-  requireHeading?: boolean;
+  positionOnly?: boolean;
   onSelect: (destination: Destination) => void;
 }
 
@@ -182,7 +182,7 @@ export function drawRobotMapMarker(
 function MapCanvas({
   map, destinations, pose, route, selected, dynamicObstacles,
   readOnly, showRobot, robotMoving, focus = null, zoom = 1,
-  requireHeading = false, onSelect,
+  positionOnly = false, onSelect,
 }: CanvasProps) {
   const { t } = useI18n();
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -277,9 +277,20 @@ function MapCanvas({
     }
     if (selected) {
       const goal = pointOnCanvas(selected);
-      context.save(); context.translate(goal.x, goal.y); context.rotate(-selected.yaw - map.origin.yaw);
-      context.fillStyle = "#f59e0b"; context.beginPath(); context.moveTo(12, 0);
-      context.lineTo(-7, 7); context.lineTo(-4, 0); context.lineTo(-7, -7); context.closePath(); context.fill(); context.restore();
+      context.save(); context.translate(goal.x, goal.y);
+      if (positionOnly) {
+        // An approximate-pose click is a search region, not a robot marker or
+        // a trusted heading. Draw a target instead of a directional arrow.
+        context.strokeStyle = "#f59e0b";
+        context.lineWidth = 3;
+        context.beginPath(); context.arc(0, 0, 11, 0, Math.PI * 2); context.stroke();
+        context.beginPath(); context.arc(0, 0, 3, 0, Math.PI * 2); context.fillStyle = "#f59e0b"; context.fill();
+      } else {
+        context.rotate(-selected.yaw - map.origin.yaw);
+        context.fillStyle = "#f59e0b"; context.beginPath(); context.moveTo(12, 0);
+        context.lineTo(-7, 7); context.lineTo(-4, 0); context.lineTo(-7, -7); context.closePath(); context.fill();
+      }
+      context.restore();
     }
     if (showRobot) {
       const center = pointOnCanvas(pose);
@@ -292,7 +303,7 @@ function MapCanvas({
         markerRadius,
       );
     }
-  }, [dynamicObstacles, fitted, imageRevision, imageState, map, pose, robotMoving, route, selected, showRobot, viewport]);
+  }, [dynamicObstacles, fitted, imageRevision, imageState, map, pose, positionOnly, robotMoving, route, selected, showRobot, viewport]);
 
   const eventWorld = (clientX: number, clientY: number): Point | null => {
     const canvas = canvasRef.current;
@@ -320,10 +331,9 @@ function MapCanvas({
         if (!start || readOnly) return;
         const end = eventWorld(event.clientX, event.clientY) ?? start.point;
         const dragged = Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) > 6;
-        if (requireHeading && !dragged) return;
         onSelect({ destination_id: "CUSTOM-GOAL", map_id: map.map_id, name: t("Điểm tùy chọn"),
           x: start.point.x, y: start.point.y,
-          yaw: dragged ? Math.atan2(end.y - start.point.y, end.x - start.point.x) : 0, enabled: true });
+          yaw: !positionOnly && dragged ? Math.atan2(end.y - start.point.y, end.x - start.point.x) : 0, enabled: true });
       }} />
     {destinations.map((destination) => {
       const marker = pointOnCanvas(destination);
@@ -419,12 +429,12 @@ export function MapPanel({
         <strong>{t(approximateMode ? "Chỉ vị trí robot gần đúng" : "Chọn điểm đến")}</strong></div>
         <button type="button" aria-label={t("Đóng bản đồ mở rộng")} onClick={() => { setExpanded(false); setApproximateMode(false); }}><X /></button></header>
         {approximateMode && <p className="map-modal__hint">
-          {t("Nhấn tại vị trí robot rồi kéo theo hướng đầu robot để đặt cả vị trí và góc quay.")}
+          {t("Nhấn vào vị trí gần đúng của robot. LiDAR sẽ tự xác định vị trí chính xác và hướng robot.")}
         </p>}</div>
         <div className="map-modal__canvas"><MapCanvas map={map} destinations={approximateMode ? [] : destinations} pose={pose}
           route={approximateMode ? null : liveRoute} selected={selected} dynamicObstacles={obstacles}
           readOnly={readOnly || loading} showRobot={ready && !approximateMode} robotMoving={moving}
-          requireHeading={approximateMode}
+          positionOnly={approximateMode}
           onSelect={approximateMode ? onSelectInitialPose ?? onSelect : onSelect} /></div>
         <footer><button type="button" onClick={() => { setExpanded(false); setApproximateMode(false); }}>{t("Hủy")}</button>
           {approximateMode ? <button type="button" className="button button--primary" disabled={!selected || loading}

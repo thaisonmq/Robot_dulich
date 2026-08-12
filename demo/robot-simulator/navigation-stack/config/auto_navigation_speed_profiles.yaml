@@ -1,0 +1,76 @@
+auto_navigation_speed_profiles:
+  default_mode: NORMAL
+
+  # Proven deployment envelope: it is identical to Web Manual Fast and the
+  # final shared velocity smoother. Auto profiles are not allowed to exceed it.
+  hardware_limits:
+    linear_max: 0.33
+    reverse_max: 0.22
+    angular_max: 0.80
+    linear_accel_max: 0.60
+    linear_decel_max: 0.60
+    angular_accel_max: 2.00
+    angular_decel_max: 2.00
+
+  debug:
+    enabled: false
+    throttle_seconds: 1.0
+
+  profiles:
+    slow:
+      linear_max: 0.17
+      angular_max: 0.60
+      linear_accel: 0.30
+      linear_decel: 0.45
+      angular_accel: 1.20
+      angular_decel: 1.50
+      regulated_min_radius: 0.65
+      regulated_min_speed: 0.10
+      collision_horizon: 0.70
+      lookahead_dist: 0.35
+      min_lookahead_dist: 0.20
+      max_lookahead_dist: 0.50
+      lookahead_time: 1.50
+      replan_frequency: 2.0
+      recovery_wait: 1.00
+      backup_distance: 0.10
+      backup_speed: 0.08
+
+    normal:
+      linear_max: 0.27
+      angular_max: 0.75
+      linear_accel: 0.45
+      linear_decel: 0.55
+      angular_accel: 1.70
+      angular_decel: 1.80
+      regulated_min_radius: 0.60
+      regulated_min_speed: 0.12
+      collision_horizon: 0.90
+      lookahead_dist: 0.50
+      min_lookahead_dist: 0.30
+      max_lookahead_dist: 0.75
+      lookahead_time: 1.60
+      replan_frequency: 2.0
+      recovery_wait: 1.00
+      backup_distance: 0.12
+      backup_speed: 0.10
+
+    fast:
+      # FAST deliberately equals, but never exceeds, proven Manual Fast.
+      linear_max: 0.33
+      angular_max: 0.80
+      linear_accel: 0.60
+      linear_decel: 0.60
+      angular_accel: 2.00
+      angular_decel: 2.00
+      regulated_min_radius: 0.55
+      regulated_min_speed: 0.15
+      collision_horizon: 1.10
+      lookahead_dist: 0.60
+      min_lookahead_dist: 0.35
+      max_lookahead_dist: 0.90
+      lookahead_time: 1.80
+      replan_frequency: 2.0
+      recovery_wait: 1.00
+      backup_distance: 0.15
+      backup_speed: 0.12

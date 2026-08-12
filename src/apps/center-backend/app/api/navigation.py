@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -67,6 +68,7 @@ class InitialPoseRequest(NavigationCommandBase):
 class RelocalizeRequest(NavigationCommandBase):
     map_id: str = Field(min_length=2, max_length=64)
     version: int = Field(ge=1)
+    allow_rotation: bool = False
 
 
 class ComputePathRequest(NavigationCommandBase):
@@ -77,6 +79,10 @@ class ComputePathRequest(NavigationCommandBase):
 
 class MissionCommandRequest(NavigationCommandBase):
     mission_id: str = Field(min_length=8, max_length=64)
+
+
+class SpeedModeRequest(NavigationCommandBase):
+    mode: Literal["SLOW", "NORMAL", "FAST"]
 
 
 def _mission_view(mission: NavigationMission) -> dict:
@@ -99,6 +105,21 @@ def _mission_view(mission: NavigationMission) -> dict:
         "created_at": mission.created_at.isoformat(),
         "updated_at": mission.updated_at.isoformat(),
     }
+
+
+def _mission_start_rejection(mission: NavigationMission) -> dict | None:
+    """Return a user-facing rejection before any navigation command is sent."""
+    if mission.status == "READY" and mission.path:
+        return None
+    code = str(mission.error_code or ("NO_PATH" if not mission.path else "MISSION_NOT_READY"))
+    if code in {"NO_PATH", "PLAN_REJECTED", "PLANNER_TIMEOUT"} or not mission.path:
+        message = (
+            "Không tìm thấy lộ trình an toàn từ vị trí hiện tại. "
+            "Hãy chọn điểm khác hoặc tạo thêm khoảng trống quanh robot."
+        )
+    else:
+        message = str(mission.error_message or "Lộ trình chưa sẵn sàng để bắt đầu.")
+    return {"code": code, "message": message, "status": mission.status}
 
 
 def _valid_lease(robot_id: str, session_id: str, user_id: str) -> None:
@@ -348,7 +369,11 @@ async def relocalize(
         robot_id=body.robot_id,
         command_type="map.relocalize",
         expected_state=body.expected_state,
-        payload={"map_id": body.map_id, "version": body.version},
+        payload={
+            "map_id": body.map_id,
+            "version": body.version,
+            "allow_rotation": body.allow_rotation,
+        },
     )
 
 
@@ -377,6 +402,48 @@ async def navigation_health(
             "nav2Healthy": health.get("nav2") == "READY",
         } if mode == "NAVIGATION" else None,
         "mapRegistry": health.get("map_registry", {"localCount": 0, "pendingSync": 0}),
+    }
+
+
+@router.get("/speed-mode/{robot_id}")
+async def auto_navigation_speed_mode(
+    robot_id: str,
+    session_id: str,
+    user_id: str = Depends(current_user),
+) -> dict:
+    _valid_lease(robot_id, session_id, user_id)
+    runtime = hub.robots.get(robot_id)
+    if runtime is None or runtime.status != "online":
+        raise HTTPException(status_code=409, detail="Robot đang ngoại tuyến")
+    mode = str(runtime.health.get("auto_speed_mode") or "NORMAL").upper()
+    if mode not in {"SLOW", "NORMAL", "FAST"}:
+        mode = "NORMAL"
+    return {
+        "mode": mode,
+        "profile": runtime.health.get("auto_speed_profile"),
+    }
+
+
+@router.post("/speed-mode")
+async def set_auto_navigation_speed_mode(
+    body: SpeedModeRequest,
+    user_id: str = Depends(current_user),
+    database: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    _valid_lease(body.robot_id, body.session_id, user_id)
+    result = await _command(
+        database,
+        settings,
+        request_id=body.request_id,
+        robot_id=body.robot_id,
+        command_type="navigation.speed_mode",
+        expected_state=body.expected_state,
+        payload={"mode": body.mode},
+    )
+    return {
+        **result,
+        "mode": str(result.get("mode") or body.mode).upper(),
     }
 
 
@@ -459,12 +526,22 @@ async def start_navigation(
     mission = database.get(NavigationMission, body.mission_id)
     if mission is None or mission.robot_id != body.robot_id:
         raise HTTPException(status_code=404, detail="Không tìm thấy mission")
+    rejection = _mission_start_rejection(mission)
+    if rejection is not None:
+        raise HTTPException(status_code=409, detail=rejection)
     robot = _robot_by_public_id(database, body.robot_id)
     if robot is None or robot.map_id != mission.map_id or robot.active_map_version != mission.map_version:
         raise HTTPException(status_code=409, detail="Map mission không còn là active map của robot")
     failures = _navigation_preflight(body.robot_id)
     if failures:
-        raise HTTPException(status_code=409, detail={"code": "PREFLIGHT_FAILED", "failures": failures})
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PREFLIGHT_FAILED",
+                "message": "Robot chưa đủ điều kiện an toàn để bắt đầu tự hành.",
+                "failures": failures,
+            },
+        )
     try:
         navigation_transition(mission.status, "NAVIGATING")
     except InvalidTransition as exc:

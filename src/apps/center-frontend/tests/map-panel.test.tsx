@@ -177,6 +177,8 @@ describe("MapPanel navigation controls", () => {
 
     const dialog = screen.getByRole("dialog", { name: "Chỉ vị trí robot gần đúng" });
     expect(dialog).toBeInTheDocument();
+    expect(screen.getByText(/LiDAR sẽ tự xác định vị trí chính xác và hướng robot/)).toBeInTheDocument();
+    expect(screen.queryByText(/kéo theo hướng đầu robot/)).not.toBeInTheDocument();
     const panelElement = dialog.querySelector(".map-modal__panel");
     expect(panelElement).toHaveClass("map-modal__panel");
     expect(panelElement?.children).toHaveLength(3);

@@ -12,6 +12,7 @@ export type MessageType =
   | "navigation.pause"
   | "navigation.resume"
   | "navigation.cancel"
+  | "navigation.speed_mode"
   | "navigation.status"
   | "navigation.result"
   | "navigation.visualization"

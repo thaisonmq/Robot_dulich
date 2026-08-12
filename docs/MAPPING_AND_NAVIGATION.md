@@ -36,11 +36,11 @@ Tại **Bản đồ hành trình**, chọn map/version rồi bấm **Kích hoạ
 
 Localization không hỏi tọa độ ban đầu theo mặc định:
 
-1. `LOCALIZING_LAST_POSE`: thử pose gần nhất đúng map/version, có tuổi tối đa và covariance.
-2. AMCL + LiDAR + TF xác minh; một pose publish đơn lẻ không đủ. Confidence kết hợp covariance và chuỗi pose ổn định.
+1. `LOCALIZING_LAST_POSE`: dùng pose gần nhất đúng map/version làm gợi ý có covariance rộng, không coi là vị trí đã xác nhận vì robot có thể đã được di chuyển bằng tay.
+2. AMCL + LiDAR + TF xác minh bằng dữ liệu mới; một pose publish đơn lẻ không đủ. Confidence kết hợp covariance và chuỗi pose ổn định, cùng một ngưỡng xác nhận cho cả pose cũ và global localization.
 3. Nếu pose cũ không hội tụ: `LOCALIZING_GLOBAL` qua `/reinitialize_global_localization`.
-4. Khi cần thêm góc nhìn: `LOCALIZING_ROTATING` với tốc độ mặc định 20°/s, timeout 45 s, tối đa 360°. Velocity đi qua `/cmd_vel_nav -> twist_mux -> velocity smoother -> motion-safety`; E-stop, scan stale, obstacle/directional mask hoặc manual control dừng xoay ngay.
-5. Chỉ `READY` mới cho chọn goal. Nếu thất bại, UI mới hiện **Thử lại** và **Chỉ vị trí robot gần đúng**; xác nhận fallback publish `/initialpose` với covariance rộng để AMCL refine.
+4. Mặc định mọi lần map load, mở Control, mất định vị và nhập vị trí gần đúng đều định vị **thụ động**, chỉ dùng LiDAR/TF tại chỗ và không phát velocity. `LOCALIZING_ROTATING` chỉ được phép khi một lệnh riêng truyền `allow_rotation=true`; velocity vẫn đi qua `/cmd_vel_nav -> twist_mux -> velocity smoother -> motion-safety`, và E-stop, scan stale, obstacle/directional mask hoặc manual control dừng xoay ngay.
+5. Mỗi phiên Control mới yêu cầu robot xác minh lại pose hiện tại và chỉ `READY` mới cho chọn goal. Nếu thất bại, UI mới hiện **Thử lại** và **Chỉ vị trí robot gần đúng**; người dùng chỉ chọn vùng vị trí, không cần biết hướng robot. Điểm này là tâm vùng tìm kiếm `/initialpose` cục bộ với phương sai vị trí `0.36 m²` và phương sai hướng phủ đủ `360°`; LiDAR + AMCL tự tìm cả vị trí lẫn hướng. UI dùng ký hiệu vùng tìm kiếm, xóa ngay gợi ý sau khi gửi và chỉ hiện marker robot sau khi AMCL hội tụ; gợi ý không hội tụ sẽ tự chuyển sang global localization.
 
 Last Known Pose lưu 5 giây/lần gồm map/version, x/y/yaw, covariance và timestamp. Khi confidence tụt trong lúc đi, adapter cancel Nav2, phát zero qua safety chain, xóa path và global-localize lại; không tự tiếp tục goal cũ.
 

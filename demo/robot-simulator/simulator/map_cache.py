@@ -217,13 +217,12 @@ class RobotMapCacheManager:
         pose avoids throwing away the strongest localization hint immediately
         after a map is saved.
         """
-        # Only reuse a navigation pose while it is operationally recent. It
-        # was persisted exclusively from a localized READY state, so restart
-        # it with the same tight AMCL prior instead of the UI confidence
-        # complement stored for diagnostics.
+        # Only reuse a navigation pose while it is operationally recent, but
+        # keep it explicitly approximate: the chassis may have been carried
+        # without odometry while the navigation runtime was stopped.
         pose = self.last_pose(map_id, version, max_age_seconds=3600)
         if pose is not None:
-            pose["covariance"] = 0.04
+            pose["covariance"] = 1.0
             pose["source"] = "recent_navigation_pose"
             return pose
         try:
@@ -246,7 +245,7 @@ class RobotMapCacheManager:
                 "x": float(candidate["x"]),
                 "y": float(candidate["y"]),
                 "yaw": float(candidate["yaw"]),
-                "covariance": 0.04,
+                "covariance": 1.0,
                 "source": "mapping_terminal_pose",
             }
         except (FileNotFoundError, OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):

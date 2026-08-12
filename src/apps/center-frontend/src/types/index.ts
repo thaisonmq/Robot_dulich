@@ -285,6 +285,8 @@ export interface Pose {
   confidence?: number;
 }
 
+export type AutoNavigationSpeedMode = "SLOW" | "NORMAL" | "FAST";
+
 export interface Health {
   battery_percent: number;
   network_rtt_ms: number;
@@ -299,6 +301,10 @@ export interface Health {
   map_id?: string;
   localized?: boolean;
   nav2?: string;
+  auto_speed_mode?: AutoNavigationSpeedMode;
+  auto_speed_profile?: Record<string, unknown>;
+  replan_frequency_hz?: number;
+  navigation_metrics?: Record<string, unknown>;
   safety?: string;
   scan_fresh?: boolean;
   odometry_ready?: boolean;
@@ -417,6 +423,8 @@ export interface Route {
   goal?: { x: number; y: number; yaw: number };
   map_id?: string;
   map_version?: number;
+  error_code?: string | null;
+  error_message?: string | null;
 }
 
 export interface NavigationFeedback {

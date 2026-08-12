@@ -72,6 +72,9 @@ services:
       ROVERA_USE_VENDOR_BASE_RUNTIME: ${ROVERA_USE_VENDOR_BASE_RUNTIME:-0}
       NAVIGATION_SOCKET_PATH: /var/lib/rovera/navigation/navigation.sock
       NAVIGATION_SOCKET_GID: ${ROBOT_GID:-1000}
+      AUTO_NAVIGATION_SPEED_PROFILES_PATH: /opt/rovera/config/auto_navigation_speed_profiles.yaml
+      AUTO_NAVIGATION_SPEED_MODE_PATH: /var/lib/rovera/navigation/auto-speed-mode.json
+      AUTO_NAVIGATION_BT_DIRECTORY: /var/lib/rovera/navigation/behavior_trees
       ROVERA_MAP_ROOT: /var/lib/rovera/maps
       NAV2_MAP_YAML: ${NAV2_MAP_YAML:-/opt/rovera/config/bootstrap-map.yaml}
       REQUIRE_SENSOR_HEALTH: ${REQUIRE_SENSOR_HEALTH:-1}
@@ -90,8 +93,16 @@ services:
         target: /ws/install/rovera_navigation_adapter/lib/python3.10/site-packages/navigation_core.py
         read_only: true
       - type: bind
+        source: ./navigation-stack/speed_profiles.py
+        target: /ws/install/rovera_navigation_adapter/lib/python3.10/site-packages/speed_profiles.py
+        read_only: true
+      - type: bind
         source: ./navigation-stack/config/nav2_params.yaml
         target: /opt/rovera/config/nav2_params.yaml
+        read_only: true
+      - type: bind
+        source: ./navigation-stack/config/auto_navigation_speed_profiles.yaml
+        target: /opt/rovera/config/auto_navigation_speed_profiles.yaml
         read_only: true
       - type: bind
         source: ./micro_ros_fastdds.xml

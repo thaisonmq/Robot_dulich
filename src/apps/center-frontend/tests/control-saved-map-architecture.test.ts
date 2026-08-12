@@ -20,6 +20,39 @@ describe("Control saved-map architecture", () => {
     expect(dashboard).toMatch(/onSuccess:[\s\S]*setSelectedMapId\(selectedMap\.map_id\)/);
   });
 
+  it("offers an independent runtime Auto Navigation speed selector", () => {
+    const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
+    const controlPad = readFileSync(resolve("src/components/ControlPad.tsx"), "utf8");
+    const api = readFileSync(resolve("src/api/client.ts"), "utf8");
+
+    expect(controlPad).toContain("Tốc độ thủ công");
+    expect(controlPad).toContain("Tốc độ tự động");
+    for (const mode of ["SLOW", "NORMAL", "FAST"]) {
+      expect(controlPad).toContain(`value: "${mode}"`);
+    }
+    expect(dashboard).toContain("setAutoNavigationSpeedMode");
+    expect(api).toContain('"/api/navigation/speed-mode"');
+  });
+
+  it("never starts a blocked or empty planned mission", () => {
+    const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
+    expect(dashboard).toContain('newRoute.status?.toUpperCase() === "READY"');
+    expect(dashboard).toContain("newRoute.points.length > 0");
+    expect(dashboard).toContain('route.status?.toUpperCase() !== "READY"');
+    expect(dashboard).toContain("Chưa có lộ trình an toàn để bắt đầu");
+  });
+
+  it("revalidates robot pose per control session before planning or starting", () => {
+    const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
+
+    expect(dashboard).toContain('type PoseVerificationState = "required"');
+    expect(dashboard).toContain('mapLocalized && poseVerificationState === "confirmed"');
+    expect(dashboard).toContain("relocalize.mutate({ expectedState: runtimeState, verificationKey })");
+    expect(dashboard).toContain("allow_rotation: false");
+    expect(dashboard.match(/if \(!poseVerified\)/g)).toHaveLength(2);
+    expect(dashboard).toContain("setSelectedDestination(null)");
+  });
+
   it("loads the navigable map catalogue and recovers from a stale robot map id", () => {
     const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
     expect(dashboard).toContain('api.maps(user?.role === "guest" ? "ACTIVE" : undefined)');

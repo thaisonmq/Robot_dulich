@@ -52,6 +52,23 @@ async def test_manual_takeover_cancels_without_auto_resume() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_speed_mode_switches_at_runtime_and_rejects_invalid_mode() -> None:
+    motion = MotionSimulator(SimulatorConfig())
+    backend = SimulatorNavigationBackend(NavigationSimulator(motion), motion)
+
+    result = await backend.execute(
+        "navigation.speed_mode",
+        {"mode": "FAST", "expected_state": "STALE_BROWSER_STATE"},
+    )
+
+    assert result["mode"] == "FAST"
+    assert backend.state()["auto_speed_mode"] == "FAST"
+    with pytest.raises(NavigationBackendError) as error:
+        await backend.execute("navigation.speed_mode", {"mode": "TURBO"})
+    assert error.value.code == "INVALID_SPEED_MODE"
+
+
+@pytest.mark.asyncio
 async def test_expected_state_rejects_stale_command() -> None:
     motion = MotionSimulator(SimulatorConfig())
     backend = SimulatorNavigationBackend(NavigationSimulator(motion), motion)
@@ -125,6 +142,35 @@ def test_ros2_mapping_commands_allow_slow_posegraph_io() -> None:
     assert backend._response_timeout("mapping.save") == 90
     assert backend._response_timeout("mapping.finish") == 90
     assert backend._response_timeout("mapping.start") == 90
+
+
+@pytest.mark.asyncio
+async def test_ros2_speed_mode_never_requests_a_stack_restart(monkeypatch) -> None:
+    backend = Ros2NavigationBackend("/tmp/navigation.sock")
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_call(command: str, payload: dict, timeout: float) -> dict:
+        del timeout
+        calls.append((command, payload))
+        return {
+            "status": "completed",
+            "mode": "SLOW",
+            "state": {"mode": "MAPPING", "state": "MAPPING_RUNNING"},
+        }
+
+    async def forbidden_mode_switch(command: str) -> bool:
+        raise AssertionError(f"speed mode tried to restart stack for {command}")
+
+    monkeypatch.setattr(backend, "_call_adapter", fake_call)
+    monkeypatch.setattr(backend, "_ensure_mode", forbidden_mode_switch)
+
+    # execute still calls _ensure_mode; exercise the real decision separately
+    # and then stub it to its expected no-switch result.
+    assert backend._required_mode("navigation.speed_mode") is None
+    monkeypatch.setattr(backend, "_ensure_mode", lambda command: asyncio.sleep(0, result=False))
+    result = await backend.execute("navigation.speed_mode", {"mode": "SLOW"})
+    assert result["mode"] == "SLOW"
+    assert calls == [("navigation.speed_mode", {"mode": "SLOW"})]
 
 
 def test_ros2_mapping_start_retry_filter_only_accepts_startup_races() -> None:

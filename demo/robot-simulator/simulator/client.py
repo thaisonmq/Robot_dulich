@@ -679,6 +679,7 @@ class RobotConnectionClient:
                     "navigation.resume",
                     "navigation.cancel",
                     "navigation.goal",
+                    "navigation.speed_mode",
                 }
             ):
                 if (
@@ -1439,11 +1440,12 @@ class RobotConnectionClient:
         except (NavigationBackendError, MapCacheError) as exc:
             if getattr(exc, "code", "") == "NAVIGATION_BACKEND_UNAVAILABLE":
                 self.navigation.status = "failed"
-            self._stop_motion(
-                "navigation_unsupported"
-                if getattr(exc, "code", "") == "NAVIGATION_BACKEND_UNAVAILABLE"
-                else "navigation_command_rejected"
-            )
+            if message.message_type != "navigation.speed_mode":
+                self._stop_motion(
+                    "navigation_unsupported"
+                    if getattr(exc, "code", "") == "NAVIGATION_BACKEND_UNAVAILABLE"
+                    else "navigation_command_rejected"
+                )
             await self._ack(
                 socket,
                 message,
@@ -1839,6 +1841,18 @@ class RobotConnectionClient:
                             "localization_state": backend_state.get("localization_state", "IDLE"),
                             "localization_confidence": backend_state.get("localization_confidence", 0),
                             "nav2": backend_state.get("nav2", "UNAVAILABLE"),
+                            "auto_speed_mode": backend_state.get(
+                                "auto_speed_mode", "NORMAL"
+                            ),
+                            "auto_speed_profile": backend_state.get(
+                                "auto_speed_profile"
+                            ),
+                            "replan_frequency_hz": backend_state.get(
+                                "replan_frequency_hz", 0.0
+                            ),
+                            "navigation_metrics": backend_state.get(
+                                "navigation_metrics"
+                            ),
                             "safety": (
                                 "HEALTHY"
                                 if self.config.motion_backend == "simulator"

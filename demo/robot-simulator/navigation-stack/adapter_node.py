@@ -23,9 +23,12 @@ from nav2_msgs.action import ComputePathToPose, NavigateToPose
 from nav2_msgs.srv import LoadMap
 from nav_msgs.msg import OccupancyGrid, Path as NavigationPath
 from PIL import Image
+from rcl_interfaces.srv import SetParametersAtomically
 from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
@@ -39,6 +42,12 @@ from navigation_core import (
     compact_lethal_cells,
     localization_confidence,
     navigation_abort_state,
+)
+from speed_profiles import (
+    AutoNavigationProfiles,
+    ProfileVelocityLimiter,
+    SpeedModeStore,
+    SpeedProfileError,
 )
 
 
@@ -97,11 +106,16 @@ class NavigationAdapter(Node):
         self.last_amcl_pose: tuple[float, float, float] | None = None
         self.last_amcl_covariance: list[float] = []
         self.low_confidence_since: float | None = None
-        self.trusted_last_pose = False
         self.last_nomotion_request_monotonic = 0.0
+        self.localization_seed_pose: dict[str, Any] | None = None
+        self.localization_seed_approximate = False
+        self.last_initial_pose_publish_monotonic = 0.0
         self.rotation_active = False
         self.rotation_angle = 0.0
         self.rotation_last_monotonic = 0.0
+        # Passive by default: physical rotation always requires an explicit
+        # command and is never implied by map load, reconnect or recovery.
+        self.localization_rotation_authorized = False
         self.localization_confidence_threshold = float(
             os.getenv("LOCALIZATION_CONFIDENCE_THRESHOLD", "0.72")
         )
@@ -136,6 +150,56 @@ class NavigationAdapter(Node):
         self.latest_dynamic_obstacles: list[dict[str, float]] = []
         self.visualization_revision = 0
         self.mapping_started_monotonic = 0.0
+        self.replan_timestamps: list[float] = []
+
+        self.speed_profiles = AutoNavigationProfiles.load(
+            os.getenv(
+                "AUTO_NAVIGATION_SPEED_PROFILES_PATH",
+                "/opt/rovera/config/auto_navigation_speed_profiles.yaml",
+            )
+        )
+        self.speed_mode_store = SpeedModeStore(
+            os.getenv(
+                "AUTO_NAVIGATION_SPEED_MODE_PATH",
+                "/var/lib/rovera/navigation/auto-speed-mode.json",
+            ),
+            self.speed_profiles.default_mode,
+        )
+        self.auto_speed_mode = self.speed_mode_store.load()
+        self.behavior_tree_paths = self.speed_profiles.write_behavior_trees(
+            os.getenv(
+                "AUTO_NAVIGATION_BT_DIRECTORY",
+                "/var/lib/rovera/navigation/behavior_trees",
+            )
+        )
+        self.profile_limiter = ProfileVelocityLimiter()
+        self.applied_speed_mode = self.auto_speed_mode if self.mode != "NAVIGATION" else ""
+        self.profile_applied = self.mode != "NAVIGATION"
+        self.profile_apply_error = ""
+        self.profile_apply_pending = self.mode == "NAVIGATION"
+        self.last_profile_apply_attempt = 0.0
+        self.last_pipeline_log_monotonic = 0.0
+        self.pipeline_samples: dict[str, tuple[float, float, float]] = {}
+        self.profile_clamp_reasons: tuple[str, ...] = ()
+        self.nearest_forward_obstacle = math.inf
+        self.obstacle_slowdown_active = False
+        self.last_slowdown_obstacle_distance = math.inf
+        self.last_replan_obstacle_distance = math.inf
+        self.profile_callback_latency_ms = 0.0
+        self.rotation_metric_active = False
+        self.rotation_metric_started = 0.0
+        self.rotation_metric_last_sample = 0.0
+        self.rotation_metric_integrated_angle = 0.0
+        self.rotation_metric_peak_requested = 0.0
+        self.rotation_metric_peak_final = 0.0
+        self.last_rotation_metrics: dict[str, float] = {}
+        self.declare_parameter(
+            "cmd_vel_debug_enabled", self.speed_profiles.debug_enabled
+        )
+        self.declare_parameter(
+            "cmd_vel_debug_throttle_seconds",
+            self.speed_profiles.debug_throttle_seconds,
+        )
 
         self.compute_path_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
         self.navigate_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
@@ -157,6 +221,26 @@ class NavigationAdapter(Node):
         self.nomotion_update_client = self.create_client(
             Empty, "/request_nomotion_update"
         )
+        # Runtime profile changes wait for parameter-service responses. Keep
+        # those clients and their retry timer in a re-entrant callback group so
+        # the timer cannot block the very response callback it is waiting for,
+        # or starve /map and AMCL callbacks during stack bootstrap.
+        self.profile_callback_group = ReentrantCallbackGroup()
+        self.controller_parameter_client = self.create_client(
+            SetParametersAtomically,
+            "/controller_server/set_parameters_atomically",
+            callback_group=self.profile_callback_group,
+        )
+        self.behavior_parameter_client = self.create_client(
+            SetParametersAtomically,
+            "/behavior_server/set_parameters_atomically",
+            callback_group=self.profile_callback_group,
+        )
+        self.smoother_parameter_client = self.create_client(
+            SetParametersAtomically,
+            "/velocity_smoother/set_parameters_atomically",
+            callback_group=self.profile_callback_group,
+        )
         self.mapping_scan = self.create_publisher(
             LaserScan, "/scan_mapping", qos_profile_sensor_data
         )
@@ -166,9 +250,24 @@ class NavigationAdapter(Node):
         self.initial_pose = self.create_publisher(
             PoseWithCovarianceStamped, "/initialpose", 1
         )
-        # This is a low-priority twist_mux input. It is smoothed and checked by
-        # motion-safety before /cmd_vel; the adapter never bypasses safety.
-        self.localization_velocity = self.create_publisher(Twist, "/cmd_vel_nav", 1)
+        # Nav2 and recovery commands arrive on the private raw topic. Only the
+        # selected Auto profile is applied here; the output remains the same
+        # low-priority twist_mux input and still passes through the shared
+        # smoother plus final motion-safety layer.
+        self.navigation_velocity = self.create_publisher(Twist, "/cmd_vel_nav", 1)
+        self.localization_velocity = self.navigation_velocity
+        self.create_subscription(
+            Twist, "/cmd_vel_nav_raw", self._auto_velocity_callback, 1
+        )
+        self.create_subscription(
+            Twist, "/cmd_vel_muxed", lambda message: self._record_pipeline("twist_mux", message), 1
+        )
+        self.create_subscription(
+            Twist, "/cmd_vel_smoothed", lambda message: self._record_pipeline("velocity_smoother", message), 1
+        )
+        self.create_subscription(
+            Twist, "/cmd_vel", lambda message: self._record_pipeline("motion_safety", message), 1
+        )
         self.create_subscription(OccupancyGrid, "/map", self._map_callback, 1)
         self.create_subscription(
             PoseWithCovarianceStamped, "/amcl_pose", self._amcl_pose_callback, 5
@@ -202,9 +301,346 @@ class NavigationAdapter(Node):
         self.create_timer(60.0, self._schedule_autosave)
         self.create_timer(0.2, self._update_pose)
         self.create_timer(0.2, self._localization_tick)
-        self.get_logger().info(
-            f"navigation adapter ready mode={self.mode} socket={self.socket_path}"
+        self.create_timer(
+            0.5,
+            self._profile_runtime_tick,
+            callback_group=self.profile_callback_group,
         )
+        self.create_timer(0.2, self._cmd_vel_debug_tick)
+        self.get_logger().info(
+            f"navigation adapter ready mode={self.mode} socket={self.socket_path} "
+            f"auto_speed_mode={self.auto_speed_mode}"
+        )
+
+    @staticmethod
+    def _parameter_request(values: dict[str, Any]) -> SetParametersAtomically.Request:
+        request = SetParametersAtomically.Request()
+        request.parameters = [
+            Parameter(name=name, value=value).to_parameter_msg()
+            for name, value in values.items()
+        ]
+        return request
+
+    def _set_runtime_parameters(
+        self,
+        client: Any,
+        node_name: str,
+        values: dict[str, Any],
+    ) -> None:
+        if not client.wait_for_service(timeout_sec=1.0):
+            raise AdapterError(
+                "SPEED_PROFILE_UNAVAILABLE",
+                f"{node_name} parameter service is unavailable",
+            )
+        response = self._wait(
+            client.call_async(self._parameter_request(values)),
+            3.0,
+            "SPEED_PROFILE_TIMEOUT",
+        )
+        if not response.result.successful:
+            raise AdapterError(
+                "SPEED_PROFILE_REJECTED",
+                f"{node_name} rejected speed profile: {response.result.reason}",
+            )
+
+    def _apply_speed_profile(self, mode: str) -> None:
+        profile = self.speed_profiles.get(mode)
+        previous_mode = self.applied_speed_mode
+        applied: list[tuple[Any, str]] = []
+        updates = [
+            (
+                self.controller_parameter_client,
+                "controller_server",
+                profile.controller_parameters(),
+            ),
+            (
+                self.behavior_parameter_client,
+                "behavior_server",
+                profile.behavior_parameters(),
+            ),
+            (
+                self.smoother_parameter_client,
+                "velocity_smoother",
+                self.speed_profiles.smoother_parameters(),
+            ),
+        ]
+        try:
+            for client, node_name, values in updates:
+                self._set_runtime_parameters(client, node_name, values)
+                applied.append((client, node_name))
+        except AdapterError:
+            # ROS has no transaction spanning multiple nodes. Roll already
+            # updated nodes back to the last complete profile before exposing
+            # the failure; the downstream smoother uses one invariant manual-
+            # safe envelope for every profile.
+            if previous_mode:
+                previous = self.speed_profiles.get(previous_mode)
+                rollback_values = {
+                    "controller_server": previous.controller_parameters(),
+                    "behavior_server": previous.behavior_parameters(),
+                    "velocity_smoother": self.speed_profiles.smoother_parameters(),
+                }
+                for client, node_name in reversed(applied):
+                    try:
+                        self._set_runtime_parameters(
+                            client,
+                            node_name,
+                            rollback_values[node_name],
+                        )
+                    except AdapterError as rollback_error:
+                        self.get_logger().error(
+                            f"speed profile rollback failed node={node_name}: {rollback_error}"
+                        )
+            raise
+        self.applied_speed_mode = profile.mode
+        self.profile_applied = True
+        self.profile_apply_pending = False
+        self.profile_apply_error = ""
+
+    def _set_auto_speed_mode(self, requested_mode: object) -> dict[str, Any]:
+        try:
+            profile = self.speed_profiles.get(requested_mode)
+        except SpeedProfileError as exc:
+            raise AdapterError("INVALID_SPEED_MODE", str(exc)) from exc
+        previous_mode = self.auto_speed_mode
+        if self.mode == "NAVIGATION":
+            try:
+                self._apply_speed_profile(profile.mode)
+            except AdapterError as exc:
+                self.profile_apply_error = str(exc)
+                self.auto_speed_mode = previous_mode
+                raise
+        else:
+            # Mapping has no controller/behavior server. Persist the choice and
+            # the next Navigation runtime applies it without restarting Nav2.
+            self.profile_apply_pending = True
+        try:
+            self.speed_mode_store.save(profile.mode)
+        except OSError as exc:
+            if self.mode == "NAVIGATION" and previous_mode != profile.mode:
+                try:
+                    self._apply_speed_profile(previous_mode)
+                except AdapterError as rollback_error:
+                    self.get_logger().error(
+                        f"speed profile persistence rollback failed: {rollback_error}"
+                    )
+            self.auto_speed_mode = previous_mode
+            raise AdapterError(
+                "SPEED_MODE_PERSIST_FAILED", f"Cannot persist speed mode: {exc}"
+            ) from exc
+        self.auto_speed_mode = profile.mode
+        return {
+            "status": "completed",
+            "current_state": self.current_state,
+            "mode": profile.mode,
+            "profile": self._speed_profile_state(profile.mode),
+            "state": self._state(),
+        }
+
+    def _profile_runtime_tick(self) -> None:
+        if self.mode != "NAVIGATION" or not self.profile_apply_pending:
+            return
+        if not all(
+            client.service_is_ready()
+            for client in (
+                self.controller_parameter_client,
+                self.behavior_parameter_client,
+                self.smoother_parameter_client,
+            )
+        ):
+            return
+        now = time.monotonic()
+        if now - self.last_profile_apply_attempt < 1.0:
+            return
+        self.last_profile_apply_attempt = now
+        try:
+            self._apply_speed_profile(self.auto_speed_mode)
+        except AdapterError as exc:
+            message = str(exc)
+            if message != self.profile_apply_error:
+                self.get_logger().warning(f"Auto speed profile apply pending: {message}")
+            self.profile_apply_error = message
+        else:
+            self.get_logger().info(
+                f"Auto speed profile applied mode={self.auto_speed_mode} without Nav2 restart"
+            )
+
+    def _auto_velocity_callback(self, message: Twist) -> None:
+        now = time.monotonic()
+        self._record_pipeline("controller_requested", message, now=now)
+        profile = self.speed_profiles.get(self.auto_speed_mode)
+        linear, angular, reasons = self.profile_limiter.apply(
+            message.linear.x,
+            message.angular.z,
+            profile,
+            now,
+        )
+        output = Twist()
+        output.linear.x = linear
+        output.linear.y = message.linear.y
+        output.angular.z = angular
+        self.profile_clamp_reasons = reasons
+        self._record_pipeline("auto_profile", output, now=now)
+        self.navigation_velocity.publish(output)
+        self.profile_callback_latency_ms = round(
+            (time.monotonic() - now) * 1000.0, 3
+        )
+        self._update_motion_metrics(message, output, now)
+
+    def _update_motion_metrics(
+        self,
+        requested: Twist,
+        output: Twist,
+        now: float,
+    ) -> None:
+        profile = self.speed_profiles.get(self.auto_speed_mode)
+        slowing = (
+            requested.linear.x > 0.02
+            and requested.linear.x < profile.linear_max * 0.85
+        )
+        if slowing and not self.obstacle_slowdown_active:
+            self.last_slowdown_obstacle_distance = self.nearest_forward_obstacle
+        self.obstacle_slowdown_active = slowing
+
+        rotating = abs(requested.linear.x) < 0.02 and abs(requested.angular.z) > 0.08
+        if rotating:
+            if not self.rotation_metric_active:
+                self.rotation_metric_active = True
+                self.rotation_metric_started = now
+                self.rotation_metric_last_sample = now
+                self.rotation_metric_integrated_angle = 0.0
+                self.rotation_metric_peak_requested = 0.0
+                self.rotation_metric_peak_final = 0.0
+            delta = max(0.0, min(0.25, now - self.rotation_metric_last_sample))
+            self.rotation_metric_integrated_angle += abs(output.angular.z) * delta
+            self.rotation_metric_last_sample = now
+            self.rotation_metric_peak_requested = max(
+                self.rotation_metric_peak_requested,
+                abs(float(requested.angular.z)),
+            )
+        elif self.rotation_metric_active:
+            self.last_rotation_metrics = {
+                "duration_seconds": round(now - self.rotation_metric_started, 3),
+                "angle_degrees": round(
+                    math.degrees(self.rotation_metric_integrated_angle), 1
+                ),
+                "peak_requested_angular": round(
+                    self.rotation_metric_peak_requested, 3
+                ),
+                "peak_final_angular": round(self.rotation_metric_peak_final, 3),
+            }
+            self.rotation_metric_active = False
+
+    def _record_pipeline(
+        self,
+        stage: str,
+        message: Twist,
+        *,
+        now: float | None = None,
+    ) -> None:
+        self.pipeline_samples[stage] = (
+            float(message.linear.x),
+            float(message.angular.z),
+            time.monotonic() if now is None else now,
+        )
+        if stage == "motion_safety" and self.rotation_metric_active:
+            self.rotation_metric_peak_final = max(
+                self.rotation_metric_peak_final,
+                abs(float(message.angular.z)),
+            )
+
+    @staticmethod
+    def _pipeline_differs(
+        left: tuple[float, float, float] | None,
+        right: tuple[float, float, float] | None,
+        tolerance: float = 0.02,
+    ) -> bool:
+        return bool(
+            left
+            and right
+            and (
+                abs(left[0] - right[0]) > tolerance
+                or abs(left[1] - right[1]) > tolerance
+            )
+        )
+
+    def _cmd_vel_debug_tick(self) -> None:
+        if not bool(self.get_parameter("cmd_vel_debug_enabled").value):
+            return
+        now = time.monotonic()
+        throttle = max(
+            0.2,
+            float(self.get_parameter("cmd_vel_debug_throttle_seconds").value),
+        )
+        if now - self.last_pipeline_log_monotonic < throttle:
+            return
+        requested = self.pipeline_samples.get("controller_requested")
+        if requested is None or now - requested[2] > 0.6:
+            return
+        profile_output = self.pipeline_samples.get("auto_profile")
+        muxed = self.pipeline_samples.get("twist_mux")
+        smoothed = self.pipeline_samples.get("velocity_smoother")
+        final = self.pipeline_samples.get("motion_safety")
+        reasons = list(self.profile_clamp_reasons)
+        if self._pipeline_differs(profile_output, muxed):
+            reasons.append("TWIST_MUX_OTHER_SOURCE")
+        if self._pipeline_differs(muxed, smoothed):
+            reasons.append("SMOOTHER_ACCEL_LIMIT")
+        if self._pipeline_differs(smoothed, final):
+            reasons.append(f"MOTION_SAFETY:{self.safety_health}")
+
+        def values(sample: tuple[float, float, float] | None) -> str:
+            return "unavailable" if sample is None else f"linear={sample[0]:.3f} angular={sample[1]:.3f}"
+
+        self.get_logger().info(
+            "[AUTO NAV] "
+            f"profile={self.auto_speed_mode} "
+            f"controller_requested=({values(requested)}) "
+            f"auto_profile=({values(profile_output)}) "
+            f"twist_mux=({values(muxed)}) "
+            f"velocity_smoother=({values(smoothed)}) "
+            f"motion_safety=({values(final)}) "
+            f"clamp_reason={','.join(dict.fromkeys(reasons)) or 'NONE'}"
+        )
+        self.last_pipeline_log_monotonic = now
+
+    def _speed_profile_state(self, mode: str | None = None) -> dict[str, Any]:
+        profile = self.speed_profiles.get(mode or self.auto_speed_mode)
+        return {
+            "mode": profile.mode,
+            "linear_max": profile.linear_max,
+            "angular_max": profile.angular_max,
+            "linear_accel": profile.linear_accel,
+            "angular_accel": profile.angular_accel,
+            "regulated_min_speed": profile.regulated_min_speed,
+            "collision_horizon": profile.collision_horizon,
+            "replan_frequency": profile.replan_frequency,
+            "recovery_wait": profile.recovery_wait,
+            "backup_distance": profile.backup_distance,
+            "backup_speed": profile.backup_speed,
+            "runtime_applied": self.applied_speed_mode == profile.mode,
+            "apply_error": self.profile_apply_error,
+        }
+
+    @staticmethod
+    def _finite_metric(value: float) -> float | None:
+        return round(value, 3) if math.isfinite(value) else None
+
+    def _navigation_metrics(self) -> dict[str, Any]:
+        return {
+            "replan_frequency_hz": self._measured_replan_frequency(),
+            "nearest_forward_obstacle_m": self._finite_metric(
+                self.nearest_forward_obstacle
+            ),
+            "slowdown_obstacle_distance_m": self._finite_metric(
+                self.last_slowdown_obstacle_distance
+            ),
+            "replan_obstacle_distance_m": self._finite_metric(
+                self.last_replan_obstacle_distance
+            ),
+            "profile_callback_latency_ms": self.profile_callback_latency_ms,
+            "last_rotation": dict(self.last_rotation_metrics),
+        }
 
     def _open_server(self) -> socket.socket:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,6 +737,7 @@ class NavigationAdapter(Node):
                 "localized": self.localized,
                 "localization_state": self.localization_state,
                 "localization_confidence": self.localization_confidence,
+                "localization_rotation_authorized": self.localization_rotation_authorized,
                 "nav2": nav2_state,
                 "feedback": dict(self.latest_feedback),
                 "scan_fresh": time.monotonic() - self.last_scan_monotonic <= 0.30,
@@ -318,6 +755,10 @@ class NavigationAdapter(Node):
                 "safety": "HEALTHY" if self.safety_health.startswith("HEALTHY") else self.safety_health,
                 "estop": self.estop_active,
                 "mission_id": self.current_mission_id,
+                "auto_speed_mode": self.auto_speed_mode,
+                "auto_speed_profile": self._speed_profile_state(),
+                "replan_frequency_hz": self._measured_replan_frequency(),
+                "navigation_metrics": self._navigation_metrics(),
                 "footprint": list(self.footprint),
                 "mapping": {
                     "state": self.current_state,
@@ -359,7 +800,9 @@ class NavigationAdapter(Node):
             and expected_state in navigation_terminal_states
             and self.current_state in navigation_terminal_states
         )
-        unconditional_safety_command = command in {"navigation.cancel", "map.deactivate"}
+        unconditional_safety_command = command in {
+            "navigation.cancel", "navigation.speed_mode", "map.deactivate"
+        }
         if (
             expected_state
             and expected_state != self.current_state
@@ -379,6 +822,9 @@ class NavigationAdapter(Node):
             return self._set_initial_pose(payload)
         if command == "map.relocalize":
             self._validate_command_map(payload)
+            self.localization_rotation_authorized = bool(
+                payload.get("allow_rotation", False)
+            )
             self.localization_started_monotonic = time.monotonic()
             self._start_global_localization()
             return {
@@ -409,6 +855,8 @@ class NavigationAdapter(Node):
             })
         if command == "navigation.cancel":
             return self._cancel_navigation("CANCELED")
+        if command == "navigation.speed_mode":
+            return self._set_auto_speed_mode(payload.get("mode"))
         if command.startswith("mapping."):
             return self._mapping_command(command, payload)
         if command == "system.status":
@@ -502,13 +950,34 @@ class NavigationAdapter(Node):
         )
 
     def _path_callback(self, message: NavigationPath) -> None:
+        now = time.monotonic()
+        if self.current_state == "NAVIGATING":
+            self.replan_timestamps.append(now)
+            self.replan_timestamps = [
+                timestamp
+                for timestamp in self.replan_timestamps
+                if now - timestamp <= 10.0
+            ]
         path = [
             {"x": round(float(item.pose.position.x), 3), "y": round(float(item.pose.position.y), 3)}
             for item in message.poses
         ]
         if path != self.latest_global_path:
+            had_previous_path = bool(self.latest_global_path)
             self.latest_global_path = path
+            if had_previous_path and not math.isfinite(
+                self.last_replan_obstacle_distance
+            ):
+                self.last_replan_obstacle_distance = self.nearest_forward_obstacle
             self.visualization_revision += 1
+
+    def _measured_replan_frequency(self) -> float:
+        if len(self.replan_timestamps) < 2:
+            return 0.0
+        elapsed = self.replan_timestamps[-1] - self.replan_timestamps[0]
+        if elapsed <= 0:
+            return 0.0
+        return round((len(self.replan_timestamps) - 1) / elapsed, 2)
 
     def _costmap_callback(self, message: OccupancyGrid) -> None:
         obstacles = compact_lethal_cells(message)
@@ -530,12 +999,36 @@ class NavigationAdapter(Node):
                 # Never draw or validate against odom-frame cells as though
                 # they were map-frame coordinates.
                 return
+        # The black Saved Map already displays permanent walls. Sending the
+        # same LiDAR returns again as red "dynamic obstacles" made open routes
+        # look blocked and also made goal validation overly conservative.
+        if self.saved_map is not None:
+            obstacles = [
+                item
+                for item in obstacles
+                if not self.saved_map.occupied_within(
+                    float(item["x"]), float(item["y"]), 0.10
+                )
+            ]
         if obstacles != self.latest_dynamic_obstacles:
             self.latest_dynamic_obstacles = obstacles
             self.visualization_revision += 1
 
     def _scan_callback(self, message: LaserScan) -> None:
         self.last_scan_monotonic = time.monotonic()
+        nearest_forward = math.inf
+        for index, distance in enumerate(message.ranges):
+            if (
+                not math.isfinite(distance)
+                or distance < message.range_min
+                or distance > message.range_max
+            ):
+                continue
+            angle = message.angle_min + index * message.angle_increment
+            normalized_angle = math.atan2(math.sin(angle), math.cos(angle))
+            if abs(normalized_angle) <= math.pi / 4:
+                nearest_forward = min(nearest_forward, float(distance))
+        self.nearest_forward_obstacle = nearest_forward
         # The Yahboom micro-ROS firmware can retain an old epoch offset after
         # the Agent reconnects without an MCU reboot. Messages then arrive at
         # the correct rate but are minutes behind the host TF clock, causing
@@ -590,10 +1083,35 @@ class NavigationAdapter(Node):
         )
         if active_navigation:
             self.get_logger().warning("manual takeover: canceling Nav2 goal")
-            try:
-                self._cancel_navigation("CANCELED")
-            except AdapterError as exc:
-                self.get_logger().error(f"manual takeover cancel failed: {exc}")
+            # This subscription shares the scan callback group. Waiting three
+            # seconds for Nav2's cancel response starved /scan_navigation and
+            # made both costmaps blind during a takeover. The mux already gives
+            # manual the higher priority, so invalidate Auto synchronously and
+            # let the cancel acknowledgement finish asynchronously.
+            with self.state_lock:
+                handle = self.current_goal_handle
+                self.current_goal_handle = None
+                self.current_state = "CANCELED"
+                self.navigation_goal_generation += 1
+                self.paused_goal = None
+                self.latest_global_path = []
+                self.visualization_revision += 1
+            self.profile_limiter.reset()
+            self.rotation_metric_active = False
+            self.obstacle_slowdown_active = False
+            self.navigation_velocity.publish(Twist())
+            if handle is not None:
+                future = handle.cancel_goal_async()
+
+                def canceled(cancel_future: Any) -> None:
+                    try:
+                        cancel_future.result()
+                    except Exception as exc:
+                        self.get_logger().error(
+                            f"manual takeover asynchronous cancel failed: {exc}"
+                        )
+
+                future.add_done_callback(canceled)
         elif message.data and self.mode == "NAVIGATION":
             # A takeover can land in the short window while Nav2 is accepting
             # a goal but before current_state becomes NAVIGATING. Invalidate
@@ -646,44 +1164,76 @@ class NavigationAdapter(Node):
     def _publish_initial_pose(self, pose: dict[str, Any], *, approximate: bool) -> None:
         message = PoseWithCovarianceStamped()
         message.header.frame_id = "map"
-        # Yahboom odometry reaches ROS tens of milliseconds behind wall time.
-        # Stamping an initial pose at ``now`` therefore asks AMCL for a future
-        # odom transform; AMCL logs the error and can retain a stale map->odom
-        # offset. ROS AMCL replaces a zero stamp with ``now``, so use a small,
-        # bounded look-back that is guaranteed to be inside the TF cache.
-        now = self.get_clock().now()
-        message.header.stamp = Time(
-            nanoseconds=max(0, now.nanoseconds - 200_000_000)
-        ).to_msg()
+        # Yahboom odometry reaches ROS behind wall time by a variable amount
+        # (observed up to ~0.7 s on the RK3588). Stamping at ``now`` or using a
+        # guessed look-back can therefore make AMCL discard a valid hint as a
+        # future extrapolation. Anchor the hint behind the newest transform in
+        # this node's odom TF buffer as AMCL's independent TF subscriber can be
+        # another few hundred milliseconds behind. Localization starts while
+        # stationary, so a one-second buffer margin is safe and deterministic.
+        try:
+            latest_odom = self.tf_buffer.lookup_transform(
+                "odom", "base_footprint", Time()
+            )
+            latest_stamp = latest_odom.header.stamp
+            latest_nanoseconds = (
+                int(latest_stamp.sec) * 1_000_000_000
+                + int(latest_stamp.nanosec)
+            )
+            message.header.stamp = Time(
+                nanoseconds=max(0, latest_nanoseconds - 1_000_000_000)
+            ).to_msg()
+        except TransformException:
+            now = self.get_clock().now()
+            message.header.stamp = Time(
+                nanoseconds=max(0, now.nanoseconds - 2_000_000_000)
+            ).to_msg()
         message.pose.pose.position.x = float(pose["x"])
         message.pose.pose.position.y = float(pose["y"])
         message.pose.pose.orientation = quaternion_from_yaw(float(pose.get("yaw", 0)))
-        position_variance = 1.0 if approximate else max(0.04, float(pose.get("covariance", 0.25)))
+        # An approximate point means "search near here", not "trust this
+        # position and heading".  A one-metre position variance scattered too
+        # few particles across this small indoor map, while the old 30-degree
+        # heading variance excluded the real pose whenever an operator did not
+        # know which way the robot was facing.  Keep the search local enough to
+        # converge from stationary scans and cover the complete heading range.
+        position_variance = 0.36 if approximate else max(0.04, float(pose.get("covariance", 0.25)))
         message.pose.covariance[0] = position_variance
         message.pose.covariance[7] = position_variance
-        message.pose.covariance[35] = 0.274 if approximate else 0.0685
+        message.pose.covariance[35] = math.pi ** 2 / 3.0 if approximate else 0.0685
         self.initial_pose.publish(message)
         self.initial_pose_requested = True
+        self.last_initial_pose_publish_monotonic = time.monotonic()
 
-    def _begin_auto_localization(self, last_pose: Any) -> None:
-        now = time.monotonic()
+    def _reset_localization_evidence(self) -> None:
+        """Discard every sample that could validate a previous AMCL hypothesis."""
         self.localized = False
         self.localization_confidence = 0.0
         self.amcl_stable_samples = 0
+        self.last_amcl_pose = None
+        self.last_amcl_covariance = []
         self.low_confidence_since = None
-        self.trusted_last_pose = False
         self.last_nomotion_request_monotonic = 0.0
+
+    def _begin_auto_localization(self, last_pose: Any) -> None:
+        now = time.monotonic()
+        self._reset_localization_evidence()
+        self.localization_rotation_authorized = False
         self.localization_started_monotonic = now
         self.localization_phase_started_monotonic = now
         self.rotation_angle = 0.0
         self.rotation_active = False
-        self.last_amcl_pose = None
-        self.last_amcl_covariance = []
+        self.localization_seed_pose = None
+        self.localization_seed_approximate = False
         if isinstance(last_pose, dict) and all(
             math.isfinite(float(last_pose.get(axis, 0.0))) for axis in ("x", "y", "yaw")
         ):
-            self.trusted_last_pose = float(last_pose.get("covariance", 1.0)) <= 0.25
-            self._publish_initial_pose(last_pose, approximate=False)
+            self.localization_seed_pose = dict(last_pose)
+            # A persisted pose is only a search hint. The chassis may have been
+            # carried while the robot was offline, so never recreate a tight,
+            # already-trusted AMCL hypothesis around this coordinate.
+            self.localization_seed_approximate = True
+            self._publish_initial_pose(self.localization_seed_pose, approximate=True)
             self.localization_state = "LOCALIZING_LAST_POSE"
             self.current_state = "LOCALIZING_LAST_POSE"
         else:
@@ -691,7 +1241,10 @@ class NavigationAdapter(Node):
 
     def _start_global_localization(self) -> None:
         self._stop_localization_rotation()
-        self.trusted_last_pose = False
+        self._reset_localization_evidence()
+        self.rotation_angle = 0.0
+        self.localization_seed_pose = None
+        self.localization_seed_approximate = False
         if not self.global_localization_client.wait_for_service(timeout_sec=3.0):
             self.localization_state = "LOCALIZATION_FAILED"
             self.current_state = "LOCALIZATION_FAILED"
@@ -752,6 +1305,8 @@ class NavigationAdapter(Node):
         self.latest_global_path = []
         self.visualization_revision += 1
         try:
+            self.localization_rotation_authorized = False
+            self.localization_started_monotonic = time.monotonic()
             self._start_global_localization()
         except AdapterError as exc:
             self.get_logger().error(str(exc))
@@ -771,6 +1326,22 @@ class NavigationAdapter(Node):
         if self.localization_state not in localizing_states:
             return
         now = time.monotonic()
+        # A best-effort subscriber may miss a single startup publication while
+        # AMCL is transitioning lifecycle state. Retry only until AMCL returns
+        # a fresh estimate for this localization phase; this is bounded and
+        # does not keep resetting a particle filter that is already updating.
+        if (
+            self.localization_state in {
+                "LOCALIZING_LAST_POSE", "LOCALIZING_APPROXIMATE_POSE",
+            }
+            and self.localization_seed_pose is not None
+            and self.last_amcl_monotonic < self.localization_phase_started_monotonic
+            and now - self.last_initial_pose_publish_monotonic >= 1.0
+        ):
+            self._publish_initial_pose(
+                self.localization_seed_pose,
+                approximate=self.localization_seed_approximate,
+            )
         # AMCL may publish its only stationary sample just before map->base is
         # visible. Re-evaluate it against current TF freshness on every tick.
         self._refresh_localization_confidence()
@@ -780,21 +1351,22 @@ class NavigationAdapter(Node):
         # multiple LiDAR scans instead of either trusting its first covariance
         # spike or timing out without enough samples.
         if (
-            self.localization_state in {
-                "LOCALIZING_LAST_POSE", "LOCALIZING_APPROXIMATE_POSE",
-            }
+            (
+                self.localization_state in {
+                    "LOCALIZING_LAST_POSE", "LOCALIZING_APPROXIMATE_POSE",
+                }
+                or (
+                    self.localization_state == "LOCALIZING_GLOBAL"
+                    and not self.localization_rotation_authorized
+                )
+            )
             and now - self.last_nomotion_request_monotonic >= 0.5
             and self.nomotion_update_client.service_is_ready()
         ):
             self.last_nomotion_request_monotonic = now
             self.nomotion_update_client.call_async(Empty.Request())
-        required_confidence = (
-            self.localization_low_threshold
-            if self.localization_state == "LOCALIZING_LAST_POSE" and self.trusted_last_pose
-            else self.localization_confidence_threshold
-        )
         if (
-            self.localization_confidence >= required_confidence
+            self.localization_confidence >= self.localization_confidence_threshold
             and self.amcl_stable_samples >= 5
             and now - self.last_scan_monotonic <= 0.30
             and now - self.last_map_tf_monotonic <= 0.60
@@ -804,6 +1376,8 @@ class NavigationAdapter(Node):
             self.localization_state = "READY"
             self.current_state = "READY"
             self.low_confidence_since = None
+            self.localization_seed_pose = None
+            self.localization_rotation_authorized = False
             return
         if now - self.localization_started_monotonic >= self.localization_timeout:
             self._stop_localization_rotation()
@@ -812,7 +1386,9 @@ class NavigationAdapter(Node):
             self.current_state = "LOCALIZATION_FAILED"
             return
         if (
-            self.localization_state == "LOCALIZING_LAST_POSE"
+            self.localization_state in {
+                "LOCALIZING_LAST_POSE", "LOCALIZING_APPROXIMATE_POSE",
+            }
             and now - self.localization_phase_started_monotonic >= self.last_pose_timeout
         ):
             try:
@@ -822,6 +1398,10 @@ class NavigationAdapter(Node):
             return
         if self.localization_state in {"LOCALIZING_GLOBAL", "LOW_CONFIDENCE", "LOCALIZATION_LOST"}:
             if now - self.localization_phase_started_monotonic < self.global_rotate_delay:
+                return
+            if not self.localization_rotation_authorized:
+                # Keep evaluating passive AMCL updates until timeout. Merely
+                # opening Control must never move an unchecked robot.
                 return
             self.localization_state = "LOCALIZING_ROTATING"
             self.current_state = "LOCALIZING_ROTATING"
@@ -935,21 +1515,18 @@ class NavigationAdapter(Node):
         # Never let confidence accumulated around a false, locally stable AMCL
         # hypothesis immediately validate an operator-supplied correction.
         # Require fresh AMCL samples around the new pose before returning READY.
-        self.localized = False
-        self.localization_confidence = 0.0
-        self.amcl_stable_samples = 0
-        self.last_amcl_pose = None
-        self.last_amcl_covariance = []
-        self.low_confidence_since = None
-        self.trusted_last_pose = False
-        self.last_nomotion_request_monotonic = 0.0
+        self._reset_localization_evidence()
+        self.localization_rotation_authorized = False
         self.localization_started_monotonic = time.monotonic()
         self.localization_phase_started_monotonic = self.localization_started_monotonic
-        # The operator selected a concrete map point and heading. Seed a tight
-        # local AMCL cloud around it; a one-metre variance can overlap
-        # symmetric rooms and discard the operator's correction.
-        operator_pose = {**pose, "covariance": 0.04}
-        self._publish_initial_pose(operator_pose, approximate=False)
+        # This is deliberately a broad search hint, not the robot pose. AMCL
+        # must move/refine the estimate using current LiDAR data. If the hint is
+        # wrong it falls back to global localization after the bounded hint
+        # phase instead of pinning the marker to the operator's click.
+        operator_pose = dict(pose)
+        self.localization_seed_pose = operator_pose
+        self.localization_seed_approximate = True
+        self._publish_initial_pose(operator_pose, approximate=True)
         self.localization_state = "LOCALIZING_APPROXIMATE_POSE"
         self.current_state = "LOCALIZING_APPROXIMATE_POSE"
         return {
@@ -967,6 +1544,7 @@ class NavigationAdapter(Node):
         self.saved_map = None
         self.active_map_path = None
         self.localized = False
+        self.localization_rotation_authorized = False
         self.localization_state = "IDLE"
         self.current_state = "NO_ACTIVE_MAP"
         self.current_mission_id = ""
@@ -1051,22 +1629,41 @@ class NavigationAdapter(Node):
             # path. Do not let interim READY telemetry mutate the prior goal.
             self.current_mission_id = ""
             self.current_state = "PLANNING"
+
+        def mark_plan_blocked() -> None:
+            # Never leave the previous preview visible beside a fresh NO_PATH
+            # result. That stale blue line made a blocked route look usable in
+            # Center even though Nav2 had correctly rejected the new plan.
+            with self.state_lock:
+                self.current_state = "BLOCKED"
+                if self.latest_global_path:
+                    self.latest_global_path = []
+                    self.visualization_revision += 1
+
         goal = ComputePathToPose.Goal()
         goal.goal = self._goal_pose(resolved_goal)
         goal.use_start = False
-        handle = self._wait(
-            self.compute_path_client.send_goal_async(goal), 5, "PLANNER_TIMEOUT"
-        )
+        try:
+            handle = self._wait(
+                self.compute_path_client.send_goal_async(goal), 5, "PLANNER_TIMEOUT"
+            )
+        except AdapterError:
+            mark_plan_blocked()
+            raise
         if not handle.accepted:
+            mark_plan_blocked()
             raise AdapterError("PLAN_REJECTED", "Planner rejected goal")
-        result = self._wait(handle.get_result_async(), 15, "PLANNER_TIMEOUT").result
+        try:
+            result = self._wait(handle.get_result_async(), 15, "PLANNER_TIMEOUT").result
+        except AdapterError:
+            mark_plan_blocked()
+            raise
         points = [
             {"x": pose.pose.position.x, "y": pose.pose.position.y}
             for pose in result.path.poses
         ]
         if not points:
-            with self.state_lock:
-                self.current_state = "BLOCKED"
+            mark_plan_blocked()
             raise AdapterError("NO_PATH", "Nav2 returned an empty path")
         distance = sum(
             math.hypot(b["x"] - a["x"], b["y"] - a["y"])
@@ -1094,6 +1691,9 @@ class NavigationAdapter(Node):
             raise AdapterError("NAV2_UNAVAILABLE", "NavigateToPose action unavailable")
         goal = NavigateToPose.Goal()
         goal.pose = self._goal_pose(goal_payload)
+        # Every goal selects the generated tree for the current profile. This
+        # changes replan/recovery timing without restarting bt_navigator.
+        goal.behavior_tree = str(self.behavior_tree_paths[self.auto_speed_mode])
         with self.state_lock:
             self.navigation_goal_generation += 1
             goal_generation = self.navigation_goal_generation
@@ -1101,6 +1701,9 @@ class NavigationAdapter(Node):
             # Keeping feedback from the previous goal could misclassify an
             # unrelated planner/controller failure as an obstacle blockage.
             self.latest_feedback = {"recoveries": 0}
+            self.replan_timestamps = []
+            self.last_slowdown_obstacle_distance = math.inf
+            self.last_replan_obstacle_distance = math.inf
         future = self.navigate_client.send_goal_async(
             goal,
             feedback_callback=(
@@ -1183,6 +1786,7 @@ class NavigationAdapter(Node):
                 self.paused_goal = None
                 self.latest_global_path = []
                 self.visualization_revision += 1
+        self.profile_limiter.reset()
 
     def _cancel_navigation(self, target: str) -> dict[str, Any]:
         with self.state_lock:
@@ -1200,6 +1804,10 @@ class NavigationAdapter(Node):
                 self.paused_goal = None
                 self.latest_global_path = []
                 self.visualization_revision += 1
+        self.profile_limiter.reset()
+        self.rotation_metric_active = False
+        self.obstacle_slowdown_active = False
+        self.navigation_velocity.publish(Twist())
         return {"status": "completed", "current_state": target, "state": self._state()}
 
     def _pause_navigation(self) -> dict[str, Any]:

@@ -3,10 +3,23 @@ from pathlib import Path
 
 from launch import LaunchDescription
 from launch_ros.actions import Node
+from speed_profiles import AutoNavigationProfiles
 
 
 def generate_launch_description() -> LaunchDescription:
     mode = os.getenv("NAVIGATION_MODE", "NAVIGATION").upper()
+    speed_profiles = AutoNavigationProfiles.load(
+        os.getenv(
+            "AUTO_NAVIGATION_SPEED_PROFILES_PATH",
+            "/opt/rovera/config/auto_navigation_speed_profiles.yaml",
+        )
+    )
+    behavior_trees = speed_profiles.write_behavior_trees(
+        os.getenv(
+            "AUTO_NAVIGATION_BT_DIRECTORY",
+            "/var/lib/rovera/navigation/behavior_trees",
+        )
+    )
     use_vendor_base_runtime = os.getenv(
         "ROVERA_USE_VENDOR_BASE_RUNTIME", "0"
     ).lower() in {"1", "true", "yes"}
@@ -94,11 +107,19 @@ def generate_launch_description() -> LaunchDescription:
     else:
         parameters = [
             "/opt/rovera/config/nav2_params.yaml",
-            {"use_sim_time": False},
+            {
+                "use_sim_time": False,
+                "default_nav_to_pose_bt_xml": str(
+                    behavior_trees[speed_profiles.default_mode]
+                ),
+            },
         ]
         cmd_vel_remaps = [
-            ("cmd_vel", "/cmd_vel_nav"),
-            ("cmd_vel_smoothed", "/cmd_vel_nav"),
+            # The adapter applies only the selected Auto profile before this
+            # reaches twist_mux. Manual Web/joystick sources never pass through
+            # this limiter and therefore retain their existing Fast behavior.
+            ("cmd_vel", "/cmd_vel_nav_raw"),
+            ("cmd_vel_smoothed", "/cmd_vel_nav_raw"),
         ]
         runtime = [
             Node(package="nav2_map_server", executable="map_server", name="map_server", parameters=[*parameters, {"yaml_filename": os.getenv("NAV2_MAP_YAML", "/opt/rovera/config/bootstrap-map.yaml")}], output="screen"),

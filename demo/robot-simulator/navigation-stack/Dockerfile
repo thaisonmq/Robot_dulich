@@ -23,7 +23,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /ws/src/rovera_navigation_adapter
-COPY package.xml setup.py setup.cfg adapter_node.py navigation_core.py sensor_normalizer.py ./
+COPY package.xml setup.py setup.cfg adapter_node.py navigation_core.py sensor_normalizer.py speed_profiles.py ./
 COPY resource ./resource
 WORKDIR /ws
 RUN . /opt/ros/humble/setup.sh && colcon build --packages-select rovera_navigation_adapter
