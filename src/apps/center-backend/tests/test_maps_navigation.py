@@ -56,6 +56,23 @@ def test_relocalization_rotation_requires_explicit_authorization() -> None:
     )
 
     assert request.allow_rotation is False
+    assert request.force_global is False
+
+
+def test_auto_navigation_can_request_fresh_global_localization() -> None:
+    request = RelocalizeRequest(
+        request_id="request-global-localization",
+        robot_id="ROBOT-001",
+        session_id="session-global-localization",
+        expected_state="READY",
+        map_id="MAP-001",
+        version=1,
+        allow_rotation=True,
+        force_global=True,
+    )
+
+    assert request.allow_rotation is True
+    assert request.force_global is True
 
 
 def test_blocked_or_empty_navigation_mission_cannot_start() -> None:
@@ -80,6 +97,28 @@ def test_blocked_or_empty_navigation_mission_cannot_start() -> None:
     blocked.status = "READY"
     blocked.path = [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 2.0}]
     assert _mission_start_rejection(blocked) is None
+
+
+def test_blocked_mission_preserves_specific_footprint_diagnostic() -> None:
+    blocked = NavigationMission(
+        mission_id="mission-footprint",
+        request_id="request-footprint",
+        robot_id="ROBOT-001",
+        control_session_id="session-footprint",
+        map_id="MAP-TEST",
+        map_version=1,
+        status="BLOCKED",
+        goal={"x": 1.0, "y": 1.0, "yaw": 0.0},
+        path=[],
+        error_code="GOAL_FOOTPRINT_BLOCKED",
+        error_message="Điểm đến không đủ khoảng trống cho toàn bộ thân robot.",
+    )
+
+    assert _mission_start_rejection(blocked) == {
+        "code": "GOAL_FOOTPRINT_BLOCKED",
+        "message": "Điểm đến không đủ khoảng trống cho toàn bộ thân robot.",
+        "status": "BLOCKED",
+    }
 
 
 def bundle_bytes(*, unsafe: bool = False) -> bytes:

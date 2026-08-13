@@ -38,19 +38,28 @@ describe("Control saved-map architecture", () => {
     const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
     expect(dashboard).toContain('newRoute.status?.toUpperCase() === "READY"');
     expect(dashboard).toContain("newRoute.points.length > 0");
-    expect(dashboard).toContain('route.status?.toUpperCase() !== "READY"');
+    expect(dashboard).toContain('preparedRoute.status?.toUpperCase() !== "READY"');
     expect(dashboard).toContain("Chưa có lộ trình an toàn để bắt đầu");
   });
 
-  it("revalidates robot pose per control session before planning or starting", () => {
+  it("reuses a live READY pose and localizes only when Auto Go has no pose", () => {
     const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
+    const sendGoal = dashboard.split("const sendGoal = useMutation({", 2)[1]
+      .split("const missionAction = useMutation({", 1)[0];
 
     expect(dashboard).toContain('type PoseVerificationState = "required"');
     expect(dashboard).toContain('mapLocalized && poseVerificationState === "confirmed"');
     expect(dashboard).toContain("runtimeLocalizationState === \"READY\" && health.localized");
-    expect(dashboard).toContain("relocalize.mutate({ expectedState: runtimeState, verificationKey, allowRotation: true })");
+    expect(dashboard).not.toContain("relocalize.mutate({ expectedState: runtimeState");
+    expect(sendGoal).toContain("!hasReadyRuntimePose(map.map_id, map.active_version)");
+    expect(sendGoal).toContain("await api.relocalize({");
+    expect(sendGoal).toContain("await waitForLocalizationReady(map.map_id, map.active_version)");
+    expect(sendGoal).toContain("allow_rotation: true");
+    expect(sendGoal).toContain("force_global: true");
+    expect(sendGoal).toContain("if (realRobot) {");
     expect(dashboard).toContain("allow_rotation: allowRotation");
-    expect(dashboard.match(/if \(!poseVerified\)/g)).toHaveLength(2);
+    expect(sendGoal).toContain("preparedRoute = null");
+    expect(dashboard).not.toContain("setApproximatePose");
     expect(dashboard).toContain("setSelectedDestination(null)");
   });
 

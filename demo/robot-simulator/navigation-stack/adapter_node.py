@@ -21,7 +21,7 @@ import yaml
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion, Twist
 from nav2_msgs.action import ComputePathToPose, NavigateToPose
-from nav2_msgs.srv import LoadMap
+from nav2_msgs.srv import ClearEntireCostmap, LoadMap
 from nav_msgs.msg import OccupancyGrid, Path as NavigationPath
 from PIL import Image
 from rcl_interfaces.srv import SetParametersAtomically
@@ -140,6 +140,7 @@ class NavigationAdapter(Node):
         self.rotation_active = False
         self.rotation_angle = 0.0
         self.rotation_last_monotonic = 0.0
+        self.localization_settling_evidence_started = False
         # Passive by default: physical rotation always requires an explicit
         # command and is never implied by map load, reconnect or recovery.
         self.localization_rotation_authorized = False
@@ -173,6 +174,9 @@ class NavigationAdapter(Node):
             "global_localization_rotate_delay_seconds", 5.0,
             "GLOBAL_LOCALIZATION_ROTATE_DELAY_SECONDS",
         )
+        self.localization_rotation_settle = configured(
+            "localization_rotation_settle_seconds", 1.0
+        )
         self.localization_timeout = configured(
             "auto_localization_timeout_seconds", 45.0,
             "AUTO_LOCALIZATION_TIMEOUT_SECONDS",
@@ -183,6 +187,9 @@ class NavigationAdapter(Node):
         self.localization_verify_min_scans = int(self.declare_parameter(
             "localization_verify_min_scans", 3
         ).value)
+        self.amcl_pose_freshness = configured(
+            "localization_amcl_pose_freshness_seconds", 1.5
+        )
         self.pose_minimum_samples = int(self.declare_parameter(
             "localization_pose_minimum_samples", 5
         ).value)
@@ -225,7 +232,7 @@ class NavigationAdapter(Node):
         )
         self.rotation_speed = math.radians(
             configured(
-                "auto_localization_rotation_degrees_per_second", 20.0,
+                "auto_localization_rotation_degrees_per_second", 45.0,
                 "AUTO_LOCALIZATION_ROTATION_DEG_S",
             )
         )
@@ -249,6 +256,9 @@ class NavigationAdapter(Node):
             {"x": -self.footprint_half_length, "y": -self.footprint_half_width},
             {"x": -self.footprint_half_length, "y": self.footprint_half_width},
         ]
+        self.planning_footprint_padding = float(self.declare_parameter(
+            "planning_footprint_padding", 0.01
+        ).value)
         self.footprint_clearance = float(os.getenv("GOAL_CLEARANCE_METERS", "0.15"))
         self.goal_snap_max_distance = float(
             os.getenv("GOAL_SNAP_MAX_DISTANCE_METERS", "0.45")
@@ -279,7 +289,10 @@ class NavigationAdapter(Node):
                 "/var/lib/rovera/navigation/behavior_trees",
             )
         )
-        self.profile_limiter = ProfileVelocityLimiter()
+        self.profile_limiter = ProfileVelocityLimiter(
+            pure_rotation_angular_max=self.speed_profiles.hardware.angular_max,
+            pure_rotation_angular_decel=self.speed_profiles.hardware.angular_decel_max,
+        )
         self.applied_speed_mode = self.auto_speed_mode if self.mode != "NAVIGATION" else ""
         self.profile_applied = self.mode != "NAVIGATION"
         self.profile_apply_error = ""
@@ -292,6 +305,7 @@ class NavigationAdapter(Node):
         self.obstacle_slowdown_active = False
         self.last_slowdown_obstacle_distance = math.inf
         self.last_replan_obstacle_distance = math.inf
+        self.last_planning_failure: dict[str, Any] = {}
         self.profile_callback_latency_ms = 0.0
         self.scan_callback_latency_ms = 0.0
         self.localization_callback_latency_ms = 0.0
@@ -314,6 +328,10 @@ class NavigationAdapter(Node):
         self.compute_path_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
         self.navigate_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self.map_load_client = self.create_client(LoadMap, "/map_server/load_map")
+        self.clear_global_costmap_client = self.create_client(
+            ClearEntireCostmap,
+            "/global_costmap/clear_entirely_global_costmap",
+        )
         # SLAM Toolbox exposes one toggle service for both directions. The
         # adapter state machine guarantees it is called only on MAPPING->PAUSED
         # or PAUSED->MAPPING, so the toggle remains deterministic.
@@ -464,12 +482,12 @@ class NavigationAdapter(Node):
             (
                 self.controller_parameter_client,
                 "controller_server",
-                profile.controller_parameters(),
+                self.speed_profiles.controller_parameters(profile.mode),
             ),
             (
                 self.behavior_parameter_client,
                 "behavior_server",
-                profile.behavior_parameters(),
+                self.speed_profiles.behavior_parameters(profile.mode),
             ),
             (
                 self.smoother_parameter_client,
@@ -489,8 +507,12 @@ class NavigationAdapter(Node):
             if previous_mode:
                 previous = self.speed_profiles.get(previous_mode)
                 rollback_values = {
-                    "controller_server": previous.controller_parameters(),
-                    "behavior_server": previous.behavior_parameters(),
+                    "controller_server": self.speed_profiles.controller_parameters(
+                        previous.mode
+                    ),
+                    "behavior_server": self.speed_profiles.behavior_parameters(
+                        previous.mode
+                    ),
                     "velocity_smoother": self.speed_profiles.smoother_parameters(),
                 }
                 for client, node_name in reversed(applied):
@@ -764,6 +786,7 @@ class NavigationAdapter(Node):
             "planner_latency_ms": self.planner_latency_ms,
             "motion_owner": self.motion_owner,
             "last_rotation": dict(self.last_rotation_metrics),
+            "last_planning_failure": dict(self.last_planning_failure),
         }
 
     @staticmethod
@@ -821,6 +844,7 @@ class NavigationAdapter(Node):
                 ),
             },
             "scan_age_ms": self._age_milliseconds(self.last_scan_monotonic),
+            "amcl_pose_age_ms": self._age_milliseconds(self.last_amcl_monotonic),
             "odom_age_ms": self._sensor_entry("odom").get("arrival_age_ms"),
             "imu_age_ms": self._sensor_entry("imu").get("arrival_age_ms"),
             "tf_age_ms": self._age_milliseconds(self.last_map_tf_monotonic),
@@ -1039,14 +1063,62 @@ class NavigationAdapter(Node):
                     "NAVIGATION_ACTIVE",
                     "Cancel navigation before localization verification",
                 )
-            self.localization_rotation_authorized = bool(
-                payload.get("allow_rotation", False)
-            )
-            if self.localized and self.localization_state == "READY":
+            allow_rotation = bool(payload.get("allow_rotation", False))
+            force_global = bool(payload.get("force_global", False))
+            if force_global:
+                if not allow_rotation:
+                    raise AdapterError(
+                        "ROTATION_AUTHORIZATION_REQUIRED",
+                        "Fresh global localization requires rotation authorization",
+                    )
+                if self.localization_state in {
+                    "LOCALIZING_GLOBAL", "LOCALIZING_ROTATING",
+                    "LOCALIZING_SETTLING",
+                }:
+                    # The HTTP command is acknowledged before localization is
+                    # complete, so an impatient retry can arrive while the
+                    # same scan is still progressing. Authorize rotation but
+                    # never erase AMCL particles or accumulated heading twice.
+                    self.localization_rotation_authorized = True
+                    return {
+                        "status": "accepted",
+                        "current_state": self.current_state,
+                        "state": self._state(),
+                    }
+                # Auto Go must locate the chassis from current LiDAR evidence,
+                # not reuse AMCL particles or a pose persisted before a
+                # disconnect. The global-search READY gate requires fresh
+                # scan/map agreement observed across multiple headings.
+                self.localization_rotation_authorized = True
+                self.localization_started_monotonic = time.monotonic()
+                self._start_global_localization()
+            elif self.localized and self.localization_state == "READY":
+                # Initial convergence already passed the strict stationary
+                # gates. READY is continuously maintained with lower-threshold
+                # AMCL, scan, TF and sensor-time evidence, so reuse it without
+                # destroying the particle cloud.
+                return {
+                    "status": "completed",
+                    "current_state": "READY",
+                    "state": self._state(),
+                }
+            elif self.localization_state in {
+                "LOCALIZATION_INITIALIZING", "LOCALIZING_LAST_POSE",
+                "LOCALIZING_APPROXIMATE_POSE", "VERIFYING",
+            }:
+                # Preserve a recent-pose/no-motion verification already in
+                # progress. Auto Go only authorizes its later global fallback.
+                self.localization_rotation_authorized = (
+                    self.localization_rotation_authorized or allow_rotation
+                )
+            elif self.last_amcl_pose is not None:
+                # Even when Auto Go authorizes a later rotation, first verify
+                # the existing AMCL cloud without moving the chassis.
                 self._begin_localization_verification(
-                    allow_rotation=self.localization_rotation_authorized
+                    allow_rotation=allow_rotation
                 )
             else:
+                self.localization_rotation_authorized = allow_rotation
                 self.localization_started_monotonic = time.monotonic()
                 self._start_global_localization()
             return {
@@ -1207,6 +1279,13 @@ class NavigationAdapter(Node):
             bounded(metrics.yaw_spread, self.pose_maximum_yaw_spread),
         )
 
+    def _navigation_in_progress(self) -> bool:
+        return (
+            self.current_state == "NAVIGATING"
+            and self.current_goal_handle is not None
+            and self.motion_owner == "NAVIGATION"
+        )
+
     def _sensor_entry(self, name: str) -> dict[str, Any]:
         sensors = self.sensor_time_status.get("sensors")
         if not isinstance(sensors, dict):
@@ -1230,15 +1309,35 @@ class NavigationAdapter(Node):
         if not self.last_amcl_covariance:
             self.localization_confidence = 0.0
             return
+        # Pose-window stability proves initial convergence only. Once READY,
+        # both manual and autonomous motion necessarily spread that window and
+        # must not revoke an otherwise fresh tracked pose.
+        navigation_in_progress = self._navigation_in_progress()
+        tracking_ready_pose = self.localized and self.localization_state == "READY"
+        stability_score = (
+            1.0
+            if navigation_in_progress or tracking_ready_pose
+            else self._pose_stability_score()
+        )
+        fresh_scan_map_score = (
+            self.scan_map_score
+            if time.monotonic() - self.last_scan_map_monotonic
+            <= self.scan_map_freshness
+            else 0.0
+        )
+        # Endpoint-to-static-map matching is strong stationary verification,
+        # but during travel it also penalizes people and temporary obstacles.
+        # AMCL covariance plus fresh scan/odom/TF timestamps remain mandatory;
+        # do not turn a controller collision into a false localization loss.
+        confidence_scan_map_score = (
+            max(fresh_scan_map_score, self.scan_map_threshold)
+            if navigation_in_progress
+            else fresh_scan_map_score
+        )
         self.localization_confidence = localization_confidence(
             self.last_amcl_covariance,
-            stability_score=self._pose_stability_score(),
-            scan_map_score=(
-                self.scan_map_score
-                if time.monotonic() - self.last_scan_map_monotonic
-                <= self.scan_map_freshness
-                else 0.0
-            ),
+            stability_score=stability_score,
+            scan_map_score=confidence_scan_map_score,
             scan_map_threshold=self.scan_map_threshold,
             scan_fresh=time.monotonic() - self.last_scan_monotonic <= 0.30,
             tf_stable=time.monotonic() - self.last_map_tf_monotonic <= 0.60,
@@ -1574,8 +1673,14 @@ class NavigationAdapter(Node):
             position_variance = 0.36
             yaw_variance = math.pi ** 2 / 3.0
         else:
-            position_variance = max(0.04, float(pose.get("covariance", 0.25)))
-            yaw_variance = 0.0685
+            # A recent navigation pose has already passed the sustained
+            # scan/map, covariance and stability gates. The former 20 cm
+            # standard deviation let stationary AMCL jump far enough for the
+            # robot centre to land in an adjacent 5 cm wall cell after every
+            # restart. Preserve at least 10 cm of uncertainty for correction,
+            # but do not deliberately broaden an already verified pose.
+            position_variance = max(0.01, float(pose.get("covariance", 0.25)))
+            yaw_variance = 0.02
         message.pose.covariance[0] = position_variance
         message.pose.covariance[7] = position_variance
         message.pose.covariance[35] = yaw_variance
@@ -1615,6 +1720,7 @@ class NavigationAdapter(Node):
         self.verification_started_monotonic = now
         self.verification_scan_count = 0
         self.localization_rotation_authorized = allow_rotation
+        self.global_search_requires_rotation = False
         self.last_nomotion_request_monotonic = 0.0
         self.low_confidence_since = None
         self.ready_evidence_since = None
@@ -1646,7 +1752,7 @@ class NavigationAdapter(Node):
             # a mismatch times out into the multi-heading global search below.
             # Mapping terminal poses and legacy records remain broad hints.
             self.localization_seed_approximate = not recent_verified_pose
-            self.global_search_requires_rotation = not recent_verified_pose
+            self.global_search_requires_rotation = False
             self._publish_initial_pose(
                 self.localization_seed_pose,
                 approximate=self.localization_seed_approximate,
@@ -1654,11 +1760,23 @@ class NavigationAdapter(Node):
             self.localization_state = "LOCALIZING_LAST_POSE"
             self.current_state = "LOCALIZING_LAST_POSE"
         else:
-            self._start_global_localization()
+            # Loading a map or opening Control must not start active global
+            # localization. Auto Go (or the explicit UI action) authorizes it.
+            self.localization_state = "LOCALIZATION_REQUIRED"
+            self.current_state = "LOCALIZATION_REQUIRED"
 
     def _start_global_localization(self) -> None:
         self._stop_localization_rotation()
+        if not self.localization_rotation_authorized:
+            # Never enter a state whose READY gate requires rotation while
+            # velocity ownership forbids it. Expose the required operator/Auto
+            # action immediately instead of waiting for the 45-second timeout.
+            self.global_search_requires_rotation = False
+            self.localization_state = "LOCALIZATION_REQUIRED"
+            self.current_state = "LOCALIZATION_REQUIRED"
+            return
         self._reset_localization_evidence()
+        self.localization_settling_evidence_started = False
         self.rotation_angle = 0.0
         self.localization_seed_pose = None
         self.localization_seed_approximate = False
@@ -1708,8 +1826,12 @@ class NavigationAdapter(Node):
             and time.monotonic() - self.last_manual_takeover_monotonic > 0.5
             and self.current_goal_handle is None
             and self.current_state != "NAVIGATING"
-            and self.last_amcl_pose is not None
-            and self.scan_map_valid_beams >= self.scan_map_minimum_beams
+            # Global localization starts precisely when AMCL has no trusted
+            # pose. Requiring last_amcl_pose or scan/map agreement here creates
+            # a deadlock because both depend on the map->base transform that
+            # rotation is intended to discover. They remain mandatory in the
+            # READY evidence gate; rotation safety itself uses live raw LiDAR,
+            # base->laser TF, the safety node and clearance below.
             and self.nearest_rotation_obstacle
             >= self.rotation_minimum_obstacle_distance
         )
@@ -1768,6 +1890,7 @@ class NavigationAdapter(Node):
         return (
             self.localization_confidence >= self.localization_confidence_threshold
             and self._pose_is_stable()
+            and now - self.last_amcl_monotonic <= self.amcl_pose_freshness
             and self.scan_map_valid_beams >= self.scan_map_minimum_beams
             and self.scan_map_score >= self.scan_map_threshold
             and now - self.last_scan_map_monotonic <= self.scan_map_freshness
@@ -1779,6 +1902,71 @@ class NavigationAdapter(Node):
                 or self.rotation_angle >= self.global_observation_minimum_rotation
             )
         )
+
+    def _localization_tracking_evidence_ready(self, now: float) -> bool:
+        """Maintain an acquired pose with hysteresis, not acquisition gates.
+
+        Entering READY still requires the high confidence threshold, a stable
+        stationary window, scan/map agreement and global heading observation.
+        Tracking only drops after the lower confidence threshold or fresh
+        AMCL/scan/TF/sensor evidence has been absent for the configured grace.
+        """
+        return (
+            self.localization_confidence >= self.localization_low_threshold
+            and now - self.last_amcl_monotonic <= self.amcl_pose_freshness
+            and now - self.last_scan_monotonic <= 0.30
+            and now - self.last_map_tf_monotonic <= 0.60
+            and self._critical_sensor_time_healthy()
+        )
+
+    def _begin_localization_settling(self, now: float) -> None:
+        """Stop after the global sweep and wait for stationary AMCL samples."""
+        self._stop_localization_rotation()
+        self.localization_state = "LOCALIZING_SETTLING"
+        self.current_state = "LOCALIZING_SETTLING"
+        self.localization_phase_started_monotonic = now
+        self.localization_settling_evidence_started = False
+
+    def _start_localization_settling_evidence(self) -> None:
+        """Discard moving samples without resetting AMCL's particle cloud."""
+        self.localization_confidence = 0.0
+        self.last_amcl_monotonic = 0.0
+        self.pose_window.clear()
+        self.pose_stability_metrics = pose_stability(())
+        self.scan_map_scores.clear()
+        self.scan_map_score = 0.0
+        self.scan_map_matched_beams = 0
+        self.scan_map_valid_beams = 0
+        self.last_scan_map_monotonic = 0.0
+        self.ready_evidence_since = None
+        self.ready_evidence_invalid_since = None
+        self.low_confidence_since = None
+        self.last_nomotion_request_monotonic = 0.0
+        self.localization_settling_evidence_started = True
+
+    def _nomotion_update_due(
+        self,
+        now: float,
+        *,
+        navigation_in_progress: bool,
+    ) -> bool:
+        """Keep AMCL publishing when an active controller is safely stationary.
+
+        AMCL normally publishes often enough while odometry crosses its motion
+        thresholds. A controller collision can leave a NavigateToPose action
+        active without any chassis motion, however, so AMCL emits no new pose
+        and the independent freshness gate would incorrectly revoke a valid
+        localization. Force one scan update only after half the freshness
+        budget has elapsed; ordinary moving updates therefore remain untouched.
+        """
+        if now - self.last_nomotion_request_monotonic < 0.5:
+            return False
+        if not self.nomotion_update_client.service_is_ready():
+            return False
+        if not navigation_in_progress:
+            return True
+        refresh_age = max(0.25, self.amcl_pose_freshness * 0.5)
+        return now - self.last_amcl_monotonic >= refresh_age
 
     def _localization_tick(self) -> None:
         if self.mode != "NAVIGATION":
@@ -1805,6 +1993,15 @@ class NavigationAdapter(Node):
                     self._begin_localization_verification(
                         allow_rotation=self.localization_rotation_authorized
                     )
+                elif self.localization_seed_pose is not None:
+                    # map.load can legitimately run before the USB MCU has
+                    # rejoined after a Pi reboot.  _degrade_localization keeps
+                    # the verified last-known pose, so replay that bounded
+                    # seed once scan + odometry become healthy instead of
+                    # discarding it into an unauthorized global search.  This
+                    # is stationary: only AMCL's /initialpose is republished.
+                    seed_pose = dict(self.localization_seed_pose)
+                    self._begin_auto_localization(seed_pose)
                 else:
                     self.localization_started_monotonic = now
                     try:
@@ -1814,15 +2011,18 @@ class NavigationAdapter(Node):
                 return
         self._refresh_localization_confidence()
         if self.localized and self.localization_state == "READY":
-            # Continue asking AMCL to evaluate stationary scans, then require
-            # the same independent evidence that was used to enter READY.
-            if (
-                now - self.last_nomotion_request_monotonic >= 0.5
-                and self.nomotion_update_client.service_is_ready()
+            navigation_in_progress = self._navigation_in_progress()
+            # During normal travel AMCL refreshes from odometry. If Nav2 keeps
+            # an action active while collision checking holds the chassis at
+            # zero, force a bounded scan update before the pose freshness gate
+            # expires instead of reporting a fictitious localization loss.
+            if self._nomotion_update_due(
+                now,
+                navigation_in_progress=navigation_in_progress,
             ):
                 self.last_nomotion_request_monotonic = now
                 self.nomotion_update_client.call_async(Empty.Request())
-            if self._localization_evidence_ready(now):
+            if self._localization_tracking_evidence_ready(now):
                 if self.ready_evidence_since is None:
                     self.ready_evidence_since = now
                 self.ready_evidence_invalid_since = None
@@ -1831,14 +2031,22 @@ class NavigationAdapter(Node):
                 if self.ready_evidence_invalid_since is None:
                     self.ready_evidence_invalid_since = now
                 elif now - self.ready_evidence_invalid_since >= self.localization_low_grace:
+                    amcl_age = self._age_milliseconds(self.last_amcl_monotonic)
+                    scan_age = self._age_milliseconds(self.last_scan_monotonic)
+                    tf_age = self._age_milliseconds(self.last_map_tf_monotonic)
                     self._localization_lost(
-                        "rolling pose stability or scan-to-map verification failed"
+                        "localization evidence expired "
+                        f"(navigating={navigation_in_progress}, "
+                        f"confidence={self.localization_confidence:.4f}, "
+                        f"amcl_age_ms={amcl_age}, scan_age_ms={scan_age}, "
+                        f"tf_age_ms={tf_age}, "
+                        f"sensor_time_healthy={self._critical_sensor_time_healthy()})"
                     )
             return
         localizing_states = {
             "LOCALIZATION_INITIALIZING", "LOCALIZING_LAST_POSE", "LOCALIZING_GLOBAL",
-            "LOCALIZING_APPROXIMATE_POSE", "LOCALIZING_ROTATING", "LOW_CONFIDENCE",
-            "LOCALIZATION_LOST", "VERIFYING",
+            "LOCALIZING_APPROXIMATE_POSE", "LOCALIZING_ROTATING",
+            "LOCALIZING_SETTLING", "LOW_CONFIDENCE", "LOCALIZATION_LOST", "VERIFYING",
             # A failed attempt is terminal for automatic rotation, but AMCL
             # must still be allowed to recover after an operator moves the
             # robot manually and supplies enough fresh, stable scans.
@@ -1846,6 +2054,18 @@ class NavigationAdapter(Node):
         }
         if self.localization_state not in localizing_states:
             return
+        if (
+            self.localization_state == "LOCALIZING_SETTLING"
+            and not self.localization_settling_evidence_started
+        ):
+            # Let the downstream velocity smoother bring angular velocity to
+            # zero, then require a completely fresh stationary sample window.
+            if (
+                now - self.localization_phase_started_monotonic
+                < self.localization_rotation_settle
+            ):
+                return
+            self._start_localization_settling_evidence()
         # A best-effort subscriber may miss a single startup publication while
         # AMCL is transitioning lifecycle state. Retry only until AMCL returns
         # a fresh estimate for this localization phase; this is bounded and
@@ -1957,9 +2177,10 @@ class NavigationAdapter(Node):
             self.current_state = "LOCALIZING_ROTATING"
         if self.localization_state == "LOCALIZING_ROTATING":
             if self.rotation_angle >= self.rotation_max_angle:
-                self._stop_localization_rotation()
-                self.localization_state = "LOCALIZATION_FAILED"
-                self.current_state = "LOCALIZATION_FAILED"
+                # Completing the sweep is success of the observation phase,
+                # not a localization failure. Verify fresh stationary samples
+                # without destroying AMCL's converged particle cloud.
+                self._begin_localization_settling(now)
                 return
             if not self._safe_to_rotate():
                 self._stop_localization_rotation()
@@ -2131,17 +2352,38 @@ class NavigationAdapter(Node):
             raise AdapterError("NOT_LOCALIZED", "Robot chưa định vị READY trên saved map")
         if self.saved_map is None:
             raise AdapterError("NO_ACTIVE_MAP", "Map chưa được kích hoạt")
+        allow_unknown = os.getenv("NAVIGATION_ALLOW_UNKNOWN_GOAL", "0").lower() in {
+            "1", "true", "yes"
+        }
+        obstacles = tuple(
+            (float(item["x"]), float(item["y"]))
+            for item in self.latest_dynamic_obstacles
+        )
         validation = self.saved_map.validate_goal(
             float(goal["x"]),
             float(goal["y"]),
             clearance_m=self.footprint_clearance,
-            allow_unknown=os.getenv("NAVIGATION_ALLOW_UNKNOWN_GOAL", "0").lower() in {"1", "true", "yes"},
-            lethal_world_cells=(
-                (float(item["x"]), float(item["y"])) for item in self.latest_dynamic_obstacles
-            ),
+            allow_unknown=allow_unknown,
+            lethal_world_cells=obstacles,
         )
         if not validation.valid:
             raise AdapterError(validation.code, validation.message)
+        footprint_validation = self.saved_map.validate_footprint(
+            float(goal["x"]),
+            float(goal["y"]),
+            float(goal.get("yaw", 0.0)),
+            half_length=self.footprint_half_length,
+            half_width=self.footprint_half_width,
+            padding=self.planning_footprint_padding,
+            allow_unknown=allow_unknown,
+            lethal_world_cells=obstacles,
+            code_prefix="GOAL",
+        )
+        if not footprint_validation.valid:
+            raise AdapterError(
+                footprint_validation.code,
+                footprint_validation.message,
+            )
 
     def _resolve_planning_goal(self, goal: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         """Validate a click and, when needed, move it to a nearby safe cell."""
@@ -2149,7 +2391,14 @@ class NavigationAdapter(Node):
             self._validate_goal(goal)
             return goal, False
         except AdapterError as exc:
-            if exc.code not in {"GOAL_UNKNOWN", "GOAL_OCCUPIED", "GOAL_CLEARANCE", "GOAL_LETHAL"}:
+            if exc.code not in {
+                "GOAL_UNKNOWN",
+                "GOAL_OCCUPIED",
+                "GOAL_CLEARANCE",
+                "GOAL_LETHAL",
+                "GOAL_FOOTPRINT_BLOCKED",
+                "GOAL_FOOTPRINT_OUTSIDE_MAP",
+            }:
                 raise
             if self.saved_map is None:
                 raise
@@ -2165,6 +2414,10 @@ class NavigationAdapter(Node):
                 allow_unknown=os.getenv("NAVIGATION_ALLOW_UNKNOWN_GOAL", "0").lower()
                 in {"1", "true", "yes"},
                 lethal_world_cells=obstacles,
+                yaw=float(goal.get("yaw", 0.0)),
+                footprint_half_length=self.footprint_half_length,
+                footprint_half_width=self.footprint_half_width,
+                footprint_padding=self.planning_footprint_padding,
             )
             if snapped is None:
                 raise
@@ -2173,18 +2426,66 @@ class NavigationAdapter(Node):
             self._validate_goal(resolved)
             return resolved, True
 
+    def _record_planning_failure(
+        self,
+        error: AdapterError,
+        requested_goal: dict[str, Any],
+        resolved_goal: dict[str, Any],
+        planning_started: float,
+    ) -> None:
+        details = {
+            "code": error.code,
+            "message": str(error),
+            "map_id": self.map_id,
+            "map_version": self.map_version,
+            "start_pose": dict(self.pose or {}),
+            "requested_goal": dict(requested_goal),
+            "resolved_goal": dict(resolved_goal),
+            "nearest_forward_obstacle_m": self._finite_metric(
+                self.nearest_forward_obstacle
+            ),
+            "nearest_rotation_obstacle_m": self._finite_metric(
+                self.nearest_rotation_obstacle
+            ),
+            "dynamic_obstacle_count": len(self.latest_dynamic_obstacles),
+            "latency_ms": round(
+                (time.monotonic() - planning_started) * 1000.0,
+                3,
+            ),
+        }
+        self.last_planning_failure = details
+        self.planner_latency_ms = float(details["latency_ms"])
+        self.get_logger().warning(
+            "planning failure "
+            + json.dumps(details, ensure_ascii=False, separators=(",", ":"))
+        )
+
+    def _refresh_global_costmap_for_planning(self) -> None:
+        """Rebuild the live start footprint before asking Nav2 for a path."""
+        if not self.clear_global_costmap_client.wait_for_service(timeout_sec=2.0):
+            raise AdapterError(
+                "GLOBAL_COSTMAP_UNAVAILABLE",
+                "Global costmap reset service is unavailable",
+            )
+        self._wait(
+            self.clear_global_costmap_client.call_async(
+                ClearEntireCostmap.Request()
+            ),
+            3.0,
+            "GLOBAL_COSTMAP_RESET_TIMEOUT",
+        )
+        # The global costmap runs at 5 Hz. Two updates repopulate the static
+        # and obstacle layers while clearing the robot's *current* footprint.
+        # Without this, a stationary AMCL refinement can leave the old
+        # footprint cell lethal and make a clear straight route report
+        # "start pose is an obstacle" until some unrelated map update occurs.
+        time.sleep(0.45)
+
     def _compute_path(self, payload: dict[str, Any]) -> dict[str, Any]:
         planning_started = time.monotonic()
         self._validate_command_map(payload)
         requested_goal = dict(payload["goal"])
-        resolved_goal, goal_adjusted = self._resolve_planning_goal(requested_goal)
-        if not self.compute_path_client.wait_for_server(timeout_sec=5.0):
-            raise AdapterError("PLANNER_UNAVAILABLE", "ComputePathToPose action unavailable")
-        with self.state_lock:
-            # Planning creates a new Center mission only after Nav2 returns a
-            # path. Do not let interim READY telemetry mutate the prior goal.
-            self.current_mission_id = ""
-            self.current_state = "PLANNING"
+        resolved_goal = dict(requested_goal)
 
         def mark_plan_blocked() -> None:
             # Never leave the previous preview visible beside a fresh NO_PATH
@@ -2196,6 +2497,55 @@ class NavigationAdapter(Node):
                     self.latest_global_path = []
                     self.visualization_revision += 1
 
+        try:
+            resolved_goal, goal_adjusted = self._resolve_planning_goal(
+                requested_goal
+            )
+        except AdapterError as exc:
+            mark_plan_blocked()
+            self._record_planning_failure(
+                exc,
+                requested_goal,
+                resolved_goal,
+                planning_started,
+            )
+            raise
+        # Do not reject the current pose by testing it against the saved map.
+        # A mapped wall can overlap the robot by one 5 cm cell because of SLAM
+        # quantization or a small localization offset, even though the current
+        # LiDAR and Nav2 costmap have a valid escape corridor. Nav2 owns start
+        # validity using its live, footprint-cleared costmap; goal preflight
+        # above remains strict because the robot does not already occupy it.
+        if not self.compute_path_client.wait_for_server(timeout_sec=5.0):
+            error = AdapterError(
+                "PLANNER_UNAVAILABLE",
+                "ComputePathToPose action unavailable",
+            )
+            mark_plan_blocked()
+            self._record_planning_failure(
+                error,
+                requested_goal,
+                resolved_goal,
+                planning_started,
+            )
+            raise error
+        try:
+            self._refresh_global_costmap_for_planning()
+        except AdapterError as exc:
+            mark_plan_blocked()
+            self._record_planning_failure(
+                exc,
+                requested_goal,
+                resolved_goal,
+                planning_started,
+            )
+            raise
+        with self.state_lock:
+            # Planning creates a new Center mission only after Nav2 returns a
+            # path. Do not let interim READY telemetry mutate the prior goal.
+            self.current_mission_id = ""
+            self.current_state = "PLANNING"
+
         goal = ComputePathToPose.Goal()
         goal.goal = self._goal_pose(resolved_goal)
         goal.use_start = False
@@ -2203,24 +2553,50 @@ class NavigationAdapter(Node):
             handle = self._wait(
                 self.compute_path_client.send_goal_async(goal), 5, "PLANNER_TIMEOUT"
             )
-        except AdapterError:
+        except AdapterError as exc:
             mark_plan_blocked()
+            self._record_planning_failure(
+                exc,
+                requested_goal,
+                resolved_goal,
+                planning_started,
+            )
             raise
         if not handle.accepted:
+            error = AdapterError("PLAN_REJECTED", "Planner rejected goal")
             mark_plan_blocked()
-            raise AdapterError("PLAN_REJECTED", "Planner rejected goal")
+            self._record_planning_failure(
+                error,
+                requested_goal,
+                resolved_goal,
+                planning_started,
+            )
+            raise error
         try:
             result = self._wait(handle.get_result_async(), 15, "PLANNER_TIMEOUT").result
-        except AdapterError:
+        except AdapterError as exc:
             mark_plan_blocked()
+            self._record_planning_failure(
+                exc,
+                requested_goal,
+                resolved_goal,
+                planning_started,
+            )
             raise
         points = [
             {"x": pose.pose.position.x, "y": pose.pose.position.y}
             for pose in result.path.poses
         ]
         if not points:
+            error = AdapterError("NO_PATH", "Nav2 returned an empty path")
             mark_plan_blocked()
-            raise AdapterError("NO_PATH", "Nav2 returned an empty path")
+            self._record_planning_failure(
+                error,
+                requested_goal,
+                resolved_goal,
+                planning_started,
+            )
+            raise error
         distance = sum(
             math.hypot(b["x"] - a["x"], b["y"] - a["y"])
             for a, b in zip(points, points[1:])
@@ -2232,6 +2608,7 @@ class NavigationAdapter(Node):
             self.planner_latency_ms = round(
                 (time.monotonic() - planning_started) * 1000.0, 3
             )
+            self.last_planning_failure = {}
         return {
             "status": "completed",
             "current_state": "READY",

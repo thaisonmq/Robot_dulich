@@ -279,7 +279,6 @@ class RobotMapCacheManager:
             "map_id": map_id,
             "version": version,
             "map_path": str(destination),
-            "last_known_pose": self.activation_pose(map_id, version, destination),
         }
 
     def delete_local(self, map_id: str, *, deleted_at: float | None = None) -> None:

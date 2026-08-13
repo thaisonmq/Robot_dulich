@@ -11,7 +11,15 @@ amcl:
     update_min_a: 0.05
     resample_interval: 1
     transform_tolerance: 0.3
-    laser_model_type: likelihood_field
+    # The route may pass people and temporary objects that are absent from the
+    # saved map. The probabilistic likelihood-field model can beam-skip those
+    # outliers instead of dragging the complete AMCL cloud sideways.
+    laser_model_type: likelihood_field_prob
+    do_beamskip: true
+    beam_skip_distance: 0.50
+    beam_skip_threshold: 0.30
+    beam_skip_error_threshold: 0.90
+    max_beams: 60
     laser_max_range: 8.0
     laser_min_range: 0.12
     set_initial_pose: false
@@ -23,9 +31,12 @@ rovera_navigation_adapter:
     localization_confidence_threshold: 0.72
     localization_low_confidence_threshold: 0.30
     localization_low_confidence_grace_seconds: 5.0
-    localization_ready_hold_seconds: 2.0
+    localization_ready_hold_seconds: 1.0
     localization_verify_timeout_seconds: 3.0
     localization_verify_min_scans: 3
+    # Keep a direct AMCL-output freshness gate even while moving, where a
+    # stationary pose-spread check is intentionally not applicable.
+    localization_amcl_pose_freshness_seconds: 1.5
     # A verified pose with known heading normally passes five fresh stationary
     # AMCL updates plus the evidence hold in under five seconds. If it cannot
     # agree in eight seconds, expose global/assisted localization promptly.
@@ -56,16 +67,25 @@ rovera_navigation_adapter:
     scan_map_endpoint_tolerance: 0.12
     scan_map_freshness_seconds: 0.60
     sensor_time_invalid_grace_seconds: 1.0
-    auto_localization_rotation_degrees_per_second: 20.0
+    auto_localization_rotation_degrees_per_second: 45.0
     auto_localization_max_angle_degrees: 270.0
+    # Wait for the chassis/smoother to stop before collecting the stationary
+    # AMCL window used by the strict READY acquisition gate.
+    localization_rotation_settle_seconds: 1.0
     # A global particle search must observe at least two meaningfully
     # different headings before an otherwise ambiguous static scan is trusted.
     localization_global_minimum_rotation_degrees: 30.0
-    # Clearance beyond the complete swept circle of the 0.30 x 0.10 m body,
-    # not distance from its current axis-aligned rectangle.
-    localization_rotation_minimum_obstacle_distance: 0.08
+    # The 0.40 x 0.36 m safety footprint is deliberately conservative. During
+    # an in-place localization turn, permit scan points up to 7 cm inside its
+    # corner-swept circle; this still rejects returns touching the body sides
+    # while avoiding a false block from nearby walls and isolated self-returns.
+    localization_rotation_minimum_obstacle_distance: -0.07
     footprint_half_length: 0.20
     footprint_half_width: 0.18
+    # The measured 0.40 x 0.36 m body is already the safety envelope. Extra
+    # padding here closed passages that physically fit after 5 cm map
+    # quantization; motion-safety still owns the dynamic stopping reserve.
+    planning_footprint_padding: 0.0
 
 map_server:
   ros__parameters:
@@ -74,81 +94,91 @@ map_server:
 
 planner_server:
   ros__parameters:
-    # This is the warning threshold; the generated custom BT below is what
-    # actually requests a new global plan at 2 Hz.
-    expected_planner_frequency: 2.0
+    # Diagnostic overrun threshold only. The generated BT computes once and
+    # again only after controller/recovery failure; no timer drives replanning.
+    expected_planner_frequency: 1.0
     planner_plugins: [GridBased]
     GridBased:
-      # The 2D planner only validated the path's center cells. In the narrow
-      # gap beside an obstacle it could therefore return a line that looked
-      # free on the map while the rectangular footprint was already in
-      # collision in the controller costmap. State Lattice search validates
-      # the complete oriented footprint and its differential-drive primitive
-      # set supports fast in-place heading changes without car-like loops.
-      plugin: nav2_smac_planner/SmacPlannerLattice
-      tolerance: 0.20
-      downsample_costmap: false
-      downsampling_factor: 1
+      # Theta* connects grid cells by verified line of sight. In open space it
+      # therefore emits one stable straight corridor instead of smoothing an
+      # 8-connected A* staircase into a left/right S-curve.
+      plugin: nav2_theta_star_planner/ThetaStarPlanner
+      how_many_corners: 8
       allow_unknown: false
-      max_iterations: 250000
-      max_on_approach_iterations: 1000
-      max_planning_time: 2.0
-      lattice_filepath: /opt/ros/humble/share/nav2_smac_planner/sample_primitives/5cm_resolution/0.5m_turning_radius/diff/output.json
-      analytic_expansion_ratio: 3.5
-      analytic_expansion_max_length: 1.5
-      reverse_penalty: 2.0
-      change_penalty: 0.0
-      non_straight_penalty: 1.05
-      cost_penalty: 3.0
-      rotation_penalty: 2.0
-      retrospective_penalty: 0.015
-      lookup_table_size: 5.0
-      cache_obstacle_heuristic: false
-      debug_visualizations: false
-      smooth_path: true
-      smoother:
-        max_iterations: 1000
-        w_smooth: 0.3
-        w_data: 0.2
-        tolerance: 1.0e-10
-        do_refinement: true
-        refinement_num: 2
+      w_euc_cost: 1.0
+      # Distance is the primary objective: in open space Theta* must retain a
+      # direct line instead of weaving between small inflation-cost changes.
+      # This stays non-zero so equal-length candidates prefer clearance, while
+      # the footprint collision check still protects corners and lets the only
+      # valid route pass through a genuinely narrow corridor.
+      w_traversal_cost: 0.02
+      use_final_approach_orientation: false
 
 controller_server:
   ros__parameters:
-    controller_frequency: 20.0
+    # The deployed Pi also misses 15 Hz deadlines under normal media + AMCL
+    # load. Ten deterministic updates per second move only 1.7 cm at SLOW and
+    # 3.3 cm at FAST; the downstream smoother and safety loops remain faster.
+    controller_frequency: 10.0
+    # Controller Server otherwise subscribes to its default /odom topic. This
+    # deployment has no /odom publisher; EKF owns the canonical velocity on
+    # /odometry/filtered. Without it, Humble RPP sees angular speed as zero on
+    # every cycle and repeatedly clamps a requested 0.8 rad/s turn to the
+    # first acceleration step (2.0 / 20 Hz = 0.1 rad/s).
+    odom_topic: /odometry/filtered
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
-    # Keep the controller alive across several 2 Hz replans. At 0.5 s it
-    # aborted on the same tick that the first detour arrived, causing a
-    # clear/recovery loop instead of following the new path.
-    failure_tolerance: 2.0
+    # A persistent controller failure now triggers the bounded recovery tree,
+    # whose next attempt computes a fresh path instead of timer replanning.
+    failure_tolerance: 1.0
     progress_checker_plugin: progress_checker
     goal_checker_plugins: [goal_checker]
     controller_plugins: [FollowPath]
     progress_checker:
       plugin: nav2_controller::SimpleProgressChecker
-      # Give periodic replanning enough time to route around a temporary
-      # obstacle before escalating to the bounded Nav2 recovery sequence.
-      required_movement_radius: 0.08
-      movement_time_allowance: 10.0
+      # This checker measures translation only. A worst-case initial 180-degree
+      # alignment at 0.55 rad/s legitimately takes over six seconds, so the old
+      # five-second allowance aborted a healthy turn and restarted the path.
+      required_movement_radius: 0.06
+      movement_time_allowance: 12.0
     goal_checker:
       stateful: true
       plugin: nav2_controller::SimpleGoalChecker
       xy_goal_tolerance: 0.12
       yaw_goal_tolerance: 0.18
     FollowPath:
-      plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
+      # Rotation Shim handles only the heading of a newly received path. Once
+      # it has aligned, RPP owns the complete path and drives ordinary corners
+      # as continuous arcs instead of repeatedly entering stop-turn-go.
+      plugin: nav2_rotation_shim_controller::RotationShimController
+      primary_controller: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
+      # Do not release linear motion at the former ~10-degree error. Complete
+      # the one initial alignment to ~3 degrees, settle angular momentum, then
+      # hand the stable path to RPP.
+      angular_dist_threshold: 0.05
+      # Humble keeps a separate in-rotation disengage threshold whose default
+      # is 0.785 rad. Leaving that default in place made the shim rotate for
+      # one controller tick, then hand RPP a path still misaligned by as much
+      # as 45 degrees. Keep rotating until roughly two degrees instead.
+      angular_disengage_threshold: 0.035
+      # Align to the immediate 25 cm path segment. Sampling 55 cm looked past
+      # nearby corners and started an in-place turn while the straight escape
+      # corridor directly in front of the robot was still clear.
+      forward_sampling_distance: 0.25
+      rotate_to_heading_angular_vel: 0.35
+      max_angular_accel: 0.80
+      simulate_ahead_time: 1.20
+      rotate_to_goal_heading: false
+      closed_loop: true
       # NORMAL startup values. The adapter applies the selected SLOW/NORMAL/
       # FAST profile atomically at runtime and keeps this controller, behavior
       # server and the Auto-only pre-mux limiter synchronized.
       desired_linear_vel: 0.27
-      lookahead_dist: 0.50
-      min_lookahead_dist: 0.30
-      max_lookahead_dist: 0.75
-      lookahead_time: 1.60
-      rotate_to_heading_angular_vel: 0.75
+      lookahead_dist: 0.60
+      min_lookahead_dist: 0.45
+      max_lookahead_dist: 0.90
+      lookahead_time: 2.20
       transform_tolerance: 0.2
       use_velocity_scaled_lookahead_dist: true
       min_approach_linear_velocity: 0.05
@@ -156,21 +186,20 @@ controller_server:
       use_collision_detection: true
       max_allowed_time_to_collision_up_to_carrot: 0.90
       use_regulated_linear_velocity_scaling: true
-      regulated_linear_scaling_min_radius: 0.60
-      regulated_linear_scaling_min_speed: 0.12
+      regulated_linear_scaling_min_radius: 0.85
+      regulated_linear_scaling_min_speed: 0.09
       use_cost_regulated_linear_velocity_scaling: true
       cost_scaling_dist: 0.40
       cost_scaling_gain: 0.80
       inflation_cost_scaling_factor: 3.0
       use_rotate_to_heading: true
       allow_reversing: false
-      # Align first for heading errors above ~20 degrees. The former 45 degree
-      # threshold made RPP drive a broad S-curve even when the selected route
-      # itself was straight.
-      rotate_to_heading_min_angle: 0.35
+      # Rotation Shim already handles the start. Inside the route, RPP keeps
+      # forward velocity through ordinary and right-angle corners. Only a
+      # near-reversal is sharp enough to require an in-place turn.
+      rotate_to_heading_min_angle: 2.35
       # RPP uses angular error plus this acceleration bound to run fast over
       # the large part of a turn and brake only near the requested heading.
-      max_angular_accel: 1.70
 
 local_costmap:
   local_costmap:
@@ -185,10 +214,12 @@ local_costmap:
       # A 2.5 cm rolling grid avoids a full 5 cm aliasing error when a scan
       # endpoint lands on different cells in the global and local grids.
       resolution: 0.025
-      footprint: "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
-      # The polygon is the physical body envelope. Keeping padding at zero is
-      # deliberate: a finer 2.5 cm grid below handles scan quantization, while
-      # inflation and motion-safety retain the approach/stop reserve.
+      # Costmap cells are areas, but Humble's footprint checker tests their
+      # discrete lethal representatives. Inset the collision raster by 2 cm
+      # so a wall just outside the measured 0.40 x 0.36 m body is not aliased
+      # into a corner during an in-place turn. Adapter/UI validation continues
+      # to use the complete physical footprint below.
+      footprint: "[[0.18, 0.16], [0.18, -0.16], [-0.18, -0.16], [-0.18, 0.16]]"
       footprint_padding: 0.0
       # The robot has a planar LaserScan, not a 3D point cloud. Use the same
       # 2D obstacle model as the global costmap so the planner and RPP do not
@@ -233,16 +264,21 @@ global_costmap:
       robot_base_frame: base_footprint
       resolution: 0.05
       track_unknown_space: true
-      footprint: "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
-      # The polygon is already the measured chassis outline. One centimetre
-      # provides a planning reserve without classifying a nearby but external
-      # obstacle as part of the robot's start footprint; the finer local grid
-      # below removes the controller-side endpoint aliasing.
-      footprint_padding: 0.01
+      # The saved grid is coarser (5 cm), so use the same bounded 2 cm raster
+      # allowance as the local checker. The physical footprint remains 0.40 x
+      # 0.36 m for goal preflight, visualization and localization safety.
+      footprint: "[[0.18, 0.16], [0.18, -0.16], [-0.18, -0.16], [-0.18, 0.16]]"
+      footprint_padding: 0.0
       plugins: [static_layer, obstacle_layer, inflation_layer]
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
         map_subscribe_transient_local: true
+        # A saved 5 cm map can overlap the localized pose by one or two cells.
+        # The robot is already physically occupying this polygon, so clear the
+        # static layer only under its current measured footprint. The scan
+        # obstacle layer, inflation, RPP collision check and motion-safety stay
+        # active; this only prevents Theta* rejecting a valid starting cell.
+        footprint_clearing_enabled: true
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
@@ -261,7 +297,9 @@ global_costmap:
           raytrace_min_range: 0.12
           obstacle_max_range: 3.5
           obstacle_min_range: 0.12
-          observation_persistence: 0.35
+          # One current scan is enough at 12.7 Hz. Persisting old endpoints
+          # thickened both sides of a narrow corridor after small AMCL shifts.
+          observation_persistence: 0.0
           expected_update_rate: 0.30
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
@@ -274,11 +312,14 @@ global_costmap:
 bt_navigator:
   ros__parameters:
     use_sim_time: false
+    # Humble defaults to only 20 ms for an action acknowledgement. The Pi
+    # exceeded that during normal load and entered recovery although the
+    # planner was healthy. This is milliseconds, not planning-result timeout.
+    default_server_timeout: 500
     global_frame: map
     robot_base_frame: base_footprint
     odom_topic: /odometry/filtered
     bt_loop_duration: 20
-    default_server_timeout: 20
     # The launch file supplies the generated NORMAL tree here. Each goal also
     # carries the selected profile's generated custom tree, so no restart is
     # needed when the operator changes speed mode.
@@ -302,9 +343,12 @@ behavior_server:
     robot_base_frame: base_footprint
     transform_tolerance: 0.2
     simulate_ahead_time: 1.1
-    max_rotational_vel: 0.75
+    # Recovery Spin is also pure Auto rotation. Use the same proven limit and
+    # acceleration as Manual Fast/RPP; twist_mux, smoother and motion-safety
+    # remain downstream and unchanged.
+    max_rotational_vel: 0.80
     min_rotational_vel: 0.20
-    rotational_acc_lim: 1.70
+    rotational_acc_lim: 2.00
 
 waypoint_follower:
   ros__parameters:

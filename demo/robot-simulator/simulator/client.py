@@ -1385,9 +1385,10 @@ class RobotConnectionClient:
                 download_url=str(payload["download_url"]),
             )
             command_payload["map_path"] = str(destination)
-            command_payload["last_known_pose"] = self.map_cache.activation_pose(
-                str(payload["map_id"]), int(payload["version"]), destination
-            )
+            # A powered-off or carried robot may be nowhere near its last
+            # persisted pose. Loading a map therefore starts unlocalized; Auto
+            # Go explicitly requests a fresh global LiDAR localization before
+            # Center computes any path.
         if (
             command == "mapping.start"
             and self.config.navigation_backend == "ros2"

@@ -9,6 +9,17 @@
 
   <participant profile_name="rovera_udp_only" is_default_profile="true">
     <rtps>
+      <!-- The robot graph is entirely hosted on this Pi. Center communicates
+           through the authenticated edge WebSocket, not DDS. Reject remote
+           DomainParticipants so an incompatible ROS distribution on the LAN
+           cannot inject ParticipantEntitiesInfo/type metadata that makes the
+           Humble micro-ROS Agent abort in Fast CDR. Same-host containers are
+           different processes, not different hosts, and remain discoverable. -->
+      <builtin>
+        <discovery_config>
+          <ignoreParticipantFlags>FILTER_DIFFERENT_HOST</ignoreParticipantFlags>
+        </discovery_config>
+      </builtin>
       <useBuiltinTransports>false</useBuiltinTransports>
       <userTransports>
         <transport_id>rovera_udp_v4</transport_id>

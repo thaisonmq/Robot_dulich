@@ -159,50 +159,46 @@ describe("MapPanel navigation controls", () => {
     expect(onMapChange).toHaveBeenCalledWith("MAP-B");
   });
 
-  it("offers assisted localization immediately when passive global search needs another view", () => {
+  it("does not restart an active scan and still allows choosing an Auto goal", () => {
     const onRetryLocalization = vi.fn();
     panel({
       mapState: "LOCALIZING_GLOBAL", localizationState: "LOCALIZING_GLOBAL",
       onRetryLocalization,
     });
     expect(screen.getByText(/Đang xác định vị trí robot/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Chỉ vị trí robot gần đúng" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Cho phép xoay để định vị" }));
-    expect(onRetryLocalization).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("button", { name: "Chọn điểm đến" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Chỉ vị trí robot gần đúng" })).not.toBeInTheDocument();
+    const retry = screen.getByRole("button", { name: "Quét lại vị trí hiện tại" });
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    expect(onRetryLocalization).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Chọn điểm đến" })).toBeInTheDocument();
   });
 
-  it("only offers approximate pose after auto localization fails", () => {
-    const onSetInitialPose = vi.fn();
+  it("never accepts a map click as the robot position after localization fails", () => {
+    const onRetryLocalization = vi.fn();
     panel({
       mapState: "LOCALIZATION_FAILED", localizationState: "LOCALIZATION_FAILED",
-      selected: poi, onSetInitialPose,
+      selected: poi, onRetryLocalization,
     });
     expect(screen.getByText("NAV2 · Định vị thất bại")).toBeInTheDocument();
     expect(screen.queryByText("NAV2 · LOCALIZATION_FAILED")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Chỉ vị trí robot gần đúng" }));
-    fireEvent.click(screen.getByRole("button", { name: "Xác nhận vị trí gần đúng" }));
-    expect(onSetInitialPose).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "Chỉ vị trí robot gần đúng" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Xác nhận vị trí gần đúng" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Quét lại vị trí hiện tại" }));
+    expect(onRetryLocalization).toHaveBeenCalledOnce();
   });
 
-  it("allows a ready robot to correct a false but confident localization", () => {
+  it("does not expose operator-supplied robot coordinates even while ready", () => {
     panel({
       localized: true,
       localizationState: "READY",
       mapState: "READY",
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Chỉ vị trí robot gần đúng" }));
-
-    const dialog = screen.getByRole("dialog", { name: "Chỉ vị trí robot gần đúng" });
-    expect(dialog).toBeInTheDocument();
-    expect(screen.getByText(/LiDAR sẽ tự xác định vị trí chính xác và hướng robot/)).toBeInTheDocument();
-    expect(screen.queryByText(/kéo theo hướng đầu robot/)).not.toBeInTheDocument();
-    const panelElement = dialog.querySelector(".map-modal__panel");
-    expect(panelElement).toHaveClass("map-modal__panel");
-    expect(panelElement?.children).toHaveLength(3);
-    expect(panelElement?.children[1]).toHaveClass("map-modal__canvas");
-    expect(screen.getByRole("button", { name: "Xác nhận vị trí gần đúng" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Chỉ vị trí robot gần đúng" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Chọn điểm đến" }));
+    expect(screen.getByRole("dialog", { name: "Chọn điểm đến" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Xác nhận vị trí gần đúng" })).not.toBeInTheDocument();
   });
 
   it("localizes map accessibility and navigation action labels", () => {
@@ -246,6 +242,18 @@ describe("MapPanel navigation controls", () => {
 
     expect(screen.getByLabelText("Map")).toBeDisabled();
     expect(screen.getByRole("alert")).toHaveTextContent("Nav2 chưa sẵn sàng");
+  });
+
+  it("distinguishes a dead sensor transport from ordinary localization", () => {
+    panel({
+      mapState: "SENSOR_TIME_INVALID",
+      localizationState: "SENSOR_TIME_INVALID",
+      localized: false,
+    });
+
+    expect(screen.getByText(/Đã mất dữ liệu LiDAR và odometry/)).toBeInTheDocument();
+    expect(screen.getByText(/khởi động lại nguồn robot/)).toBeInTheDocument();
+    expect(screen.queryByText(/Robot đang quét môi trường/)).not.toBeInTheDocument();
   });
 
   it("explains obstacle recovery and a safely blocked route", () => {

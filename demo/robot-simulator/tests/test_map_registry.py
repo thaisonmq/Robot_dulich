@@ -105,7 +105,7 @@ def test_new_map_activation_uses_terminal_pose_until_navigation_pose_exists(tmp_
     assert recent["source"] == "recent_navigation_pose"
 
 
-def test_runtime_restores_verified_active_map_after_adapter_restart(tmp_path: Path) -> None:
+def test_runtime_restores_active_map_without_reusing_robot_pose(tmp_path: Path) -> None:
     destination = tmp_path / "MAP-A" / "v2"
     destination.mkdir(parents=True)
     (destination / "map.yaml").write_text(
@@ -120,16 +120,6 @@ def test_runtime_restores_verified_active_map_after_adapter_restart(tmp_path: Pa
         "map_id": "MAP-A",
         "version": 2,
         "map_path": str(destination),
-        "last_known_pose": {
-            "x": 1.0,
-            "y": -2.0,
-            "yaw": 0.5,
-            "covariance": 0.25,
-            "source": "recent_navigation_pose",
-            "map_id": "MAP-A",
-            "map_version": 2,
-            "timestamp": pytest.approx(time.time(), abs=2),
-        },
     }
 
 

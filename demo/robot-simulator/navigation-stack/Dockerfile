@@ -22,6 +22,14 @@ RUN apt-get update \
         ros-humble-std-srvs \
     && rm -rf /var/lib/apt/lists/*
 
+# Keep these small controller/planner additions in their own layer so existing
+# robot images reuse the much larger ROS/Nav2 dependency layer above.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ros-humble-nav2-rotation-shim-controller \
+        ros-humble-nav2-theta-star-planner \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /ws/src/rovera_navigation_adapter
 COPY package.xml setup.py setup.cfg adapter_node.py navigation_core.py sensor_normalizer.py speed_profiles.py ./
 COPY resource ./resource

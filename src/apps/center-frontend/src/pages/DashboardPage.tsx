@@ -32,8 +32,41 @@ type PoseVerificationState = "required" | "requesting" | "localizing" | "confirm
 const LOCALIZATION_IN_PROGRESS_STATES = new Set([
   "LOCALIZATION_INITIALIZING", "LOCALIZING", "LOCALIZING_LAST_POSE",
   "LOCALIZING_APPROXIMATE_POSE", "LOCALIZING_GLOBAL", "LOCALIZING_ROTATING",
+  "LOCALIZING_SETTLING",
   "LOW_CONFIDENCE", "LOCALIZATION_LOST", "VERIFYING", "SENSOR_TIME_INVALID",
 ]);
+
+async function waitForLocalizationReady(mapId: string, mapVersion: number): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < 50_000) {
+    const runtime = useAppStore.getState();
+    const runtimeHealth = runtime.health;
+    const state = String(
+      runtimeHealth.localization_state ?? runtimeHealth.map_state ?? "",
+    ).toUpperCase();
+    if (
+      runtimeHealth.localized && state === "READY"
+      && runtimeHealth.map_id === mapId
+      && Number(runtimeHealth.map_version ?? 0) === mapVersion
+    ) return;
+    if (runtime.connectionState !== "connected") {
+      throw new Error("Mất kết nối trong khi xác định vị trí robot.");
+    }
+    if (Date.now() - started >= 1_000 && state === "LOCALIZATION_FAILED") {
+      throw new Error("Không thể tự xác định chính xác vị trí robot.");
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
+  }
+  throw new Error("Hết thời gian xác định vị trí robot.");
+}
+
+function hasReadyRuntimePose(mapId: string, mapVersion: number): boolean {
+  const runtimeHealth = useAppStore.getState().health;
+  return Boolean(runtimeHealth.localized)
+    && String(runtimeHealth.localization_state ?? runtimeHealth.map_state ?? "").toUpperCase() === "READY"
+    && runtimeHealth.map_id === mapId
+    && Number(runtimeHealth.map_version ?? 0) === mapVersion;
+}
 
 export function DashboardPage() {
   const navigate = useNavigate();
@@ -179,9 +212,11 @@ export function DashboardPage() {
         FAULT: "failed", FAILED: "failed", LOCALIZATION_FAILED: "failed",
         READY: "ready", LOCALIZING: "localizing", LOCALIZING_LAST_POSE: "localizing",
         LOCALIZING_GLOBAL: "localizing", LOCALIZING_ROTATING: "localizing",
+        LOCALIZING_SETTLING: "localizing",
         VERIFYING: "localizing", SENSOR_TIME_INVALID: "recovery",
         MAP_LOADING: "loading_map", LOADING_MAP: "loading_map", PLANNING: "planning",
         RECOVERY: "recovery", LOCALIZATION_LOST: "recovery", LOW_CONFIDENCE: "localizing",
+        LOCALIZATION_REQUIRED: "idle",
       } as const;
       const next = states[normalized as keyof typeof states];
       if (next) setNavigationState(next);
@@ -301,6 +336,9 @@ export function DashboardPage() {
     isSpectator || sessionEndedReason || controlState === "disabled"
     || controlState === "robot_offline",
   );
+  const realRobot = health.motion_backend === "ros2"
+    || health.navigation_backend === "ros2"
+    || selectedRobot?.capabilities.source !== "simulator";
   const selectCamera = useMutation({
     mutationFn: (cameraId: string) => api.selectSessionCamera(session!.session_id, cameraId),
     onSuccess: (selected) => {
@@ -463,50 +501,14 @@ export function DashboardPage() {
     },
     onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
-  const setApproximatePose = useMutation({
-    mutationFn: (destination: Destination) => api.setApproximatePose({
-      request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
-      expected_state: mapState, map_id: map!.map_id, version: map!.active_version!,
-      pose: { x: destination.x, y: destination.y, yaw: destination.yaw },
-    }),
-    onMutate: () => {
-      navigationRequestInFlightRef.current = true;
-      poseVerificationSawLocalizingRef.current = false;
-      updatePoseVerification("requesting");
-      setNavigationError("");
-      setMapLocalized(false);
-      setRoute(null);
-    },
-    onSuccess: (result) => {
-      const state = String(result.current_state ?? "LOCALIZING").toUpperCase();
-      const resultLocalized = state === "READY" && Boolean(
-        (result.state as { localized?: boolean } | undefined)?.localized
-        ?? result.localized,
-      );
-      setMapState(state);
-      setMapLocalized(resultLocalized);
-      if (resultLocalized) {
-        updatePoseVerification("confirmed");
-      } else {
-        updatePoseVerification("localizing");
-      }
-      setNavigationState(resultLocalized ? "ready" : "localizing");
-      // The orange click marker is only an AMCL search hint. Remove it as soon
-      // as the robot accepts the hint so it can never masquerade as robot pose.
-      setSelectedDestination(null);
-    },
-    onError: (reason) => {
-      updatePoseVerification("failed");
-      setNavigationState("failed");
-      setNavigationError(reason instanceof Error ? reason.message : t("Không thể đặt vị trí ban đầu"));
-    },
-    onSettled: () => { navigationRequestInFlightRef.current = false; },
-  });
   const relocalize = useMutation({
-    mutationFn: ({ expectedState, allowRotation = true }: { expectedState: string; verificationKey?: string; allowRotation?: boolean }) => api.relocalize({
+    mutationFn: ({ expectedState, allowRotation = true, forceGlobal = false }: {
+      expectedState: string; verificationKey?: string; allowRotation?: boolean; forceGlobal?: boolean;
+    }) => api.relocalize({
       request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
       expected_state: expectedState, map_id: map!.map_id, version: map!.active_version!,
       allow_rotation: allowRotation,
+      force_global: forceGlobal,
     }),
     onMutate: ({ verificationKey }) => {
       navigationRequestInFlightRef.current = true;
@@ -547,7 +549,6 @@ export function DashboardPage() {
       || Number(health.map_version ?? 0) !== map.active_version
     ) return;
     const verificationKey = `${session.session_id}:${map.map_id}:${map.active_version}`;
-    if (poseVerificationKeyRef.current === verificationKey) return;
     const runtimeState = String(health.map_state ?? mapState).toUpperCase();
     const runtimeLocalizationState = String(
       health.localization_state ?? runtimeState,
@@ -563,48 +564,107 @@ export function DashboardPage() {
       setNavigationState("ready");
       return;
     }
+    if (poseVerificationKeyRef.current === verificationKey) return;
     if (LOCALIZATION_IN_PROGRESS_STATES.has(runtimeLocalizationState)) {
       poseVerificationKeyRef.current = verificationKey;
       poseVerificationSawLocalizingRef.current = true;
       updatePoseVerification("localizing");
       setMapLocalized(false);
-      setSelectedDestination(null);
-      setRoute(null);
       return;
     }
     if (![
       "READY", "SUCCEEDED", "ARRIVED", "CANCELED", "CANCELLED", "FAILED",
-      "BLOCKED", "LOCALIZATION_FAILED",
+      "BLOCKED", "LOCALIZATION_FAILED", "LOCALIZATION_REQUIRED",
     ].includes(runtimeState)) return;
-    relocalize.mutate({ expectedState: runtimeState, verificationKey, allowRotation: true });
+    // Adopt runtime localization state only. Opening a Control session must
+    // never authorize global localization or publish angular velocity.
+    poseVerificationKeyRef.current = verificationKey;
+    poseVerificationSawLocalizingRef.current = false;
+    updatePoseVerification("required");
+    setMapLocalized(false);
   }, [
     activeMapId, connectionState, health.localized, health.localization_state, health.map_id,
-    health.map_state, health.map_version, isSpectator, map, mapState, relocalize,
-    session, sessionEndedReason, setRoute, updatePoseVerification,
+    health.map_state, health.map_version, isSpectator, map, mapState,
+    session, sessionEndedReason, updatePoseVerification,
   ]);
   const sendGoal = useMutation({
-    mutationFn: () => {
-      if (!poseVerified) {
-        return Promise.reject(new Error(t("Không thể tự xác định chính xác vị trí robot.")));
-      }
-      if (!route || (route.mission_id && (
-        route.status?.toUpperCase() !== "READY" || route.points.length === 0
-      ))) {
-        return Promise.reject(new Error(t("Chưa có lộ trình an toàn để bắt đầu")));
-      }
-      return route.mission_id
-        ? api.startNavigation({
+    mutationFn: async () => {
+      let preparedRoute = route;
+      if (map?.active_version) {
+        if (!selectedDestination) {
+          throw new Error(t("Chưa chọn điểm đến"));
+        }
+        if (realRobot && !hasReadyRuntimePose(map.map_id, map.active_version)) {
+          // Auto Go may be the first localization request after map load or a
+          // genuine loss. Start one fresh global search only in that case.
+          // A READY pose is already being continuously refreshed from live
+          // LiDAR/AMCL and must never be destroyed just because Go was clicked.
+          await api.relocalize({
+            request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
+            expected_state: mapState, map_id: map.map_id, version: map.active_version,
+            allow_rotation: true,
+            force_global: true,
+          });
+          await waitForLocalizationReady(map.map_id, map.active_version);
+        }
+        if (realRobot) {
+          // Always rebuild the route from the currently tracked pose. This
+          // refreshes a preview after manual motion without resetting AMCL.
+          preparedRoute = null;
+        }
+        if (!preparedRoute) {
+          preparedRoute = await api.computePath({
+            request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
+            expected_state: "READY", map_id: map.map_id, version: map.active_version,
+            goal: {
+              x: selectedDestination.x,
+              y: selectedDestination.y,
+              yaw: selectedDestination.yaw,
+            },
+          });
+        }
+        if (
+          !preparedRoute.mission_id
+          || preparedRoute.status?.toUpperCase() !== "READY"
+          || preparedRoute.points.length === 0
+        ) {
+          throw new Error(t("Chưa có lộ trình an toàn để bắt đầu"));
+        }
+        await api.startNavigation({
           request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
-          expected_state: mapState, mission_id: route.mission_id,
-        })
-        : api.sendGoal(robotId, session!.session_id, route.route_id);
+          expected_state: "READY", mission_id: preparedRoute.mission_id,
+        });
+        return preparedRoute;
+      }
+      if (!preparedRoute) throw new Error(t("Chưa có lộ trình an toàn để bắt đầu"));
+      await api.sendGoal(robotId, session!.session_id, preparedRoute.route_id);
+      return preparedRoute;
     },
     onMutate: () => {
       navigationRequestInFlightRef.current = true;
       setNavigationError("");
-      setNavigationState("sending_goal");
+      if (
+        realRobot && map?.active_version
+        && !hasReadyRuntimePose(map.map_id, map.active_version)
+      ) {
+        poseVerificationSawLocalizingRef.current = false;
+        updatePoseVerification("requesting");
+        setMapLocalized(false);
+        setRoute(null);
+        setNavigationState("localizing");
+      } else {
+        setNavigationState("planning");
+      }
     },
-    onSuccess: () => setNavigationState("moving"),
+    onSuccess: (preparedRoute) => {
+      if (realRobot && map?.active_version) {
+        poseVerificationSawLocalizingRef.current = true;
+        updatePoseVerification("confirmed");
+        setMapLocalized(true);
+      }
+      setRoute(preparedRoute);
+      setNavigationState("moving");
+    },
     onError: (reason) => {
       setNavigationState("failed");
       setNavigationError(reason instanceof Error ? reason.message : t("Không thể bắt đầu tự hành"));
@@ -628,9 +688,6 @@ export function DashboardPage() {
     onError: () => setNavigationState("failed"),
   });
 
-  const realRobot = health.motion_backend === "ros2"
-    || health.navigation_backend === "ros2"
-    || selectedRobot?.capabilities.source !== "simulator";
   const preflightFailures = [
     ...(connectionState === "connected" ? [] : ["ROBOT_OFFLINE"]),
     ...(map?.active_version || !realRobot ? [] : ["MAP_NOT_ACTIVE"]),
@@ -643,6 +700,9 @@ export function DashboardPage() {
     ...(health.battery_percent >= 15 ? [] : ["BATTERY_LOW"]),
     ...(controlState === "ready" || controlState === "active" || isSpectator ? [] : ["NO_CONTROL_LEASE"]),
   ];
+  const autoStartPreflightFailures = preflightFailures.filter(
+    (failure) => failure !== "NOT_LOCALIZED",
+  );
   const canRequestNewPath = [
     "READY", "SUCCEEDED", "ARRIVED", "CANCELED", "CANCELLED", "FAILED", "BLOCKED",
   ].includes(mapState);
@@ -1303,7 +1363,7 @@ export function DashboardPage() {
                 pose={pose}
                 route={route}
                 selected={selectedDestination}
-                loading={preview.isPending || loadMap.isPending || setApproximatePose.isPending || relocalize.isPending}
+                loading={preview.isPending || loadMap.isPending || relocalize.isPending || sendGoal.isPending}
                 navigationStatus={navigationState}
                 mapState={mapState}
                 localizationState={displayedLocalizationState}
@@ -1313,13 +1373,13 @@ export function DashboardPage() {
                 feedback={navigationFeedback}
                 footprint={health.footprint}
                 canStart={Boolean(
-                  route
-                  && (!route.mission_id || (
+                  selectedDestination
+                  && (!route?.mission_id || (
                     route.status?.toUpperCase() === "READY" && route.points.length > 0
                   ))
-                  && preflightFailures.length === 0
+                  && autoStartPreflightFailures.length === 0
                 )}
-                preflightFailures={preflightFailures}
+                preflightFailures={autoStartPreflightFailures}
                 errorMessage={navigationError}
                 noticeMessage={navigationNotice}
                 mapActivationError={mapActivationError}
@@ -1340,21 +1400,11 @@ export function DashboardPage() {
                   setRoute(null);
                   if (canRequestNewPath && poseVerified) preview.mutate(destination);
                 }}
-                onSelectInitialPose={(destination) => {
-                  if (navigationRequestInFlightRef.current) return;
-                  setSelectedDestination(destination);
-                  setRoute(null);
-                  setNavigationNotice("");
-                }}
-                onSetInitialPose={() => {
-                  if (selectedDestination && map?.active_version) setApproximatePose.mutate(selectedDestination);
-                }}
-                onRetryLocalization={() => relocalize.mutate({ expectedState: mapState, allowRotation: true })}
-                onClearSelection={() => {
-                  setSelectedDestination(null);
-                  setRoute(null);
-                  setNavigationNotice("");
-                }}
+                onRetryLocalization={() => relocalize.mutate({
+                  expectedState: mapState,
+                  allowRotation: true,
+                  forceGlobal: true,
+                })}
                 onGo={() => sendGoal.mutate()}
                 onPause={() => {
                   if (route?.mission_id) missionAction.mutate("pause");

@@ -461,6 +461,111 @@ class SavedOccupancyMap:
                 return GoalValidation(False, "GOAL_LETHAL", "Điểm đến đang có vật cản động nguy hiểm.")
         return GoalValidation(True)
 
+    def validate_footprint(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        *,
+        half_length: float,
+        half_width: float,
+        padding: float = 0.0,
+        allow_unknown: bool = False,
+        lethal_world_cells: Iterable[tuple[float, float]] = (),
+        code_prefix: str = "GOAL",
+    ) -> GoalValidation:
+        """Validate the same oriented rectangular body envelope Nav2 uses.
+
+        Goal click validation historically checked only a small circle around
+        the center point, so Nav2 could reject poses the adapter had already
+        called safe. Test occupied map cells as squares against the oriented
+        robot rectangle so preflight retains the complete configured footprint.
+        """
+        prefix = str(code_prefix).strip().upper() or "GOAL"
+        length = max(0.0, float(half_length) + float(padding))
+        width = max(0.0, float(half_width) + float(padding))
+        if length <= 0 or width <= 0:
+            raise ValueError("footprint half dimensions must be positive")
+
+        robot_x_axis = (math.cos(yaw), math.sin(yaw))
+        robot_y_axis = (-math.sin(yaw), math.cos(yaw))
+        map_x_axis = (math.cos(self.origin_yaw), math.sin(self.origin_yaw))
+        map_y_axis = (-math.sin(self.origin_yaw), math.cos(self.origin_yaw))
+
+        corners = [
+            (
+                x + sx * length * robot_x_axis[0] + sy * width * robot_y_axis[0],
+                y + sx * length * robot_x_axis[1] + sy * width * robot_y_axis[1],
+            )
+            for sx in (-1, 1)
+            for sy in (-1, 1)
+        ]
+        center_cell = self.world_to_cell(x, y)
+        if center_cell is None or any(self.world_to_cell(*corner) is None for corner in corners):
+            subject = "Vị trí hiện tại" if prefix == "START" else "Điểm đến"
+            return GoalValidation(
+                False,
+                f"{prefix}_FOOTPRINT_OUTSIDE_MAP",
+                f"{subject} không đủ chỗ cho toàn bộ thân robot trong bản đồ.",
+            )
+
+        half_cell = self.resolution / 2.0
+
+        def rectangles_intersect(cell_x: float, cell_y: float) -> bool:
+            delta = (cell_x - x, cell_y - y)
+            for axis in (robot_x_axis, robot_y_axis, map_x_axis, map_y_axis):
+                separation = abs(delta[0] * axis[0] + delta[1] * axis[1])
+                robot_projection = (
+                    length * abs(robot_x_axis[0] * axis[0] + robot_x_axis[1] * axis[1])
+                    + width * abs(robot_y_axis[0] * axis[0] + robot_y_axis[1] * axis[1])
+                )
+                cell_projection = half_cell * (
+                    abs(map_x_axis[0] * axis[0] + map_x_axis[1] * axis[1])
+                    + abs(map_y_axis[0] * axis[0] + map_y_axis[1] * axis[1])
+                )
+                if separation > robot_projection + cell_projection:
+                    return False
+            return True
+
+        center_column, center_row = center_cell
+        search_radius = math.ceil(
+            (math.hypot(length, width) + math.sqrt(2.0) * half_cell)
+            / self.resolution
+        ) + 1
+        for row in range(center_row - search_radius, center_row + search_radius + 1):
+            for column in range(
+                center_column - search_radius,
+                center_column + search_radius + 1,
+            ):
+                if not (0 <= column < self.width and 0 <= row < self.height):
+                    continue
+                cell_x, cell_y = self.cell_center(column, row)
+                if not rectangles_intersect(cell_x, cell_y):
+                    continue
+                value = self.value_at(column, row)
+                if value >= 65 or (value < 0 and not allow_unknown):
+                    subject = "Vị trí hiện tại" if prefix == "START" else "Điểm đến"
+                    obstacle = "vùng chưa lập bản đồ" if value < 0 else "vật cản"
+                    return GoalValidation(
+                        False,
+                        f"{prefix}_FOOTPRINT_BLOCKED",
+                        f"{subject} không đủ khoảng trống cho toàn bộ thân robot ({obstacle} nằm trong footprint).",
+                    )
+
+        for obstacle_x, obstacle_y in lethal_world_cells:
+            delta_x = float(obstacle_x) - x
+            delta_y = float(obstacle_y) - y
+            local_x = delta_x * robot_x_axis[0] + delta_y * robot_x_axis[1]
+            local_y = delta_x * robot_y_axis[0] + delta_y * robot_y_axis[1]
+            if abs(local_x) <= length and abs(local_y) <= width:
+                subject = "Vị trí hiện tại" if prefix == "START" else "Điểm đến"
+                return GoalValidation(
+                    False,
+                    f"{prefix}_FOOTPRINT_BLOCKED",
+                    f"{subject} đang có vật cản động nằm trong footprint của robot.",
+                )
+        return GoalValidation(True)
+
     def nearest_valid_goal(
         self,
         x: float,
@@ -470,6 +575,10 @@ class SavedOccupancyMap:
         max_distance_m: float,
         allow_unknown: bool = False,
         lethal_world_cells: Iterable[tuple[float, float]] = (),
+        yaw: float = 0.0,
+        footprint_half_length: float | None = None,
+        footprint_half_width: float | None = None,
+        footprint_padding: float = 0.0,
     ) -> tuple[float, float] | None:
         """Find the closest safe cell center to a requested in-map goal.
 
@@ -501,6 +610,19 @@ class SavedOccupancyMap:
                     allow_unknown=allow_unknown,
                     lethal_world_cells=dynamic_obstacles,
                 )
+                if not validation.valid:
+                    continue
+                if footprint_half_length is not None and footprint_half_width is not None:
+                    validation = self.validate_footprint(
+                        candidate_x,
+                        candidate_y,
+                        yaw,
+                        half_length=footprint_half_length,
+                        half_width=footprint_half_width,
+                        padding=footprint_padding,
+                        allow_unknown=allow_unknown,
+                        lethal_world_cells=dynamic_obstacles,
+                    )
                 if validation.valid:
                     candidates.append((distance, row, column, candidate_x, candidate_y))
         if not candidates:

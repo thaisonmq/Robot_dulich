@@ -162,6 +162,8 @@ class AutoNavigationProfiles:
     default_mode: str
     hardware: HardwareLimits
     profiles: dict[str, AutoNavigationSpeedProfile]
+    initial_alignment_angular_vel: float
+    initial_alignment_angular_accel: float
     debug_enabled: bool = False
     debug_throttle_seconds: float = 1.0
 
@@ -182,6 +184,19 @@ class AutoNavigationProfiles:
         if not isinstance(hardware_data, dict) or not isinstance(profile_data, dict):
             raise SpeedProfileError("hardware_limits and profiles are required")
         hardware = HardwareLimits.from_mapping(hardware_data)
+        alignment_data = root.get("initial_alignment")
+        if not isinstance(alignment_data, dict):
+            raise SpeedProfileError("initial_alignment is required")
+        alignment_angular_vel = _positive(alignment_data, "angular_velocity")
+        alignment_angular_accel = _positive(alignment_data, "angular_accel")
+        if alignment_angular_vel > hardware.angular_max:
+            raise SpeedProfileError(
+                "initial_alignment.angular_velocity exceeds the hardware limit"
+            )
+        if alignment_angular_accel > hardware.angular_accel_max:
+            raise SpeedProfileError(
+                "initial_alignment.angular_accel exceeds the hardware limit"
+            )
         profiles = {
             mode: AutoNavigationSpeedProfile.from_mapping(
                 mode,
@@ -199,12 +214,32 @@ class AutoNavigationProfiles:
             default_mode=default_mode,
             hardware=hardware,
             profiles=profiles,
+            initial_alignment_angular_vel=alignment_angular_vel,
+            initial_alignment_angular_accel=alignment_angular_accel,
             debug_enabled=bool(debug.get("enabled", False)),
             debug_throttle_seconds=throttle,
         )
 
     def get(self, mode: object) -> AutoNavigationSpeedProfile:
         return self.profiles[normalize_speed_mode(mode)]
+
+    def controller_parameters(self, mode: object) -> dict[str, float]:
+        """Apply travel limits plus one precise initial heading alignment."""
+        values = self.get(mode).controller_parameters()
+        values["FollowPath.rotate_to_heading_angular_vel"] = (
+            self.initial_alignment_angular_vel
+        )
+        values["FollowPath.max_angular_accel"] = (
+            self.initial_alignment_angular_accel
+        )
+        return values
+
+    def behavior_parameters(self, mode: object) -> dict[str, float]:
+        """Use Manual Fast's proven envelope for every in-place recovery turn."""
+        values = self.get(mode).behavior_parameters()
+        values["max_rotational_vel"] = self.hardware.angular_max
+        values["rotational_acc_lim"] = self.hardware.angular_accel_max
+        return values
 
     def smoother_parameters(self) -> dict[str, list[float]]:
         """Return the shared manual-safe envelope, never a per-Auto clamp.
@@ -260,10 +295,18 @@ class SpeedModeStore:
 class ProfileVelocityLimiter:
     """Per-Auto envelope before twist_mux; manual commands never pass here."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        pure_rotation_angular_max: float | None = None,
+        pure_rotation_angular_decel: float | None = None,
+    ) -> None:
         self.linear = 0.0
         self.angular = 0.0
         self.last_time: float | None = None
+        self.pure_rotation_angular_max = pure_rotation_angular_max
+        self.pure_rotation_angular_decel = pure_rotation_angular_decel
+        self.pure_rotation_active = False
+        self.rotation_settle_until = 0.0
 
     @staticmethod
     def _slew(current: float, target: float, accel: float, decel: float, dt: float) -> tuple[float, bool]:
@@ -284,27 +327,65 @@ class ProfileVelocityLimiter:
         now: float,
     ) -> tuple[float, float, tuple[str, ...]]:
         reasons: list[str] = []
-        target_linear = max(-profile.linear_max, min(profile.linear_max, float(linear)))
-        target_angular = max(-profile.angular_max, min(profile.angular_max, float(angular)))
+        requested_linear = float(linear)
+        requested_angular = float(angular)
+        pure_rotation = abs(requested_linear) < 0.02 and abs(requested_angular) > 0.08
+        angular_max = (
+            self.pure_rotation_angular_max
+            if pure_rotation and self.pure_rotation_angular_max is not None
+            else profile.angular_max
+        )
+        target_linear = max(-profile.linear_max, min(profile.linear_max, requested_linear))
+        target_angular = max(-angular_max, min(angular_max, requested_angular))
         if not math.isclose(target_linear, linear, abs_tol=1e-9):
             reasons.append("PROFILE_LINEAR_MAX")
         if not math.isclose(target_angular, angular, abs_tol=1e-9):
             reasons.append("PROFILE_ANGULAR_MAX")
         dt = 0.05 if self.last_time is None else max(0.001, min(0.25, now - self.last_time))
-        self.linear, linear_limited = self._slew(
-            self.linear,
-            target_linear,
-            profile.linear_accel,
-            profile.linear_decel,
-            dt,
-        )
-        self.angular, angular_limited = self._slew(
-            self.angular,
-            target_angular,
-            profile.angular_accel,
-            profile.angular_decel,
-            dt,
-        )
+        if pure_rotation:
+            # RPP has already selected an in-place turn. Do not slew it a
+            # second time here: the shared downstream velocity smoother keeps
+            # the same 2 rad/s² envelope used by Manual Fast, and motion-safety
+            # remains the final authority. A zero linear command stays zero.
+            self.linear = 0.0
+            self.angular = target_angular
+            self.pure_rotation_active = True
+            self.rotation_settle_until = 0.0
+            linear_limited = False
+            angular_limited = False
+        else:
+            if self.pure_rotation_active:
+                deceleration = self.pure_rotation_angular_decel or profile.angular_decel
+                # The smoother reaches mathematical zero after |w| / decel,
+                # but the physical chassis and AMCL/odom observation lag need
+                # a short additional hold. Without it, RPP begins translating
+                # while the robot is still carrying angular momentum and must
+                # steer back across the path.
+                self.rotation_settle_until = now + abs(self.angular) / deceleration + 0.25
+                self.pure_rotation_active = False
+            if now < self.rotation_settle_until:
+                # Feed zero through the shared smoother until its previous
+                # angular command has reached zero. Only then may linear motion
+                # begin, preventing a turn-in-place from becoming an exit arc.
+                self.linear = 0.0
+                self.angular = 0.0
+                self.last_time = now
+                reasons.append("PURE_ROTATION_SETTLE")
+                return self.linear, self.angular, tuple(reasons)
+            self.linear, linear_limited = self._slew(
+                self.linear,
+                target_linear,
+                profile.linear_accel,
+                profile.linear_decel,
+                dt,
+            )
+            self.angular, angular_limited = self._slew(
+                self.angular,
+                target_angular,
+                profile.angular_accel,
+                profile.angular_decel,
+                dt,
+            )
         self.last_time = now
         if linear_limited:
             reasons.append("PROFILE_LINEAR_ACCEL")
@@ -316,6 +397,8 @@ class ProfileVelocityLimiter:
         self.linear = 0.0
         self.angular = 0.0
         self.last_time = None
+        self.pure_rotation_active = False
+        self.rotation_settle_until = 0.0
 
 
 def render_behavior_tree(profile: AutoNavigationSpeedProfile) -> str:
@@ -328,19 +411,17 @@ def render_behavior_tree(profile: AutoNavigationSpeedProfile) -> str:
     return f'''<!-- Generated from auto_navigation_speed_profiles.yaml ({profile.mode}). -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="5" name="NavigateRecovery">
-      <PipelineSequence name="NavigateWithEarlyReplanning">
-        <RateController hz="{profile.replan_frequency:.2f}">
-          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
-            <ComputePathToPose goal="{{goal}}" path="{{path}}" planner_id="GridBased"/>
-            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
-          </RecoveryNode>
-        </RateController>
-        <RecoveryNode number_of_retries="1" name="FollowPath">
-          <FollowPath path="{{path}}" controller_id="FollowPath"/>
-          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+    <RecoveryNode number_of_retries="4" name="NavigateRecovery">
+      <Sequence name="NavigateWithStablePath">
+        <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+          <ComputePathToPose goal="{{goal}}" path="{{path}}" planner_id="GridBased"/>
+          <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
         </RecoveryNode>
-      </PipelineSequence>
+        <!-- A failed path returns directly to the outer recovery. Retrying the
+             identical path after only a local clear made the rotation shim
+             align twice to a route which RPP had already rejected. -->
+        <FollowPath path="{{path}}" controller_id="FollowPath"/>
+      </Sequence>
       <ReactiveFallback name="RecoveryFallback">
         <GoalUpdated/>
         <RoundRobin name="BoundedRecoveryActions">
@@ -355,7 +436,10 @@ def render_behavior_tree(profile: AutoNavigationSpeedProfile) -> str:
                the first short retreat was insufficient. -->
           <BackUp name="BackUp-First" backup_dist="{profile.backup_distance:.2f}" backup_speed="{profile.backup_speed:.2f}"/>
           <BackUp name="BackUp-Second" backup_dist="{profile.backup_distance:.2f}" backup_speed="{profile.backup_speed:.2f}"/>
-          <Spin spin_dist="1.57"/>
+          <!-- Deliberately no Spin recovery: an unrequested 90-degree turn in
+               a narrow corridor moves the chassis away from an otherwise
+               valid route. Clear, wait and two short straight retreats are
+               the complete bounded recovery set. -->
         </RoundRobin>
       </ReactiveFallback>
     </RecoveryNode>

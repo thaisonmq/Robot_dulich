@@ -19,7 +19,9 @@ services:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
       RMW_IMPLEMENTATION: rmw_fastrtps_cpp
       FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
-      MICRO_ROS_AGENT_VERBOSITY: ${MICRO_ROS_AGENT_VERBOSITY:-2}
+      # Level 4 keeps XRCE entity/session handling stable on this MCU without
+      # the packet hex dump emitted by level 6.
+      MICRO_ROS_AGENT_VERBOSITY: ${MICRO_ROS_AGENT_VERBOSITY:-4}
       # Fast DDS reserves a large virtual address range; an AS limit causes
       # std::bad_alloc even though the Agent RSS is only a few MiB.
       MICRO_ROS_AGENT_VMEM_KB: ${MICRO_ROS_AGENT_VMEM_KB:-0}
@@ -31,7 +33,7 @@ services:
         source: ./micro_ros_fastdds.xml
         target: /etc/rovera/micro_ros_fastdds.xml
         read_only: true
-    command: ["serial", "--dev", "/dev/ttyUSB0", "-b", "921600", "-v${MICRO_ROS_AGENT_VERBOSITY:-2}"]
+    command: ["serial", "--dev", "/dev/ttyUSB0", "-b", "921600", "-v${MICRO_ROS_AGENT_VERBOSITY:-4}"]
     mem_limit: 256m
     memswap_limit: 256m
     pids_limit: 64

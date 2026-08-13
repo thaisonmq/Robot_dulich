@@ -347,15 +347,9 @@ export const api = {
   }) => request<Record<string, unknown>>("/api/navigation/map/load", {
     method: "POST", body: JSON.stringify(input),
   }),
-  setApproximatePose: (input: {
-    request_id: string; robot_id: string; session_id: string; expected_state: string;
-    map_id: string; version: number; pose: { x: number; y: number; yaw: number };
-  }) => request<Record<string, unknown>>("/api/navigation/map/approximate-pose", {
-    method: "POST", body: JSON.stringify(input),
-  }),
   relocalize: (input: {
     request_id: string; robot_id: string; session_id: string; expected_state: string;
-    map_id: string; version: number; allow_rotation?: boolean;
+    map_id: string; version: number; allow_rotation?: boolean; force_global?: boolean;
   }) => request<Record<string, unknown>>("/api/navigation/map/relocalize", {
     method: "POST", body: JSON.stringify(input),
   }),

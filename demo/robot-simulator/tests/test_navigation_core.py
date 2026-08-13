@@ -71,6 +71,58 @@ def test_goal_validation_preserves_occupied_unknown_clearance_and_dynamic_cells(
     assert saved.validate_goal(*free, clearance_m=0.05).valid
 
 
+def test_oriented_footprint_catches_collision_missed_by_center_clearance() -> None:
+    width = height = 25
+    occupancy = [0] * (width * height)
+    occupancy[10 * width + 12] = 100
+    saved = SavedOccupancyMap(width, height, 0.1, 0, 0, 0, occupancy)
+    center = saved.cell_center(10, 10)
+
+    # The legacy 15 cm center circle passes, but the 25 cm half-length body
+    # reaches the occupied cell when its long axis points toward it.
+    assert saved.validate_goal(*center, clearance_m=0.15).valid
+    blocked = saved.validate_footprint(
+        *center,
+        0.0,
+        half_length=0.25,
+        half_width=0.08,
+    )
+    assert blocked.code == "GOAL_FOOTPRINT_BLOCKED"
+
+    rotated = saved.validate_footprint(
+        *center,
+        math.pi / 2,
+        half_length=0.25,
+        half_width=0.08,
+    )
+    assert rotated.valid
+
+
+def test_goal_snap_validates_complete_oriented_footprint() -> None:
+    width = height = 25
+    occupancy = [0] * (width * height)
+    occupancy[10 * width + 12] = 100
+    saved = SavedOccupancyMap(width, height, 0.1, 0, 0, 0, occupancy)
+    requested = saved.cell_center(10, 10)
+
+    snapped = saved.nearest_valid_goal(
+        *requested,
+        clearance_m=0.15,
+        max_distance_m=0.6,
+        yaw=0.0,
+        footprint_half_length=0.25,
+        footprint_half_width=0.08,
+    )
+
+    assert snapped is not None
+    assert saved.validate_footprint(
+        *snapped,
+        0.0,
+        half_length=0.25,
+        half_width=0.08,
+    ).valid
+
+
 def test_nearest_valid_goal_snaps_unsafe_click_within_a_strict_bound() -> None:
     occupancy = [0] * (15 * 15)
     occupancy[7 * 15 + 7] = 100
@@ -384,26 +436,44 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     planner = navigation["planner_server"]["ros__parameters"]["GridBased"]
     global_costmap = navigation["global_costmap"]["global_costmap"]["ros__parameters"]
     local_costmap = navigation["local_costmap"]["local_costmap"]["ros__parameters"]
+    behavior = navigation["behavior_server"]["ros__parameters"]
     limits = smoother["velocity_smoother"]["ros__parameters"]
 
-    assert planner["plugin"] == "nav2_smac_planner/SmacPlannerLattice"
-    assert planner["smooth_path"] is True
+    assert controller["odom_topic"] == "/odometry/filtered"
+    assert follow["plugin"] == "nav2_rotation_shim_controller::RotationShimController"
+    assert follow["primary_controller"] == (
+        "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+    )
+    assert 0.0 < follow["angular_dist_threshold"] <= math.radians(4)
+    assert 0.0 < follow["angular_disengage_threshold"] < follow["angular_dist_threshold"]
+    assert follow["closed_loop"] is True
+    assert follow["rotate_to_goal_heading"] is False
+    assert planner["plugin"] == "nav2_theta_star_planner/ThetaStarPlanner"
     assert planner["allow_unknown"] is False
-    assert planner["lattice_filepath"].endswith("/diff/output.json")
-    assert planner["cost_penalty"] >= 2.0
-    assert planner["rotation_penalty"] <= 2.0
+    assert planner["how_many_corners"] == 8
+    assert planner["w_euc_cost"] == 1.0
+    # Euclidean distance dominates small inflation changes, preventing an
+    # otherwise open straight route from becoming an S-shaped preview. The
+    # footprint check, not a large soft cost, remains the collision authority.
+    assert 0.0 < planner["w_traversal_cost"] <= 0.05
+    assert 0.20 <= follow["forward_sampling_distance"] <= 0.30
     assert 0.15 < follow["desired_linear_vel"] <= limits["max_velocity"][0]
-    assert 0.55 < follow["rotate_to_heading_angular_vel"] <= limits["max_velocity"][2]
+    assert 0.25 < follow["rotate_to_heading_angular_vel"] <= 0.40
+    assert follow["rotate_to_heading_angular_vel"] < limits["max_velocity"][2]
     assert follow["lookahead_dist"] >= 0.35
     assert follow["regulated_linear_scaling_min_speed"] >= 0.07
     assert follow["max_allowed_time_to_collision_up_to_carrot"] >= 0.5
-    assert controller["progress_checker"]["movement_time_allowance"] >= 10.0
-    assert controller["failure_tolerance"] >= 1.5
-    assert follow["rotate_to_heading_min_angle"] <= 0.4
+    assert 10.0 <= controller["progress_checker"]["movement_time_allowance"] <= 15.0
+    assert controller["failure_tolerance"] <= 1.0
+    # Wide/right-angle corners must remain forward arcs, while an almost
+    # opposite initial heading still selects the fast in-place turn.
+    assert math.pi / 2 < follow["rotate_to_heading_min_angle"] < math.pi
+    assert follow["rotate_to_heading_angular_vel"] < limits["max_velocity"][2]
     assert global_costmap["update_frequency"] >= 5
     assert local_costmap["update_frequency"] > global_costmap["update_frequency"]
     assert global_costmap["obstacle_layer"]["combination_method"] == 1
-    assert global_costmap["footprint_padding"] > local_costmap["footprint_padding"]
+    assert global_costmap["footprint_padding"] == local_costmap["footprint_padding"] == 0.0
+    assert global_costmap["static_layer"]["footprint_clearing_enabled"] is True
     assert global_costmap["inflation_layer"]["inflation_radius"] >= 0.4
     assert local_costmap["update_frequency"] >= 10
     assert local_costmap["resolution"] <= 0.025
@@ -416,21 +486,41 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
         assert scan["obstacle_max_range"] >= 3.0
         assert scan["raytrace_max_range"] >= scan["obstacle_max_range"]
         assert scan["expected_update_rate"] <= 0.30
-    assert global_costmap["obstacle_layer"]["scan"]["observation_persistence"] <= 0.5
-    assert controller["controller_frequency"] >= 20.0
+    assert global_costmap["obstacle_layer"]["scan"]["observation_persistence"] == 0.0
+    assert 10.0 <= controller["controller_frequency"] <= local_costmap["update_frequency"]
     assert limits["smoothing_frequency"] >= controller["controller_frequency"]
     assert abs(limits["max_decel"][0]) >= 0.5
     localization = navigation["rovera_navigation_adapter"]["ros__parameters"]
     assert localization["footprint_half_length"] == 0.20
     assert localization["footprint_half_width"] == 0.18
-    expected_footprint = "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
-    assert local_costmap["footprint"] == expected_footprint
-    assert global_costmap["footprint"] == expected_footprint
+    assert localization["localization_rotation_minimum_obstacle_distance"] == -0.07
+    assert localization["planning_footprint_padding"] == global_costmap["footprint_padding"]
+    # Nav2's rasterized collision polygon has a bounded sub-cell allowance,
+    # while adapter preflight and UI retain the complete physical dimensions.
+    expected_collision_footprint = (
+        "[[0.18, 0.16], [0.18, -0.16], [-0.18, -0.16], [-0.18, 0.16]]"
+    )
+    assert local_costmap["footprint"] == expected_collision_footprint
+    assert global_costmap["footprint"] == expected_collision_footprint
+    assert behavior["max_rotational_vel"] == limits["max_velocity"][2]
+    assert behavior["rotational_acc_lim"] == limits["max_accel"][2]
     assert localization["scan_map_maximum_beams"] <= 120
     assert localization["scan_map_minimum_score"] > 0
     assert localization["localization_verify_timeout_seconds"] <= 3.0
     # This stale block was never launched; motion-safety owns the one smoother source of truth.
     assert "velocity_smoother" not in navigation
+
+
+def test_micro_ros_agent_uses_stable_info_verbosity_by_default() -> None:
+    project = Path(__file__).parents[1]
+
+    for filename in ("compose.yaml", "compose.legacy-hardware.yml"):
+        compose = (project / filename).read_text()
+        assert compose.count("${MICRO_ROS_AGENT_VERBOSITY:-4}") == 2
+        assert "${MICRO_ROS_AGENT_VERBOSITY:-2}" not in compose
+    assert "MICRO_ROS_AGENT_VERBOSITY=4" in (
+        project / "edge.env.example"
+    ).read_text()
 
 
 def test_ekf_uses_one_wheel_measurement_path_and_keeps_imu_unfused() -> None:
@@ -453,12 +543,18 @@ def test_all_auto_speed_profiles_are_centralized_and_within_manual_fast() -> Non
 
     assert profiles.default_mode == "NORMAL"
     assert profiles.get("slow").linear_max == 0.17
+    assert profiles.get("slow").min_lookahead_dist >= 0.50
+    assert profiles.get("slow").lookahead_time >= 3.0
     assert profiles.get("normal").linear_max == 0.27
     assert profiles.get("fast").linear_max == profiles.hardware.linear_max == 0.33
     assert profiles.get("fast").angular_max == profiles.hardware.angular_max == 0.8
-    assert profiles.get("FAST").controller_parameters()[
-        "FollowPath.rotate_to_heading_angular_vel"
-    ] == 0.8
+    assert profiles.get("fast").regulated_min_radius >= 1.0
+    assert profiles.get("fast").regulated_min_speed <= 0.10
+    assert profiles.get("fast").min_lookahead_dist >= 0.55
+    assert profiles.behavior_parameters("SLOW") == {
+        "max_rotational_vel": profiles.hardware.angular_max,
+        "rotational_acc_lim": profiles.hardware.angular_accel_max,
+    }
     assert profiles.smoother_parameters()["max_velocity"] == [0.33, 0.0, 0.8]
     with pytest.raises(SpeedProfileError):
         profiles.get("TURBO")
@@ -495,7 +591,38 @@ def test_auto_velocity_limiter_switches_profiles_without_touching_manual() -> No
     assert fast_angular == pytest.approx(0.26)
 
 
-def test_custom_behavior_trees_use_profile_replan_and_bounded_recovery(tmp_path: Path) -> None:
+def test_pure_rotation_uses_one_shared_manual_fast_acceleration_stage() -> None:
+    project = Path(__file__).parents[1]
+    profiles = AutoNavigationProfiles.load(
+        project / "navigation-stack/config/auto_navigation_speed_profiles.yaml"
+    )
+    limiter = ProfileVelocityLimiter(
+        pure_rotation_angular_max=profiles.hardware.angular_max,
+        pure_rotation_angular_decel=profiles.hardware.angular_decel_max,
+    )
+
+    linear, angular, reasons = limiter.apply(
+        0.0, 0.8, profiles.get("SLOW"), now=1.0
+    )
+
+    assert linear == 0.0
+    assert angular == profiles.hardware.angular_max
+    assert "PROFILE_ANGULAR_ACCEL" not in reasons
+
+    settling_linear, settling_angular, settling_reasons = limiter.apply(
+        0.2, 0.0, profiles.get("SLOW"), now=1.1
+    )
+    assert (settling_linear, settling_angular) == (0.0, 0.0)
+    assert "PURE_ROTATION_SETTLE" in settling_reasons
+
+    resumed_linear, resumed_angular, _ = limiter.apply(
+        0.2, 0.0, profiles.get("SLOW"), now=1.8
+    )
+    assert resumed_linear > 0.0
+    assert resumed_angular == 0.0
+
+
+def test_custom_behavior_trees_keep_path_until_bounded_recovery(tmp_path: Path) -> None:
     project = Path(__file__).parents[1]
     profiles = AutoNavigationProfiles.load(
         project / "navigation-stack/config/auto_navigation_speed_profiles.yaml"
@@ -503,17 +630,25 @@ def test_custom_behavior_trees_use_profile_replan_and_bounded_recovery(tmp_path:
     paths = profiles.write_behavior_trees(tmp_path)
 
     fast_root = ElementTree.parse(paths["FAST"]).getroot()
+    stable_sequence = fast_root.find(".//Sequence[@name='NavigateWithStablePath']")
     rate = fast_root.find(".//RateController")
+    planners = fast_root.findall(".//ComputePathToPose")
     wait = fast_root.find(".//Wait")
     backups = fast_root.findall(".//BackUp")
+    spins = fast_root.findall(".//Spin")
+    follow_recovery = fast_root.find(".//RecoveryNode[@name='FollowPath']")
     recovery = fast_root.find(".//RecoveryNode[@name='NavigateRecovery']")
-    assert rate is not None and rate.attrib["hz"] == "2.00"
+    assert stable_sequence is not None
+    assert rate is None
+    assert len(planners) == 1
     assert wait is not None and wait.attrib["wait_duration"] == "1"
     assert [backup.attrib for backup in backups] == [
         {"name": "BackUp-First", "backup_dist": "0.15", "backup_speed": "0.12"},
         {"name": "BackUp-Second", "backup_dist": "0.15", "backup_speed": "0.12"},
     ]
-    assert recovery is not None and recovery.attrib["number_of_retries"] == "5"
+    assert spins == []
+    assert follow_recovery is None
+    assert recovery is not None and recovery.attrib["number_of_retries"] == "4"
 
 
 def test_navigation_image_installs_the_configured_planner() -> None:
@@ -521,3 +656,16 @@ def test_navigation_image_installs_the_configured_planner() -> None:
     dockerfile = (project / "navigation-stack/Dockerfile").read_text()
 
     assert "ros-humble-nav2-smac-planner" in dockerfile
+    assert "ros-humble-nav2-rotation-shim-controller" in dockerfile
+
+
+def test_pi_dds_profile_rejects_incompatible_remote_participants() -> None:
+    project = Path(__file__).parents[1]
+    profile = ElementTree.parse(project / "micro_ros_fastdds.xml").getroot()
+    namespace = {"f": "http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles"}
+
+    assert profile.findtext(
+        ".//f:participant/f:rtps/f:builtin/f:discovery_config/"
+        "f:ignoreParticipantFlags",
+        namespaces=namespace,
+    ) == "FILTER_DIFFERENT_HOST"

@@ -22,7 +22,9 @@ const NAVIGATION_STATE_LABELS: Record<string, string> = {
   LOCALIZING_APPROXIMATE_POSE: "Đang hiệu chỉnh vị trí",
   LOCALIZING_GLOBAL: "Đang tự định vị",
   LOCALIZING_ROTATING: "Đang xoay để định vị",
+  LOCALIZING_SETTLING: "Đang xác minh vị trí sau khi xoay",
   LOCALIZING: "Đang xác định vị trí",
+  LOCALIZATION_REQUIRED: "Sẽ định vị khi tự hành",
   LOW_CONFIDENCE: "Độ tin cậy thấp",
   LOCALIZATION_LOST: "Mất định vị",
   LOCALIZATION_FAILED: "Định vị thất bại",
@@ -84,11 +86,8 @@ interface Props {
   localized?: boolean;
   readOnly?: boolean;
   onMapChange?: (mapId: string) => void;
-  onSetInitialPose?: () => void;
   onRetryLocalization?: () => void;
-  onClearSelection?: () => void;
   onSelect: (destination: Destination) => void;
-  onSelectInitialPose?: (destination: Destination) => void;
   onGo: () => void;
   onPause?: () => void;
   onResume?: () => void;
@@ -107,7 +106,6 @@ interface CanvasProps {
   robotMoving: boolean;
   focus?: Point | null;
   zoom?: number;
-  positionOnly?: boolean;
   onSelect: (destination: Destination) => void;
 }
 
@@ -203,7 +201,7 @@ export function goalApproachYaw(
 function MapCanvas({
   map, destinations, pose, route, selected, dynamicObstacles,
   readOnly, showRobot, robotMoving, focus = null, zoom = 1,
-  positionOnly = false, onSelect,
+  onSelect,
 }: CanvasProps) {
   const { t } = useI18n();
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -299,18 +297,9 @@ function MapCanvas({
     if (selected) {
       const goal = pointOnCanvas(selected);
       context.save(); context.translate(goal.x, goal.y);
-      if (positionOnly) {
-        // An approximate-pose click is a search region, not a robot marker or
-        // a trusted heading. Draw a target instead of a directional arrow.
-        context.strokeStyle = "#f59e0b";
-        context.lineWidth = 3;
-        context.beginPath(); context.arc(0, 0, 11, 0, Math.PI * 2); context.stroke();
-        context.beginPath(); context.arc(0, 0, 3, 0, Math.PI * 2); context.fillStyle = "#f59e0b"; context.fill();
-      } else {
-        context.rotate(worldYawToCanvas(selected.yaw, map.origin.yaw));
-        context.fillStyle = "#f59e0b"; context.beginPath(); context.moveTo(12, 0);
-        context.lineTo(-7, 7); context.lineTo(-4, 0); context.lineTo(-7, -7); context.closePath(); context.fill();
-      }
+      context.rotate(worldYawToCanvas(selected.yaw, map.origin.yaw));
+      context.fillStyle = "#f59e0b"; context.beginPath(); context.moveTo(12, 0);
+      context.lineTo(-7, 7); context.lineTo(-4, 0); context.lineTo(-7, -7); context.closePath(); context.fill();
       context.restore();
     }
     if (showRobot) {
@@ -324,7 +313,7 @@ function MapCanvas({
         markerRadius,
       );
     }
-  }, [dynamicObstacles, fitted, imageRevision, imageState, map, pose, positionOnly, robotMoving, route, selected, showRobot, viewport]);
+  }, [dynamicObstacles, fitted, imageRevision, imageState, map, pose, robotMoving, route, selected, showRobot, viewport]);
 
   const eventWorld = (clientX: number, clientY: number): Point | null => {
     const canvas = canvasRef.current;
@@ -354,11 +343,9 @@ function MapCanvas({
         const dragged = Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) > 6;
         onSelect({ destination_id: "CUSTOM-GOAL", map_id: map.map_id, name: t("Điểm tùy chọn"),
           x: start.point.x, y: start.point.y,
-          yaw: positionOnly
-            ? 0
-            : dragged
-              ? Math.atan2(end.y - start.point.y, end.x - start.point.x)
-              : goalApproachYaw(pose, start.point),
+          yaw: dragged
+            ? Math.atan2(end.y - start.point.y, end.x - start.point.x)
+            : goalApproachYaw(pose, start.point),
           enabled: true });
       }} />
     {destinations.map((destination) => {
@@ -379,12 +366,11 @@ export function MapPanel({
   localizationConfidence = 0, health, visualization, feedback,
   canStart = true, preflightFailures = [], errorMessage = "", noticeMessage = "", localized = false,
   mapActivationError = "",
-  onMapChange, onSelect, onSelectInitialPose, onSetInitialPose, onRetryLocalization, onClearSelection, onGo, onPause,
+  onMapChange, onSelect, onRetryLocalization, onGo, onPause,
   onResume, onCancel, readOnly = false,
 }: Props) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
-  const [approximateMode, setApproximateMode] = useState(false);
   const [candidateMapId, setCandidateMapId] = useState(selectedMapId ?? map.map_id);
   const [followRobot, setFollowRobot] = useState(false);
   const [centerRobot, setCenterRobot] = useState(false);
@@ -392,8 +378,13 @@ export function MapPanel({
   const moving = navigationStatus === "moving";
   const paused = navigationStatus === "paused";
   const localizationFailed = localizationState === "LOCALIZATION_FAILED";
+  const localizationInProgress = [
+    "LOCALIZATION_INITIALIZING", "LOCALIZING", "LOCALIZING_LAST_POSE",
+    "LOCALIZING_APPROXIMATE_POSE", "LOCALIZING_GLOBAL", "LOCALIZING_ROTATING",
+    "LOCALIZING_SETTLING", "VERIFYING",
+  ].includes(localizationState);
   const localizationNeedsAssistance = localizationFailed || [
-    "LOCALIZING_GLOBAL", "LOW_CONFIDENCE", "LOCALIZATION_LOST",
+    "LOCALIZATION_REQUIRED", "LOCALIZING_GLOBAL", "LOW_CONFIDENCE", "LOCALIZATION_LOST",
   ].includes(localizationState);
   const ready = localized && localizationState === "READY" && pose.map_id === map.map_id
     && (pose.map_version == null || pose.map_version === map.active_version)
@@ -423,8 +414,15 @@ export function MapPanel({
         dynamicObstacles={obstacles} readOnly showRobot={ready} robotMoving={moving}
         focus={followRobot || centerRobot ? pose : null} zoom={followRobot || centerRobot ? 2 : 1} onSelect={onSelect} />
       {!ready && <div className="localization-overlay"><Navigation />
-        <strong>{localizationFailed ? t("Không thể tự xác định chính xác vị trí robot.") : t("Đang xác định vị trí robot…")}</strong>
-        {!localizationFailed && <span>{t("Robot đang quét môi trường…")} · {Math.round(localizationConfidence * 100)}%</span>}
+        <strong>{localizationFailed
+          ? t("Không thể tự xác định chính xác vị trí robot.")
+          : localizationState === "SENSOR_TIME_INVALID"
+            ? t("Đã mất dữ liệu LiDAR và odometry từ bộ điều khiển robot.")
+          : localizationState === "LOCALIZATION_REQUIRED"
+            ? t("Vị trí sẽ được xác định khi bắt đầu tự hành.")
+            : t("Đang xác định vị trí robot…")}</strong>
+        {!localizationFailed && !["LOCALIZATION_REQUIRED", "SENSOR_TIME_INVALID"].includes(localizationState) && <span>{t("Robot đang quét môi trường…")} · {Math.round(localizationConfidence * 100)}%</span>}
+        {localizationState === "SENSOR_TIME_INVALID" && <span>{t("Hãy khởi động lại nguồn robot để khôi phục kết nối cảm biến an toàn.")}</span>}
       </div>}
     </div>
     <div className="navigation-health-row">
@@ -443,34 +441,26 @@ export function MapPanel({
       {t("Đường đi đang bị chặn. Robot đã dừng an toàn; hãy dời vật cản hoặc chọn điểm khác.")}
     </p>}
     <div className="navigation-actions">
-      {localizationNeedsAssistance ? <><button type="button" onClick={onRetryLocalization}>{t("Cho phép xoay để định vị")}</button>
-        <button type="button" onClick={() => { onClearSelection?.(); setApproximateMode(true); setExpanded(true); }}>{t("Chỉ vị trí robot gần đúng")}</button></>
+      {localizationNeedsAssistance ? <><button type="button" className="button button--primary" disabled={readOnly}
+        onClick={() => setExpanded(true)}><Flag /> {t("Chọn điểm đến")}</button>
+        <button type="button" disabled={readOnly || loading || localizationInProgress}
+          onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button></>
         : moving ? <><button type="button" onClick={onPause}><Pause /> {t("Tạm dừng")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
         : paused ? <><button type="button" onClick={onResume}><Play /> {t("Tiếp tục")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
-        : <><button type="button" className="button button--primary" disabled={!ready || readOnly}
-          onClick={() => { setApproximateMode(false); setExpanded(true); }}><Flag /> {t("Chọn điểm đến")}</button>
-          {ready && <button type="button" disabled={readOnly || loading}
-            onClick={() => { onClearSelection?.(); setApproximateMode(true); setExpanded(true); }}>
-            <LocateFixed /> {t("Chỉ vị trí robot gần đúng")}
-          </button>}</>}
+        : <><button type="button" className="button button--primary" disabled={readOnly}
+          onClick={() => setExpanded(true)}><Flag /> {t("Chọn điểm đến")}</button></>}
     </div>
-    {expanded && <div className="map-modal" role="dialog" aria-modal="true" aria-label={t(approximateMode ? "Chỉ vị trí robot gần đúng" : "Chọn điểm đến")}>
+    {expanded && <div className="map-modal" role="dialog" aria-modal="true" aria-label={t("Chọn điểm đến")}>
       <div className="map-modal__panel"><div className="map-modal__heading"><header><div><small>{map.name} · v{map.active_version}</small>
-        <strong>{t(approximateMode ? "Chỉ vị trí robot gần đúng" : "Chọn điểm đến")}</strong></div>
-        <button type="button" aria-label={t("Đóng bản đồ mở rộng")} onClick={() => { setExpanded(false); setApproximateMode(false); }}><X /></button></header>
-        {approximateMode && <p className="map-modal__hint">
-          {t("Nhấn vào vị trí gần đúng của robot. LiDAR sẽ tự xác định vị trí chính xác và hướng robot.")}
-        </p>}</div>
-        <div className="map-modal__canvas"><MapCanvas map={map} destinations={approximateMode ? [] : destinations} pose={pose}
-          route={approximateMode ? null : liveRoute} selected={selected} dynamicObstacles={obstacles}
-          readOnly={readOnly || loading} showRobot={ready && !approximateMode} robotMoving={moving}
-          positionOnly={approximateMode}
-          onSelect={approximateMode ? onSelectInitialPose ?? onSelect : onSelect} /></div>
-        <footer><button type="button" onClick={() => { setExpanded(false); setApproximateMode(false); }}>{t("Hủy")}</button>
-          {approximateMode ? <button type="button" className="button button--primary" disabled={!selected || loading}
-            onClick={() => { onSetInitialPose?.(); setExpanded(false); setApproximateMode(false); }}><Navigation /> {t("Xác nhận vị trí gần đúng")}</button>
-            : <button type="button" className="button button--primary" disabled={!selected || !route || !canStart || loading}
-              title={preflightFailures.join(", ")} onClick={() => { onGo(); setExpanded(false); }}><RouteIcon /> {t("Đi đến đây")}</button>}</footer>
+        <strong>{t("Chọn điểm đến")}</strong></div>
+        <button type="button" aria-label={t("Đóng bản đồ mở rộng")} onClick={() => setExpanded(false)}><X /></button></header></div>
+        <div className="map-modal__canvas"><MapCanvas map={map} destinations={destinations} pose={pose}
+          route={liveRoute} selected={selected} dynamicObstacles={obstacles}
+          readOnly={readOnly || loading} showRobot={ready} robotMoving={moving}
+          onSelect={onSelect} /></div>
+        <footer><button type="button" onClick={() => setExpanded(false)}>{t("Hủy")}</button>
+          <button type="button" className="button button--primary" disabled={!selected || !canStart || loading}
+            title={preflightFailures.join(", ")} onClick={() => { onGo(); setExpanded(false); }}><RouteIcon /> {t("Đi đến đây")}</button></footer>
       </div></div>}
   </section>;
 }

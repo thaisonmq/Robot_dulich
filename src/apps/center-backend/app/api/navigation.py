@@ -69,6 +69,7 @@ class RelocalizeRequest(NavigationCommandBase):
     map_id: str = Field(min_length=2, max_length=64)
     version: int = Field(ge=1)
     allow_rotation: bool = False
+    force_global: bool = False
 
 
 class ComputePathRequest(NavigationCommandBase):
@@ -112,7 +113,7 @@ def _mission_start_rejection(mission: NavigationMission) -> dict | None:
     if mission.status == "READY" and mission.path:
         return None
     code = str(mission.error_code or ("NO_PATH" if not mission.path else "MISSION_NOT_READY"))
-    if code in {"NO_PATH", "PLAN_REJECTED", "PLANNER_TIMEOUT"} or not mission.path:
+    if code in {"NO_PATH", "PLAN_REJECTED", "PLANNER_TIMEOUT"}:
         message = (
             "Không tìm thấy lộ trình an toàn từ vị trí hiện tại. "
             "Hãy chọn điểm khác hoặc tạo thêm khoảng trống quanh robot."
@@ -336,19 +337,16 @@ async def set_initial_pose(
     body: InitialPoseRequest,
     user_id: str = Depends(current_user),
     database: Session = Depends(get_db),
-    settings: Settings = Depends(get_settings),
 ) -> dict:
     _valid_lease(body.robot_id, body.session_id, user_id)
     if _active_version(database, body.map_id, body.version) is None:
         raise HTTPException(status_code=409, detail="Map/version chưa ACTIVE")
-    return await _command(
-        database,
-        settings,
-        request_id=body.request_id,
-        robot_id=body.robot_id,
-        command_type="map.set_initial_pose",
-        expected_state=body.expected_state,
-        payload={"map_id": body.map_id, "version": body.version, "pose": body.pose.model_dump()},
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Không dùng điểm bấm làm vị trí robot. "
+            "Hãy chạy định vị LiDAR toàn cục trước khi tự hành."
+        ),
     )
 
 
@@ -373,6 +371,7 @@ async def relocalize(
             "map_id": body.map_id,
             "version": body.version,
             "allow_rotation": body.allow_rotation,
+            "force_global": body.force_global,
         },
     )
 
@@ -447,8 +446,8 @@ async def set_auto_navigation_speed_mode(
     }
 
 
-# Compatibility for older Center builds. The product UI calls this only as an
-# approximate-pose fallback after automatic localization has failed.
+# Compatibility route for older clients. The handler deliberately rejects
+# operator-supplied coordinates; a map click must never become robot pose.
 router.add_api_route(
     "/map/initial-pose",
     set_initial_pose,
