@@ -51,6 +51,36 @@ function navigationStateLabel(state: string, t: Translate): string {
   return t(NAVIGATION_STATE_LABELS[state] ?? state);
 }
 
+function sensorTimeFailureMessage(reason: string | undefined, t: Translate) {
+  const messages: Record<string, [string, string]> = {
+    SCAN_STALE: [
+      "Dữ liệu LiDAR tạm thời không khả dụng.",
+      "Robot đã dừng an toàn và đang chờ LiDAR phục hồi.",
+    ],
+    ODOM_STALE: [
+      "Dữ liệu odometry tạm thời không khả dụng.",
+      "Robot đã dừng an toàn và đang chờ odometry phục hồi.",
+    ],
+    SCAN_ODOM_STALE: [
+      "Đã mất dữ liệu LiDAR và odometry từ bộ điều khiển robot.",
+      "Robot đã dừng an toàn và đang chờ kết nối cảm biến phục hồi.",
+    ],
+    SENSOR_FRAME_INVALID: [
+      "Khung tọa độ cảm biến không hợp lệ.",
+      "Robot đã dừng an toàn và đang chờ dữ liệu đúng khung tọa độ.",
+    ],
+    TIMESTAMP_SYNC_INVALID: [
+      "Dấu thời gian cảm biến chưa đồng bộ.",
+      "Robot đã dừng an toàn và đang thử đồng bộ lại dữ liệu định vị.",
+    ],
+  };
+  const [title, detail] = messages[reason ?? ""] ?? [
+    "Dữ liệu định vị tạm thời không đồng bộ.",
+    "Robot đã dừng an toàn và đang thử khôi phục vị trí.",
+  ];
+  return { title: t(title), detail: t(detail) };
+}
+
 // One immutable Saved Map asset per map/version for the lifetime of Control.
 // Mini and expanded canvases share this promise, so opening the modal never
 // downloads the occupancy image a second time.
@@ -452,8 +482,12 @@ export function MapPanel({
     && (health?.map_version == null || health.map_version === map.active_version);
   const visualizationMatches = visualization?.map_id === map.map_id
     && visualization.map_version === map.active_version;
+  const sensorTimeMessage = sensorTimeFailureMessage(
+    health?.sensor_time_failure_reason,
+    t,
+  );
   const liveRoute = visualization?.global_path?.length && visualizationMatches
-    ? { ...(route ?? { route_id: "live-path", robot_id: "", destination_id: "CUSTOM-GOAL", distance_m: 0, estimated_seconds: 0 }), points: visualization.global_path }
+    ? { ...(route ?? { route_id: "live-path", robot_id: "", destination_id: "CUSTOM-GOAL", distance_m: 0, estimated_seconds: 0 }), route_id: visualization.route_id ?? route?.route_id ?? "live-path", points: visualization.global_path }
     : route;
   const obstacles = visualizationMatches ? visualization?.dynamic_obstacles ?? [] : [];
   const recoveryCount = Math.max(0, Number(feedback?.recoveries ?? 0));
@@ -480,12 +514,12 @@ export function MapPanel({
         <strong>{localizationFailed
           ? t("Không thể tự xác định chính xác vị trí robot.")
           : localizationState === "SENSOR_TIME_INVALID"
-            ? t("Đã mất dữ liệu LiDAR và odometry từ bộ điều khiển robot.")
+            ? sensorTimeMessage.title
           : localizationState === "LOCALIZATION_REQUIRED"
             ? t("Vị trí sẽ được xác định khi bắt đầu tự hành.")
             : t("Đang xác định vị trí robot…")}</strong>
         {!localizationFailed && !["LOCALIZATION_REQUIRED", "SENSOR_TIME_INVALID"].includes(localizationState) && <span>{t("Robot đang quét môi trường…")} · {Math.round(localizationConfidence * 100)}%</span>}
-        {localizationState === "SENSOR_TIME_INVALID" && <span>{t("Hãy khởi động lại nguồn robot để khôi phục kết nối cảm biến an toàn.")}</span>}
+        {localizationState === "SENSOR_TIME_INVALID" && <span>{sensorTimeMessage.detail}</span>}
       </div>}
     </div>
     <div className="navigation-health-row">

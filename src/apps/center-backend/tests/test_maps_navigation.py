@@ -47,6 +47,18 @@ def test_navigation_resolves_robot_by_public_robot_id() -> None:
         assert robot.id == "internal-robot-uuid"
 
 
+def test_navigation_route_id_is_deterministic_from_executable_geometry() -> None:
+    path = [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.5}]
+
+    assert navigation_api._route_id_for_path(path) == navigation_api._route_id_for_path(
+        list(path)
+    )
+    assert navigation_api._route_id_for_path(path).startswith("route-")
+    assert navigation_api._route_id_for_path(path) != navigation_api._route_id_for_path(
+        [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.6}]
+    )
+
+
 def test_relocalization_rotation_requires_explicit_authorization() -> None:
     request = RelocalizeRequest(
         request_id="request-passive-localization",

@@ -4,7 +4,7 @@ import {
   drawRobotMapMarker, goalApproachYaw, MapPanel, worldYawToCanvas,
 } from "../src/components/MapPanel";
 import { I18nProvider } from "../src/i18n/I18nProvider";
-import type { Destination, MapData } from "../src/types";
+import type { Destination, Health, MapData } from "../src/types";
 
 const map: MapData = {
   map_id: "MAP-A",
@@ -257,16 +257,29 @@ describe("MapPanel navigation controls", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Nav2 chưa sẵn sàng");
   });
 
-  it("distinguishes a dead sensor transport from ordinary localization", () => {
+  it("does not claim both sensors are lost without a specific backend reason", () => {
     panel({
       mapState: "SENSOR_TIME_INVALID",
       localizationState: "SENSOR_TIME_INVALID",
       localized: false,
     });
 
-    expect(screen.getByText(/Đã mất dữ liệu LiDAR và odometry/)).toBeInTheDocument();
-    expect(screen.getByText(/khởi động lại nguồn robot/)).toBeInTheDocument();
+    expect(screen.getByText(/Dữ liệu định vị tạm thời không đồng bộ/)).toBeInTheDocument();
+    expect(screen.getByText(/đang thử khôi phục vị trí/)).toBeInTheDocument();
+    expect(screen.queryByText(/Đã mất dữ liệu LiDAR và odometry/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Robot đang quét môi trường/)).not.toBeInTheDocument();
+  });
+
+  it("shows the exact failed sensor component exposed by backend", () => {
+    panel({
+      mapState: "SENSOR_TIME_INVALID",
+      localizationState: "SENSOR_TIME_INVALID",
+      localized: false,
+      health: { sensor_time_failure_reason: "SCAN_STALE" } as Health,
+    });
+
+    expect(screen.getByText(/LiDAR tạm thời không khả dụng/)).toBeInTheDocument();
+    expect(screen.queryByText(/LiDAR và odometry/)).not.toBeInTheDocument();
   });
 
   it("explains obstacle recovery and a safely blocked route", () => {

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from datetime import datetime, timezone
 from typing import Literal
@@ -98,9 +100,16 @@ class SpeedModeRequest(NavigationCommandBase):
     mode: Literal["SLOW", "NORMAL", "FAST"]
 
 
+def _route_id_for_path(path: list[dict[str, float]]) -> str:
+    digest = hashlib.sha1(
+        json.dumps(path, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:12]
+    return f"route-{digest}"
+
+
 def _mission_view(mission: NavigationMission) -> dict:
     return {
-        "route_id": mission.mission_id,
+        "route_id": _route_id_for_path(list(mission.path or [])),
         "mission_id": mission.mission_id,
         "destination_id": "CUSTOM-GOAL",
         "request_id": mission.request_id,
@@ -580,7 +589,7 @@ async def start_navigation(
         expected_state=body.expected_state,
         payload={
             "mission_id": mission.mission_id,
-            "route_id": mission.mission_id,
+            "route_id": _route_id_for_path(list(mission.path or [])),
             "map_id": mission.map_id,
             "version": mission.map_version,
             "goal": mission.goal,

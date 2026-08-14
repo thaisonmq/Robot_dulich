@@ -310,6 +310,8 @@ export interface Health {
   scan_fresh?: boolean;
   sensor_clock_state?: "CLOCK_SYNCING" | "SYNCED" | "SENSOR_TIME_INVALID";
   sensor_time_healthy?: boolean;
+  sensor_time_failure_reason?: string;
+  sensor_time_diagnostics?: Record<string, unknown>;
   scan_arrival_fresh?: boolean;
   scan_timestamp_valid?: boolean;
   scan_clock_skew_seconds?: number;
@@ -479,6 +481,7 @@ export interface NavigationVisualization {
   revision: number;
   map_id: string;
   map_version: number;
+  route_id?: string;
   global_path?: Point[];
   dynamic_obstacles?: Point[];
 }
