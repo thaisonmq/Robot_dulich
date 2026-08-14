@@ -44,6 +44,11 @@ class SafetyDecision:
     blocked: Direction
     nearest_clearance: float
     reason: str = ""
+    angular_scale: float = 1.0
+    front_clearance: float = math.inf
+    rear_clearance: float = math.inf
+    left_clearance: float = math.inf
+    right_clearance: float = math.inf
 
 
 def stopping_clearance(speed: float, config: SafetyConfig) -> float:
@@ -98,6 +103,10 @@ def evaluate_scan(
     slow_distance = required + config.slow_extra
     rotation_radius = math.hypot(config.half_length, config.half_width)
     nearest = math.inf
+    front_clearance = math.inf
+    rear_clearance = math.inf
+    left_clearance = math.inf
+    right_clearance = math.inf
     blocked = Direction.NONE
     slow_scale = 1.0
     valid = 0
@@ -123,6 +132,7 @@ def evaluate_scan(
         # when its point happens to have x > the front axle.
         if x >= config.half_length and abs(y) <= config.half_width + config.side_margin:
             forward_gap = x - config.half_length
+            front_clearance = min(front_clearance, forward_gap)
             if forward_gap <= required:
                 point_mask |= Direction.FRONT
             elif linear_x > 0 and forward_gap < slow_distance:
@@ -135,6 +145,7 @@ def evaluate_scan(
             and abs(y) <= config.half_width + config.side_margin
         ):
             rear_gap = -x - config.half_length
+            rear_clearance = min(rear_clearance, rear_gap)
             if rear_gap <= required:
                 point_mask |= Direction.REAR
             elif linear_x < 0 and rear_gap < slow_distance:
@@ -157,45 +168,86 @@ def evaluate_scan(
                 point_mask |= Direction.LEFT | Direction.RIGHT
         if (
             y >= config.half_width
-            and y - config.half_width <= config.side_margin
             and -config.half_length <= x <= config.half_length + required
         ):
-            point_mask |= Direction.LEFT
-            left_path_turn_blocked = True
+            left_clearance = min(left_clearance, y - config.half_width)
+            if radial_gap <= config.rotation_margin:
+                point_mask |= Direction.LEFT
+                left_path_turn_blocked = True
         if (
             y <= -config.half_width
-            and -y - config.half_width <= config.side_margin
             and -config.half_length <= x <= config.half_length + required
         ):
-            point_mask |= Direction.RIGHT
-            right_path_turn_blocked = True
+            right_clearance = min(right_clearance, -y - config.half_width)
+            if radial_gap <= config.rotation_margin:
+                point_mask |= Direction.RIGHT
+                right_path_turn_blocked = True
         blocked |= point_mask
 
     if valid == 0:
-        return SafetyDecision(True, 0.0, Direction.FRONT | Direction.REAR | Direction.LEFT | Direction.RIGHT, math.inf, "empty_scan")
+        return SafetyDecision(
+            True,
+            0.0,
+            Direction.FRONT | Direction.REAR | Direction.LEFT | Direction.RIGHT,
+            math.inf,
+            "empty_scan",
+            angular_scale=0.0,
+        )
 
-    motion_blocked = (
+    translation_blocked = (
         (linear_x > 0 and bool(blocked & Direction.FRONT))
         or (linear_x < 0 and bool(blocked & Direction.REAR))
-        or (pure_rotation and rotation_blocked)
-        or (
-            not pure_rotation
-            and angular_z > 0.05
-            and left_path_turn_blocked
-        )
-        or (
-            not pure_rotation
-            and angular_z < -0.05
-            and right_path_turn_blocked
+    )
+    hard_stop = translation_blocked or (pure_rotation and rotation_blocked)
+    turn_clamped = (
+        not hard_stop
+        and not pure_rotation
+        and (
+            (angular_z > 0.05 and left_path_turn_blocked)
+            or (angular_z < -0.05 and right_path_turn_blocked)
         )
     )
+    if translation_blocked:
+        reason = "front_sweep_collision" if linear_x > 0 else "rear_sweep_collision"
+    elif pure_rotation and rotation_blocked:
+        reason = "rotation_sweep_collision"
+    elif turn_clamped:
+        reason = (
+            "left_turn_clearance" if angular_z > 0 else "right_turn_clearance"
+        )
+    else:
+        reason = ""
     return SafetyDecision(
-        stop=motion_blocked,
-        speed_scale=0.0 if motion_blocked else slow_scale,
+        stop=hard_stop,
+        speed_scale=0.0 if hard_stop else slow_scale,
         blocked=blocked,
         nearest_clearance=nearest,
-        reason="obstacle" if motion_blocked else "",
+        reason=reason,
+        angular_scale=(0.0 if hard_stop or turn_clamped else slow_scale),
+        front_clearance=front_clearance,
+        rear_clearance=rear_clearance,
+        left_clearance=left_clearance,
+        right_clearance=right_clearance,
     )
+
+
+def clip_motion_by_mask(
+    linear_x: float,
+    angular_z: float,
+    blocked: Direction,
+) -> tuple[float, float]:
+    """Remove only velocity components aimed into an external interlock."""
+    safe_linear = float(linear_x)
+    safe_angular = float(angular_z)
+    if (safe_linear > 0 and blocked & Direction.FRONT) or (
+        safe_linear < 0 and blocked & Direction.REAR
+    ):
+        safe_linear = 0.0
+    if (safe_angular > 0 and blocked & Direction.LEFT) or (
+        safe_angular < 0 and blocked & Direction.RIGHT
+    ):
+        safe_angular = 0.0
+    return safe_linear, safe_angular
 
 
 def motion_blocked_by_mask(
@@ -208,12 +260,10 @@ def motion_blocked_by_mask(
     removes components that point into a blocked direction.
     """
 
-    return (
-        (linear_x > 0 and bool(blocked & Direction.FRONT))
-        or (linear_x < 0 and bool(blocked & Direction.REAR))
-        or (angular_z > 0 and bool(blocked & Direction.LEFT))
-        or (angular_z < 0 and bool(blocked & Direction.RIGHT))
+    safe_linear, safe_angular = clip_motion_by_mask(
+        linear_x, angular_z, blocked
     )
+    return safe_linear != linear_x or safe_angular != angular_z
 
 
 @dataclass(slots=True)

@@ -36,6 +36,7 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
+from rclpy.duration import Duration
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from slam_toolbox.srv import DeserializePoseGraph, Pause, SaveMap, SerializePoseGraph
@@ -249,6 +250,11 @@ class NavigationAdapter(Node):
         self.scan_map_minimum_beams = int(self.declare_parameter(
             "scan_map_minimum_valid_beams", 25
         ).value)
+        self.localization_final_minimum_residual_beams = max(1, int(
+            self.declare_parameter(
+                "localization_final_minimum_residual_beams", 20
+            ).value
+        ))
         self.scan_map_maximum_beams = int(self.declare_parameter(
             "scan_map_maximum_beams", 90
         ).value)
@@ -269,13 +275,21 @@ class NavigationAdapter(Node):
         self.dynamic_overlay_static_tolerance = configured(
             "dynamic_overlay_static_tolerance", 0.08
         )
+        self.scan_tf_wait = configured("scan_tf_wait_seconds", 0.02)
+        self.scan_tf_fallback_max_age = configured(
+            "scan_tf_fallback_max_age_seconds", 0.12
+        )
         self.scan_map_freshness = configured("scan_map_freshness_seconds", 0.60)
         self.sensor_time_invalid_grace = configured(
             "sensor_time_invalid_grace_seconds", 1.0
         )
         self.rotation_minimum_obstacle_distance = configured(
-            "localization_rotation_minimum_obstacle_distance", 0.25
+            "localization_rotation_minimum_obstacle_distance", 0.04
         )
+        self.localization_rotation_blocked_timeout = configured(
+            "localization_rotation_blocked_timeout_seconds", 5.0
+        )
+        self.localization_rotation_blocked_since: float | None = None
         self.global_heading_bin_count = max(4, int(self.declare_parameter(
             "localization_global_heading_bin_count", 8
         ).value))
@@ -359,6 +373,7 @@ class NavigationAdapter(Node):
             half_width=self.footprint_half_width,
             side_margin=self.corridor_side_margin,
             front_clearance_required=self.corridor_front_clearance,
+            rotation_margin=self.rotation_minimum_obstacle_distance,
         )
         self.last_corridor_log_monotonic = 0.0
         self.failed_segments: list[dict[str, Any]] = []
@@ -366,6 +381,7 @@ class NavigationAdapter(Node):
         self.navigation_corridor_clear_retried = False
         self.navigation_original_path_length = 0.0
         self.safety_stop_source = "UNKNOWN"
+        self.safety_stop_reason = "UNKNOWN"
         self.last_logged_stop_source = ""
 
         self.speed_profiles = AutoNavigationProfiles.load(
@@ -428,6 +444,10 @@ class NavigationAdapter(Node):
         }
         self.last_scan_filter_log_monotonic = 0.0
         self.last_localization_candidate_log_monotonic = 0.0
+        self.last_tf_debug_monotonic: dict[str, float] = {}
+        self.scan_transform_cache: dict[
+            tuple[str, str, int], tuple[float, float, float] | None
+        ] = {}
         self.declare_parameter(
             "cmd_vel_debug_enabled",
             self.navigation_debug_enabled and self.speed_profiles.debug_enabled,
@@ -1933,32 +1953,112 @@ class NavigationAdapter(Node):
         target_frame: str,
         message: LaserScan,
     ) -> tuple[float, float, float] | None:
-        """Resolve a scan frame at capture time; never substitute stale AMCL."""
+        """Resolve capture-time TF with one bounded, age-checked fallback."""
+        source_frame = str(message.header.frame_id)
+        scan_stamp = Time.from_msg(message.header.stamp)
+        cache_key = (target_frame, source_frame, int(scan_stamp.nanoseconds))
+        if cache_key in self.scan_transform_cache:
+            return self.scan_transform_cache[cache_key]
         try:
             transform = self.tf_buffer.lookup_transform(
                 target_frame,
-                str(message.header.frame_id),
-                Time.from_msg(message.header.stamp),
+                source_frame,
+                scan_stamp,
+                timeout=Duration(seconds=max(0.0, self.scan_tf_wait)),
             )
         except TransformException:
-            return None
+            self._tf_debug(
+                "TF_AT_SCAN_MISS",
+                target=target_frame,
+                source=source_frame,
+            )
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    target_frame, source_frame, Time()
+                )
+            except TransformException:
+                self._tf_debug(
+                    "SCAN_REJECTED_TF",
+                    target=target_frame,
+                    source=source_frame,
+                    reason="NO_TRANSFORM",
+                )
+                self.scan_transform_cache[cache_key] = None
+                return None
+            transform_stamp = Time.from_msg(transform.header.stamp)
+            age_seconds = abs(
+                scan_stamp.nanoseconds - transform_stamp.nanoseconds
+            ) / 1e9
+            if (
+                transform_stamp.nanoseconds <= 0
+                or age_seconds > self.scan_tf_fallback_max_age
+            ):
+                self._tf_debug(
+                    "SCAN_REJECTED_TF",
+                    target=target_frame,
+                    source=source_frame,
+                    tf_age_ms=age_seconds * 1000.0,
+                    reason="TF_STALE",
+                )
+                self.scan_transform_cache[cache_key] = None
+                return None
+            self._tf_debug(
+                "TF_FALLBACK",
+                target=target_frame,
+                source=source_frame,
+                tf_age_ms=age_seconds * 1000.0,
+            )
+        else:
+            self._tf_debug(
+                "TF_AT_SCAN_OK",
+                target=target_frame,
+                source=source_frame,
+                tf_age_ms=0.0,
+            )
         translation = transform.transform.translation
-        return (
+        result = (
             float(translation.x),
             float(translation.y),
             self._yaw_from_quaternion(transform.transform.rotation),
         )
+        self.scan_transform_cache[cache_key] = result
+        return result
+
+    def _tf_debug(self, event: str, **fields: Any) -> None:
+        if not self.navigation_debug_enabled:
+            return
+        now = time.monotonic()
+        if now - self.last_tf_debug_monotonic.get(event, 0.0) < 1.0:
+            return
+        self._nav_debug(event, **fields)
+        self.last_tf_debug_monotonic[event] = now
 
     def _scan_heading_in_odom(self, message: LaserScan) -> float | None:
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                "odom",
-                "base_footprint",
-                Time.from_msg(message.header.stamp),
-            )
-        except TransformException:
-            return None
-        return self._yaw_from_quaternion(transform.transform.rotation)
+        scan_pose = self._scan_transform("odom", message)
+        return None if scan_pose is None else scan_pose[2]
+
+    def _record_heading_observation(self, message: LaserScan) -> None:
+        """Record physical scan headings independently from AMCL quality."""
+        if not self.global_search_requires_rotation:
+            return
+        valid_beams = sum(
+            1
+            for distance in message.ranges
+            if math.isfinite(distance)
+            and message.range_min <= distance <= message.range_max
+        )
+        if valid_beams < self.scan_map_minimum_beams:
+            return
+        heading = self._scan_heading_in_odom(message)
+        if heading is None:
+            return
+        self.localization_evidence_headings.append(heading)
+        diversity = heading_diversity(
+            self.localization_evidence_headings,
+            bin_count=self.global_heading_bin_count,
+        )
+        self.localization_heading_bins = diversity.observed_bins
+        self.localization_heading_span = diversity.span_radians
 
     def _update_scan_map_match(self, message: LaserScan) -> None:
         if self.saved_map is None:
@@ -2003,22 +2103,6 @@ class NavigationAdapter(Node):
         self.last_scan_map_monotonic = time.monotonic()
         if self.verification_started_monotonic:
             self.verification_scan_count += 1
-        if (
-            self.global_search_requires_rotation
-            and match.score >= self.global_scan_map_threshold
-            and match.median_residual
-            <= self.localization_final_max_median_residual
-            and match.p90_residual <= self.localization_final_max_p90_residual
-        ):
-            heading = self._scan_heading_in_odom(message)
-            if heading is not None:
-                self.localization_evidence_headings.append(heading)
-                diversity = heading_diversity(
-                    self.localization_evidence_headings,
-                    bin_count=self.global_heading_bin_count,
-                )
-                self.localization_heading_bins = diversity.observed_bins
-                self.localization_heading_span = diversity.span_radians
         self._refresh_localization_confidence()
 
     def _planning_scan_message(self, message: LaserScan) -> LaserScan:
@@ -2094,6 +2178,7 @@ class NavigationAdapter(Node):
 
     def _scan_callback(self, message: LaserScan) -> None:
         callback_started = time.monotonic()
+        self.scan_transform_cache.clear()
         self.last_scan_monotonic = callback_started
         nearest_forward = math.inf
         nearest_left = math.inf
@@ -2143,6 +2228,7 @@ class NavigationAdapter(Node):
             side_margin=self.corridor_side_margin,
             front_clearance_required=self.corridor_front_clearance,
             lookahead=self.corridor_lookahead,
+            rotation_margin=self.rotation_minimum_obstacle_distance,
         )
         self.latest_corridor = corridor
         self.corridor_samples.append((callback_started, corridor, path_error))
@@ -2177,6 +2263,9 @@ class NavigationAdapter(Node):
                 can_rotate=corridor.can_rotate,
             )
             self.last_corridor_log_monotonic = callback_started
+        # Observation coverage must keep progressing even while the current
+        # AMCL candidate has no usable map transform or fails strict residuals.
+        self._record_heading_observation(message)
         self._update_scan_map_match(message)
         if self.mode == "MAPPING" and self.current_state in {"MAPPING", "MAPPING_RUNNING"}:
             self.mapping_scan.publish(message)
@@ -2200,6 +2289,12 @@ class NavigationAdapter(Node):
         self.scan_clock_skew_seconds = float(scan.get("clock_skew_ms", 0.0)) / 1000.0
     def _safety_callback(self, message: String) -> None:
         self.safety_health = message.data
+        if self.safety_health.startswith("BLOCKED:"):
+            self.safety_stop_reason = self.safety_health.split(":", 1)[1].upper()
+        elif self.safety_health.startswith("FAULT:"):
+            self.safety_stop_reason = self.safety_health.split(":", 1)[1].upper()
+        elif self.safety_health.startswith("HEALTHY"):
+            self.safety_stop_reason = "NONE"
 
     def _safety_source_callback(self, message: String) -> None:
         source = str(message.data or "UNKNOWN")
@@ -2215,11 +2310,7 @@ class NavigationAdapter(Node):
         requested = self.pipeline_samples.get("controller_requested")
         self._nav_debug(
             "STOP",
-            reason=(
-                "OBSTACLE"
-                if "OBSTACLE" in source or source == "MOTION_SAFETY"
-                else "SAFETY"
-            ),
+            reason=(self.safety_stop_reason if self.safety_stop_reason != "NONE" else "SAFETY"),
             source=source,
             direction_mask=self.safety_direction_mask,
             linear_cmd=None if requested is None else requested[0],
@@ -2419,6 +2510,7 @@ class NavigationAdapter(Node):
         self.ready_evidence_invalid_since = None
         self.low_confidence_since = None
         self.last_nomotion_request_monotonic = 0.0
+        self.localization_rotation_blocked_since = None
 
     def _begin_localization_verification(self, *, allow_rotation: bool) -> None:
         """Verify the current AMCL cloud without resetting its particles."""
@@ -2610,7 +2702,8 @@ class NavigationAdapter(Node):
             and now - self.last_amcl_monotonic <= self.amcl_pose_freshness
             and self.scan_map_valid_beams >= self.scan_map_minimum_beams
             and self.scan_map_score >= required_scan_score
-            and self.scan_map_residual_beams > 0
+            and self.scan_map_residual_beams
+            >= self.localization_final_minimum_residual_beams
             and self.scan_map_median_residual
             <= self.localization_final_max_median_residual
             and self.scan_map_p90_residual
@@ -2640,8 +2733,11 @@ class NavigationAdapter(Node):
             return "INSUFFICIENT_VALID_BEAMS"
         if self.scan_map_score < required_scan_score:
             return "SCAN_MATCH_SCORE_TOO_LOW"
-        if self.scan_map_residual_beams <= 0:
-            return "NO_ENDPOINT_RESIDUALS"
+        if (
+            self.scan_map_residual_beams
+            < self.localization_final_minimum_residual_beams
+        ):
+            return "INSUFFICIENT_ENDPOINT_RESIDUALS"
         if self.scan_map_median_residual > self.localization_final_max_median_residual:
             return "MEDIAN_RESIDUAL_TOO_HIGH"
         if self.scan_map_p90_residual > self.localization_final_max_p90_residual:
@@ -3014,9 +3110,24 @@ class NavigationAdapter(Node):
                 # opening Control must never move an unchecked robot.
                 return
             if not self._safe_to_rotate():
-                # Do not claim that the chassis is rotating while a live
-                # safety gate is withholding velocity ownership.
+                # Do not claim progress while a live safety gate withholds
+                # velocity. A stable geometric block is terminal with a
+                # specific reason, not a generic localization timeout.
+                if self.localization_rotation_blocked_since is None:
+                    self.localization_rotation_blocked_since = now
+                elif (
+                    now - self.localization_rotation_blocked_since
+                    >= self.localization_rotation_blocked_timeout
+                ):
+                    self._stop_localization_rotation()
+                    self.localized = False
+                    self.localization_state = "LOCALIZATION_FAILED"
+                    self._set_state(
+                        "LOCALIZATION_FAILED",
+                        "rotation_clearance_blocked",
+                    )
                 return
+            self.localization_rotation_blocked_since = None
             self.localization_state = "LOCALIZING_ROTATING"
             self._set_state("LOCALIZING_ROTATING", "global_search_needs_new_heading")
         if self.localization_state == "LOCALIZING_ROTATING":
@@ -3030,6 +3141,8 @@ class NavigationAdapter(Node):
                 self._stop_localization_rotation()
                 self.localization_state = "LOCALIZING_GLOBAL"
                 self._set_state("LOCALIZING_GLOBAL", "rotation_safety_gate_closed")
+                if self.localization_rotation_blocked_since is None:
+                    self.localization_rotation_blocked_since = now
                 return
             delta = now - self.rotation_last_monotonic if self.rotation_last_monotonic else 0.0
             self.rotation_angle += abs(self.rotation_speed) * max(0.0, min(delta, 0.5))
@@ -3696,9 +3809,13 @@ class NavigationAdapter(Node):
                 evidence_reason, corridor = self._corridor_failure_evidence()
                 retry_goal = dict(self.paused_goal or {})
                 old_path = list(self.latest_global_path)
+                localization_reliable = (
+                    self.localized
+                    and self.localization_state == "READY"
+                    and self.localization_confidence >= self.localization_low_threshold
+                )
                 if (
-                    recoveries > 0
-                    and retry_goal
+                    retry_goal
                     and evidence_reason == "CORRIDOR_CLEAR"
                     and not self.navigation_corridor_clear_retried
                 ):
@@ -3706,11 +3823,11 @@ class NavigationAdapter(Node):
                     self._set_state("RECOVERING", "corridor_clear_retry_current_path")
                     retry = (evidence_reason, retry_goal, corridor, old_path)
                 elif (
-                    recoveries > 0
-                    and retry_goal
+                    retry_goal
                     and evidence_reason in {
                         "INSUFFICIENT_CLEARANCE", "CONFIRMED_FRONT_OBSTACLE",
                     }
+                    and localization_reliable
                     and self.navigation_recovery_attempts
                     < self.failed_segment_max_replans
                 ):
@@ -3721,13 +3838,22 @@ class NavigationAdapter(Node):
                     # Unconfirmed sensor/localization/controller failures are
                     # not route evidence. BLOCKED is reserved for a planner
                     # proving no route after a confirmed keepout below.
-                    terminal_reason = (
-                        "NAV2_ABORTED"
-                        if recoveries == 0
-                        else "CORRIDOR_EVIDENCE_UNCONFIRMED"
-                        if evidence_reason == "UNCONFIRMED"
-                        else "CORRIDOR_CLEAR_CONTROLLER_FAILURE"
-                    )
+                    if (
+                        evidence_reason in {
+                            "INSUFFICIENT_CLEARANCE",
+                            "CONFIRMED_FRONT_OBSTACLE",
+                        }
+                        and not localization_reliable
+                    ):
+                        terminal_reason = "LOCALIZATION_UNRELIABLE"
+                    elif evidence_reason == "UNCONFIRMED":
+                        terminal_reason = "CORRIDOR_EVIDENCE_UNCONFIRMED"
+                    elif evidence_reason == "CORRIDOR_CLEAR":
+                        terminal_reason = "CORRIDOR_CLEAR_CONTROLLER_FAILURE"
+                    elif self.navigation_recovery_attempts >= self.failed_segment_max_replans:
+                        terminal_reason = "RECOVERY_LIMIT_REACHED"
+                    else:
+                        terminal_reason = "NAV2_ABORTED"
                     self._set_state("FAILED", terminal_reason.lower())
                     self.latest_feedback["terminal_reason"] = terminal_reason
                     self.paused_goal = None

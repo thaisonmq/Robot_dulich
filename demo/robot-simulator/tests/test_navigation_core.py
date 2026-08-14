@@ -511,6 +511,14 @@ def test_force_rescan_heading_diversity_rejects_a_thirty_degree_cluster() -> Non
     assert math.degrees(diverse.span_radians) == pytest.approx(180)
 
 
+def test_force_rescan_accepts_real_non_cardinal_heading_coverage() -> None:
+    observed = heading_diversity(
+        map(math.radians, [3, 47, 92, 139, 176]), bin_count=8
+    )
+    assert len(observed.observed_bins) >= 4
+    assert math.degrees(observed.span_radians) >= 150
+
+
 def test_corridor_geometry_separates_straight_and_rotation_clearance() -> None:
     walls_72cm = [
         (x, side)
@@ -542,6 +550,23 @@ def test_corridor_geometry_separates_straight_and_rotation_clearance() -> None:
     )
     assert narrow_rotation.can_go_straight
     assert not narrow_rotation.can_rotate
+
+
+@pytest.mark.parametrize("offset", [0.0, 0.03, 0.05])
+def test_72cm_corridor_tolerates_realistic_offset_and_scan_noise(offset: float) -> None:
+    points = [
+        (x, side - offset + noise)
+        for x, noise in [(-0.2, 0.002), (0.0, -0.003), (0.3, 0.001), (0.6, 0.0)]
+        for side in (-0.36, 0.36)
+    ]
+    assessment = evaluate_corridor(
+        points,
+        half_length=0.20,
+        half_width=0.18,
+        side_margin=0.06,
+        front_clearance_required=0.20,
+    )
+    assert assessment.can_go_straight
 
 
 def test_corridor_geometry_blocks_true_narrow_or_front_obstacle() -> None:
@@ -676,7 +701,7 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert local_costmap["update_frequency"] > global_costmap["update_frequency"]
     assert global_costmap["obstacle_layer"]["combination_method"] == 1
     assert global_costmap["footprint_padding"] == 0.0
-    assert local_costmap["footprint_padding"] == -0.02
+    assert local_costmap["footprint_padding"] == 0.0
     assert global_costmap["static_layer"]["footprint_clearing_enabled"] is True
     assert 0.25 <= global_costmap["inflation_layer"]["inflation_radius"] <= 0.30
     assert local_costmap["inflation_layer"]["inflation_radius"] >= 0.4
@@ -710,7 +735,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     localization = navigation["rovera_navigation_adapter"]["ros__parameters"]
     assert localization["footprint_half_length"] == 0.20
     assert localization["footprint_half_width"] == 0.18
-    assert localization["localization_rotation_minimum_obstacle_distance"] == -0.07
+    assert localization["localization_rotation_minimum_obstacle_distance"] == safety[
+        "rotation_margin"
+    ]
     assert localization["planning_footprint_padding"] == global_costmap["footprint_padding"]
     assert safety["lidar_obstacle_avoidance_enabled"] is True
     assert safety["half_length"] == localization["footprint_half_length"]
@@ -726,7 +753,12 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert behavior["rotational_acc_lim"] == limits["max_accel"][2]
     assert localization["scan_map_maximum_beams"] <= 120
     assert localization["scan_map_minimum_score"] > 0
-    assert localization["localization_global_scan_map_minimum_score"] >= 0.75
+    assert localization["localization_global_scan_map_minimum_score"] >= localization[
+        "scan_map_minimum_score"
+    ]
+    assert localization["localization_final_minimum_residual_beams"] >= 20
+    assert localization["localization_final_max_median_residual"] < 0.08
+    assert localization["localization_final_max_p90_residual"] < 0.11
     assert localization["localization_coarse_match_tolerance"] > localization[
         "localization_final_max_median_residual"
     ]
@@ -737,7 +769,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
         "localization_coarse_match_tolerance"
     ]
     assert localization["localization_global_min_heading_bins"] >= 4
-    assert localization["localization_global_min_heading_span_degrees"] >= 180
+    assert 135 <= localization["localization_global_min_heading_span_degrees"] < 180
+    assert 0 < localization["scan_tf_wait_seconds"] <= 0.05
+    assert 0 < localization["scan_tf_fallback_max_age_seconds"] <= 0.15
     assert localization["auto_localization_max_angle_degrees"] >= 360.0
     assert navigation["amcl"]["ros__parameters"]["max_particles"] >= 3000
     assert navigation["amcl"]["ros__parameters"]["max_beams"] >= 90

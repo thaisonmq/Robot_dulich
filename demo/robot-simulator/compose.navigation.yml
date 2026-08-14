@@ -18,6 +18,7 @@ services:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-20}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
       FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/micro_ros_fastdds.xml
+      NAVIGATION_DEBUG_LOG: "${NAVIGATION_DEBUG_LOG:-true}"
     volumes:
       # Mount cấu hình từ project để đổi chế độ/tốc độ chỉ cần recreate riêng
       # motion-safety, không phải build lại image và không đụng USB Agent.

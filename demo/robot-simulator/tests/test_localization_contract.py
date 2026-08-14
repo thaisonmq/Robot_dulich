@@ -94,6 +94,8 @@ def test_localization_rotation_keeps_every_live_safety_gate() -> None:
     assert "self.rotation_angle >= self.rotation_max_angle" in tick
     assert "self._stop_localization_rotation()" in tick
     assert 'self.localization_state = "LOCALIZING_GLOBAL"' in tick
+    assert "self.localization_rotation_blocked_timeout" in tick
+    assert '"rotation_clearance_blocked"' in tick
 
 
 def test_global_search_requires_rotation_only_after_explicit_authorization() -> None:
@@ -212,11 +214,36 @@ def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
     assert "self._critical_sensor_time_healthy()" in evidence
     assert "self.localization_final_max_median_residual" in evidence
     assert "self.localization_final_max_p90_residual" in evidence
+    assert "self.localization_final_minimum_residual_beams" in evidence
     assert "self.global_minimum_heading_bins" in evidence
     assert 'self.localization_state == "VERIFYING"' in tick
     assert "self.localization_ready_hold" in tick
     assert 'self.localized and self.localization_state == "READY"' in tick
     assert "self.ready_evidence_invalid_since" in tick
+
+
+def test_heading_observation_is_independent_from_candidate_quality() -> None:
+    observation = _method_source(
+        "_record_heading_observation", "_update_scan_map_match"
+    )
+    callback = _method_source("_scan_callback", "_sensor_time_callback")
+    assert "valid_beams < self.scan_map_minimum_beams" in observation
+    assert "self._scan_heading_in_odom(message)" in observation
+    assert "match.score" not in observation
+    assert "residual" not in observation
+    assert callback.index("self._record_heading_observation(message)") < callback.index(
+        "self._update_scan_map_match(message)"
+    )
+
+
+def test_scan_tf_uses_bounded_wait_and_age_checked_fallback() -> None:
+    transform = _method_source("_scan_transform", "_tf_debug")
+    assert "timeout=Duration(" in transform
+    assert 'lookup_transform(\n                    target_frame, source_frame, Time()' in transform
+    assert "self.scan_tf_fallback_max_age" in transform
+    assert '"TF_AT_SCAN_MISS"' in transform
+    assert '"TF_FALLBACK"' in transform
+    assert '"SCAN_REJECTED_TF"' in transform
 
 
 def test_ready_tracking_uses_low_threshold_without_stationary_reacquisition() -> None:
@@ -372,6 +399,9 @@ def test_navigation_abort_uses_confirmed_corridor_then_alternate_replan() -> Non
     assert "self._request_path_once(goal)" in recover
     assert "self._path_crosses_segment(alternative, segment)" in recover
     assert '"BLOCKED", "NO_ALTERNATIVE_ROUTE"' in recover
+    assert "recoveries > 0" not in result
+    assert "localization_reliable" in result
+    assert 'terminal_reason = "LOCALIZATION_UNRELIABLE"' in result
 
 
 def test_navigation_debug_events_cover_new_geometry_and_recovery_sources() -> None:

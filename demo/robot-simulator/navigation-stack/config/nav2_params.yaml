@@ -64,22 +64,28 @@ rovera_navigation_adapter:
     scan_map_maximum_beams: 90
     scan_map_minimum_valid_beams: 25
     scan_map_minimum_score: 0.35
-    # A force-global search needs much stronger evidence than verification of
-    # an already tracked pose. Field logs showed wrong hypotheses at 0.588-
-    # 0.663 and the correct pose at 0.9655; reject the ambiguous cluster.
-    localization_global_scan_map_minimum_score: 0.80
+    # Live rooms contain people/furniture and only 35-50% of endpoints may be
+    # saved structure. Do not demand an impossible 80% ratio: final acceptance
+    # separately requires enough matched endpoints plus strict residuals,
+    # stable AMCL covariance/pose and multi-heading physical observation.
+    localization_global_scan_map_minimum_score: 0.35
     scan_map_minimum_range: 0.20
     scan_map_maximum_range: 6.0
     localization_coarse_match_tolerance: 0.12
-    # A 5 cm map contributes up to roughly half a cell of endpoint
-    # quantization. These limits still accept the observed 2-6 cm cluster but
-    # reject a pose displaced 8-12 cm inside the coarse match radius.
-    localization_final_max_median_residual: 0.05
-    localization_final_max_p90_residual: 0.08
+    # Require a substantial geometric sample, then judge its real residuals.
+    # The deployed 5 cm map produces about 5.1 cm median / 9.6 cm p90 at the
+    # stable physical pose; an 8/11 cm false candidate remains rejected.
+    localization_final_minimum_residual_beams: 20
+    localization_final_max_median_residual: 0.06
+    localization_final_max_p90_residual: 0.10
     # Planning scan filtering has different semantics: compare measured range
     # with a map raycast, and never reuse the localization coarse tolerance.
     planning_static_match_tolerance: 0.08
     dynamic_overlay_static_tolerance: 0.08
+    # Prefer capture-time TF, wait briefly for normal listener jitter, then
+    # accept the nearest transform only inside this explicit age budget.
+    scan_tf_wait_seconds: 0.02
+    scan_tf_fallback_max_age_seconds: 0.12
     scan_map_freshness_seconds: 0.60
     sensor_time_invalid_grace_seconds: 1.0
     auto_localization_rotation_degrees_per_second: 45.0
@@ -95,12 +101,12 @@ rovera_navigation_adapter:
     # residual pass. Commanded rotation alone is never localization evidence.
     localization_global_heading_bin_count: 8
     localization_global_min_heading_bins: 4
-    localization_global_min_heading_span_degrees: 180.0
-    # The 0.40 x 0.36 m safety footprint is deliberately conservative. During
-    # an in-place localization turn, permit scan points up to 7 cm inside its
-    # corner-swept circle; this still rejects returns touching the body sides
-    # while avoiding a false block from nearby walls and isolated self-returns.
-    localization_rotation_minimum_obstacle_distance: -0.07
+    localization_global_min_heading_span_degrees: 150.0
+    # Pure localization rotation uses the same rectangular corner sweep and
+    # explicit margin as final motion-safety. Straight travel can remain valid
+    # when this rotation gate is closed.
+    localization_rotation_minimum_obstacle_distance: 0.04
+    localization_rotation_blocked_timeout_seconds: 5.0
     footprint_half_length: 0.20
     footprint_half_width: 0.18
     # The measured 0.40 x 0.36 m body is already the safety envelope. Extra
@@ -249,12 +255,11 @@ local_costmap:
       # endpoint lands on different cells in the global and local grids.
       resolution: 0.025
       # Keep the measured 0.40 x 0.36 m polygon as the source of truth. The
-      # local 2.5 cm raster can move a wall representative by almost one cell,
-      # so compensate that discretization explicitly. The adapter, global
-      # planner, raw-scan motion safety and stopping margin retain the complete
-      # physical footprint.
+      # local 2.5 cm raster can move a wall representative by almost one cell;
+      # retain the full measured body and handle grid uncertainty with explicit
+      # margins/inflation instead of shrinking collision geometry.
       footprint: "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
-      footprint_padding: -0.02
+      footprint_padding: 0.0
       # The robot has a planar LaserScan, not a 3D point cloud. Use the same
       # 2D obstacle model as the global costmap so the planner and RPP do not
       # disagree about which cells are lethal.

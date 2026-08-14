@@ -5,6 +5,7 @@ from safety_core import (
     SafetyConfig,
     ScanSample,
     StopHysteresis,
+    clip_motion_by_mask,
     evaluate_scan,
     motion_blocked_by_mask,
     stopping_clearance,
@@ -39,7 +40,12 @@ def test_side_and_corner_set_directional_polygon_mask() -> None:
         config=CONFIG,
     )
     assert side.stop and side.blocked & Direction.LEFT
-    corner = evaluate_scan(scan_with_points([(0.20, 0.10)]), linear_x=0.1, angular_z=0, config=CONFIG)
+    corner = evaluate_scan(
+        scan_with_points([(0.22, 0.19)]),
+        linear_x=0.1,
+        angular_z=0,
+        config=CONFIG,
+    )
     assert corner.blocked & Direction.FRONT
     assert corner.blocked & Direction.LEFT
 
@@ -84,6 +90,26 @@ def test_corridor_can_allow_forward_but_block_left_rotation() -> None:
     )
     assert rotating.stop
     assert rotating.blocked & Direction.LEFT
+
+
+def test_forward_arc_clips_only_unsafe_turn_component() -> None:
+    decision = evaluate_scan(
+        # Seven centimetres beside the 0.18 m half-width clears the 0.06 m
+        # straight margin, but lies inside the rectangular corner's turn sweep.
+        scan_with_points([(0.0, 0.25), (1.0, 0.0)]),
+        linear_x=0.15,
+        angular_z=0.10,
+        config=CONFIG,
+    )
+    assert not decision.stop
+    assert decision.speed_scale > 0
+    assert decision.angular_scale == 0
+    assert decision.reason == "left_turn_clearance"
+
+
+def test_external_direction_mask_clips_components_independently() -> None:
+    assert clip_motion_by_mask(0.15, 0.10, Direction.LEFT) == (0.15, 0.0)
+    assert clip_motion_by_mask(0.15, 0.10, Direction.FRONT) == (0.0, 0.10)
 
 
 def test_dynamic_braking_distance_grows_with_velocity() -> None:
