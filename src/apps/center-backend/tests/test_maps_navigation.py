@@ -13,6 +13,8 @@ from app.api.maps import (
     _mapping_start_health_failures,
     _posegraph_basename,
 )
+from app.api import navigation as navigation_api
+from app.core.config import Settings
 from app.api.navigation import RelocalizeRequest, _mission_start_rejection, _robot_by_public_id
 from app.api.websockets import persist_robot_runtime_event
 from app.models.database import Base, SessionLocal
@@ -73,6 +75,42 @@ def test_auto_navigation_can_request_fresh_global_localization() -> None:
 
     assert request.allow_rotation is True
     assert request.force_global is True
+
+
+@pytest.mark.asyncio
+async def test_relocalize_allows_bounded_ros_mode_switch(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_command(database, settings, **kwargs):
+        del database, settings
+        captured.update(kwargs)
+        return {"status": "accepted", "current_state": "LOCALIZING_GLOBAL"}
+
+    monkeypatch.setattr(navigation_api, "_valid_lease", lambda *args: None)
+    monkeypatch.setattr(navigation_api, "_active_version", lambda *args: object())
+    monkeypatch.setattr(navigation_api, "_command", fake_command)
+    settings = Settings(mapping_command_timeout_seconds=73.0)
+    request = RelocalizeRequest(
+        request_id="request-mode-switch-budget",
+        robot_id="ROBOT-001",
+        session_id="session-mode-switch-budget",
+        expected_state="READY",
+        map_id="MAP-001",
+        version=1,
+        allow_rotation=True,
+        force_global=True,
+    )
+
+    result = await navigation_api.relocalize(
+        request,
+        user_id="operator-1",
+        database=object(),
+        settings=settings,
+    )
+
+    assert result["status"] == "accepted"
+    assert captured["command_type"] == "map.relocalize"
+    assert captured["timeout_seconds"] == 73.0
 
 
 def test_plan_failed_or_empty_navigation_mission_cannot_start() -> None:

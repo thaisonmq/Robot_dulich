@@ -383,6 +383,10 @@ async def relocalize(
             "allow_rotation": body.allow_rotation,
             "force_global": body.force_global,
         },
+        # Relocalization may first perform the guarded MAPPING -> NAVIGATION
+        # container handoff. Give that bounded switch the same ACK budget as
+        # map loading instead of returning a false 504 after 15 seconds.
+        timeout_seconds=settings.mapping_command_timeout_seconds,
     )
 
 

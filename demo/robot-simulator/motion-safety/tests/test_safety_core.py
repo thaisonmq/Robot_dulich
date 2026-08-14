@@ -32,11 +32,58 @@ def test_front_and_rear_obstacles_only_block_matching_translation() -> None:
 
 
 def test_side_and_corner_set_directional_polygon_mask() -> None:
-    side = evaluate_scan(scan_with_points([(0.0, 0.14)]), linear_x=0, angular_z=0.4, config=CONFIG)
+    side = evaluate_scan(
+        scan_with_points([(0.0, 0.24)]),
+        linear_x=0,
+        angular_z=0.4,
+        config=CONFIG,
+    )
     assert side.stop and side.blocked & Direction.LEFT
     corner = evaluate_scan(scan_with_points([(0.20, 0.10)]), linear_x=0.1, angular_z=0, config=CONFIG)
     assert corner.blocked & Direction.FRONT
     assert corner.blocked & Direction.LEFT
+
+
+def test_two_side_walls_do_not_become_a_front_stop() -> None:
+    corridor = scan_with_points([
+        (-0.1, -0.36), (0.0, -0.36), (0.3, -0.36),
+        (-0.1, 0.36), (0.0, 0.36), (0.3, 0.36),
+        (1.0, 0.0),
+    ])
+    decision = evaluate_scan(
+        corridor,
+        linear_x=0.17,
+        angular_z=0.02,
+        config=CONFIG,
+    )
+    assert not decision.stop
+    assert not decision.blocked & Direction.FRONT
+
+
+def test_front_object_in_swept_footprint_still_stops() -> None:
+    decision = evaluate_scan(
+        scan_with_points([(0.32, 0.0), (1.0, 0.5)]),
+        linear_x=0.17,
+        angular_z=0.0,
+        config=CONFIG,
+    )
+    assert decision.stop
+    assert decision.blocked & Direction.FRONT
+
+
+def test_corridor_can_allow_forward_but_block_left_rotation() -> None:
+    corridor = scan_with_points([(0.0, -0.275), (0.0, 0.275), (1.0, 0.0)])
+    assert not evaluate_scan(
+        corridor, linear_x=0.1, angular_z=0.0, config=CONFIG
+    ).stop
+    assert not evaluate_scan(
+        corridor, linear_x=0.1, angular_z=0.04, config=CONFIG
+    ).stop
+    rotating = evaluate_scan(
+        corridor, linear_x=0.0, angular_z=0.3, config=CONFIG
+    )
+    assert rotating.stop
+    assert rotating.blocked & Direction.LEFT
 
 
 def test_dynamic_braking_distance_grows_with_velocity() -> None:

@@ -16,9 +16,11 @@ class Direction(IntFlag):
 
 @dataclass(frozen=True, slots=True)
 class SafetyConfig:
-    half_length: float = 0.15
-    half_width: float = 0.05
+    half_length: float = 0.20
+    half_width: float = 0.18
     clearance: float = 0.10
+    side_margin: float = 0.06
+    rotation_margin: float = 0.04
     slow_extra: float = 0.20
     latency_seconds: float = 0.12
     braking_acceleration: float = 0.35
@@ -73,23 +75,6 @@ def point_inside_footprint(x: float, y: float, config: SafetyConfig) -> bool:
     return abs(x) < config.half_length and abs(y) < config.half_width
 
 
-def point_direction(x: float, y: float, config: SafetyConfig) -> Direction:
-    # Corners intentionally block both adjacent directions. This keeps turns
-    # from sweeping a physical corner into an obstacle.
-    direction = Direction.NONE
-    if x >= config.half_length:
-        direction |= Direction.FRONT
-    elif x <= -config.half_length:
-        direction |= Direction.REAR
-    if y >= config.half_width:
-        direction |= Direction.LEFT
-    elif y <= -config.half_width:
-        direction |= Direction.RIGHT
-    if direction == Direction.NONE:
-        direction = Direction.FRONT | Direction.REAR | Direction.LEFT | Direction.RIGHT
-    return direction
-
-
 def valid_scan_points(scan: ScanSample) -> Iterable[tuple[float, float]]:
     for index, distance in enumerate(scan.ranges):
         if (
@@ -111,10 +96,15 @@ def evaluate_scan(
 ) -> SafetyDecision:
     required = stopping_clearance(linear_x, config)
     slow_distance = required + config.slow_extra
+    rotation_radius = math.hypot(config.half_length, config.half_width)
     nearest = math.inf
     blocked = Direction.NONE
     slow_scale = 1.0
     valid = 0
+    pure_rotation = abs(linear_x) < 0.02 and abs(angular_z) > 0.05
+    left_path_turn_blocked = False
+    right_path_turn_blocked = False
+    rotation_blocked = False
     for x, y in valid_scan_points(scan):
         if point_inside_footprint(x, y, config):
             continue
@@ -126,21 +116,60 @@ def evaluate_scan(
             half_width=config.half_width,
         )
         nearest = min(nearest, clearance)
-        direction = point_direction(x, y, config)
-        if clearance <= required:
-            blocked |= direction
-        elif clearance < slow_distance and motion_blocked_by_mask(
-            linear_x,
-            angular_z,
-            direction,
+        point_mask = Direction.NONE
+
+        # Translation uses a true swept rectangle. A side wall beyond the
+        # lateral body + margin is not in the forward braking envelope even
+        # when its point happens to have x > the front axle.
+        if x >= config.half_length and abs(y) <= config.half_width + config.side_margin:
+            forward_gap = x - config.half_length
+            if forward_gap <= required:
+                point_mask |= Direction.FRONT
+            elif linear_x > 0 and forward_gap < slow_distance:
+                slow_scale = min(
+                    slow_scale,
+                    max(0.05, (forward_gap - required) / config.slow_extra),
+                )
+        if (
+            x <= -config.half_length
+            and abs(y) <= config.half_width + config.side_margin
         ):
-            # Slow only for geometry in the commanded direction. A close
-            # wall beside or behind the robot must not make clear forward
-            # motion pulse as unrelated scan points move between frames.
-            slow_scale = min(
-                slow_scale,
-                max(0.05, (clearance - required) / config.slow_extra),
-            )
+            rear_gap = -x - config.half_length
+            if rear_gap <= required:
+                point_mask |= Direction.REAR
+            elif linear_x < 0 and rear_gap < slow_distance:
+                slow_scale = min(
+                    slow_scale,
+                    max(0.05, (rear_gap - required) / config.slow_extra),
+                )
+
+        # Rotation is a separate chassis-corner sweep. It is deliberately not
+        # reused as a forward-stop test: a corridor can permit straight travel
+        # while being too narrow for an in-place turn.
+        radial_gap = math.hypot(x, y) - rotation_radius
+        if pure_rotation and radial_gap <= config.rotation_margin:
+            rotation_blocked = True
+            if y > 0:
+                point_mask |= Direction.LEFT
+            elif y < 0:
+                point_mask |= Direction.RIGHT
+            else:
+                point_mask |= Direction.LEFT | Direction.RIGHT
+        if (
+            y >= config.half_width
+            and y - config.half_width <= config.side_margin
+            and -config.half_length <= x <= config.half_length + required
+        ):
+            point_mask |= Direction.LEFT
+            left_path_turn_blocked = True
+        if (
+            y <= -config.half_width
+            and -y - config.half_width <= config.side_margin
+            and -config.half_length <= x <= config.half_length + required
+        ):
+            point_mask |= Direction.RIGHT
+            right_path_turn_blocked = True
+        blocked |= point_mask
 
     if valid == 0:
         return SafetyDecision(True, 0.0, Direction.FRONT | Direction.REAR | Direction.LEFT | Direction.RIGHT, math.inf, "empty_scan")
@@ -148,8 +177,17 @@ def evaluate_scan(
     motion_blocked = (
         (linear_x > 0 and bool(blocked & Direction.FRONT))
         or (linear_x < 0 and bool(blocked & Direction.REAR))
-        or (angular_z > 0 and bool(blocked & (Direction.LEFT | Direction.REAR)))
-        or (angular_z < 0 and bool(blocked & (Direction.RIGHT | Direction.REAR)))
+        or (pure_rotation and rotation_blocked)
+        or (
+            not pure_rotation
+            and angular_z > 0.05
+            and left_path_turn_blocked
+        )
+        or (
+            not pure_rotation
+            and angular_z < -0.05
+            and right_path_turn_blocked
+        )
     )
     return SafetyDecision(
         stop=motion_blocked,

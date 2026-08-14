@@ -104,7 +104,10 @@ def test_global_search_requires_rotation_only_after_explicit_authorization() -> 
     requirement = global_search.index("self.global_search_requires_rotation = True")
     assert guard < requirement
     assert "self.global_search_requires_rotation = True" in global_search
-    assert "self.rotation_angle >= self.global_observation_minimum_rotation" in evidence
+    assert "len(self.localization_heading_bins)" in evidence
+    assert "self.global_minimum_heading_bins" in evidence
+    assert "self.localization_heading_span" in evidence
+    assert "self.global_minimum_heading_span" in evidence
     assert 'self.localization_state = "LOCALIZATION_REQUIRED"' in global_search
 
 
@@ -207,7 +210,9 @@ def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
     assert "self.global_scan_map_threshold" in evidence
     assert "self.scan_map_score >= required_scan_score" in evidence
     assert "self._critical_sensor_time_healthy()" in evidence
-    assert "self.global_observation_minimum_rotation" in evidence
+    assert "self.localization_final_max_median_residual" in evidence
+    assert "self.localization_final_max_p90_residual" in evidence
+    assert "self.global_minimum_heading_bins" in evidence
     assert 'self.localization_state == "VERIFYING"' in tick
     assert "self.localization_ready_hold" in tick
     assert 'self.localized and self.localization_state == "READY"' in tick
@@ -264,11 +269,14 @@ def test_active_but_stationary_navigation_refreshes_amcl_before_pose_expires() -
 
 def test_scan_callback_never_replaces_capture_stamp_with_now() -> None:
     scan = _method_source("_scan_callback", "_sensor_time_callback")
+    transform = _method_source("_scan_transform", "_update_scan_map_match")
     normalizer = (
         Path(__file__).parents[1] / "navigation-stack" / "sensor_normalizer.py"
     ).read_text()
 
     assert "header.stamp" not in scan
+    assert "Time.from_msg(message.header.stamp)" in transform
+    assert 'target_frame' in transform
     assert "SensorClockEstimator" in normalizer
     assert "corrected_nanoseconds" in normalizer
 
@@ -343,5 +351,48 @@ def test_scan_filter_is_used_only_for_global_planning_topic() -> None:
     callback = _method_source("_scan_callback", "_sensor_time_callback")
 
     assert "filter_static_map_scan" in scan
+    assert 'self._scan_transform("map", message)' in scan
+    assert "self.last_amcl_pose" not in scan
+    assert "self.planning_static_match_tolerance" in scan
+    assert "self.localization_coarse_match_tolerance" not in scan
     assert "self.navigation_scan.publish(message)" in callback
     assert "self.planning_scan.publish(self._planning_scan_message(message))" in callback
+
+
+def test_navigation_abort_uses_confirmed_corridor_then_alternate_replan() -> None:
+    result = _method_source("_navigation_result", "_set_recovery_terminal")
+    recover = _method_source("_recover_navigation", "_cancel_navigation")
+    evidence = _method_source("_corridor_failure_evidence", "_mark_failed_segment")
+
+    assert "self._corridor_failure_evidence()" in result
+    assert 'evidence_reason == "CORRIDOR_CLEAR"' in result
+    assert '"INSUFFICIENT_CLEARANCE", "CONFIRMED_FRONT_OBSTACLE"' in result
+    assert "self.corridor_confirmation_samples" in evidence
+    assert "self.corridor_confirmation_duration" in evidence
+    assert "self._request_path_once(goal)" in recover
+    assert "self._path_crosses_segment(alternative, segment)" in recover
+    assert '"BLOCKED", "NO_ALTERNATIVE_ROUTE"' in recover
+
+
+def test_navigation_debug_events_cover_new_geometry_and_recovery_sources() -> None:
+    for event in (
+        '"LOCALIZATION_VERIFY"',
+        '"CORRIDOR"',
+        '"STOP"',
+        '"FAILED_SEGMENT"',
+        '"REPLAN"',
+    ):
+        assert event in ADAPTER_SOURCE
+    assert '"/safety/stop_source"' in ADAPTER_SOURCE
+    assert '"/navigation/failed_segment_mask"' in ADAPTER_SOURCE
+
+
+def test_failed_segment_ttl_clears_only_the_dedicated_mask() -> None:
+    tick = _method_source("_failed_segment_tick", "_corridor_failure_evidence")
+    publish = _method_source("_publish_failed_segments", "_failed_segment_tick")
+
+    assert "ClearEntireCostmap" not in tick
+    assert "ClearEntireCostmap" not in publish
+    assert "self._publish_failed_segments()" in tick
+    assert "message.data = [0] * (width * height)" in publish
+    assert '"/map", self._map_callback, transient_map_qos' in ADAPTER_SOURCE

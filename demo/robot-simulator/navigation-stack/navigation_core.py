@@ -218,6 +218,10 @@ class ScanMapMatch:
     score: float
     matched_beams: int
     valid_beams: int
+    residual_beams: int
+    median_residual: float
+    p90_residual: float
+    mean_residual: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +231,122 @@ class PlanningScanFilter:
     valid_beams: int
     static_map_matches: int
     dynamic_points_kept: int
+    raycast_unavailable: int
+
+
+@dataclass(frozen=True, slots=True)
+class HeadingDiversity:
+    observed_bins: tuple[int, ...]
+    span_radians: float
+
+
+@dataclass(frozen=True, slots=True)
+class CorridorAssessment:
+    left_clearance: float
+    right_clearance: float
+    available_width: float
+    required_width: float
+    front_clearance: float
+    can_go_straight: bool
+    can_rotate: bool
+
+
+def heading_diversity(
+    headings: Iterable[float],
+    *,
+    bin_count: int = 8,
+) -> HeadingDiversity:
+    """Summarize independent physical scan headings on a circle."""
+    count = max(1, int(bin_count))
+    normalized = [float(value) % (2.0 * math.pi) for value in headings]
+    bins = tuple(sorted({
+        min(count - 1, int(value / (2.0 * math.pi) * count))
+        for value in normalized
+    }))
+    span = 0.0
+    for left in normalized:
+        for right in normalized:
+            span = max(
+                span,
+                abs(math.atan2(math.sin(left - right), math.cos(left - right))),
+            )
+    return HeadingDiversity(bins, span)
+
+
+def evaluate_corridor(
+    points: Iterable[tuple[float, float]],
+    *,
+    half_length: float,
+    half_width: float,
+    side_margin: float,
+    front_clearance_required: float,
+    lookahead: float = 0.80,
+    rotation_margin: float | None = None,
+) -> CorridorAssessment:
+    """Evaluate straight and in-place-rotation envelopes independently.
+
+    Points are expressed in a frame whose +X axis follows the immediate path.
+    Side walls constrain width, while only points inside the forward swept
+    rectangle constrain forward braking. This distinction is what lets a
+    physically valid corridor remain traversable without weakening collision
+    safety for an object in the path.
+    """
+    length = max(0.0, float(half_length))
+    width = max(0.0, float(half_width))
+    margin = max(0.0, float(side_margin))
+    forward_required = max(0.0, float(front_clearance_required))
+    forward_limit = length + max(forward_required, float(lookahead))
+    values = [
+        (float(x), float(y))
+        for x, y in points
+        if math.isfinite(float(x)) and math.isfinite(float(y))
+        and not (abs(float(x)) < length and abs(float(y)) < width)
+    ]
+
+    side_window = [
+        (x, y) for x, y in values
+        if -length <= x <= forward_limit
+    ]
+    left_center = min((y for _, y in side_window if y >= width), default=math.inf)
+    right_center = min((-y for _, y in side_window if y <= -width), default=math.inf)
+    left_clearance = (
+        max(0.0, left_center - width) if math.isfinite(left_center) else math.inf
+    )
+    right_clearance = (
+        max(0.0, right_center - width) if math.isfinite(right_center) else math.inf
+    )
+    available_width = (
+        left_center + right_center
+        if math.isfinite(left_center) and math.isfinite(right_center)
+        else math.inf
+    )
+    required_width = 2.0 * width + 2.0 * margin
+
+    front_clearance = min(
+        (
+            x - length
+            for x, y in values
+            if x >= length and abs(y) <= width + margin
+        ),
+        default=math.inf,
+    )
+    side_clear = left_clearance >= margin and right_clearance >= margin
+    can_go_straight = side_clear and front_clearance > forward_required
+
+    rotate_margin = margin if rotation_margin is None else max(
+        0.0, float(rotation_margin)
+    )
+    rotation_radius = math.hypot(length, width) + rotate_margin
+    nearest_radius = min((math.hypot(x, y) for x, y in values), default=math.inf)
+    return CorridorAssessment(
+        left_clearance=left_clearance,
+        right_clearance=right_clearance,
+        available_width=available_width,
+        required_width=required_width,
+        front_clearance=front_clearance,
+        can_go_straight=can_go_straight,
+        can_rotate=nearest_radius > rotation_radius,
+    )
 
 
 def environment_flag(name: str, default: bool = False) -> bool:
@@ -343,11 +463,11 @@ def filter_static_map_scan(
     laser_x: float,
     laser_y: float,
     laser_yaw: float,
-    endpoint_tolerance: float,
+    expected_range_tolerance: float,
     minimum_usable_range: float = 0.20,
     maximum_usable_range: float = 6.0,
 ) -> PlanningScanFilter:
-    """Mask saved-wall endpoints only in the scan consumed by global planning.
+    """Mask only beams whose measured range agrees with a saved-map raycast.
 
     Infinite ranges remain clearing rays when the global ObstacleLayer enables
     ``inf_is_valid``. AMCL, the local costmap and motion safety retain the
@@ -358,7 +478,8 @@ def filter_static_map_scan(
     upper = min(float(range_max), float(maximum_usable_range))
     valid = 0
     static_matches = 0
-    for index, _, endpoint_x, endpoint_y in _scan_endpoints(
+    raycast_unavailable = 0
+    for index, distance, _, _ in _scan_endpoints(
         output,
         angle_min=float(angle_min),
         angle_increment=float(angle_increment),
@@ -369,9 +490,20 @@ def filter_static_map_scan(
         laser_yaw=float(laser_yaw),
     ):
         valid += 1
-        if saved_map.occupied_within(
-            endpoint_x, endpoint_y, float(endpoint_tolerance)
-        ):
+        angle = float(laser_yaw) + float(angle_min) + index * float(angle_increment)
+        expected = saved_map.raycast_static_range(
+            float(laser_x),
+            float(laser_y),
+            angle,
+            minimum_range=lower,
+            maximum_range=upper,
+        )
+        if expected is None:
+            # Unknown/out-of-map rays are not evidence that a physical return
+            # is static. Keeping it is the fail-safe outcome.
+            raycast_unavailable += 1
+            continue
+        if abs(distance - expected) <= float(expected_range_tolerance):
             output[index] = math.inf
             static_matches += 1
     return PlanningScanFilter(
@@ -380,6 +512,7 @@ def filter_static_map_scan(
         valid_beams=valid,
         static_map_matches=static_matches,
         dynamic_points_kept=max(0, valid - static_matches),
+        raycast_unavailable=raycast_unavailable,
     )
 
 
@@ -421,15 +554,16 @@ def scan_to_map_match(
     maximum_usable_range: float = 6.0,
     endpoint_tolerance: float = 0.12,
 ) -> ScanMapMatch:
-    """Compare a bounded sample of scan endpoints with occupied map cells."""
+    """Compare scan endpoints and retain their actual map residuals."""
     measurements = list(ranges)
     if not measurements:
-        return ScanMapMatch(0.0, 0, 0)
+        return ScanMapMatch(0.0, 0, 0, 0, math.inf, math.inf, math.inf)
     step = max(1, math.ceil(len(measurements) / max(1, int(maximum_beams))))
     lower = max(float(range_min), float(minimum_usable_range))
     upper = min(float(range_max), float(maximum_usable_range))
     matched = 0
     valid = 0
+    residuals: list[float] = []
     for _, _, endpoint_x, endpoint_y in _scan_endpoints(
         measurements,
         angle_min=angle_min,
@@ -442,18 +576,25 @@ def scan_to_map_match(
         step=step,
     ):
         valid += 1
-        if saved_map.occupied_within(endpoint_x, endpoint_y, endpoint_tolerance):
+        residual = saved_map.nearest_occupied_distance(
+            endpoint_x,
+            endpoint_y,
+            maximum_distance=float(endpoint_tolerance),
+        )
+        if residual is not None:
             matched += 1
+            residuals.append(residual)
+    ordered = sorted(residuals)
+    p90_index = max(0, math.ceil(0.9 * len(ordered)) - 1)
     return ScanMapMatch(
         score=0.0 if valid == 0 else round(matched / valid, 4),
         matched_beams=matched,
         valid_beams=valid,
+        residual_beams=len(ordered),
+        median_residual=(statistics.median(ordered) if ordered else math.inf),
+        p90_residual=(ordered[p90_index] if ordered else math.inf),
+        mean_residual=(statistics.fmean(ordered) if ordered else math.inf),
     )
-
-
-def navigation_abort_state(recoveries: int) -> str:
-    """Classify an exhausted Nav2 action without hiding technical failures."""
-    return "BLOCKED" if max(0, int(recoveries)) > 0 else "FAILED"
 
 
 def rotation_swept_clearance(
@@ -596,11 +737,24 @@ class SavedOccupancyMap:
 
     def occupied_within(self, x: float, y: float, distance_m: float) -> bool:
         """Return whether a saved occupied cell already explains a live hit."""
+        return self.nearest_occupied_distance(
+            x, y, maximum_distance=distance_m
+        ) is not None
+
+    def nearest_occupied_distance(
+        self,
+        x: float,
+        y: float,
+        *,
+        maximum_distance: float,
+    ) -> float | None:
+        """Return metric endpoint residual to the nearest occupied cell."""
         cell = self.world_to_cell(x, y)
-        if cell is None or distance_m < 0:
-            return False
+        if cell is None or maximum_distance < 0:
+            return None
         column, row = cell
-        radius = math.ceil(distance_m / self.resolution)
+        radius = math.ceil(maximum_distance / self.resolution)
+        nearest = math.inf
         for offset_y in range(-radius, radius + 1):
             for offset_x in range(-radius, radius + 1):
                 check_column = column + offset_x
@@ -611,12 +765,57 @@ class SavedOccupancyMap:
                 ):
                     continue
                 center_x, center_y = self.cell_center(check_column, check_row)
+                distance = math.hypot(center_x - x, center_y - y)
                 if (
-                    math.hypot(center_x - x, center_y - y) <= distance_m
+                    distance <= maximum_distance
                     and self.value_at(check_column, check_row) >= 65
                 ):
-                    return True
-        return False
+                    nearest = min(nearest, distance)
+        return nearest if math.isfinite(nearest) else None
+
+    def raycast_static_range(
+        self,
+        x: float,
+        y: float,
+        angle: float,
+        *,
+        minimum_range: float,
+        maximum_range: float,
+    ) -> float | None:
+        """Return expected range to the first known occupied map cell.
+
+        Reaching unknown space or leaving the map before an occupied cell is
+        deliberately inconclusive so callers retain the live obstacle point.
+        """
+        lower = max(0.0, float(minimum_range))
+        upper = max(lower, float(maximum_range))
+        # Half-cell sampling cannot skip a grid cell along either axis and
+        # keeps the per-scan raycast bounded on the Pi.
+        step = max(0.005, self.resolution * 0.5)
+        cosine, sine = math.cos(angle), math.sin(angle)
+        distance = lower
+        visited: set[tuple[int, int]] = set()
+        while distance <= upper:
+            cell = self.world_to_cell(
+                float(x) + distance * cosine,
+                float(y) + distance * sine,
+            )
+            if cell is None:
+                return None
+            if cell not in visited:
+                visited.add(cell)
+                value = self.value_at(*cell)
+                if value < 0:
+                    return None
+                if value >= 65:
+                    center_x, center_y = self.cell_center(*cell)
+                    projected = (
+                        (center_x - float(x)) * cosine
+                        + (center_y - float(y)) * sine
+                    )
+                    return max(lower, projected)
+            distance += step
+        return None
 
     def segment_crosses_unknown(
         self,

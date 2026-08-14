@@ -3,9 +3,14 @@ rovera_motion_safety:
     # Chỉ bật/tắt lớp tránh vật cản hình học dùng dữ liệu /scan. Khi tắt,
     # E-stop, cliff/bumper/range, watchdog lệnh và các topic chặn bên ngoài
     # /rovera/obstacle_stop + /rovera/obstacle_directions vẫn hoạt động.
-    lidar_obstacle_avoidance_enabled: false
+    lidar_obstacle_avoidance_enabled: true
     half_length: 0.20
     half_width: 0.18
+    # Side walls are compared with this lateral envelope, not with the longer
+    # forward braking distance. A centered 0.36 m robot therefore remains
+    # traversable in a 0.72 m corridor while a point in its swept path stops it.
+    side_margin: 0.06
+    rotation_margin: 0.04
     clearance: 0.10
     slow_extra: 0.20
     latency: 0.12

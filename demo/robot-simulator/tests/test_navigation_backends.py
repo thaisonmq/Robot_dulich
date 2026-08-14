@@ -280,6 +280,44 @@ async def test_ros2_backend_requests_safe_mode_switch_before_map_load(
 
 
 @pytest.mark.asyncio
+async def test_ros2_backend_surfaces_mode_supervisor_fault_immediately(
+    tmp_path, monkeypatch
+) -> None:
+    marker = tmp_path / "mode-request.json"
+    backend = Ros2NavigationBackend(
+        str(tmp_path / "navigation.sock"),
+        mode_request_path=str(marker),
+        mode_switch_timeout_seconds=30,
+    )
+
+    async def old_adapter(command: str, payload: dict, timeout: float) -> dict:
+        del payload, timeout
+        assert command == "system.status"
+        return {
+            "status": "completed",
+            "state": {"mode": "MAPPING", "state": "MAPPING", "nav2": "MAPPING"},
+        }
+
+    async def publish_fault(_: float) -> None:
+        request = json.loads(marker.read_text())
+        marker.with_name("mode-status.json").write_text(json.dumps({
+            "request_id": request["request_id"],
+            "mode": "NAVIGATION",
+            "status": "FAULT",
+            "error": "managed-motion base authority is unsafe",
+        }))
+
+    monkeypatch.setattr(backend, "_call_adapter", old_adapter)
+    monkeypatch.setattr("simulator.navigation_backends.asyncio.sleep", publish_fault)
+
+    with pytest.raises(NavigationBackendError) as captured:
+        await backend.execute("map.relocalize", {"expected_state": "READY"})
+
+    assert captured.value.code == "MODE_SWITCH_FAILED"
+    assert "base authority is unsafe" in str(captured.value)
+
+
+@pytest.mark.asyncio
 async def test_mapping_finish_requests_navigation_without_waiting(
     tmp_path, monkeypatch
 ) -> None:
@@ -367,7 +405,7 @@ def test_mode_supervisor_idle_stops_both_ros_authorities(tmp_path, monkeypatch) 
     spec.loader.exec_module(module)
     calls: list[tuple[tuple[str, ...], str]] = []
 
-    monkeypatch.setattr(module, "vendor_base_runtime_count", lambda: 1)
+    monkeypatch.setattr(module, "validate_base_runtime", lambda: "managed-motion")
     monkeypatch.setattr(module, "adapter_status", lambda: (_ for _ in ()).throw(OSError()))
     monkeypatch.setattr(
         module,
@@ -389,3 +427,60 @@ def test_mode_supervisor_idle_stops_both_ros_authorities(tmp_path, monkeypatch) 
         (("stop", "navigation-stack"), "navigation"),
         (("stop", "mapping-stack"), "legacy-coexistence"),
     ]
+
+
+def test_mode_supervisor_accepts_guarded_managed_motion_without_vendor(
+    tmp_path, monkeypatch
+) -> None:
+    project_dir = Path(__file__).parents[1]
+    monkeypatch.setenv("ROVERA_PROJECT_DIR", str(project_dir))
+    monkeypatch.setenv("ROVERA_STATE_DIR", str(tmp_path))
+    script = project_dir / "scripts" / "mode_supervisor.py"
+    spec = importlib.util.spec_from_file_location("managed_mode_supervisor", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    values = {
+        "ROVERA_CONTROL_MODE": "managed-motion",
+        "ROVERA_CMD_VEL_MODE": "exclusive",
+        "ROVERA_EXCLUSIVE_CMD_VEL_ACK": module.REQUIRED_EXCLUSIVE_ACK,
+    }
+    monkeypatch.setattr(module, "configured_value", values.get)
+    monkeypatch.setattr(module, "runtime_process_counts", lambda: {
+        "vendor_base": 0,
+        "serial_agent": 1,
+        "managed_bridge": 1,
+        "motion_safety": 1,
+    })
+
+    assert module.validate_base_runtime() == "managed-motion"
+
+
+def test_mode_supervisor_rejects_managed_motion_without_safety(
+    tmp_path, monkeypatch
+) -> None:
+    project_dir = Path(__file__).parents[1]
+    monkeypatch.setenv("ROVERA_PROJECT_DIR", str(project_dir))
+    monkeypatch.setenv("ROVERA_STATE_DIR", str(tmp_path))
+    script = project_dir / "scripts" / "mode_supervisor.py"
+    spec = importlib.util.spec_from_file_location("unsafe_mode_supervisor", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    values = {
+        "ROVERA_CONTROL_MODE": "managed-motion",
+        "ROVERA_CMD_VEL_MODE": "exclusive",
+        "ROVERA_EXCLUSIVE_CMD_VEL_ACK": module.REQUIRED_EXCLUSIVE_ACK,
+    }
+    monkeypatch.setattr(module, "configured_value", values.get)
+    monkeypatch.setattr(module, "runtime_process_counts", lambda: {
+        "vendor_base": 0,
+        "serial_agent": 1,
+        "managed_bridge": 1,
+        "motion_safety": 0,
+    })
+
+    with pytest.raises(RuntimeError, match="motion_safety=0"):
+        module.validate_base_runtime()

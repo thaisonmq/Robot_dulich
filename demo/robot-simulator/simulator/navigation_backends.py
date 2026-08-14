@@ -268,6 +268,14 @@ class Ros2NavigationBackend:
         os.replace(temporary, self.mode_request_path)
         return str(request["request_id"])
 
+    def _read_mode_status(self) -> dict[str, Any]:
+        status_path = self.mode_request_path.with_name("mode-status.json")
+        try:
+            value = json.loads(status_path.read_text())
+        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
     async def _wait_for_idle(self, command: str) -> None:
         request_id = await asyncio.to_thread(self._write_mode_request, "IDLE", command)
         status_path = self.mode_request_path.with_name("mode-status.json")
@@ -334,10 +342,26 @@ class Ros2NavigationBackend:
                 return False
         except (OSError, asyncio.TimeoutError, NavigationBackendError):
             current_mode = ""
-        await asyncio.to_thread(self._write_mode_request, required, command)
+        request_id = await asyncio.to_thread(
+            self._write_mode_request, required, command
+        )
         deadline = time.monotonic() + self.mode_switch_timeout_seconds
         while time.monotonic() < deadline:
             await asyncio.sleep(0.5)
+            supervisor = await asyncio.to_thread(self._read_mode_status)
+            if str(supervisor.get("request_id", "")) == request_id:
+                if str(supervisor.get("status", "")).upper() == "FAULT":
+                    state = dict(supervisor.get("state") or {})
+                    if state:
+                        self._state.update(state)
+                    raise NavigationBackendError(
+                        "MODE_SWITCH_FAILED",
+                        str(
+                            supervisor.get("error")
+                            or f"Failed to switch ROS runtime to {required}"
+                        ),
+                        current_state=str(self._state.get("state", "FAULT")),
+                    )
             try:
                 status = await self._call_adapter("system.status", {}, 3.0)
             except (OSError, asyncio.TimeoutError, NavigationBackendError):

@@ -28,9 +28,11 @@ class MotionSafetyNode(Node):
         self.declare_parameter("scan_timeout", 0.28)
         self.declare_parameter("clear_hysteresis", 0.40)
         self.declare_parameter("lidar_obstacle_avoidance_enabled", True)
-        self.declare_parameter("half_length", 0.15)
-        self.declare_parameter("half_width", 0.05)
+        self.declare_parameter("half_length", 0.20)
+        self.declare_parameter("half_width", 0.18)
         self.declare_parameter("clearance", 0.10)
+        self.declare_parameter("side_margin", 0.06)
+        self.declare_parameter("rotation_margin", 0.04)
         self.declare_parameter("slow_extra", 0.20)
         self.declare_parameter("latency", 0.12)
         self.declare_parameter("braking_acceleration", 0.35)
@@ -38,6 +40,8 @@ class MotionSafetyNode(Node):
             half_length=float(self.get_parameter("half_length").value),
             half_width=float(self.get_parameter("half_width").value),
             clearance=float(self.get_parameter("clearance").value),
+            side_margin=float(self.get_parameter("side_margin").value),
+            rotation_margin=float(self.get_parameter("rotation_margin").value),
             slow_extra=float(self.get_parameter("slow_extra").value),
             latency_seconds=float(self.get_parameter("latency").value),
             braking_acceleration=float(self.get_parameter("braking_acceleration").value),
@@ -51,6 +55,7 @@ class MotionSafetyNode(Node):
         self.stop_state = self.create_publisher(Bool, "/safety/stop", 1)
         self.direction_state = self.create_publisher(UInt8, "/safety/directional_mask", 1)
         self.health = self.create_publisher(String, "/safety/health", 1)
+        self.stop_source = self.create_publisher(String, "/safety/stop_source", 1)
         self.manual_takeover = self.create_publisher(Bool, "/safety/manual_takeover", 1)
         self.create_subscription(Twist, "/cmd_vel_smoothed", self._on_command, 1)
         self.create_subscription(Twist, "/cmd_vel_joy", self._on_joy, 1)
@@ -189,6 +194,19 @@ class MotionSafetyNode(Node):
             else f"FAULT:{reason}"
         )
         self.health.publish(String(data=status))
+        sources = {
+            "obstacle": "MOTION_SAFETY",
+            "external_obstacle": "EXTERNAL_OBSTACLE_STOP",
+            "external_direction": "EXTERNAL_OBSTACLE_DIRECTION",
+            "estop": "EMERGENCY_STOP",
+            "cliff": "CLIFF",
+            "bumper": "BUMPER",
+            "range": "RANGE_SENSOR",
+            "scan_timeout": "SCAN_TIMEOUT",
+            "command_timeout": "COMMAND_TIMEOUT",
+            "clear_hysteresis": "MOTION_SAFETY_HYSTERESIS",
+        }
+        self.stop_source.publish(String(data=sources.get(reason, reason.upper())))
 
     def _tick(self) -> None:
         now = time.monotonic()
@@ -231,6 +249,7 @@ class MotionSafetyNode(Node):
             self.stop_state.publish(Bool(data=False))
             self.direction_state.publish(UInt8(data=int(self.external_directions)))
             self.health.publish(String(data="HEALTHY:LIDAR_AVOIDANCE_DISABLED"))
+            self.stop_source.publish(String(data="NONE"))
             return
         if self.scan is None or now - self.last_scan > self.config.scan_timeout_seconds:
             self.hysteresis.update(True, now)
@@ -255,6 +274,7 @@ class MotionSafetyNode(Node):
             UInt8(data=int(decision.blocked | self.external_directions))
         )
         self.health.publish(String(data="HEALTHY"))
+        self.stop_source.publish(String(data="NONE"))
 
 
 def main() -> None:

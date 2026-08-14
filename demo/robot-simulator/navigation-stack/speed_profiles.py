@@ -413,10 +413,7 @@ def render_behavior_tree(profile: AutoNavigationSpeedProfile) -> str:
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="4" name="NavigateRecovery">
       <Sequence name="NavigateWithStablePath">
-        <RecoveryNode number_of_retries="1" name="ComputePathToPose">
-          <ComputePathToPose goal="{{goal}}" path="{{path}}" planner_id="GridBased"/>
-          <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
-        </RecoveryNode>
+        <ComputePathToPose goal="{{goal}}" path="{{path}}" planner_id="GridBased"/>
         <!-- A failed path returns directly to the outer recovery. Retrying the
              identical path after only a local clear made the rotation shim
              align twice to a route which RPP had already rejected. -->
@@ -425,10 +422,9 @@ def render_behavior_tree(profile: AutoNavigationSpeedProfile) -> str:
       <ReactiveFallback name="RecoveryFallback">
         <GoalUpdated/>
         <RoundRobin name="BoundedRecoveryActions">
-          <Sequence name="ClearingActions">
-            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
-            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
-          </Sequence>
+          <!-- Do not erase confirmed live obstacles. The adapter diagnoses
+               corridor geometry after bounded recovery and adds a temporary
+               global keepout before requesting an alternate path. -->
           <Wait wait_duration="{recovery_wait_seconds}"/>
           <!-- Two individually bounded retreats let a robot that stopped too
                close to an obstacle regain enough planning clearance. A new

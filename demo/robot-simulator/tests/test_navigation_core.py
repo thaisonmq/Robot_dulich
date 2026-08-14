@@ -16,10 +16,11 @@ from navigation_core import (  # noqa: E402
     SensorClockEstimator,
     classify_planning_failure,
     compact_lethal_cells,
+    evaluate_corridor,
     filter_static_map_scan,
+    heading_diversity,
     localization_confidence,
     mask_scan_self_returns,
-    navigation_abort_state,
     pose_stability,
     rotation_swept_clearance,
     scan_to_map_match,
@@ -75,29 +76,59 @@ def test_goal_validation_preserves_occupied_unknown_clearance_and_dynamic_cells(
 
 
 def test_global_planning_scan_filters_saved_corridor_walls_but_keeps_new_object() -> None:
-    occupancy = [0] * (30 * 30)
-    occupancy[6 * 30 + 10] = 100
-    occupancy[14 * 30 + 10] = 100
-    saved = SavedOccupancyMap(30, 30, 0.1, 0, 0, 0, occupancy)
+    occupancy = [0] * (40 * 20)
+    for row in range(20):
+        occupancy[row * 40 + 24] = 100
+    saved = SavedOccupancyMap(40, 20, 0.05, 0, 0, 0, occupancy)
 
-    filtered = filter_static_map_scan(
+    static = filter_static_map_scan(
         saved,
-        [0.4, 0.5, 0.4],
-        angle_min=-math.pi / 2,
-        angle_increment=math.pi / 2,
+        [1.18],
+        angle_min=0.0,
+        angle_increment=0.0,
         range_min=0.1,
         range_max=8.0,
-        laser_x=1.05,
-        laser_y=1.05,
+        laser_x=0.025,
+        laser_y=0.525,
         laser_yaw=0.0,
-        endpoint_tolerance=0.08,
+        expected_range_tolerance=0.08,
+    )
+    dynamic = filter_static_map_scan(
+        saved,
+        [0.95],
+        angle_min=0.0,
+        angle_increment=0.0,
+        range_min=0.1,
+        range_max=8.0,
+        laser_x=0.025,
+        laser_y=0.525,
+        laser_yaw=0.0,
+        expected_range_tolerance=0.08,
     )
 
-    assert filtered.static_map_matches == 2
-    assert filtered.dynamic_points_kept == 1
-    assert math.isinf(filtered.ranges[0])
-    assert filtered.ranges[1] == 0.5  # New chair/obstacle in mapped free space.
-    assert math.isinf(filtered.ranges[2])
+    assert static.static_map_matches == 1
+    assert math.isinf(static.ranges[0])
+    assert dynamic.static_map_matches == 0
+    assert dynamic.dynamic_points_kept == 1
+    assert dynamic.ranges[0] == 0.95  # New object protrudes before saved wall.
+
+
+def test_static_filter_keeps_beam_when_raycast_is_unknown() -> None:
+    saved = SavedOccupancyMap(10, 10, 0.1, 0, 0, 0, [0] * 100)
+    filtered = filter_static_map_scan(
+        saved,
+        [0.5],
+        angle_min=0.0,
+        angle_increment=0.0,
+        range_min=0.1,
+        range_max=8.0,
+        laser_x=0.55,
+        laser_y=0.55,
+        laser_yaw=0.0,
+        expected_range_tolerance=0.08,
+    )
+    assert filtered.ranges == [0.5]
+    assert filtered.raycast_unavailable == 1
 
 
 def test_physical_footprint_still_rejects_a_genuinely_too_narrow_corridor() -> None:
@@ -441,6 +472,99 @@ def test_scan_map_match_distinguishes_correct_and_wrong_pose() -> None:
     assert wrong.score == 0.0
 
 
+def test_scan_map_residual_rejects_offset_hidden_by_coarse_score() -> None:
+    occupancy = [0] * (300 * 30)
+    for row in range(30):
+        occupancy[row * 300 + 200] = 100
+    saved = SavedOccupancyMap(300, 30, 0.01, 0.0, 0.0, 0.0, occupancy)
+    common = {
+        "angle_min": 0.0,
+        "angle_increment": 0.0,
+        "range_min": 0.1,
+        "range_max": 8.0,
+        "laser_x": 1.0,
+        "laser_y": 0.155,
+        "laser_yaw": 0.0,
+        "maximum_beams": 4,
+        "endpoint_tolerance": 0.12,
+    }
+    good = scan_to_map_match(saved, [0.98, 0.97, 0.96, 0.95], **common)
+    offset = scan_to_map_match(saved, [0.90, 0.91, 0.92, 0.93], **common)
+
+    assert good.score == offset.score == 1.0
+    assert good.median_residual < 0.05
+    assert good.p90_residual < 0.07
+    assert offset.median_residual > 0.07
+    assert offset.p90_residual > 0.07
+
+
+def test_force_rescan_heading_diversity_rejects_a_thirty_degree_cluster() -> None:
+    clustered = heading_diversity(
+        map(math.radians, [0, 10, 20, 30]), bin_count=8
+    )
+    diverse = heading_diversity(
+        map(math.radians, [0, 60, 120, 180]), bin_count=8
+    )
+    assert len(clustered.observed_bins) < 4
+    assert math.degrees(clustered.span_radians) == pytest.approx(30)
+    assert len(diverse.observed_bins) >= 4
+    assert math.degrees(diverse.span_radians) == pytest.approx(180)
+
+
+def test_corridor_geometry_separates_straight_and_rotation_clearance() -> None:
+    walls_72cm = [
+        (x, side)
+        for x in (-0.2, 0.0, 0.2, 0.5)
+        for side in (-0.36, 0.36)
+    ]
+    wide = evaluate_corridor(
+        walls_72cm,
+        half_length=0.20,
+        half_width=0.18,
+        side_margin=0.06,
+        front_clearance_required=0.20,
+    )
+    assert wide.available_width == pytest.approx(0.72)
+    assert wide.required_width == pytest.approx(0.48)
+    assert wide.can_go_straight
+
+    walls_55cm = [
+        (x, side)
+        for x in (-0.2, 0.0, 0.2, 0.5)
+        for side in (-0.275, 0.275)
+    ]
+    narrow_rotation = evaluate_corridor(
+        walls_55cm,
+        half_length=0.20,
+        half_width=0.18,
+        side_margin=0.04,
+        front_clearance_required=0.20,
+    )
+    assert narrow_rotation.can_go_straight
+    assert not narrow_rotation.can_rotate
+
+
+def test_corridor_geometry_blocks_true_narrow_or_front_obstacle() -> None:
+    too_narrow = evaluate_corridor(
+        [(0.0, -0.21), (0.0, 0.21)],
+        half_length=0.20,
+        half_width=0.18,
+        side_margin=0.04,
+        front_clearance_required=0.20,
+    )
+    front_blocked = evaluate_corridor(
+        [(0.0, -0.36), (0.0, 0.36), (0.35, 0.0)],
+        half_length=0.20,
+        half_width=0.18,
+        side_margin=0.06,
+        front_clearance_required=0.20,
+    )
+    assert too_narrow.available_width < too_narrow.required_width
+    assert not too_narrow.can_go_straight
+    assert front_blocked.front_clearance == pytest.approx(0.15)
+    assert not front_blocked.can_go_straight
+
+
 def test_dynamic_obstacle_payload_is_metric_and_bounded() -> None:
     message = SimpleNamespace(
         info=SimpleNamespace(
@@ -464,12 +588,6 @@ def test_saved_static_hits_can_be_removed_from_dynamic_overlay(tmp_path: Path) -
     assert saved.occupied_within(*occupied, 0.05)
     assert saved.occupied_within(occupied[0] + 0.08, occupied[1], 0.10)
     assert not saved.occupied_within(*free, 0.05)
-
-
-def test_navigation_abort_is_blocked_only_after_bounded_recovery() -> None:
-    assert navigation_abort_state(0) == "FAILED"
-    assert navigation_abort_state(1) == "BLOCKED"
-    assert navigation_abort_state(6) == "BLOCKED"
 
 
 def test_rotation_clearance_uses_the_complete_rectangular_body_sweep() -> None:
@@ -512,6 +630,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     smoother = yaml.safe_load(
         (project / "motion-safety/config/velocity_smoother.yaml").read_text()
     )
+    safety = yaml.safe_load(
+        (project / "motion-safety/config/safety.yaml").read_text()
+    )["rovera_motion_safety"]["ros__parameters"]
     controller = navigation["controller_server"]["ros__parameters"]
     follow = controller["FollowPath"]
     planner = navigation["planner_server"]["ros__parameters"]["GridBased"]
@@ -573,7 +694,16 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert global_costmap["obstacle_layer"]["scan"]["observation_persistence"] == 0.0
     assert global_costmap["obstacle_layer"]["scan"]["topic"] == "/scan_planning"
     assert global_costmap["obstacle_layer"]["scan"]["inf_is_valid"] is True
+    assert global_costmap["obstacle_layer"]["observation_sources"] == "scan"
+    assert "failed_segment_layer" in global_costmap["plugins"]
+    failed_layer = global_costmap["failed_segment_layer"]
+    assert failed_layer["plugin"] == "nav2_costmap_2d::StaticLayer"
+    assert failed_layer["map_topic"] == "/navigation/failed_segment_mask"
+    assert failed_layer["map_subscribe_transient_local"] is True
+    assert failed_layer["use_maximum"] is True
+    assert failed_layer["footprint_clearing_enabled"] is False
     assert local_costmap["obstacle_layer"]["scan"]["topic"] == "/scan_navigation"
+    assert local_costmap["obstacle_layer"]["observation_sources"] == "scan"
     assert 10.0 <= controller["controller_frequency"] <= local_costmap["update_frequency"]
     assert limits["smoothing_frequency"] >= controller["controller_frequency"]
     assert abs(limits["max_decel"][0]) >= 0.5
@@ -582,6 +712,10 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert localization["footprint_half_width"] == 0.18
     assert localization["localization_rotation_minimum_obstacle_distance"] == -0.07
     assert localization["planning_footprint_padding"] == global_costmap["footprint_padding"]
+    assert safety["lidar_obstacle_avoidance_enabled"] is True
+    assert safety["half_length"] == localization["footprint_half_length"]
+    assert safety["half_width"] == localization["footprint_half_width"]
+    assert safety["side_margin"] == localization["corridor_side_margin"]
     # The complete measured footprint is the single source of truth.
     expected_collision_footprint = (
         "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
@@ -593,6 +727,17 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert localization["scan_map_maximum_beams"] <= 120
     assert localization["scan_map_minimum_score"] > 0
     assert localization["localization_global_scan_map_minimum_score"] >= 0.75
+    assert localization["localization_coarse_match_tolerance"] > localization[
+        "localization_final_max_median_residual"
+    ]
+    assert localization["localization_final_max_p90_residual"] < localization[
+        "localization_coarse_match_tolerance"
+    ]
+    assert localization["planning_static_match_tolerance"] != localization[
+        "localization_coarse_match_tolerance"
+    ]
+    assert localization["localization_global_min_heading_bins"] >= 4
+    assert localization["localization_global_min_heading_span_degrees"] >= 180
     assert localization["auto_localization_max_angle_degrees"] >= 360.0
     assert navigation["amcl"]["ros__parameters"]["max_particles"] >= 3000
     assert navigation["amcl"]["ros__parameters"]["max_beams"] >= 90
@@ -729,6 +874,7 @@ def test_custom_behavior_trees_keep_path_until_bounded_recovery(tmp_path: Path) 
     spins = fast_root.findall(".//Spin")
     follow_recovery = fast_root.find(".//RecoveryNode[@name='FollowPath']")
     recovery = fast_root.find(".//RecoveryNode[@name='NavigateRecovery']")
+    clears = fast_root.findall(".//ClearEntireCostmap")
     assert stable_sequence is not None
     assert rate is None
     assert len(planners) == 1
@@ -739,6 +885,7 @@ def test_custom_behavior_trees_keep_path_until_bounded_recovery(tmp_path: Path) 
     ]
     assert spins == []
     assert follow_recovery is None
+    assert clears == []
     assert recovery is not None and recovery.attrib["number_of_retries"] == "4"
 
 

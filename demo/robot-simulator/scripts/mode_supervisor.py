@@ -26,6 +26,7 @@ STATUS_PATH = STATE_DIR / "navigation" / "mode-status.json"
 SOCKET_PATH = STATE_DIR / "navigation" / "navigation.sock"
 LOCK_PATH = STATE_DIR / "navigation" / "mode-supervisor.lock"
 POLL_SECONDS = 0.25
+REQUIRED_EXCLUSIVE_ACK = "I_ACCEPT_EXCLUSIVE_CMD_VEL_OWNERSHIP"
 
 
 def run(*args: str, timeout: float = 90.0, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -58,16 +59,101 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def vendor_base_runtime_count() -> int:
+def configured_value(name: str) -> str:
+    """Read deployment mode from the service environment or project .env."""
+    direct = os.environ.get(name)
+    if direct is not None:
+        return direct.strip()
+    try:
+        lines = (PROJECT_DIR / ".env").read_text().splitlines()
+    except OSError:
+        return ""
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.removeprefix("export ").strip() == name:
+            return value.strip().strip("\"'")
+    return ""
+
+
+def runtime_process_counts() -> dict[str, int]:
+    """Count running hardware/control authorities once per container."""
     result = run("docker", "ps", "-q")
-    count = 0
+    counts = {
+        "vendor_base": 0,
+        "serial_agent": 0,
+        "managed_bridge": 0,
+        "motion_safety": 0,
+    }
     for container_id in result.stdout.split():
         top = run(
             "docker", "top", container_id, "-eo", "pid,args", check=False, timeout=5
         ).stdout
         if "yahboomcar_bringup_launch.py" in top:
-            count += 1
-    return count
+            counts["vendor_base"] += 1
+        if (
+            "micro_ros_agent" in top
+            and " serial " in f" {top} "
+            and "/dev/ttyUSB0" in top
+        ):
+            counts["serial_agent"] += 1
+        if "control_bridge.py" in top:
+            counts["managed_bridge"] += 1
+        if "/rovera_motion_safety/safety_node" in top:
+            counts["motion_safety"] += 1
+    return counts
+
+
+def validate_base_runtime() -> str:
+    """Fail closed while accepting both supported Pi control architectures.
+
+    The managed-motion cutover deliberately disables the legacy Yahboom
+    desktop runtime. In that mode the serial Agent, control bridge and final
+    motion-safety node collectively form the single base authority. Requiring
+    ``yahboomcar_bringup_launch.py`` there incorrectly prevents every
+    SLAM/Nav2 switch even though the guarded replacement is healthy.
+    """
+    counts = runtime_process_counts()
+    control_mode = configured_value("ROVERA_CONTROL_MODE").lower()
+    command_mode = configured_value("ROVERA_CMD_VEL_MODE").lower()
+    exclusive_ack = configured_value("ROVERA_EXCLUSIVE_CMD_VEL_ACK")
+    if control_mode == "managed-motion":
+        configuration_errors = []
+        if command_mode != "exclusive":
+            configuration_errors.append(
+                f"ROVERA_CMD_VEL_MODE={command_mode or '<missing>'}"
+            )
+        if exclusive_ack != REQUIRED_EXCLUSIVE_ACK:
+            configuration_errors.append("exclusive ownership ACK is missing")
+        expected = {
+            "serial_agent": 1,
+            "managed_bridge": 1,
+            "motion_safety": 1,
+        }
+        runtime_errors = [
+            f"{name}={counts[name]} (expected {expected_count})"
+            for name, expected_count in expected.items()
+            if counts[name] != expected_count
+        ]
+        if counts["vendor_base"] > 1:
+            runtime_errors.append(
+                f"vendor_base={counts['vendor_base']} (expected at most 1)"
+            )
+        errors = [*configuration_errors, *runtime_errors]
+        if errors:
+            raise RuntimeError(
+                "managed-motion base authority is unsafe: " + "; ".join(errors)
+            )
+        return "managed-motion"
+
+    if counts["vendor_base"] != 1:
+        raise RuntimeError(
+            "expected exactly one Yahboom base runtime in legacy mode, "
+            f"found {counts['vendor_base']}; refusing ROS switch"
+        )
+    return "legacy-yahboom"
 
 
 def adapter_status(timeout: float = 2.0) -> dict[str, Any]:
@@ -127,12 +213,7 @@ def switch_mode(request: dict[str, Any]) -> dict[str, Any]:
     mode = str(request.get("mode", "")).upper()
     if mode not in {"IDLE", "MAPPING", "NAVIGATION"}:
         raise ValueError(f"unsupported mode: {mode}")
-    vendor_count = vendor_base_runtime_count()
-    if vendor_count != 1:
-        raise RuntimeError(
-            f"expected exactly one Yahboom base runtime, found {vendor_count}; "
-            "refusing ROS switch"
-        )
+    validate_base_runtime()
 
     current: dict[str, Any] = {}
     try:

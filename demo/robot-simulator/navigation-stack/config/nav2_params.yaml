@@ -58,10 +58,8 @@ rovera_navigation_adapter:
     localization_pose_maximum_median_deviation: 0.06
     localization_pose_maximum_yaw_variance: 0.025
     localization_pose_maximum_yaw_spread: 0.20
-    # 90 beams bounds CPU. A 12 cm endpoint tolerance is 2.4 cells on the
-    # deployed 5 cm map and accommodates measured scan/map quantization. This
-    # is one evidence gate; the multi-heading global-search gate handles map
-    # ambiguity instead of pretending endpoint score alone proves uniqueness.
+    # Coarse endpoint agreement finds a viable AMCL hypothesis. Final READY
+    # verification below separately constrains the actual endpoint residuals.
     scan_map_score_window_size: 5
     scan_map_maximum_beams: 90
     scan_map_minimum_valid_beams: 25
@@ -72,7 +70,16 @@ rovera_navigation_adapter:
     localization_global_scan_map_minimum_score: 0.80
     scan_map_minimum_range: 0.20
     scan_map_maximum_range: 6.0
-    scan_map_endpoint_tolerance: 0.12
+    localization_coarse_match_tolerance: 0.12
+    # A 5 cm map contributes up to roughly half a cell of endpoint
+    # quantization. These limits still accept the observed 2-6 cm cluster but
+    # reject a pose displaced 8-12 cm inside the coarse match radius.
+    localization_final_max_median_residual: 0.05
+    localization_final_max_p90_residual: 0.08
+    # Planning scan filtering has different semantics: compare measured range
+    # with a map raycast, and never reuse the localization coarse tolerance.
+    planning_static_match_tolerance: 0.08
+    dynamic_overlay_static_tolerance: 0.08
     scan_map_freshness_seconds: 0.60
     sensor_time_invalid_grace_seconds: 1.0
     auto_localization_rotation_degrees_per_second: 45.0
@@ -84,9 +91,11 @@ rovera_navigation_adapter:
     # Wait for the chassis/smoother to stop before collecting the stationary
     # AMCL window used by the strict READY acquisition gate.
     localization_rotation_settle_seconds: 1.0
-    # A global particle search must observe at least two meaningfully
-    # different headings before an otherwise ambiguous static scan is trusted.
-    localization_global_minimum_rotation_degrees: 30.0
+    # Force Rescan records actual odom headings only for scans whose score and
+    # residual pass. Commanded rotation alone is never localization evidence.
+    localization_global_heading_bin_count: 8
+    localization_global_min_heading_bins: 4
+    localization_global_min_heading_span_degrees: 180.0
     # The 0.40 x 0.36 m safety footprint is deliberately conservative. During
     # an in-place localization turn, permit scan points up to 7 cm inside its
     # corner-swept circle; this still rejects returns touching the body sides
@@ -98,6 +107,15 @@ rovera_navigation_adapter:
     # padding here closed passages that physically fit after 5 cm map
     # quantization; motion-safety still owns the dynamic stopping reserve.
     planning_footprint_padding: 0.0
+    corridor_side_margin: 0.06
+    corridor_front_clearance: 0.20
+    corridor_lookahead: 0.80
+    corridor_confirmation_samples: 5
+    corridor_confirmation_duration_seconds: 0.40
+    failed_segment_ttl_seconds: 20.0
+    failed_segment_radius: 0.12
+    failed_segment_forward_offset: 0.45
+    failed_segment_max_replans: 3
 
 map_server:
   ros__parameters:
@@ -284,7 +302,7 @@ global_costmap:
       # and safety layer; costmap margins are configured explicitly below.
       footprint: "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
       footprint_padding: 0.0
-      plugins: [static_layer, obstacle_layer, inflation_layer]
+      plugins: [static_layer, failed_segment_layer, obstacle_layer, inflation_layer]
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
         map_subscribe_transient_local: true
@@ -294,6 +312,19 @@ global_costmap:
         # obstacle layer, inflation, RPP collision check and motion-safety stay
         # active; this only prevents Theta* rejecting a valid starting cell.
         footprint_clearing_enabled: true
+      failed_segment_layer:
+        plugin: nav2_costmap_2d::StaticLayer
+        # Confirmed blocked segments live in a separate full-map mask. When
+        # their TTL expires the adapter publishes an empty mask, removing only
+        # recovery keepouts without clearing saved walls or live obstacles.
+        map_topic: /navigation/failed_segment_mask
+        map_subscribe_transient_local: true
+        subscribe_to_updates: false
+        use_maximum: true
+        trinary_costmap: true
+        lethal_cost_threshold: 65
+        unknown_cost_value: -1
+        footprint_clearing_enabled: false
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
