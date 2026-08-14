@@ -228,6 +228,8 @@ class Ros2NavigationBackend:
     def _response_timeout(self, command: str) -> float:
         if command in {"mapping.start", "mapping.save", "mapping.save_draft", "mapping.finish"}:
             return max(self.timeout_seconds, 90.0)
+        if command == "navigation.alternatives":
+            return max(self.timeout_seconds, 60.0)
         return self.timeout_seconds
 
     @staticmethod
@@ -453,10 +455,14 @@ class Ros2NavigationBackend:
             "NAVIGATING",
             "PAUSED",
             "BLOCKED",
+            "NARROW_PATH_DECISION",
         }:
             return
         try:
-            await self.execute("navigation.cancel", {"reason": "manual_takeover"})
+            await self.execute(
+                "navigation.manual_handoff",
+                {"reason": "MANUAL_TAKEOVER"},
+            )
         except NavigationBackendError:
             # Manual motion must not wait for Nav2. motion-safety arbitrates the
             # source immediately; the failed cancel is surfaced in telemetry.

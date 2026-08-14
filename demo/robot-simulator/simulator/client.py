@@ -699,6 +699,10 @@ class RobotConnectionClient:
                     "navigation.pause",
                     "navigation.resume",
                     "navigation.cancel",
+                    "navigation.manual_handoff",
+                    "navigation.alternatives",
+                    "navigation.select_route",
+                    "navigation.route_selection_back",
                     "navigation.goal",
                     "navigation.speed_mode",
                 }
@@ -1937,6 +1941,10 @@ class RobotConnectionClient:
                             "mapping": backend_state.get("mapping"),
                             "map_registry": registry_health,
                             "footprint": backend_state.get("footprint"),
+                            "corridor": backend_state.get("corridor"),
+                            "route_candidates": backend_state.get("route_candidates", []),
+                            "selected_route_id": backend_state.get("selected_route_id", ""),
+                            "manual_handoff_reason": backend_state.get("manual_handoff_reason", ""),
                         },
                     )
                 )

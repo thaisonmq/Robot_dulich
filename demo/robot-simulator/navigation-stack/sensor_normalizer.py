@@ -34,26 +34,32 @@ class SensorNormalizer(Node):
         self.declare_parameter("scan_arrival_timeout_seconds", 0.30)
         self.declare_parameter("odom_arrival_timeout_seconds", 0.25)
         self.declare_parameter("imu_arrival_timeout_seconds", 0.25)
-        self.declare_parameter("scan_self_filter_half_length", 0.20)
-        self.declare_parameter("scan_self_filter_half_width", 0.18)
+        self.declare_parameter("scan_self_filter_half_length", 0.15)
+        self.declare_parameter("scan_self_filter_half_width", 0.10)
         self.declare_parameter("scan_laser_x", -0.0046412)
         self.declare_parameter("scan_laser_y", 0.0)
         self.declare_parameter("scan_laser_yaw", 0.0)
-        self.clock = SensorClockEstimator(
-            minimum_sync_samples=int(self.get_parameter("minimum_sync_samples").value),
-            window_samples=int(self.get_parameter("window_samples").value),
-            sync_spread_seconds=float(self.get_parameter("sync_spread_seconds").value),
-            jump_tolerance_seconds=float(self.get_parameter("jump_tolerance_seconds").value),
-            maximum_corrected_age_seconds=float(
+        clock_options = {
+            "minimum_sync_samples": int(self.get_parameter("minimum_sync_samples").value),
+            "window_samples": int(self.get_parameter("window_samples").value),
+            "sync_spread_seconds": float(self.get_parameter("sync_spread_seconds").value),
+            "jump_tolerance_seconds": float(self.get_parameter("jump_tolerance_seconds").value),
+            "maximum_corrected_age_seconds": float(
                 self.get_parameter("maximum_corrected_age_seconds").value
             ),
-            future_tolerance_seconds=float(
+            "future_tolerance_seconds": float(
                 self.get_parameter("future_tolerance_seconds").value
             ),
-            invalid_debounce_samples=int(
+            "invalid_debounce_samples": int(
                 self.get_parameter("invalid_debounce_samples").value
             ),
-        )
+        }
+        # IMU is diagnostic-only on this chassis. Separate estimators ensure a
+        # malformed IMU clock can never reset valid scan/odom capture time.
+        self.clocks = {
+            sensor: SensorClockEstimator(**clock_options)
+            for sensor in self.SENSOR_NAMES
+        }
         self.arrival_timeouts = {
             "scan": float(self.get_parameter("scan_arrival_timeout_seconds").value),
             "odom": float(self.get_parameter("odom_arrival_timeout_seconds").value),
@@ -106,7 +112,8 @@ class SensorNormalizer(Node):
         arrival = self.get_clock().now()
         monotonic_now = time.monotonic()
         self.last_arrival_monotonic[sensor] = monotonic_now
-        correction = self.clock.observe(
+        clock = self.clocks[sensor]
+        correction = clock.observe(
             sensor,
             source_nanoseconds=self._stamp_nanoseconds(message),
             arrival_nanoseconds=arrival.nanoseconds,
@@ -216,10 +223,11 @@ class SensorNormalizer(Node):
             )
             arrival_fresh = arrival_age <= self.arrival_timeouts[sensor]
             timestamp_valid = (
-                self.clock.state == "SYNCED"
+                self.clocks[sensor].state == "SYNCED"
                 and valid_age <= self.arrival_timeouts[sensor]
                 and self.frame_valid[sensor]
-                and self.clock.invalid_streak < self.clock.invalid_debounce_samples
+                and self.clocks[sensor].invalid_streak
+                < self.clocks[sensor].invalid_debounce_samples
             )
             sensors[sensor] = {
                 "arrival_fresh": arrival_fresh,
@@ -228,19 +236,40 @@ class SensorNormalizer(Node):
                 "arrival_age_ms": None if not math.isfinite(arrival_age) else round(arrival_age * 1000, 1),
                 "corrected_age_ms": self.last_corrected_age_ms[sensor],
                 "clock_skew_ms": round(
-                    self.clock.last_raw_skew_seconds.get(sensor, 0.0) * 1000, 1
+                    self.clocks[sensor].last_raw_skew_seconds.get(sensor, 0.0) * 1000, 1
                 ),
+                "clock_state": self.clocks[sensor].state,
+                "invalid_streak": self.clocks[sensor].invalid_streak,
                 "rejected_packets": self.sensor_rejections[sensor],
                 "last_rejection": self.last_rejection[sensor],
             }
+        critical_clock_state = (
+            "SYNCED"
+            if all(self.clocks[name].state == "SYNCED" for name in ("scan", "odom"))
+            else "SENSOR_TIME_INVALID"
+            if any(
+                self.clocks[name].state == "SENSOR_TIME_INVALID"
+                for name in ("scan", "odom")
+            )
+            else "CLOCK_SYNCING"
+        )
+        critical_offsets = [
+            self.clocks[name].offset_nanoseconds
+            for name in ("scan", "odom")
+            if self.clocks[name].offset_nanoseconds is not None
+        ]
         status = {
-            "clock_state": self.clock.state,
+            "clock_state": critical_clock_state,
             "estimated_clock_offset_ms": (
                 None
-                if self.clock.offset_nanoseconds is None
-                else round(self.clock.offset_nanoseconds / 1e6, 3)
+                if not critical_offsets
+                else round(sum(critical_offsets) / len(critical_offsets) / 1e6, 3)
             ),
-            "invalid_streak": self.clock.invalid_streak,
+            "invalid_streak": max(
+                self.clocks["scan"].invalid_streak,
+                self.clocks["odom"].invalid_streak,
+            ),
+            "imu_diagnostic_health": sensors["imu"],
             "scan_self_filtered_beams": self.last_scan_self_filtered_beams,
             "sensors": sensors,
         }

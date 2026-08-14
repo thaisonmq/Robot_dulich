@@ -16,15 +16,18 @@ class Direction(IntFlag):
 
 @dataclass(frozen=True, slots=True)
 class SafetyConfig:
-    half_length: float = 0.20
-    half_width: float = 0.18
-    clearance: float = 0.10
-    side_margin: float = 0.06
-    rotation_margin: float = 0.04
-    slow_extra: float = 0.20
+    half_length: float = 0.15
+    half_width: float = 0.10
+    clearance: float = 0.04
+    side_margin: float = 0.04
+    rotation_margin: float = 0.03
+    slow_extra: float = 0.10
     latency_seconds: float = 0.12
-    braking_acceleration: float = 0.35
-    clear_hysteresis_seconds: float = 0.40
+    braking_acceleration: float = 0.60
+    angular_braking_acceleration: float = 2.0
+    rotation_preview_angle: float = 0.30
+    trajectory_samples: int = 6
+    clear_hysteresis_seconds: float = 0.20
     scan_timeout_seconds: float = 0.28
 
 
@@ -49,6 +52,8 @@ class SafetyDecision:
     rear_clearance: float = math.inf
     left_clearance: float = math.inf
     right_clearance: float = math.inf
+    required_stop_distance: float = 0.0
+    hard_stop: bool = False
 
 
 def stopping_clearance(speed: float, config: SafetyConfig) -> float:
@@ -57,6 +62,27 @@ def stopping_clearance(speed: float, config: SafetyConfig) -> float:
         velocity * config.latency_seconds
         + velocity * velocity / (2 * config.braking_acceleration)
         + config.clearance
+    )
+
+
+def maximum_safe_speed(clearance: float, config: SafetyConfig) -> float:
+    """Invert ``stopping_clearance`` for a bumper-to-obstacle gap.
+
+    This provides a continuous velocity cap.  It avoids interpreting an
+    upstream requested velocity as the chassis' current velocity, which can
+    otherwise permanently latch a stationary robot at zero output.
+    """
+
+    available = max(0.0, float(clearance) - config.clearance)
+    acceleration = max(1e-3, float(config.braking_acceleration))
+    latency = max(0.0, float(config.latency_seconds))
+    return max(
+        0.0,
+        -acceleration * latency
+        + math.sqrt(
+            acceleration * acceleration * latency * latency
+            + 2.0 * acceleration * available
+        ),
     )
 
 
@@ -92,16 +118,122 @@ def valid_scan_points(scan: ScanSample) -> Iterable[tuple[float, float]]:
         yield distance * math.cos(angle), distance * math.sin(angle)
 
 
+def _point_in_pose_footprint(
+    point_x: float,
+    point_y: float,
+    *,
+    pose_x: float,
+    pose_y: float,
+    pose_yaw: float,
+    half_length: float,
+    half_width: float,
+    margin: float,
+) -> bool:
+    """Test a scan point against the physical rectangle at one future pose."""
+    delta_x = point_x - pose_x
+    delta_y = point_y - pose_y
+    cosine = math.cos(pose_yaw)
+    sine = math.sin(pose_yaw)
+    local_x = cosine * delta_x + sine * delta_y
+    local_y = -sine * delta_x + cosine * delta_y
+    return (
+        abs(local_x) <= half_length + margin
+        and abs(local_y) <= half_width + margin
+    )
+
+
+def _rotation_direction_blocked(
+    points: tuple[tuple[float, float], ...],
+    *,
+    angular_z: float,
+    config: SafetyConfig,
+) -> bool:
+    """Check only the commanded rotation sweep, not a directionless circle."""
+    speed = abs(float(angular_z))
+    if speed <= 0.05:
+        return False
+    angular_decel = max(1e-3, float(config.angular_braking_acceleration))
+    stop_angle = (
+        speed * config.latency_seconds
+        + speed * speed / (2.0 * angular_decel)
+    )
+    direction = 1.0 if angular_z > 0 else -1.0
+    samples = max(2, int(config.trajectory_samples))
+    for sample in range(1, samples + 1):
+        # Preview enough of a sustained in-place command to cover the long
+        # rectangular corner.  Braking angle alone is only a few degrees at
+        # low speed and would incorrectly approve rotation in a corridor that
+        # the 0.30 x 0.20 m body cannot rotate inside.
+        yaw = direction * max(config.rotation_preview_angle, stop_angle) * sample / samples
+        if any(
+            _point_in_pose_footprint(
+                x,
+                y,
+                pose_x=0.0,
+                pose_y=0.0,
+                pose_yaw=yaw,
+                half_length=config.half_length,
+                half_width=config.half_width,
+                margin=config.rotation_margin,
+            )
+            for x, y in points
+        ):
+            return True
+    return False
+
+
+def _arc_turn_blocked(
+    points: tuple[tuple[float, float], ...],
+    *,
+    linear_x: float,
+    angular_z: float,
+    travel_distance: float,
+    config: SafetyConfig,
+) -> bool:
+    """Check 4-8 rectangular future poses along the requested arc."""
+    if abs(linear_x) <= 0.02 or abs(angular_z) <= 0.05:
+        return False
+    samples = max(4, min(8, int(config.trajectory_samples)))
+    curvature = angular_z / linear_x
+    direction = 1.0 if linear_x > 0 else -1.0
+    for sample in range(1, samples + 1):
+        distance = direction * travel_distance * sample / samples
+        yaw = curvature * distance
+        if abs(curvature) <= 1e-6:
+            pose_x, pose_y = distance, 0.0
+        else:
+            radius = 1.0 / curvature
+            pose_x = radius * math.sin(yaw)
+            pose_y = radius * (1.0 - math.cos(yaw))
+        if any(
+            _point_in_pose_footprint(
+                x,
+                y,
+                pose_x=pose_x,
+                pose_y=pose_y,
+                pose_yaw=yaw,
+                half_length=config.half_length,
+                half_width=config.half_width,
+                margin=config.side_margin,
+            )
+            for x, y in points
+        ):
+            return True
+    return False
+
+
 def evaluate_scan(
     scan: ScanSample,
     *,
     linear_x: float,
     angular_z: float,
     config: SafetyConfig,
+    measured_linear_x: float | None = None,
 ) -> SafetyDecision:
-    required = stopping_clearance(linear_x, config)
-    slow_distance = required + config.slow_extra
-    rotation_radius = math.hypot(config.half_length, config.half_width)
+    braking_speed = (
+        linear_x if measured_linear_x is None else measured_linear_x
+    )
+    required = stopping_clearance(braking_speed, config)
     nearest = math.inf
     front_clearance = math.inf
     rear_clearance = math.inf
@@ -110,13 +242,12 @@ def evaluate_scan(
     blocked = Direction.NONE
     slow_scale = 1.0
     valid = 0
-    pure_rotation = abs(linear_x) < 0.02 and abs(angular_z) > 0.05
-    left_path_turn_blocked = False
-    right_path_turn_blocked = False
-    rotation_blocked = False
-    for x, y in valid_scan_points(scan):
-        if point_inside_footprint(x, y, config):
-            continue
+    points = tuple(
+        (x, y)
+        for x, y in valid_scan_points(scan)
+        if not point_inside_footprint(x, y, config)
+    )
+    for x, y in points:
         valid += 1
         clearance = rectangle_clearance(
             x,
@@ -135,11 +266,6 @@ def evaluate_scan(
             front_clearance = min(front_clearance, forward_gap)
             if forward_gap <= required:
                 point_mask |= Direction.FRONT
-            elif linear_x > 0 and forward_gap < slow_distance:
-                slow_scale = min(
-                    slow_scale,
-                    max(0.05, (forward_gap - required) / config.slow_extra),
-                )
         if (
             x <= -config.half_length
             and abs(y) <= config.half_width + config.side_margin
@@ -148,41 +274,28 @@ def evaluate_scan(
             rear_clearance = min(rear_clearance, rear_gap)
             if rear_gap <= required:
                 point_mask |= Direction.REAR
-            elif linear_x < 0 and rear_gap < slow_distance:
-                slow_scale = min(
-                    slow_scale,
-                    max(0.05, (rear_gap - required) / config.slow_extra),
-                )
 
-        # Rotation is a separate chassis-corner sweep. It is deliberately not
-        # reused as a forward-stop test: a corridor can permit straight travel
-        # while being too narrow for an in-place turn.
-        radial_gap = math.hypot(x, y) - rotation_radius
-        if pure_rotation and radial_gap <= config.rotation_margin:
-            rotation_blocked = True
-            if y > 0:
-                point_mask |= Direction.LEFT
-            elif y < 0:
-                point_mask |= Direction.RIGHT
-            else:
-                point_mask |= Direction.LEFT | Direction.RIGHT
         if (
             y >= config.half_width
             and -config.half_length <= x <= config.half_length + required
         ):
             left_clearance = min(left_clearance, y - config.half_width)
-            if radial_gap <= config.rotation_margin:
-                point_mask |= Direction.LEFT
-                left_path_turn_blocked = True
         if (
             y <= -config.half_width
             and -config.half_length <= x <= config.half_length + required
         ):
             right_clearance = min(right_clearance, -y - config.half_width)
-            if radial_gap <= config.rotation_margin:
-                point_mask |= Direction.RIGHT
-                right_path_turn_blocked = True
         blocked |= point_mask
+
+    # The hard-stop envelope is based on measured chassis velocity.  Outside
+    # it, cap the requested component to a speed that can still stop inside
+    # the available bumper clearance.  The cap is continuous as the gap
+    # closes and never creates the old 5%-command dead zone.
+    requested_speed = abs(float(linear_x))
+    requested_gap = front_clearance if linear_x > 0 else rear_clearance
+    if requested_speed > 1e-4 and math.isfinite(requested_gap):
+        safe_speed = maximum_safe_speed(requested_gap, config)
+        slow_scale = min(1.0, safe_speed / requested_speed)
 
     if valid == 0:
         return SafetyDecision(
@@ -192,24 +305,37 @@ def evaluate_scan(
             math.inf,
             "empty_scan",
             angular_scale=0.0,
+            required_stop_distance=required,
+            hard_stop=True,
         )
 
-    translation_blocked = (
+    translation_blocked = bool(
         (linear_x > 0 and bool(blocked & Direction.FRONT))
         or (linear_x < 0 and bool(blocked & Direction.REAR))
     )
-    hard_stop = translation_blocked or (pure_rotation and rotation_blocked)
-    turn_clamped = (
-        not hard_stop
-        and not pure_rotation
-        and (
-            (angular_z > 0.05 and left_path_turn_blocked)
-            or (angular_z < -0.05 and right_path_turn_blocked)
-        )
+    turn_clamped = _rotation_direction_blocked(
+        points,
+        angular_z=angular_z,
+        config=config,
     )
+    if not translation_blocked and not turn_clamped and _arc_turn_blocked(
+        points,
+        linear_x=linear_x,
+        angular_z=angular_z,
+        travel_distance=required,
+        config=config,
+    ):
+        # Straight motion is still valid; remove only the turn that bends the
+        # rectangular footprint into the obstacle.
+        turn_clamped = True
+    if turn_clamped:
+        blocked |= Direction.LEFT if angular_z > 0 else Direction.RIGHT
+    hard_stop = translation_blocked and (
+        abs(angular_z) <= 0.05 or turn_clamped
+    ) or (abs(linear_x) <= 0.02 and turn_clamped)
     if translation_blocked:
         reason = "front_sweep_collision" if linear_x > 0 else "rear_sweep_collision"
-    elif pure_rotation and rotation_blocked:
+    elif abs(linear_x) <= 0.02 and turn_clamped:
         reason = "rotation_sweep_collision"
     elif turn_clamped:
         reason = (
@@ -219,15 +345,17 @@ def evaluate_scan(
         reason = ""
     return SafetyDecision(
         stop=hard_stop,
-        speed_scale=0.0 if hard_stop else slow_scale,
+        speed_scale=0.0 if translation_blocked else slow_scale,
         blocked=blocked,
         nearest_clearance=nearest,
         reason=reason,
-        angular_scale=(0.0 if hard_stop or turn_clamped else slow_scale),
+        angular_scale=(0.0 if turn_clamped else 1.0),
         front_clearance=front_clearance,
         rear_clearance=rear_clearance,
         left_clearance=left_clearance,
         right_clearance=right_clearance,
+        required_stop_distance=required,
+        hard_stop=hard_stop,
     )
 
 

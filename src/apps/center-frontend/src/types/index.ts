@@ -10,7 +10,8 @@ export type ControlState =
 export type NavigationState =
   | "idle" | "previewing" | "route_ready" | "sending_goal"
   | "loading_map" | "localizing" | "ready" | "planning"
-  | "moving" | "paused" | "blocked" | "recovery" | "arrived" | "cancelled" | "failed";
+  | "moving" | "paused" | "blocked" | "recovery" | "arrived" | "cancelled" | "failed"
+  | "narrow_decision" | "manual_bypass" | "computing_alternatives" | "route_selection";
 
 export interface User {
   id: string;
@@ -328,6 +329,10 @@ export interface Health {
   map_version?: number;
   mode?: "IDLE" | "MAPPING" | "NAVIGATION";
   footprint?: Point[];
+  corridor?: CorridorStatus;
+  route_candidates?: RouteCandidate[];
+  selected_route_id?: string;
+  manual_handoff_reason?: string;
   mapping?: {
     state: string;
     scanHealthy: boolean;
@@ -437,6 +442,31 @@ export interface Route {
   map_version?: number;
   error_code?: string | null;
   error_message?: string | null;
+}
+
+export interface RouteCandidate {
+  route_id: string;
+  points: Point[];
+  total_length: number;
+  estimated_time: number;
+  minimum_clearance?: number | null;
+  narrow_segments: number;
+  overlap_with_original: number;
+  valid: boolean;
+  recommended: boolean;
+}
+
+export interface CorridorStatus {
+  classification: "CLEAR" | "NARROW_OR_UNCERTAIN" | "PHYSICALLY_BLOCKED";
+  reason: string;
+  available_width?: number | null;
+  hard_required_width: number;
+  auto_required_width: number;
+  left_clearance?: number | null;
+  right_clearance?: number | null;
+  front_clearance?: number | null;
+  can_go_straight: boolean;
+  can_rotate: boolean;
 }
 
 export interface NavigationFeedback {

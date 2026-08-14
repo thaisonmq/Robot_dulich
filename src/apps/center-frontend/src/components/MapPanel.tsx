@@ -7,6 +7,7 @@ import { authenticatedAsset } from "../api/client";
 import { useI18n } from "../i18n/I18nProvider";
 import type {
   Destination, Health, MapData, NavigationFeedback, NavigationVisualization, Point, Pose, Route,
+  RouteCandidate,
 } from "../types";
 import { pixelToWorld, worldToPixel } from "../../../../packages/map-utils";
 
@@ -35,6 +36,10 @@ const NAVIGATION_STATE_LABELS: Record<string, string> = {
   PAUSED: "Đã tạm dừng",
   BLOCKED: "Lối đi bị chặn",
   RECOVERY: "Đang phục hồi",
+  NARROW_PATH_DECISION: "Cần chọn cách qua đường hẹp",
+  MANUAL_BYPASS: "Điều khiển thủ công qua đường hẹp",
+  COMPUTING_ALTERNATIVES: "Đang tìm tuyến thay thế",
+  ROUTE_SELECTION: "Chọn tuyến đường",
   SUCCEEDED: "Đã đến nơi",
   ARRIVED: "Đã đến nơi",
   CANCELED: "Đã hủy",
@@ -68,6 +73,8 @@ interface Props {
   destinations: Destination[];
   pose: Pose;
   route: Route | null;
+  routeCandidates?: RouteCandidate[];
+  selectedRouteId?: string;
   selected: Destination | null;
   loading: boolean;
   navigationStatus: string;
@@ -91,6 +98,11 @@ interface Props {
   onGo: () => void;
   onPause?: () => void;
   onResume?: () => void;
+  onManualHandoff?: () => void;
+  onFindAlternatives?: () => void;
+  onSelectRoute?: (routeId: string) => void;
+  onConfirmRoute?: () => void;
+  onBackRouteSelection?: () => void;
   onCancel: () => void;
 }
 
@@ -99,6 +111,8 @@ interface CanvasProps {
   destinations: Destination[];
   pose: Pose;
   route: Route | null;
+  routeCandidates?: RouteCandidate[];
+  selectedRouteId?: string;
   selected: Destination | null;
   dynamicObstacles: Point[];
   readOnly: boolean;
@@ -107,6 +121,7 @@ interface CanvasProps {
   focus?: Point | null;
   zoom?: number;
   onSelect: (destination: Destination) => void;
+  onSelectRoute?: (routeId: string) => void;
 }
 
 export function drawRobotMapMarker(
@@ -199,9 +214,9 @@ export function goalApproachYaw(
 }
 
 function MapCanvas({
-  map, destinations, pose, route, selected, dynamicObstacles,
+  map, destinations, pose, route, routeCandidates = [], selectedRouteId, selected, dynamicObstacles,
   readOnly, showRobot, robotMoving, focus = null, zoom = 1,
-  onSelect,
+  onSelect, onSelectRoute,
 }: CanvasProps) {
   const { t } = useI18n();
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -282,17 +297,34 @@ function MapCanvas({
       context.fillStyle = "rgba(220,38,38,.72)";
       context.fillRect(point.x - size / 2, point.y - size / 2, size, size);
     });
-    if (route?.points.length) {
+    const drawPath = (points: Point[], color: string, width: number) => {
       context.beginPath();
-      route.points.forEach((point, index) => {
+      points.forEach((point, index) => {
         const output = pointOnCanvas(point);
         if (index) context.lineTo(output.x, output.y); else context.moveTo(output.x, output.y);
       });
-      context.strokeStyle = "#1759d6";
-      context.lineWidth = Math.max(2, viewport.width / 500);
+      context.strokeStyle = color;
+      context.lineWidth = width;
       context.lineCap = "round";
       context.lineJoin = "round";
       context.stroke();
+    };
+    if (routeCandidates.length) {
+      routeCandidates
+        .filter((candidate) => candidate.route_id !== selectedRouteId)
+        .forEach((candidate) => drawPath(
+          candidate.points,
+          "rgba(79, 104, 143, .48)",
+          Math.max(1.5, viewport.width / 650),
+        ));
+      const selectedCandidate = routeCandidates.find((candidate) => candidate.route_id === selectedRouteId);
+      if (selectedCandidate) drawPath(
+        selectedCandidate.points,
+        "#1759d6",
+        Math.max(3, viewport.width / 420),
+      );
+    } else if (route?.points.length) {
+      drawPath(route.points, "#1759d6", Math.max(2, viewport.width / 500));
     }
     if (selected) {
       const goal = pointOnCanvas(selected);
@@ -313,7 +345,7 @@ function MapCanvas({
         markerRadius,
       );
     }
-  }, [dynamicObstacles, fitted, imageRevision, imageState, map, pose, robotMoving, route, selected, showRobot, viewport]);
+  }, [dynamicObstacles, fitted, imageRevision, imageState, map, pose, robotMoving, route, routeCandidates, selected, selectedRouteId, showRobot, viewport]);
 
   const eventWorld = (clientX: number, clientY: number): Point | null => {
     const canvas = canvasRef.current;
@@ -341,6 +373,26 @@ function MapCanvas({
         if (!start || readOnly) return;
         const end = eventWorld(event.clientX, event.clientY) ?? start.point;
         const dragged = Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) > 6;
+        if (!dragged && routeCandidates.length && onSelectRoute) {
+          const distanceToSegment = (point: Point, left: Point, right: Point) => {
+            const dx = right.x - left.x;
+            const dy = right.y - left.y;
+            const denominator = dx * dx + dy * dy;
+            const ratio = denominator <= 1e-9 ? 0 : Math.max(0, Math.min(1,
+              ((point.x - left.x) * dx + (point.y - left.y) * dy) / denominator,
+            ));
+            return Math.hypot(left.x + ratio * dx - point.x, left.y + ratio * dy - point.y);
+          };
+          const nearest = routeCandidates
+            .map((candidate) => ({ candidate, distance: Math.min(...candidate.points.slice(1).map(
+              (point, index) => distanceToSegment(start.point, candidate.points[index], point),
+            )) }))
+            .sort((left, right) => left.distance - right.distance)[0];
+          if (nearest && nearest.distance <= 0.20) {
+            onSelectRoute(nearest.candidate.route_id);
+            return;
+          }
+        }
         onSelect({ destination_id: "CUSTOM-GOAL", map_id: map.map_id, name: t("Điểm tùy chọn"),
           x: start.point.x, y: start.point.y,
           yaw: dragged
@@ -361,13 +413,15 @@ function MapCanvas({
 }
 
 export function MapPanel({
-  map, maps = [], selectedMapId, destinations, pose, route, selected, loading,
+  map, maps = [], selectedMapId, destinations, pose, route,
+  routeCandidates = [], selectedRouteId = "", selected, loading,
   navigationStatus, mapState = "READY", localizationState = mapState,
   localizationConfidence = 0, health, visualization, feedback,
   canStart = true, preflightFailures = [], errorMessage = "", noticeMessage = "", localized = false,
   mapActivationError = "",
   onMapChange, onSelect, onRetryLocalization, onGo, onPause,
-  onResume, onCancel, readOnly = false,
+  onResume, onManualHandoff, onFindAlternatives, onSelectRoute,
+  onConfirmRoute, onBackRouteSelection, onCancel, readOnly = false,
 }: Props) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
@@ -377,6 +431,10 @@ export function MapPanel({
   useEffect(() => setCandidateMapId(selectedMapId ?? map.map_id), [map.map_id, selectedMapId]);
   const moving = navigationStatus === "moving";
   const paused = navigationStatus === "paused";
+  const narrowDecision = mapState === "NARROW_PATH_DECISION";
+  const manualBypass = mapState === "MANUAL_BYPASS";
+  const computingAlternatives = mapState === "COMPUTING_ALTERNATIVES";
+  const routeSelection = mapState === "ROUTE_SELECTION";
   const localizationFailed = localizationState === "LOCALIZATION_FAILED";
   const localizationInProgress = [
     "LOCALIZATION_INITIALIZING", "LOCALIZING", "LOCALIZING_LAST_POSE",
@@ -413,9 +471,11 @@ export function MapPanel({
       <button type="button" disabled={!ready} onClick={() => { setFollowRobot(false); setCenterRobot(true); }}><LocateFixed size={13} /> {t("Tới robot")}</button>
       <button type="button" disabled={!ready} className={followRobot ? "is-active" : ""} onClick={() => { setCenterRobot(false); setFollowRobot((value) => !value); }}><Crosshair size={13} /> {t("Theo robot")}</button></div>
     <div className="map-canvas map-canvas--mini" onDoubleClick={() => ready && setExpanded(true)}>
-      <MapCanvas map={map} destinations={[]} pose={pose} route={liveRoute} selected={selected}
+      <MapCanvas map={map} destinations={[]} pose={pose} route={liveRoute}
+        routeCandidates={routeCandidates} selectedRouteId={selectedRouteId} selected={selected}
         dynamicObstacles={obstacles} readOnly showRobot={ready} robotMoving={moving}
-        focus={followRobot || centerRobot ? pose : null} zoom={followRobot || centerRobot ? 2 : 1} onSelect={onSelect} />
+        focus={followRobot || centerRobot ? pose : null} zoom={followRobot || centerRobot ? 2 : 1}
+        onSelect={onSelect} onSelectRoute={onSelectRoute} />
       {!ready && <div className="localization-overlay"><Navigation />
         <strong>{localizationFailed
           ? t("Không thể tự xác định chính xác vị trí robot.")
@@ -443,8 +503,40 @@ export function MapPanel({
     {mapState === "BLOCKED" && !errorMessage && <p className="navigation-inline-recovery" role="status">
       {t("Đường đi đang bị chặn. Robot đã dừng an toàn; hãy dời vật cản hoặc chọn điểm khác.")}
     </p>}
+    {narrowDecision && <div className="narrow-path-decision" role="alert">
+      <strong>{t("Đường đi phía trước có vẻ không đủ rộng để robot tự động đi qua an toàn.")}</strong>
+      <span>{t("Bạn có thể điều khiển thủ công qua đoạn này hoặc chọn một tuyến đường khác.")}</span>
+    </div>}
+    {manualBypass && <div className="narrow-path-decision" role="status">
+      <strong>{t("Đang điều khiển thủ công để vượt đoạn đường hẹp.")}</strong>
+      <span>{t("Điểm đến vẫn được giữ. Khi đã vượt qua đoạn đường hẹp, nhấn “Tiếp tục tự động”.")}</span>
+    </div>}
+    {computingAlternatives && <div className="narrow-path-decision" role="status">
+      <strong>{t("Đang tìm các tuyến đường khác tới cùng điểm đến…")}</strong>
+      <span>{t("Robot vẫn dừng an toàn trong khi kiểm tra độ rộng và vật cản của từng tuyến.")}</span>
+    </div>}
+    {routeSelection && <div className="route-candidate-list" role="list">
+      {routeCandidates.map((candidate, index) => <button type="button" role="listitem"
+        key={candidate.route_id} className={candidate.route_id === selectedRouteId ? "is-selected" : ""}
+        onClick={() => onSelectRoute?.(candidate.route_id)}>
+        <span>{t("Tuyến {number}", { number: index + 1 })}{candidate.recommended ? ` · ${t("Đề xuất")}` : ""}</span>
+        <small>{Math.round(candidate.total_length)}m · {Math.max(1, Math.round(candidate.estimated_time / 60))} phút
+          {candidate.minimum_clearance != null ? ` · ${Math.round(candidate.minimum_clearance * 100)}cm` : ""}</small>
+      </button>)}
+    </div>}
     <div className="navigation-actions">
-      {localizationNeedsAssistance ? <><button type="button" className="button button--primary" disabled={readOnly}
+      {narrowDecision ? <><button type="button" className="button button--primary" disabled={readOnly || loading}
+        onClick={onManualHandoff}>{t("Điều khiển thủ công")}</button>
+        <button type="button" disabled={readOnly || loading} onClick={onFindAlternatives}>{t("Tìm đường khác")}</button></>
+        : manualBypass ? <><button type="button" className="button button--primary" disabled={readOnly || loading}
+          onClick={onResume}><Play /> {t("Tiếp tục tự động")}</button>
+          <button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
+        : computingAlternatives ? <button type="button" disabled>{t("Đang tìm đường khác…")}</button>
+        : routeSelection ? <><button type="button" className="button button--primary"
+          disabled={readOnly || loading || !selectedRouteId} onClick={onConfirmRoute}>
+          <RouteIcon /> {t("Đi theo tuyến này")}</button>
+          <button type="button" onClick={onBackRouteSelection}>{t("Quay lại")}</button></>
+        : localizationNeedsAssistance ? <><button type="button" className="button button--primary" disabled={readOnly}
         onClick={() => setExpanded(true)}><Flag /> {t("Chọn điểm đến")}</button>
         <button type="button" disabled={readOnly || loading || rescanBlocked || !onRetryLocalization}
           title={rescanBlocked ? t("Không thể quét lại khi robot đang di chuyển hoặc định vị.") : undefined}
@@ -465,9 +557,10 @@ export function MapPanel({
         <strong>{t("Chọn điểm đến")}</strong></div>
         <button type="button" aria-label={t("Đóng bản đồ mở rộng")} onClick={() => setExpanded(false)}><X /></button></header></div>
         <div className="map-modal__canvas"><MapCanvas map={map} destinations={destinations} pose={pose}
-          route={liveRoute} selected={selected} dynamicObstacles={obstacles}
+          route={liveRoute} routeCandidates={routeCandidates} selectedRouteId={selectedRouteId}
+          selected={selected} dynamicObstacles={obstacles}
           readOnly={readOnly || loading} showRobot={ready} robotMoving={moving}
-          onSelect={onSelect} /></div>
+          onSelect={onSelect} onSelectRoute={onSelectRoute} /></div>
         <footer><button type="button" onClick={() => setExpanded(false)}>{t("Hủy")}</button>
           <button type="button" className="button button--primary" disabled={!selected || !canStart || loading}
             title={preflightFailures.join(", ")} onClick={() => { onGo(); setExpanded(false); }}><RouteIcon /> {t("Đi đến đây")}</button></footer>

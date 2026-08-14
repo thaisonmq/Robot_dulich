@@ -22,7 +22,7 @@ import type { PtzCommand, PtzSpeed } from "../transports/ControlTransport";
 import { WebSocketTelemetryTransport } from "../transports/TelemetryTransport";
 import type {
   AutoNavigationSpeedMode, Destination, MediaState, NavigationFeedback,
-  NavigationVisualization, VideoProfile,
+  NavigationVisualization, RouteCandidate, VideoProfile,
 } from "../types";
 import { createUuid } from "../utils/uuid";
 
@@ -145,6 +145,8 @@ export function DashboardPage() {
   const [poseVerificationState, setPoseVerificationState] = useState<PoseVerificationState>("required");
   const [visualization, setVisualization] = useState<NavigationVisualization | null>(null);
   const [navigationFeedback, setNavigationFeedback] = useState<NavigationFeedback>({});
+  const [routeCandidates, setRouteCandidates] = useState<RouteCandidate[]>([]);
+  const [selectedRouteId, setSelectedRouteId] = useState("");
   const [operationMode, setOperationMode] = useState<"navigation" | "mapping">(() => (
     sessionStorage.getItem("rovera:mapping-intent") ? "mapping" : "navigation"
   ));
@@ -175,6 +177,15 @@ export function DashboardPage() {
       }
       const runtimeMapState = String(nextHealth.map_state ?? "").toUpperCase();
       if (runtimeMapState) setMapState(runtimeMapState);
+      if (nextHealth.route_candidates) {
+        setRouteCandidates(nextHealth.route_candidates);
+        setSelectedRouteId(
+          nextHealth.selected_route_id
+          || nextHealth.route_candidates.find((item) => item.recommended)?.route_id
+          || nextHealth.route_candidates[0]?.route_id
+          || "",
+        );
+      }
       const localizationReady = Boolean(nextHealth.localized)
         && String(nextHealth.localization_state ?? runtimeMapState).toUpperCase() === "READY";
       setMapLocalized(localizationReady);
@@ -234,6 +245,10 @@ export function DashboardPage() {
         MAP_LOADING: "loading_map", LOADING_MAP: "loading_map", PLANNING: "planning",
         RECOVERY: "recovery", LOCALIZATION_LOST: "recovery", LOW_CONFIDENCE: "localizing",
         LOCALIZATION_REQUIRED: "idle",
+        NARROW_PATH_DECISION: "narrow_decision",
+        MANUAL_BYPASS: "manual_bypass",
+        COMPUTING_ALTERNATIVES: "computing_alternatives",
+        ROUTE_SELECTION: "route_selection",
       } as const;
       const next = states[normalized as keyof typeof states];
       if (next) setNavigationState(next);
@@ -256,6 +271,8 @@ export function DashboardPage() {
       setMapLocalized(false);
       setSelectedDestination(null);
       setRoute(null);
+      setRouteCandidates([]);
+      setSelectedRouteId("");
       setConnectionState("reconnecting");
     },
     onReconnect: () => {
@@ -416,6 +433,8 @@ export function DashboardPage() {
       setMapLocalized(false);
       setNavigationState("loading_map");
       setRoute(null);
+      setRouteCandidates([]);
+      setSelectedRouteId("");
       setVisualization(null);
       return {
         previousMapState: mapState,
@@ -480,6 +499,8 @@ export function DashboardPage() {
       setNavigationError("");
       setNavigationNotice("");
       setNavigationState("previewing");
+      setRouteCandidates([]);
+      setSelectedRouteId("");
     },
     onSuccess: (newRoute, requestedDestination) => {
       const routeReady = newRoute.status?.toUpperCase() === "READY"
@@ -693,16 +714,37 @@ export function DashboardPage() {
   });
 
   const missionAction = useMutation({
-    mutationFn: (action: "pause" | "resume" | "cancel") => api.missionAction(action, {
+    mutationFn: ({ action, routeId }: {
+      action: "pause" | "resume" | "cancel" | "manual" | "alternatives" | "select-route" | "back";
+      routeId?: string;
+    }) => api.missionAction(action, {
       request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
-      expected_state: mapState, mission_id: route!.mission_id!,
+      expected_state: mapState, mission_id: route!.mission_id!, route_id: routeId,
     }),
-    onSuccess: (mission) => {
+    onSuccess: (mission, variables) => {
       setRoute(mission);
+      if (mission.candidates) {
+        setRouteCandidates(mission.candidates);
+        setSelectedRouteId(
+          mission.candidates.find((item) => item.recommended)?.route_id
+          ?? mission.candidates[0]?.route_id
+          ?? "",
+        );
+      }
+      if (variables.action === "alternatives" && !mission.candidates?.length) {
+        setNavigationNotice(t("Không tìm thấy tuyến đường thay thế hợp lệ tới điểm đến. Bạn có thể chuyển sang điều khiển thủ công hoặc dừng điều hướng."));
+      } else if (variables.action === "manual") {
+        setNavigationNotice(t("Điểm đến vẫn được giữ. Khi đã vượt qua đoạn đường hẹp, nhấn “Tiếp tục tự động”."));
+      } else {
+        setNavigationNotice("");
+      }
       const state = mission.status?.toUpperCase();
       if (state === "PAUSED") setNavigationState("paused");
       else if (state === "NAVIGATING") setNavigationState("moving");
       else if (state === "CANCELED") setNavigationState("cancelled");
+      else if (state === "MANUAL_BYPASS") setNavigationState("manual_bypass");
+      else if (state === "NARROW_PATH_DECISION") setNavigationState("narrow_decision");
+      else if (state === "ROUTE_SELECTION") setNavigationState("route_selection");
       if (state) setMapState(state);
     },
     onError: () => setNavigationState("failed"),
@@ -1382,8 +1424,10 @@ export function DashboardPage() {
                 destinations={destinations}
                 pose={pose}
                 route={route}
+                routeCandidates={routeCandidates}
+                selectedRouteId={selectedRouteId}
                 selected={selectedDestination}
-                loading={preview.isPending || loadMap.isPending || relocalize.isPending || sendGoal.isPending}
+                loading={preview.isPending || loadMap.isPending || relocalize.isPending || sendGoal.isPending || missionAction.isPending}
                 navigationStatus={navigationState}
                 mapState={mapState}
                 localizationState={displayedLocalizationState}
@@ -1412,12 +1456,16 @@ export function DashboardPage() {
                   const expectedState = mapState;
                   setSelectedDestination(null);
                   setRoute(null);
+                  setRouteCandidates([]);
+                  setSelectedRouteId("");
                   loadMap.mutate({ selectedMap: nextMap, expectedState });
                 }}
                 onSelect={(destination) => {
                   if (navigationRequestInFlightRef.current) return;
                   setSelectedDestination(destination);
                   setRoute(null);
+                  setRouteCandidates([]);
+                  setSelectedRouteId("");
                   if (canRequestNewPath && poseVerified) preview.mutate(destination);
                 }}
                 onRetryLocalization={() => relocalize.mutate({
@@ -1427,13 +1475,28 @@ export function DashboardPage() {
                 })}
                 onGo={() => sendGoal.mutate()}
                 onPause={() => {
-                  if (route?.mission_id) missionAction.mutate("pause");
+                  if (route?.mission_id) missionAction.mutate({ action: "pause" });
                 }}
                 onResume={() => {
-                  if (route?.mission_id) missionAction.mutate("resume");
+                  if (route?.mission_id) missionAction.mutate({ action: "resume" });
+                }}
+                onManualHandoff={() => {
+                  if (route?.mission_id) missionAction.mutate({ action: "manual" });
+                }}
+                onFindAlternatives={() => {
+                  if (route?.mission_id) missionAction.mutate({ action: "alternatives" });
+                }}
+                onSelectRoute={setSelectedRouteId}
+                onConfirmRoute={() => {
+                  if (route?.mission_id && selectedRouteId) {
+                    missionAction.mutate({ action: "select-route", routeId: selectedRouteId });
+                  }
+                }}
+                onBackRouteSelection={() => {
+                  if (route?.mission_id) missionAction.mutate({ action: "back" });
                 }}
                 onCancel={() => {
-                  if (route?.mission_id) missionAction.mutate("cancel");
+                  if (route?.mission_id) missionAction.mutate({ action: "cancel" });
                   else {
                     void api.cancelNavigation(robotId, session.session_id);
                     setNavigationState("cancelled");

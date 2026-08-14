@@ -21,6 +21,7 @@ from navigation_core import (  # noqa: E402
     heading_diversity,
     localization_confidence,
     mask_scan_self_returns,
+    path_overlap_ratio,
     pose_stability,
     rotation_swept_clearance,
     scan_to_map_match,
@@ -134,16 +135,16 @@ def test_static_filter_keeps_beam_when_raycast_is_unknown() -> None:
 def test_physical_footprint_still_rejects_a_genuinely_too_narrow_corridor() -> None:
     occupancy = [0] * (30 * 30)
     for column in range(30):
-        occupancy[8 * 30 + column] = 100
-        occupancy[12 * 30 + column] = 100
+        occupancy[9 * 30 + column] = 100
+        occupancy[11 * 30 + column] = 100
     saved = SavedOccupancyMap(30, 30, 0.1, 0, 0, 0, occupancy)
 
     validation = saved.validate_footprint(
         1.05,
         1.05,
         0.0,
-        half_length=0.20,
-        half_width=0.18,
+        half_length=0.15,
+        half_width=0.10,
     )
 
     assert validation.code == "GOAL_FOOTPRINT_BLOCKED"
@@ -519,75 +520,95 @@ def test_force_rescan_accepts_real_non_cardinal_heading_coverage() -> None:
     assert math.degrees(observed.span_radians) >= 150
 
 
-def test_corridor_geometry_separates_straight_and_rotation_clearance() -> None:
-    walls_72cm = [
+def test_40cm_corridor_allows_straight_but_not_unsafe_rotation() -> None:
+    walls_40cm = [
         (x, side)
-        for x in (-0.2, 0.0, 0.2, 0.5)
-        for side in (-0.36, 0.36)
+        for x in (-0.15, 0.0, 0.15, 0.5)
+        for side in (-0.20, 0.20)
     ]
-    wide = evaluate_corridor(
-        walls_72cm,
-        half_length=0.20,
-        half_width=0.18,
-        side_margin=0.06,
-        front_clearance_required=0.20,
+    assessment = evaluate_corridor(
+        walls_40cm,
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.05,
+        hard_side_margin=0.02,
+        localization_uncertainty=0.02,
+        rotation_margin=0.03,
+        front_clearance_required=0.14,
     )
-    assert wide.available_width == pytest.approx(0.72)
-    assert wide.required_width == pytest.approx(0.48)
-    assert wide.can_go_straight
-
-    walls_55cm = [
-        (x, side)
-        for x in (-0.2, 0.0, 0.2, 0.5)
-        for side in (-0.275, 0.275)
-    ]
-    narrow_rotation = evaluate_corridor(
-        walls_55cm,
-        half_length=0.20,
-        half_width=0.18,
-        side_margin=0.04,
-        front_clearance_required=0.20,
-    )
-    assert narrow_rotation.can_go_straight
-    assert not narrow_rotation.can_rotate
+    assert assessment.available_width == pytest.approx(0.40)
+    assert assessment.hard_required_width == pytest.approx(0.24)
+    assert assessment.auto_required_width == pytest.approx(0.32)
+    assert assessment.classification == "CLEAR"
+    assert assessment.can_go_straight
+    assert not assessment.can_rotate
 
 
-@pytest.mark.parametrize("offset", [0.0, 0.03, 0.05])
-def test_72cm_corridor_tolerates_realistic_offset_and_scan_noise(offset: float) -> None:
+@pytest.mark.parametrize("offset", [0.0, 0.01, 0.02])
+def test_40cm_corridor_tolerates_realistic_offset_and_scan_noise(offset: float) -> None:
     points = [
         (x, side - offset + noise)
-        for x, noise in [(-0.2, 0.002), (0.0, -0.003), (0.3, 0.001), (0.6, 0.0)]
-        for side in (-0.36, 0.36)
+        for x, noise in [(-0.15, 0.002), (0.0, -0.003), (0.3, 0.001), (0.6, 0.0)]
+        for side in (-0.20, 0.20)
     ]
     assessment = evaluate_corridor(
         points,
-        half_length=0.20,
-        half_width=0.18,
-        side_margin=0.06,
-        front_clearance_required=0.20,
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.05,
+        hard_side_margin=0.02,
+        front_clearance_required=0.14,
     )
     assert assessment.can_go_straight
 
 
-def test_corridor_geometry_blocks_true_narrow_or_front_obstacle() -> None:
-    too_narrow = evaluate_corridor(
-        [(0.0, -0.21), (0.0, 0.21)],
-        half_length=0.20,
-        half_width=0.18,
-        side_margin=0.04,
-        front_clearance_required=0.20,
+def test_corridor_geometry_reports_all_three_decision_states() -> None:
+    uncertain = evaluate_corridor(
+        [(0.0, -0.15), (0.0, 0.15)],
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.05,
+        hard_side_margin=0.02,
+        localization_uncertainty=0.02,
+        front_clearance_required=0.14,
+    )
+    physically_blocked = evaluate_corridor(
+        [(0.0, -0.11), (0.0, 0.11)],
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.05,
+        hard_side_margin=0.02,
+        front_clearance_required=0.14,
     )
     front_blocked = evaluate_corridor(
-        [(0.0, -0.36), (0.0, 0.36), (0.35, 0.0)],
-        half_length=0.20,
-        half_width=0.18,
-        side_margin=0.06,
-        front_clearance_required=0.20,
+        [(0.0, -0.20), (0.0, 0.20), (0.28, 0.0)],
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.05,
+        hard_side_margin=0.02,
+        front_clearance_required=0.14,
     )
-    assert too_narrow.available_width < too_narrow.required_width
-    assert not too_narrow.can_go_straight
-    assert front_blocked.front_clearance == pytest.approx(0.15)
-    assert not front_blocked.can_go_straight
+    assert uncertain.physically_passable
+    assert uncertain.classification == "NARROW_OR_UNCERTAIN"
+    assert not uncertain.can_go_straight
+    assert not physically_blocked.physically_passable
+    assert physically_blocked.classification == "PHYSICALLY_BLOCKED"
+    assert front_blocked.front_clearance == pytest.approx(0.13)
+    assert front_blocked.classification == "PHYSICALLY_BLOCKED"
+    assert front_blocked.reason == "FRONT_CLEARANCE"
+
+
+def test_route_overlap_rejects_near_duplicates_but_keeps_distinct_corridors() -> None:
+    original = [{"x": 0.0, "y": 0.0}, {"x": 2.0, "y": 0.0}]
+    near_duplicate = [{"x": 0.0, "y": 0.05}, {"x": 2.0, "y": 0.05}]
+    distinct = [
+        {"x": 0.0, "y": 0.0},
+        {"x": 0.6, "y": 0.8},
+        {"x": 1.4, "y": 0.8},
+        {"x": 2.0, "y": 0.0},
+    ]
+    assert path_overlap_ratio(original, near_duplicate) > 0.85
+    assert path_overlap_ratio(original, distinct) < 0.85
 
 
 def test_dynamic_obstacle_payload_is_metric_and_bounded() -> None:
@@ -629,18 +650,18 @@ def test_rotation_clearance_uses_the_complete_rectangular_body_sweep() -> None:
 
 
 def test_scan_self_filter_masks_only_points_inside_calibrated_body() -> None:
-    ranges = [0.123, 0.30, 1.0, math.inf]
+    ranges = [0.09, 0.30, 1.0, math.inf]
     filtered, masked = mask_scan_self_returns(
         ranges,
         angle_min=-math.pi / 2,
         angle_increment=math.pi / 2,
-        range_min=0.12,
+        range_min=0.05,
         range_max=8.0,
         laser_x=-0.0046412,
         laser_y=0.0,
         laser_yaw=0.0,
-        half_length=0.20,
-        half_width=0.18,
+        half_length=0.15,
+        half_width=0.10,
     )
     assert masked == 1
     assert math.isnan(filtered[0])
@@ -703,8 +724,10 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert global_costmap["footprint_padding"] == 0.0
     assert local_costmap["footprint_padding"] == 0.0
     assert global_costmap["static_layer"]["footprint_clearing_enabled"] is True
-    assert 0.25 <= global_costmap["inflation_layer"]["inflation_radius"] <= 0.30
-    assert local_costmap["inflation_layer"]["inflation_radius"] >= 0.4
+    assert 0.15 <= global_costmap["inflation_layer"]["inflation_radius"] <= 0.20
+    assert local_costmap["inflation_layer"]["inflation_radius"] == global_costmap[
+        "inflation_layer"
+    ]["inflation_radius"]
     assert local_costmap["update_frequency"] >= 10
     assert local_costmap["resolution"] <= 0.025
     assert local_costmap["obstacle_layer"]["scan"]["observation_persistence"] == 0.0
@@ -733,8 +756,8 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert limits["smoothing_frequency"] >= controller["controller_frequency"]
     assert abs(limits["max_decel"][0]) >= 0.5
     localization = navigation["rovera_navigation_adapter"]["ros__parameters"]
-    assert localization["footprint_half_length"] == 0.20
-    assert localization["footprint_half_width"] == 0.18
+    assert localization["footprint_half_length"] == 0.15
+    assert localization["footprint_half_width"] == 0.10
     assert localization["localization_rotation_minimum_obstacle_distance"] == safety[
         "rotation_margin"
     ]
@@ -742,10 +765,11 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert safety["lidar_obstacle_avoidance_enabled"] is True
     assert safety["half_length"] == localization["footprint_half_length"]
     assert safety["half_width"] == localization["footprint_half_width"]
-    assert safety["side_margin"] == localization["corridor_side_margin"]
+    assert localization["corridor_hard_side_margin"] <= safety["side_margin"]
+    assert safety["side_margin"] <= localization["corridor_side_margin"]
     # The complete measured footprint is the single source of truth.
     expected_collision_footprint = (
-        "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
+        "[[0.15, 0.10], [0.15, -0.10], [-0.15, -0.10], [-0.15, 0.10]]"
     )
     assert local_costmap["footprint"] == expected_collision_footprint
     assert global_costmap["footprint"] == expected_collision_footprint
@@ -758,7 +782,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     ]
     assert localization["localization_final_minimum_residual_beams"] >= 20
     assert localization["localization_final_max_median_residual"] < 0.08
-    assert localization["localization_final_max_p90_residual"] < 0.11
+    assert localization["localization_final_max_p90_residual"] < localization[
+        "localization_coarse_match_tolerance"
+    ]
     assert localization["localization_coarse_match_tolerance"] > localization[
         "localization_final_max_median_residual"
     ]

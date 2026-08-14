@@ -120,7 +120,7 @@ async def test_ros2_manual_control_does_not_cancel_mapping(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ros2_manual_control_cancels_active_navigation(monkeypatch) -> None:
+async def test_ros2_manual_control_hands_off_and_preserves_active_destination(monkeypatch) -> None:
     backend = Ros2NavigationBackend("/tmp/navigation.sock")
     backend._state = {"mode": "NAVIGATION", "state": "NAVIGATING"}
     commands: list[str] = []
@@ -131,7 +131,7 @@ async def test_ros2_manual_control_cancels_active_navigation(monkeypatch) -> Non
 
     monkeypatch.setattr(backend, "execute", record_execute)
     await backend.manual_takeover()
-    assert commands == ["navigation.cancel"]
+    assert commands == ["navigation.manual_handoff"]
 
 
 def test_ros2_mapping_commands_allow_slow_posegraph_io() -> None:

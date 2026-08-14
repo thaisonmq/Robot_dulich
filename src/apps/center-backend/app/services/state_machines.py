@@ -63,9 +63,20 @@ NAVIGATION_TRANSITIONS: dict[str, frozenset[str]] = {
     }),
     "NAVIGATING": frozenset({
         "PAUSED", "BLOCKED", "RECOVERY", "LOCALIZATION_LOST", "SUCCEEDED",
-        "ARRIVED", "CANCELED", "FAILED", "FAULT",
+        "ARRIVED", "CANCELED", "FAILED", "FAULT", "NARROW_PATH_DECISION",
+        "MANUAL_BYPASS",
     }),
-    "PAUSED": frozenset({"NAVIGATING", "CANCELED", "FAULT"}),
+    "NARROW_PATH_DECISION": frozenset({
+        "MANUAL_BYPASS", "COMPUTING_ALTERNATIVES", "CANCELED", "BLOCKED",
+    }),
+    "MANUAL_BYPASS": frozenset({"PLANNING", "NAVIGATING", "CANCELED", "FAULT"}),
+    "COMPUTING_ALTERNATIVES": frozenset({
+        "ROUTE_SELECTION", "NARROW_PATH_DECISION", "BLOCKED", "CANCELED",
+    }),
+    "ROUTE_SELECTION": frozenset({
+        "NAVIGATING", "NARROW_PATH_DECISION", "CANCELED", "FAULT",
+    }),
+    "PAUSED": frozenset({"NAVIGATING", "MANUAL_BYPASS", "CANCELED", "FAULT"}),
     "BLOCKED": frozenset({"NAVIGATING", "PAUSED", "RECOVERY", "CANCELED", "FAILED", "FAULT"}),
     "RECOVERY": frozenset({"NAVIGATING", "BLOCKED", "CANCELED", "FAILED", "FAULT"}),
     "SUCCEEDED": frozenset(),

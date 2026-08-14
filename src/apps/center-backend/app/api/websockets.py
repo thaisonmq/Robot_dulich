@@ -155,6 +155,8 @@ def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict)
                     "READY", "PLANNING", "NAVIGATING", "PAUSED", "BLOCKED",
                     "RECOVERY", "LOCALIZATION_LOST", "SUCCEEDED", "ARRIVED",
                     "CANCELED", "PLAN_FAILED", "FAILED", "FAULT",
+                    "NARROW_PATH_DECISION", "MANUAL_BYPASS",
+                    "COMPUTING_ALTERNATIVES", "ROUTE_SELECTION",
                 }:
                     mission.status = status_value
                     mission.error_code = payload.get("error_code")

@@ -249,6 +249,12 @@ class CorridorAssessment:
     front_clearance: float
     can_go_straight: bool
     can_rotate: bool
+    hard_required_width: float = 0.0
+    auto_required_width: float = 0.0
+    classification: str = "CLEAR"
+    reason: str = ""
+    localization_uncertainty: float = 0.0
+    physically_passable: bool = True
 
 
 def heading_diversity(
@@ -282,6 +288,8 @@ def evaluate_corridor(
     front_clearance_required: float,
     lookahead: float = 0.80,
     rotation_margin: float | None = None,
+    hard_side_margin: float = 0.02,
+    localization_uncertainty: float = 0.0,
 ) -> CorridorAssessment:
     """Evaluate straight and in-place-rotation envelopes independently.
 
@@ -320,7 +328,11 @@ def evaluate_corridor(
         if math.isfinite(left_center) and math.isfinite(right_center)
         else math.inf
     )
-    required_width = 2.0 * width + 2.0 * margin
+    hard_margin = max(0.0, float(hard_side_margin))
+    uncertainty = max(0.0, float(localization_uncertainty))
+    hard_required_width = 2.0 * width + 2.0 * hard_margin
+    auto_required_width = 2.0 * width + 2.0 * margin + uncertainty
+    required_width = auto_required_width
 
     front_clearance = min(
         (
@@ -330,8 +342,37 @@ def evaluate_corridor(
         ),
         default=math.inf,
     )
-    side_clear = left_clearance >= margin and right_clearance >= margin
-    can_go_straight = side_clear and front_clearance > forward_required
+    hard_side_clear = (
+        left_clearance >= hard_margin and right_clearance >= hard_margin
+    )
+    auto_side_requirement = margin + uncertainty / 2.0
+    auto_side_clear = (
+        left_clearance >= auto_side_requirement
+        and right_clearance >= auto_side_requirement
+    )
+    front_clear = front_clearance > forward_required
+    physically_passable = (
+        hard_side_clear
+        and available_width >= hard_required_width
+        and front_clear
+    )
+    if not physically_passable:
+        classification = "PHYSICALLY_BLOCKED"
+        reason = (
+            "FRONT_CLEARANCE"
+            if not front_clear
+            else "HARD_WIDTH_OR_SIDE_MARGIN"
+        )
+    elif (
+        not auto_side_clear
+        or available_width < auto_required_width
+    ):
+        classification = "NARROW_OR_UNCERTAIN"
+        reason = "AUTO_CLEARANCE_OR_LOCALIZATION_UNCERTAINTY"
+    else:
+        classification = "CLEAR"
+        reason = "AUTO_CLEARANCE_CONFIRMED"
+    can_go_straight = classification == "CLEAR"
 
     rotate_margin = margin if rotation_margin is None else max(
         0.0, float(rotation_margin)
@@ -346,7 +387,60 @@ def evaluate_corridor(
         front_clearance=front_clearance,
         can_go_straight=can_go_straight,
         can_rotate=nearest_radius > rotation_radius,
+        hard_required_width=hard_required_width,
+        auto_required_width=auto_required_width,
+        classification=classification,
+        reason=reason,
+        localization_uncertainty=uncertainty,
+        physically_passable=physically_passable,
     )
+
+
+def _resample_path(
+    path: Iterable[dict[str, float]],
+    *,
+    spacing: float = 0.10,
+) -> list[tuple[float, float]]:
+    points = [(float(item["x"]), float(item["y"])) for item in path]
+    if len(points) < 2:
+        return points
+    output = [points[0]]
+    step = max(0.02, float(spacing))
+    for (ax, ay), (bx, by) in zip(points, points[1:]):
+        distance = math.hypot(bx - ax, by - ay)
+        samples = max(1, math.ceil(distance / step))
+        output.extend(
+            (
+                ax + (bx - ax) * index / samples,
+                ay + (by - ay) * index / samples,
+            )
+            for index in range(1, samples + 1)
+        )
+    return output
+
+
+def path_overlap_ratio(
+    left: Iterable[dict[str, float]],
+    right: Iterable[dict[str, float]],
+    *,
+    distance_tolerance: float = 0.15,
+) -> float:
+    """Symmetric shared-corridor ratio for meaningful route distinctness."""
+    left_points = _resample_path(left)
+    right_points = _resample_path(right)
+    if not left_points or not right_points:
+        return 0.0
+    tolerance = max(0.01, float(distance_tolerance))
+
+    def covered(source: list[tuple[float, float]], target: list[tuple[float, float]]) -> float:
+        matches = sum(
+            1
+            for x, y in source
+            if min(math.hypot(x - tx, y - ty) for tx, ty in target) <= tolerance
+        )
+        return matches / len(source)
+
+    return round(min(covered(left_points, right_points), covered(right_points, left_points)), 4)
 
 
 def environment_flag(name: str, default: bool = False) -> bool:

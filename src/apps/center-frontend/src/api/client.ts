@@ -3,7 +3,7 @@ import type {
   DiagnosticResult, MediaSources, RobotCreateInput, RobotEnrollment, RobotPage,
   OnvifScanResult,
   OnvifScanRequest,
-  RobotQuickCreateInput, RobotUpdateInput, Route, Session, User, UserPage,
+  RobotQuickCreateInput, RobotUpdateInput, Route, RouteCandidate, Session, User, UserPage,
   RegisterInput, AdminUserCreateInput, ActiveControlSession, SessionCamera,
   SessionVideoProfile, VideoProfile,
   MappingSession,
@@ -363,9 +363,9 @@ export const api = {
     request_id: string; robot_id: string; session_id: string; expected_state: string; mission_id: string;
   }) => request<Route>("/api/navigation/start", { method: "POST", body: JSON.stringify(input) }),
   missionAction: (
-    action: "pause" | "resume" | "cancel",
-    input: { request_id: string; robot_id: string; session_id: string; expected_state: string; mission_id: string },
-  ) => request<Route>(`/api/navigation/missions/${input.mission_id}/${action}`, {
+    action: "pause" | "resume" | "cancel" | "manual" | "alternatives" | "select-route" | "back",
+    input: { request_id: string; robot_id: string; session_id: string; expected_state: string; mission_id: string; route_id?: string },
+  ) => request<Route & { candidates?: RouteCandidate[]; destination_preserved?: boolean; selected_route_id?: string }>(`/api/navigation/missions/${input.mission_id}/${action}`, {
     method: "POST", body: JSON.stringify(input),
   }),
 };

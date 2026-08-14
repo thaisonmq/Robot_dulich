@@ -91,6 +91,7 @@ class ComputePathRequest(NavigationCommandBase):
 
 class MissionCommandRequest(NavigationCommandBase):
     mission_id: str = Field(min_length=8, max_length=64)
+    route_id: str | None = Field(default=None, min_length=3, max_length=96)
 
 
 class SpeedModeRequest(NavigationCommandBase):
@@ -413,6 +414,10 @@ async def navigation_health(
             "localizationState": health.get("localization_state", "IDLE"),
             "localizationConfidence": float(health.get("localization_confidence", 0)),
             "nav2Healthy": health.get("nav2") == "READY",
+            "corridor": health.get("corridor"),
+            "routeCandidates": health.get("route_candidates", []),
+            "selectedRouteId": health.get("selected_route_id"),
+            "manualHandoffReason": health.get("manual_handoff_reason"),
         } if mode == "NAVIGATION" else None,
         "mapRegistry": health.get("map_registry", {"localCount": 0, "pendingSync": 0}),
     }
@@ -575,9 +580,12 @@ async def start_navigation(
         expected_state=body.expected_state,
         payload={
             "mission_id": mission.mission_id,
+            "route_id": mission.mission_id,
             "map_id": mission.map_id,
             "version": mission.map_version,
             "goal": mission.goal,
+            # FollowPath executes the exact route that the user previewed.
+            "points": mission.path,
         },
     )
     if result.get("status") in {"accepted", "completed"}:
@@ -603,6 +611,10 @@ async def mission_action(
         "pause": ("navigation.pause", "PAUSED"),
         "resume": ("navigation.resume", "NAVIGATING"),
         "cancel": ("navigation.cancel", "CANCELED"),
+        "manual": ("navigation.manual_handoff", "MANUAL_BYPASS"),
+        "alternatives": ("navigation.alternatives", "COMPUTING_ALTERNATIVES"),
+        "select-route": ("navigation.select_route", "NAVIGATING"),
+        "back": ("navigation.route_selection_back", "NARROW_PATH_DECISION"),
     }
     selected = actions.get(action)
     if selected is None:
@@ -614,8 +626,10 @@ async def mission_action(
     if mission is None or mission.robot_id != body.robot_id:
         raise HTTPException(status_code=404, detail="Không tìm thấy mission")
     command_type, target = selected
+    if action == "select-route" and not body.route_id:
+        raise HTTPException(status_code=422, detail="Chưa chọn tuyến đường")
     robot = _robot_by_public_id(database, body.robot_id)
-    if action in {"pause", "resume"} and (
+    if action in {"pause", "resume", "manual", "alternatives", "select-route", "back"} and (
         robot is None
         or robot.map_id != mission.map_id
         or robot.active_map_version != mission.map_version
@@ -637,12 +651,34 @@ async def mission_action(
             "mission_id": mission.mission_id,
             "map_id": mission.map_id,
             "version": mission.map_version,
+            "route_id": body.route_id,
+            "reason": "NARROW_PATH",
         },
+        timeout_seconds=(
+            settings.mapping_command_timeout_seconds
+            if action == "alternatives"
+            else None
+        ),
     )
     if result.get("status") in {"accepted", "completed"}:
-        mission.status = target
+        mission.status = str(result.get("current_state") or target).upper()
+        points = list(result.get("points") or [])
+        if points:
+            mission.path = points
+            mission.distance_m = sum(
+                math.hypot(
+                    float(right["x"]) - float(left["x"]),
+                    float(right["y"]) - float(left["y"]),
+                )
+                for left, right in zip(points, points[1:])
+            )
     database.commit()
-    return _mission_view(mission)
+    return {
+        **_mission_view(mission),
+        "candidates": list(result.get("candidates") or []),
+        "destination_preserved": bool(result.get("destination_preserved", True)),
+        "selected_route_id": result.get("route_id") or body.route_id,
+    }
 
 
 @router.get("/missions/{mission_id}")

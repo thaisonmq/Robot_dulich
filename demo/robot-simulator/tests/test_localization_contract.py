@@ -81,8 +81,9 @@ def test_localization_rotation_keeps_every_live_safety_gate() -> None:
     for required in (
         "self._critical_sensor_time_healthy()",
         'self.safety_health.startswith("HEALTHY")',
+        'self.safety_health.startswith("BLOCKED")',
         "not self.estop_active",
-        "self.safety_direction_mask == 0",
+        "self.safety_direction_mask & commanded_direction",
         "self.last_manual_takeover_monotonic",
         "self.current_goal_handle is None",
         "self.nearest_rotation_obstacle",
@@ -98,14 +99,19 @@ def test_localization_rotation_keeps_every_live_safety_gate() -> None:
     assert '"rotation_clearance_blocked"' in tick
 
 
-def test_global_search_requires_rotation_only_after_explicit_authorization() -> None:
+def test_global_search_is_stationary_first_then_requires_authorized_rotation() -> None:
     global_search = _method_source("_start_global_localization", "_safe_to_rotate")
     evidence = _method_source("_localization_evidence_ready", "_localization_tick")
+    tick = _method_source("_localization_tick", "_load_map")
 
     guard = global_search.index("if not self.localization_rotation_authorized")
-    requirement = global_search.index("self.global_search_requires_rotation = True")
-    assert guard < requirement
-    assert "self.global_search_requires_rotation = True" in global_search
+    stationary = global_search.index("self.global_search_requires_rotation = False", guard)
+    assert guard < stationary
+    assert "self.global_search_rotation_pending = True" in global_search
+    assert "self.global_rotate_delay" in tick
+    assert "if not self.localization_rotation_authorized" in tick
+    assert "if self.global_search_rotation_pending" in tick
+    assert "self.global_search_requires_rotation = True" in tick
     assert "len(self.localization_heading_bins)" in evidence
     assert "self.global_minimum_heading_bins" in evidence
     assert "self.localization_heading_span" in evidence
@@ -222,6 +228,29 @@ def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
     assert "self.ready_evidence_invalid_since" in tick
 
 
+def test_stationary_global_search_rejects_weak_alias_and_resamples_when_turn_blocked() -> None:
+    evidence = _method_source("_localization_evidence_ready", "_localization_tick")
+    tick = _method_source("_localization_tick", "_load_map")
+
+    assert 'self.localization_state == "LOCALIZING_GLOBAL"' in evidence
+    assert "self.global_search_rotation_pending" in evidence
+    assert "self.global_scan_map_threshold" in evidence
+    assert "self.stationary_global_candidate_ambiguous" in tick
+    assert "self.stationary_global_retry_delay" in tick
+    assert 'action="GLOBAL_RESAMPLE"' in tick
+    assert "self._start_global_localization()" in tick
+
+
+def test_map_initialization_cannot_timeout_before_session_clock_is_started() -> None:
+    tick = _method_source("_localization_tick", "_load_map")
+
+    initializing_guard = tick.index(
+        'if self.localization_state == "LOCALIZATION_INITIALIZING":'
+    )
+    timeout = tick.index("self.localization_started_monotonic >= self.localization_timeout")
+    assert initializing_guard < timeout
+
+
 def test_heading_observation_is_independent_from_candidate_quality() -> None:
     observation = _method_source(
         "_record_heading_observation", "_update_scan_map_match"
@@ -308,6 +337,21 @@ def test_scan_callback_never_replaces_capture_stamp_with_now() -> None:
     assert "corrected_nanoseconds" in normalizer
 
 
+def test_imu_clock_failure_cannot_invalidate_scan_and_odom_timing() -> None:
+    normalizer = (
+        Path(__file__).parents[1] / "navigation-stack" / "sensor_normalizer.py"
+    ).read_text()
+
+    assert "self.clocks =" in normalizer
+    assert "for sensor in self.SENSOR_NAMES" in normalizer
+    critical = normalizer.split("critical_clock_state =", 1)[1].split(
+        "status =", 1
+    )[0]
+    assert 'for name in ("scan", "odom")' in critical
+    assert 'self.clocks["imu"]' not in critical
+    assert '"imu_diagnostic_health": sensors["imu"]' in normalizer
+
+
 def test_cancel_revokes_nav_velocity_ownership_before_waiting_for_ack() -> None:
     cancel = _method_source("_cancel_navigation", "_pause_navigation")
 
@@ -386,22 +430,51 @@ def test_scan_filter_is_used_only_for_global_planning_topic() -> None:
     assert "self.planning_scan.publish(self._planning_scan_message(message))" in callback
 
 
-def test_navigation_abort_uses_confirmed_corridor_then_alternate_replan() -> None:
+def test_navigation_abort_uses_confirmed_corridor_then_preserves_user_choice() -> None:
     result = _method_source("_navigation_result", "_set_recovery_terminal")
     recover = _method_source("_recover_navigation", "_cancel_navigation")
     evidence = _method_source("_corridor_failure_evidence", "_mark_failed_segment")
 
     assert "self._corridor_failure_evidence()" in result
     assert 'evidence_reason == "CORRIDOR_CLEAR"' in result
-    assert '"INSUFFICIENT_CLEARANCE", "CONFIRMED_FRONT_OBSTACLE"' in result
+    assert '"NARROW_OR_UNCERTAIN"' in result
+    assert '"PHYSICALLY_BLOCKED"' in result
+    assert 'self._set_state("NARROW_PATH_DECISION"' in result
+    assert "self.paused_goal = None" not in result.split(
+        'self._set_state("NARROW_PATH_DECISION"', 1
+    )[1].split("else:", 1)[0]
     assert "self.corridor_confirmation_samples" in evidence
     assert "self.corridor_confirmation_duration" in evidence
     assert "self._request_path_once(goal)" in recover
-    assert "self._path_crosses_segment(alternative, segment)" in recover
-    assert '"BLOCKED", "NO_ALTERNATIVE_ROUTE"' in recover
     assert "recoveries > 0" not in result
     assert "localization_reliable" in result
     assert 'terminal_reason = "LOCALIZATION_UNRELIABLE"' in result
+
+
+def test_manual_handoff_preserves_goal_and_resume_replans_from_current_pose() -> None:
+    handoff = _method_source("_manual_handoff", "_resume_auto_from_current_pose")
+    resume = _method_source("_resume_auto_from_current_pose", "_start_selected_route")
+
+    assert 'self._set_state("MANUAL_BYPASS"' in handoff
+    assert "self.paused_goal = None" not in handoff
+    assert '"destination_preserved": True' in handoff
+    assert 'self.localization_state != "READY"' in resume
+    assert "points = self._request_path_once(goal)" in resume
+    assert 'self._set_state("PLANNING", "resume_from_current_pose")' in resume
+
+
+def test_selected_preview_polyline_is_executed_by_follow_path_without_replanning() -> None:
+    selected = _method_source("_start_selected_route", "_mapping_command")
+    navigate = _method_source("_navigate", "_navigation_feedback")
+
+    assert 'points = list(candidate["points"])' in selected
+    assert '"points": points' in selected
+    assert "self._request_path_once" not in selected
+    assert "goal = FollowPath.Goal()" in navigate
+    assert "goal.path = path" in navigate
+    assert "self.follow_path_client.send_goal_async" in navigate
+    assert "NavigateToPose" not in navigate
+    assert "actual_execution_path_route_id=route_id" in navigate
 
 
 def test_navigation_debug_events_cover_new_geometry_and_recovery_sources() -> None:

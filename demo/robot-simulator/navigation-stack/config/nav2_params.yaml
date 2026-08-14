@@ -64,20 +64,26 @@ rovera_navigation_adapter:
     scan_map_maximum_beams: 90
     scan_map_minimum_valid_beams: 25
     scan_map_minimum_score: 0.35
-    # Live rooms contain people/furniture and only 35-50% of endpoints may be
-    # saved structure. Do not demand an impossible 80% ratio: final acceptance
-    # separately requires enough matched endpoints plus strict residuals,
-    # stable AMCL covariance/pose and multi-heading physical observation.
-    localization_global_scan_map_minimum_score: 0.35
+    # A stationary global search has no heading diversity, so only accept a
+    # distinctly strong map match. Weaker aliases still qualify for the
+    # rotation-assisted path below, where the normal 0.35 score is combined
+    # with residual quality and multi-heading evidence. Live tests separated
+    # the correct 0.79-0.81 candidate from repeated 0.60-0.70 aliases.
+    localization_global_scan_map_minimum_score: 0.75
+    # If geometry blocks rotation, resample AMCL inside the same bounded Force
+    # Rescan request instead of making the operator press the button 4-5 times.
+    localization_stationary_global_retry_seconds: 1.0
     scan_map_minimum_range: 0.20
     scan_map_maximum_range: 6.0
     localization_coarse_match_tolerance: 0.12
     # Require a substantial geometric sample, then judge its real residuals.
     # The deployed 5 cm map produces about 5.1 cm median / 9.6 cm p90 at the
-    # stable physical pose; an 8/11 cm false candidate remains rejected.
+    # stable physical pose. A 11.5 cm p90 budget leaves room for dynamic-beam
+    # jitter while remaining below the 12 cm coarse match gate, so the robust
+    # percentile is still an effective (not dead) acceptance condition.
     localization_final_minimum_residual_beams: 20
-    localization_final_max_median_residual: 0.06
-    localization_final_max_p90_residual: 0.10
+    localization_final_max_median_residual: 0.075
+    localization_final_max_p90_residual: 0.115
     # Planning scan filtering has different semantics: compare measured range
     # with a map raycast, and never reuse the localization coarse tolerance.
     planning_static_match_tolerance: 0.08
@@ -105,23 +111,27 @@ rovera_navigation_adapter:
     # Pure localization rotation uses the same rectangular corner sweep and
     # explicit margin as final motion-safety. Straight travel can remain valid
     # when this rotation gate is closed.
-    localization_rotation_minimum_obstacle_distance: 0.04
+    localization_rotation_minimum_obstacle_distance: 0.03
     localization_rotation_blocked_timeout_seconds: 5.0
-    footprint_half_length: 0.20
-    footprint_half_width: 0.18
-    # The measured 0.40 x 0.36 m body is already the safety envelope. Extra
-    # padding here closed passages that physically fit after 5 cm map
-    # quantization; motion-safety still owns the dynamic stopping reserve.
+    footprint_half_length: 0.15
+    footprint_half_width: 0.10
+    # Physical source of truth is 0.30 x 0.20 m. Margins are explicit and do
+    # not shrink or enlarge the collision footprint silently.
     planning_footprint_padding: 0.0
-    corridor_side_margin: 0.06
-    corridor_front_clearance: 0.20
-    corridor_lookahead: 0.80
+    corridor_hard_side_margin: 0.02
+    corridor_side_margin: 0.05
+    corridor_localization_uncertainty_max: 0.04
+    corridor_front_clearance: 0.14
+    corridor_lookahead: 1.00
     corridor_confirmation_samples: 5
     corridor_confirmation_duration_seconds: 0.40
     failed_segment_ttl_seconds: 20.0
     failed_segment_radius: 0.12
     failed_segment_forward_offset: 0.45
     failed_segment_max_replans: 3
+    alternative_route_max_candidates: 3
+    alternative_route_overlap_threshold: 0.85
+    alternative_route_keepout_radius: 0.18
 
 map_server:
   ros__parameters:
@@ -229,7 +239,7 @@ controller_server:
       regulated_linear_scaling_min_radius: 0.85
       regulated_linear_scaling_min_speed: 0.09
       use_cost_regulated_linear_velocity_scaling: true
-      cost_scaling_dist: 0.40
+      cost_scaling_dist: 0.18
       cost_scaling_gain: 0.80
       inflation_cost_scaling_factor: 3.0
       use_rotate_to_heading: true
@@ -254,11 +264,9 @@ local_costmap:
       # A 2.5 cm rolling grid avoids a full 5 cm aliasing error when a scan
       # endpoint lands on different cells in the global and local grids.
       resolution: 0.025
-      # Keep the measured 0.40 x 0.36 m polygon as the source of truth. The
-      # local 2.5 cm raster can move a wall representative by almost one cell;
-      # retain the full measured body and handle grid uncertainty with explicit
-      # margins/inflation instead of shrinking collision geometry.
-      footprint: "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
+      # Physical 0.30 x 0.20 m body; grid uncertainty is handled by explicit
+      # inflation/corridor margins rather than a false footprint.
+      footprint: "[[0.15, 0.10], [0.15, -0.10], [-0.15, -0.10], [-0.15, 0.10]]"
       footprint_padding: 0.0
       # The robot has a planar LaserScan, not a 3D point cloud. Use the same
       # 2D obstacle model as the global costmap so the planner and RPP do not
@@ -291,7 +299,7 @@ local_costmap:
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 3.0
-        inflation_radius: 0.45
+        inflation_radius: 0.18
       always_send_full_costmap: false
 
 global_costmap:
@@ -303,9 +311,8 @@ global_costmap:
       robot_base_frame: base_footprint
       resolution: 0.05
       track_unknown_space: true
-      # Keep the same measured 0.40 x 0.36 m body as every other navigation
-      # and safety layer; costmap margins are configured explicitly below.
-      footprint: "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
+      # Same physical 0.30 x 0.20 m body as local costmap and Motion Safety.
+      footprint: "[[0.15, 0.10], [0.15, -0.10], [-0.15, -0.10], [-0.15, 0.10]]"
       footprint_padding: 0.0
       plugins: [static_layer, failed_segment_layer, obstacle_layer, inflation_layer]
       static_layer:
@@ -360,12 +367,10 @@ global_costmap:
           expected_update_rate: 0.30
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
-        # The measured half-width is 0.18 m. A 0.28 m global radius keeps a
-        # 10 cm route-selection margin without declaring a physically valid
-        # indoor corridor impossible. Local inflation and motion safety stay
-        # unchanged as the final collision authorities.
+        # A centered 0.20 m robot remains outside inflation in a 0.40 m
+        # corridor; explicit Auto classification still requires its margins.
         cost_scaling_factor: 3.0
-        inflation_radius: 0.28
+        inflation_radius: 0.18
       always_send_full_costmap: false
 
 bt_navigator:
