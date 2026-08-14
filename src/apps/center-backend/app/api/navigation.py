@@ -33,6 +33,17 @@ from app.services.state_machines import InvalidTransition, navigation_transition
 
 router = APIRouter(prefix="/api/navigation", tags=["navigation"])
 
+PLAN_FAILURE_MESSAGES = {
+    "START_BLOCKED": "Không thể lập đường: vùng xuất phát bị costmap đánh dấu là vật cản.",
+    "GOAL_BLOCKED": "Không thể lập đường: điểm đến bị costmap đánh dấu là vật cản.",
+    "NO_VALID_PATH": "Không tìm thấy đường hợp lệ tới điểm đích.",
+    "NO_PATH": "Không tìm thấy đường hợp lệ tới điểm đích.",
+    "UNKNOWN_SPACE": "Không thể lập đường vì lộ trình đi qua vùng chưa được lập bản đồ.",
+    "PLANNER_TIMEOUT": "Bộ lập đường không phản hồi đúng thời gian.",
+    "TF_ERROR": "Không thể xác định vị trí robot trên bản đồ để lập đường.",
+    "COSTMAP_NOT_READY": "Costmap chưa sẵn sàng; vui lòng thử lại sau khi dữ liệu LiDAR được cập nhật.",
+}
+
 
 class GoalPose(BaseModel):
     x: float
@@ -113,13 +124,10 @@ def _mission_start_rejection(mission: NavigationMission) -> dict | None:
     if mission.status == "READY" and mission.path:
         return None
     code = str(mission.error_code or ("NO_PATH" if not mission.path else "MISSION_NOT_READY"))
-    if code in {"NO_PATH", "PLAN_REJECTED", "PLANNER_TIMEOUT"}:
-        message = (
-            "Không tìm thấy lộ trình an toàn từ vị trí hiện tại. "
-            "Hãy chọn điểm khác hoặc tạo thêm khoảng trống quanh robot."
-        )
-    else:
-        message = str(mission.error_message or "Lộ trình chưa sẵn sàng để bắt đầu.")
+    message = PLAN_FAILURE_MESSAGES.get(
+        code,
+        str(mission.error_message or "Lộ trình chưa sẵn sàng để bắt đầu."),
+    )
     return {"code": code, "message": message, "status": mission.status}
 
 
@@ -266,7 +274,9 @@ async def load_map(
         for mission in database.scalars(
             select(NavigationMission).where(
                 NavigationMission.robot_id == body.robot_id,
-                NavigationMission.status.not_in(("SUCCEEDED", "ARRIVED", "CANCELED", "FAILED", "FAULT")),
+                NavigationMission.status.not_in(
+                    ("SUCCEEDED", "ARRIVED", "CANCELED", "PLAN_FAILED", "FAILED", "FAULT")
+                ),
             )
         ):
             mission.status = "CANCELED"
@@ -491,7 +501,14 @@ async def compute_path(
         },
     )
     points = list(result.get("points") or result.get("path") or [])
-    status = "READY" if result.get("status") in {"accepted", "completed"} and points else "BLOCKED"
+    # Planning happens before the chassis moves. A failed route is mission
+    # status PLAN_FAILED while the robot runtime remains READY; BLOCKED is
+    # reserved for an active navigation that exhausted recovery.
+    status = (
+        "READY"
+        if result.get("status") in {"accepted", "completed"} and points
+        else "PLAN_FAILED"
+    )
     resolved_goal = dict(result.get("goal") or body.goal.model_dump())
     mission = NavigationMission(
         request_id=body.request_id,

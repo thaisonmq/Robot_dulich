@@ -36,6 +36,23 @@ const LOCALIZATION_IN_PROGRESS_STATES = new Set([
   "LOW_CONFIDENCE", "LOCALIZATION_LOST", "VERIFYING", "SENSOR_TIME_INVALID",
 ]);
 
+const PLAN_FAILURE_MESSAGES: Record<string, string> = {
+  START_BLOCKED: "Không thể lập đường: vùng xuất phát bị costmap đánh dấu là vật cản.",
+  GOAL_BLOCKED: "Không thể lập đường: điểm đến bị costmap đánh dấu là vật cản.",
+  NO_VALID_PATH: "Không tìm thấy đường hợp lệ tới điểm đích.",
+  NO_PATH: "Không tìm thấy đường hợp lệ tới điểm đích.",
+  UNKNOWN_SPACE: "Không thể lập đường vì lộ trình đi qua vùng chưa được lập bản đồ.",
+  PLANNER_TIMEOUT: "Bộ lập đường không phản hồi đúng thời gian.",
+  TF_ERROR: "Không thể xác định vị trí robot trên bản đồ để lập đường.",
+  COSTMAP_NOT_READY: "Costmap chưa sẵn sàng; vui lòng thử lại sau khi dữ liệu LiDAR được cập nhật.",
+};
+
+function planFailureMessage(code?: string | null, fallback?: string | null): string {
+  return PLAN_FAILURE_MESSAGES[String(code ?? "").toUpperCase()]
+    ?? fallback
+    ?? "Không thể tạo đường đi an toàn";
+}
+
 async function waitForLocalizationReady(mapId: string, mapVersion: number): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < 50_000) {
@@ -470,11 +487,10 @@ export function DashboardPage() {
       if (newRoute.mission_id && !routeReady) {
         setRoute(null);
         setNavigationState("failed");
-        setNavigationError(
-          newRoute.error_code === "NO_PATH"
-            ? t("Không tìm thấy lộ trình an toàn từ vị trí hiện tại. Hãy chọn điểm khác hoặc tạo thêm khoảng trống quanh robot.")
-            : newRoute.error_message || t("Không thể tạo đường đi an toàn"),
-        );
+        setNavigationError(t(planFailureMessage(
+          newRoute.error_code,
+          newRoute.error_message,
+        )));
         return;
       }
       setRoute(newRoute);
@@ -502,7 +518,7 @@ export function DashboardPage() {
     onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
   const relocalize = useMutation({
-    mutationFn: ({ expectedState, allowRotation = true, forceGlobal = false }: {
+    mutationFn: ({ expectedState, allowRotation = false, forceGlobal = false }: {
       expectedState: string; verificationKey?: string; allowRotation?: boolean; forceGlobal?: boolean;
     }) => api.relocalize({
       request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
@@ -517,7 +533,9 @@ export function DashboardPage() {
       updatePoseVerification("requesting");
       setNavigationError("");
       setMapLocalized(false);
-      setSelectedDestination(null);
+      // A force rescan invalidates the pose-dependent path, not the selected
+      // map-coordinate destination. The operator can plan the same goal again
+      // as soon as localization returns READY.
       setRoute(null);
       setNavigationState("localizing");
     },
@@ -595,15 +613,14 @@ export function DashboardPage() {
           throw new Error(t("Chưa chọn điểm đến"));
         }
         if (realRobot && !hasReadyRuntimePose(map.map_id, map.active_version)) {
-          // Auto Go may be the first localization request after map load or a
-          // genuine loss. Start one fresh global search only in that case.
-          // A READY pose is already being continuously refreshed from live
-          // LiDAR/AMCL and must never be destroyed just because Go was clicked.
+          // First preserve and passively verify any current AMCL hypothesis.
+          // The adapter falls back to an authorized global scan only if that
+          // bounded verification fails.
           await api.relocalize({
             request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
             expected_state: mapState, map_id: map.map_id, version: map.active_version,
             allow_rotation: true,
-            force_global: true,
+            force_global: false,
           });
           await waitForLocalizationReady(map.map_id, map.active_version);
         }
@@ -628,7 +645,10 @@ export function DashboardPage() {
           || preparedRoute.status?.toUpperCase() !== "READY"
           || preparedRoute.points.length === 0
         ) {
-          throw new Error(t("Chưa có lộ trình an toàn để bắt đầu"));
+          throw new Error(t(planFailureMessage(
+            preparedRoute.error_code,
+            preparedRoute.error_message,
+          )));
         }
         await api.startNavigation({
           request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,

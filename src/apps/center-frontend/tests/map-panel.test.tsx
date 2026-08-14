@@ -189,16 +189,28 @@ describe("MapPanel navigation controls", () => {
   });
 
   it("does not expose operator-supplied robot coordinates even while ready", () => {
+    const onRetryLocalization = vi.fn();
     panel({
       localized: true,
       localizationState: "READY",
       mapState: "READY",
+      onRetryLocalization,
     });
 
     expect(screen.queryByRole("button", { name: "Chỉ vị trí robot gần đúng" })).not.toBeInTheDocument();
+    const rescan = screen.getByRole("button", { name: "Quét lại vị trí hiện tại" });
+    expect(rescan).toBeEnabled();
+    fireEvent.click(rescan);
+    expect(onRetryLocalization).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole("button", { name: "Chọn điểm đến" }));
     expect(screen.getByRole("dialog", { name: "Chọn điểm đến" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Xác nhận vị trí gần đúng" })).not.toBeInTheDocument();
+  });
+
+  it("disables force rescan while the robot is rotating", () => {
+    panel({ localized: true, localizationState: "READY", mapState: "ROTATING" });
+
+    expect(screen.getByRole("button", { name: "Quét lại vị trí hiện tại" })).toBeDisabled();
   });
 
   it("localizes map accessibility and navigation action labels", () => {
@@ -212,6 +224,7 @@ describe("MapPanel navigation controls", () => {
     expect(screen.getByLabelText("Bản đồ đã lưu với robot, lộ trình và điểm đến")).toBeInTheDocument();
     expect(screen.getByText("NAV2 · Sẵn sàng")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Tạm dừng" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Quét lại vị trí hiện tại" })).not.toBeInTheDocument();
     expect(screen.getByText("Định vị")).toBeInTheDocument();
   });
 

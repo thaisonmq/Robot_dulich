@@ -386,6 +386,9 @@ export function MapPanel({
   const localizationNeedsAssistance = localizationFailed || [
     "LOCALIZATION_REQUIRED", "LOCALIZING_GLOBAL", "LOW_CONFIDENCE", "LOCALIZATION_LOST",
   ].includes(localizationState);
+  const rescanBlocked = moving
+    || ["NAVIGATING", "MOVING", "ROTATING", "PLANNING", "RECOVERY"].includes(mapState)
+    || localizationInProgress;
   const ready = localized && localizationState === "READY" && pose.map_id === map.map_id
     && (pose.map_version == null || pose.map_version === map.active_version)
     && (health?.map_version == null || health.map_version === map.active_version);
@@ -443,12 +446,19 @@ export function MapPanel({
     <div className="navigation-actions">
       {localizationNeedsAssistance ? <><button type="button" className="button button--primary" disabled={readOnly}
         onClick={() => setExpanded(true)}><Flag /> {t("Chọn điểm đến")}</button>
-        <button type="button" disabled={readOnly || loading || localizationInProgress}
+        <button type="button" disabled={readOnly || loading || rescanBlocked || !onRetryLocalization}
+          title={rescanBlocked ? t("Không thể quét lại khi robot đang di chuyển hoặc định vị.") : undefined}
           onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button></>
         : moving ? <><button type="button" onClick={onPause}><Pause /> {t("Tạm dừng")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
-        : paused ? <><button type="button" onClick={onResume}><Play /> {t("Tiếp tục")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
+        : paused ? <><button type="button" onClick={onResume}><Play /> {t("Tiếp tục")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button>
+          <button type="button" disabled={readOnly || loading || rescanBlocked || !onRetryLocalization}
+            title={rescanBlocked ? t("Không thể quét lại khi robot đang di chuyển hoặc định vị.") : undefined}
+            onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button></>
         : <><button type="button" className="button button--primary" disabled={readOnly}
-          onClick={() => setExpanded(true)}><Flag /> {t("Chọn điểm đến")}</button></>}
+          onClick={() => setExpanded(true)}><Flag /> {t("Chọn điểm đến")}</button>
+          <button type="button" disabled={readOnly || loading || rescanBlocked || !onRetryLocalization}
+            title={rescanBlocked ? t("Không thể quét lại khi robot đang di chuyển hoặc định vị.") : undefined}
+            onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button></>}
     </div>
     {expanded && <div className="map-modal" role="dialog" aria-modal="true" aria-label={t("Chọn điểm đến")}>
       <div className="map-modal__panel"><div className="map-modal__heading"><header><div><small>{map.name} · v{map.active_version}</small>

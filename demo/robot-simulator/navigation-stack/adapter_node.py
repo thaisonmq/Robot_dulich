@@ -39,9 +39,13 @@ from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from navigation_core import (
+    NavigationDebugLog,
     PoseStability,
     SavedOccupancyMap,
+    classify_planning_failure,
     compact_lethal_cells,
+    environment_flag,
+    filter_static_map_scan,
     localization_confidence,
     navigation_abort_state,
     pose_stability,
@@ -77,6 +81,16 @@ class NavigationAdapter(Node):
             )
         )
         self.map_root = Path(os.getenv("ROVERA_MAP_ROOT", "/var/lib/rovera/maps"))
+        self.navigation_debug_enabled = environment_flag(
+            "NAVIGATION_DEBUG_LOG", True
+        )
+        self.navigation_debug_log = NavigationDebugLog(
+            enabled=self.navigation_debug_enabled,
+            path=os.getenv(
+                "NAVIGATION_DEBUG_LOG_PATH",
+                "/var/lib/rovera/navigation/logs/navigation-debug.log",
+            ),
+        )
         self.state_lock = threading.Lock()
         self.current_state = "IDLE" if self.mode == "MAPPING" else "STARTING"
         self.localization_state = "IDLE"
@@ -209,6 +223,10 @@ class NavigationAdapter(Node):
             "localization_pose_maximum_yaw_spread", 0.20
         )
         self.scan_map_threshold = configured("scan_map_minimum_score", 0.35)
+        self.global_scan_map_threshold = max(
+            self.scan_map_threshold,
+            configured("localization_global_scan_map_minimum_score", 0.80),
+        )
         self.scan_map_minimum_beams = int(self.declare_parameter(
             "scan_map_minimum_valid_beams", 25
         ).value)
@@ -265,6 +283,9 @@ class NavigationAdapter(Node):
         )
         self.latest_global_path: list[dict[str, float]] = []
         self.latest_dynamic_obstacles: list[dict[str, float]] = []
+        self.latest_global_costmap: OccupancyGrid | None = None
+        self.last_global_costmap_monotonic = 0.0
+        self.global_costmap_update = threading.Event()
         self.visualization_revision = 0
         self.mapping_started_monotonic = 0.0
         self.replan_timestamps: list[float] = []
@@ -302,6 +323,8 @@ class NavigationAdapter(Node):
         self.pipeline_samples: dict[str, tuple[float, float, float]] = {}
         self.profile_clamp_reasons: tuple[str, ...] = ()
         self.nearest_forward_obstacle = math.inf
+        self.nearest_left_obstacle = math.inf
+        self.nearest_right_obstacle = math.inf
         self.obstacle_slowdown_active = False
         self.last_slowdown_obstacle_distance = math.inf
         self.last_replan_obstacle_distance = math.inf
@@ -317,8 +340,17 @@ class NavigationAdapter(Node):
         self.rotation_metric_peak_requested = 0.0
         self.rotation_metric_peak_final = 0.0
         self.last_rotation_metrics: dict[str, float] = {}
+        self.last_scan_filter_stats = {
+            "scan_points_total": 0,
+            "scan_points_valid": 0,
+            "static_map_matches": 0,
+            "dynamic_points_kept": 0,
+        }
+        self.last_scan_filter_log_monotonic = 0.0
+        self.last_localization_candidate_log_monotonic = 0.0
         self.declare_parameter(
-            "cmd_vel_debug_enabled", self.speed_profiles.debug_enabled
+            "cmd_vel_debug_enabled",
+            self.navigation_debug_enabled and self.speed_profiles.debug_enabled,
         )
         self.declare_parameter(
             "cmd_vel_debug_throttle_seconds",
@@ -375,6 +407,9 @@ class NavigationAdapter(Node):
         self.navigation_scan = self.create_publisher(
             LaserScan, "/scan_navigation", qos_profile_sensor_data
         )
+        self.planning_scan = self.create_publisher(
+            LaserScan, "/scan_planning", qos_profile_sensor_data
+        )
         self.initial_pose = self.create_publisher(
             PoseWithCovarianceStamped, "/initialpose", 1
         )
@@ -405,6 +440,12 @@ class NavigationAdapter(Node):
         )
         self.create_subscription(
             OccupancyGrid, "/local_costmap/costmap", self._costmap_callback, 1
+        )
+        self.create_subscription(
+            OccupancyGrid,
+            "/global_costmap/costmap",
+            self._global_costmap_callback,
+            1,
         )
         self.create_subscription(
             LaserScan, "/scan/normalized", self._scan_callback, qos_profile_sensor_data
@@ -442,6 +483,26 @@ class NavigationAdapter(Node):
             f"navigation adapter ready mode={self.mode} socket={self.socket_path} "
             f"auto_speed_mode={self.auto_speed_mode}"
         )
+        self._nav_debug(
+            "STARTUP",
+            mode=self.mode,
+            debug_log_path=str(self.navigation_debug_log.path),
+            static_obstacle_match_tolerance=self.scan_map_endpoint_tolerance,
+        )
+
+    def _nav_debug(self, event: str, **fields: Any) -> None:
+        message = self.navigation_debug_log.event(event, **fields)
+        if message:
+            self.get_logger().info(message)
+
+    def _set_state(self, state: str, reason: str) -> None:
+        previous = self.current_state
+        self.current_state = state
+        if previous != state:
+            self._nav_debug(
+                "STATE",
+                **{"from": previous, "to": state, "reason": reason},
+            )
 
     @staticmethod
     def _parameter_request(values: dict[str, Any]) -> SetParametersAtomically.Request:
@@ -677,6 +738,8 @@ class NavigationAdapter(Node):
         *,
         now: float | None = None,
     ) -> None:
+        if not self.navigation_debug_enabled:
+            return
         self.pipeline_samples[stage] = (
             float(message.linear.x),
             float(message.angular.z),
@@ -704,7 +767,10 @@ class NavigationAdapter(Node):
         )
 
     def _cmd_vel_debug_tick(self) -> None:
-        if not bool(self.get_parameter("cmd_vel_debug_enabled").value):
+        if (
+            not self.navigation_debug_enabled
+            or not bool(self.get_parameter("cmd_vel_debug_enabled").value)
+        ):
             return
         now = time.monotonic()
         throttle = max(
@@ -731,17 +797,41 @@ class NavigationAdapter(Node):
         def values(sample: tuple[float, float, float] | None) -> str:
             return "unavailable" if sample is None else f"linear={sample[0]:.3f} angular={sample[1]:.3f}"
 
-        self.get_logger().info(
-            "[AUTO NAV] "
-            f"profile={self.auto_speed_mode} "
-            f"controller_requested=({values(requested)}) "
-            f"auto_profile=({values(profile_output)}) "
-            f"twist_mux=({values(muxed)}) "
-            f"velocity_smoother=({values(smoothed)}) "
-            f"motion_safety=({values(final)}) "
-            f"clamp_reason={','.join(dict.fromkeys(reasons)) or 'NONE'}"
+        pure_rotation = abs(requested[0]) < 0.02 and abs(requested[1]) > 0.08
+        event = "ROTATE" if pure_rotation else "CMD_VEL"
+        target_heading, heading_error = self._current_path_heading()
+        self._nav_debug(
+            event,
+            profile=self.auto_speed_mode,
+            rotation_mode="PURE_ROTATION" if pure_rotation else "PATH_FOLLOWING",
+            heading_current=(self.pose or {}).get("yaw"),
+            heading_target=target_heading,
+            heading_error_deg=(
+                None if heading_error is None else math.degrees(heading_error)
+            ),
+            controller_requested=values(requested),
+            profile_limited=values(profile_output),
+            twist_mux=values(muxed),
+            velocity_smoother=values(smoothed),
+            final_cmd=values(final),
+            clamp_reason=list(dict.fromkeys(reasons)) or ["NONE"],
         )
         self.last_pipeline_log_monotonic = now
+
+    def _current_path_heading(self) -> tuple[float | None, float | None]:
+        if self.pose is None:
+            return None, None
+        pose_x = float(self.pose.get("x", 0.0))
+        pose_y = float(self.pose.get("y", 0.0))
+        for point in self.latest_global_path:
+            delta_x = float(point["x"]) - pose_x
+            delta_y = float(point["y"]) - pose_y
+            if math.hypot(delta_x, delta_y) < 0.08:
+                continue
+            target = math.atan2(delta_y, delta_x)
+            current = float(self.pose.get("yaw", 0.0))
+            return target, self._yaw_delta(target, current)
+        return None, None
 
     def _speed_profile_state(self, mode: str | None = None) -> dict[str, Any]:
         profile = self.speed_profiles.get(mode or self.auto_speed_mode)
@@ -771,6 +861,12 @@ class NavigationAdapter(Node):
             "nearest_forward_obstacle_m": self._finite_metric(
                 self.nearest_forward_obstacle
             ),
+            "nearest_left_obstacle_m": self._finite_metric(
+                self.nearest_left_obstacle
+            ),
+            "nearest_right_obstacle_m": self._finite_metric(
+                self.nearest_right_obstacle
+            ),
             "nearest_rotation_obstacle_m": self._finite_metric(
                 self.nearest_rotation_obstacle
             ),
@@ -787,6 +883,7 @@ class NavigationAdapter(Node):
             "motion_owner": self.motion_owner,
             "last_rotation": dict(self.last_rotation_metrics),
             "last_planning_failure": dict(self.last_planning_failure),
+            "scan_filter": dict(self.last_scan_filter_stats),
         }
 
     @staticmethod
@@ -1065,6 +1162,13 @@ class NavigationAdapter(Node):
                 )
             allow_rotation = bool(payload.get("allow_rotation", False))
             force_global = bool(payload.get("force_global", False))
+            self._nav_debug(
+                "RELOCALIZE",
+                reason="user_force_rescan" if force_global else "auto_pose_verification",
+                force_global=force_global,
+                rotation_allowed=allow_rotation,
+                current_localization_state=self.localization_state,
+            )
             if force_global:
                 if not allow_rotation:
                     raise AdapterError(
@@ -1085,10 +1189,15 @@ class NavigationAdapter(Node):
                         "current_state": self.current_state,
                         "state": self._state(),
                     }
-                # Auto Go must locate the chassis from current LiDAR evidence,
-                # not reuse AMCL particles or a pose persisted before a
-                # disconnect. The global-search READY gate requires fresh
-                # scan/map agreement observed across multiple headings.
+                # An operator-forced rescan deliberately discards the old
+                # route/mission and AMCL hypothesis. The map-coordinate goal
+                # remains owned by Center so it can be planned again after
+                # localization returns READY.
+                self.paused_goal = None
+                self.current_mission_id = ""
+                if self.latest_global_path:
+                    self.latest_global_path = []
+                    self.visualization_revision += 1
                 self.localization_rotation_authorized = True
                 self.localization_started_monotonic = time.monotonic()
                 self._start_global_localization()
@@ -1362,12 +1471,41 @@ class NavigationAdapter(Node):
         ]
         if path != self.latest_global_path:
             had_previous_path = bool(self.latest_global_path)
+            previous_path = list(self.latest_global_path)
             self.latest_global_path = path
             if had_previous_path and not math.isfinite(
                 self.last_replan_obstacle_distance
             ):
                 self.last_replan_obstacle_distance = self.nearest_forward_obstacle
             self.visualization_revision += 1
+            if had_previous_path and self.current_state == "NAVIGATING":
+                recoveries = int(self.latest_feedback.get("recoveries", 0) or 0)
+                reason = (
+                    "RECOVERY"
+                    if recoveries > 0
+                    else "DYNAMIC_OBSTACLE"
+                    if self.nearest_forward_obstacle < 0.8
+                    else "COSTMAP_CHANGED"
+                )
+                self._nav_debug(
+                    "REPLAN",
+                    reason=reason,
+                    old_path_length=self._path_length(previous_path),
+                    new_path_length=self._path_length(path),
+                    nearest_forward_obstacle=self._finite_metric(
+                        self.nearest_forward_obstacle
+                    ),
+                )
+
+    @staticmethod
+    def _path_length(path: list[dict[str, float]]) -> float:
+        return round(sum(
+            math.hypot(
+                float(right["x"]) - float(left["x"]),
+                float(right["y"]) - float(left["y"]),
+            )
+            for left, right in zip(path, path[1:])
+        ), 3)
 
     def _measured_replan_frequency(self) -> float:
         if len(self.replan_timestamps) < 2:
@@ -1405,12 +1543,87 @@ class NavigationAdapter(Node):
                 item
                 for item in obstacles
                 if not self.saved_map.occupied_within(
-                    float(item["x"]), float(item["y"]), 0.10
+                    float(item["x"]),
+                    float(item["y"]),
+                    self.scan_map_endpoint_tolerance,
                 )
             ]
         if obstacles != self.latest_dynamic_obstacles:
             self.latest_dynamic_obstacles = obstacles
             self.visualization_revision += 1
+
+    def _global_costmap_callback(self, message: OccupancyGrid) -> None:
+        if int(message.info.width) <= 0 or int(message.info.height) <= 0:
+            return
+        self.latest_global_costmap = message
+        self.last_global_costmap_monotonic = time.monotonic()
+        self.global_costmap_update.set()
+
+    def _global_cost_at(self, x: float, y: float) -> int | None:
+        message = self.latest_global_costmap
+        if message is None:
+            return None
+        origin = message.info.origin
+        yaw = self._yaw_from_quaternion(origin.orientation)
+        delta_x = float(x) - float(origin.position.x)
+        delta_y = float(y) - float(origin.position.y)
+        cosine, sine = math.cos(yaw), math.sin(yaw)
+        local_x = cosine * delta_x + sine * delta_y
+        local_y = -sine * delta_x + cosine * delta_y
+        resolution = float(message.info.resolution)
+        if resolution <= 0:
+            return None
+        column = math.floor(local_x / resolution)
+        row = math.floor(local_y / resolution)
+        width = int(message.info.width)
+        height = int(message.info.height)
+        if column < 0 or row < 0 or column >= width or row >= height:
+            return None
+        return int(message.data[row * width + column])
+
+    def _nearby_global_cost_counts(
+        self,
+        x: float,
+        y: float,
+        radius_m: float = 0.75,
+    ) -> dict[str, int]:
+        if not self.navigation_debug_enabled or self.latest_global_costmap is None:
+            return {}
+        message = self.latest_global_costmap
+        origin = message.info.origin
+        yaw = self._yaw_from_quaternion(origin.orientation)
+        delta_x = float(x) - float(origin.position.x)
+        delta_y = float(y) - float(origin.position.y)
+        cosine, sine = math.cos(yaw), math.sin(yaw)
+        resolution = float(message.info.resolution)
+        if resolution <= 0:
+            return {}
+        center_column = math.floor((cosine * delta_x + sine * delta_y) / resolution)
+        center_row = math.floor((-sine * delta_x + cosine * delta_y) / resolution)
+        radius_cells = math.ceil(radius_m / resolution)
+        width = int(message.info.width)
+        height = int(message.info.height)
+        counts = {"lethal": 0, "inflated": 0, "unknown": 0}
+        for row in range(
+            max(0, center_row - radius_cells),
+            min(height, center_row + radius_cells + 1),
+        ):
+            for column in range(
+                max(0, center_column - radius_cells),
+                min(width, center_column + radius_cells + 1),
+            ):
+                if math.hypot(
+                    column - center_column, row - center_row
+                ) * resolution > radius_m:
+                    continue
+                value = int(message.data[row * width + column])
+                if value < 0:
+                    counts["unknown"] += 1
+                elif value >= 99:
+                    counts["lethal"] += 1
+                elif value > 0:
+                    counts["inflated"] += 1
+        return counts
 
     def _laser_extrinsic(self, frame_id: str) -> tuple[float, float, float] | None:
         if self.laser_in_base is not None:
@@ -1464,10 +1677,75 @@ class NavigationAdapter(Node):
             self.verification_scan_count += 1
         self._refresh_localization_confidence()
 
+    def _planning_scan_message(self, message: LaserScan) -> LaserScan:
+        extrinsic = self._laser_extrinsic(str(message.header.frame_id))
+        if self.saved_map is None or self.last_amcl_pose is None or extrinsic is None:
+            valid = sum(
+                1
+                for distance in message.ranges
+                if math.isfinite(distance)
+                and message.range_min <= distance <= message.range_max
+            )
+            self.last_scan_filter_stats = {
+                "scan_points_total": len(message.ranges),
+                "scan_points_valid": valid,
+                "static_map_matches": 0,
+                "dynamic_points_kept": valid,
+            }
+            return message
+        base_x, base_y, base_yaw = self.last_amcl_pose
+        offset_x, offset_y, offset_yaw = extrinsic
+        cosine, sine = math.cos(base_yaw), math.sin(base_yaw)
+        filtered = filter_static_map_scan(
+            self.saved_map,
+            message.ranges,
+            angle_min=float(message.angle_min),
+            angle_increment=float(message.angle_increment),
+            range_min=float(message.range_min),
+            range_max=float(message.range_max),
+            laser_x=base_x + cosine * offset_x - sine * offset_y,
+            laser_y=base_y + sine * offset_x + cosine * offset_y,
+            laser_yaw=base_yaw + offset_yaw,
+            endpoint_tolerance=self.scan_map_endpoint_tolerance,
+            minimum_usable_range=self.scan_map_minimum_range,
+            maximum_usable_range=self.scan_map_maximum_range,
+        )
+        planning = LaserScan()
+        planning.header = message.header
+        planning.angle_min = message.angle_min
+        planning.angle_max = message.angle_max
+        planning.angle_increment = message.angle_increment
+        planning.time_increment = message.time_increment
+        planning.scan_time = message.scan_time
+        planning.range_min = message.range_min
+        planning.range_max = message.range_max
+        planning.ranges = filtered.ranges
+        planning.intensities = list(message.intensities)
+        self.last_scan_filter_stats = {
+            "scan_points_total": filtered.total_beams,
+            "scan_points_valid": filtered.valid_beams,
+            "static_map_matches": filtered.static_map_matches,
+            "dynamic_points_kept": filtered.dynamic_points_kept,
+        }
+        now = time.monotonic()
+        if (
+            self.navigation_debug_enabled
+            and now - self.last_scan_filter_log_monotonic >= 1.0
+        ):
+            self._nav_debug(
+                "SCAN_FILTER",
+                **self.last_scan_filter_stats,
+                tolerance_m=self.scan_map_endpoint_tolerance,
+            )
+            self.last_scan_filter_log_monotonic = now
+        return planning
+
     def _scan_callback(self, message: LaserScan) -> None:
         callback_started = time.monotonic()
         self.last_scan_monotonic = callback_started
         nearest_forward = math.inf
+        nearest_left = math.inf
+        nearest_right = math.inf
         nearest_rotation_obstacle = math.inf
         extrinsic = self._laser_extrinsic(str(message.header.frame_id))
         for index, distance in enumerate(message.ranges):
@@ -1478,9 +1756,14 @@ class NavigationAdapter(Node):
             ):
                 continue
             angle = message.angle_min + index * message.angle_increment
-            normalized_angle = math.atan2(math.sin(angle), math.cos(angle))
+            base_angle = (extrinsic[2] if extrinsic is not None else 0.0) + angle
+            normalized_angle = math.atan2(math.sin(base_angle), math.cos(base_angle))
             if abs(normalized_angle) <= math.pi / 4:
                 nearest_forward = min(nearest_forward, float(distance))
+            elif math.pi / 4 < normalized_angle < 3 * math.pi / 4:
+                nearest_left = min(nearest_left, float(distance))
+            elif -3 * math.pi / 4 < normalized_angle < -math.pi / 4:
+                nearest_right = min(nearest_right, float(distance))
             if extrinsic is not None:
                 offset_x, offset_y, offset_yaw = extrinsic
                 base_angle = offset_yaw + angle
@@ -1501,12 +1784,15 @@ class NavigationAdapter(Node):
                     nearest_rotation_obstacle, clearance
                 )
         self.nearest_forward_obstacle = nearest_forward
+        self.nearest_left_obstacle = nearest_left
+        self.nearest_right_obstacle = nearest_right
         self.nearest_rotation_obstacle = nearest_rotation_obstacle
         self._update_scan_map_match(message)
         if self.mode == "MAPPING" and self.current_state in {"MAPPING", "MAPPING_RUNNING"}:
             self.mapping_scan.publish(message)
         elif self.mode == "NAVIGATION":
             self.navigation_scan.publish(message)
+            self.planning_scan.publish(self._planning_scan_message(message))
         self.scan_callback_latency_ms = round(
             (time.monotonic() - callback_started) * 1000.0, 3
         )
@@ -1535,7 +1821,7 @@ class NavigationAdapter(Node):
                 self.motion_owner = "NONE"
                 self.navigation_goal_generation += 1
                 if self.current_state == "NAVIGATING":
-                    self.current_state = "CANCELED"
+                    self._set_state("CANCELED", "emergency_stop")
             self.navigation_velocity.publish(Twist())
             if handle is not None:
                 handle.cancel_goal_async()
@@ -1562,7 +1848,7 @@ class NavigationAdapter(Node):
             with self.state_lock:
                 handle = self.current_goal_handle
                 self.current_goal_handle = None
-                self.current_state = "CANCELED"
+                self._set_state("CANCELED", "manual_takeover")
                 self.navigation_goal_generation += 1
                 self.paused_goal = None
                 self.latest_global_path = []
@@ -1603,7 +1889,7 @@ class NavigationAdapter(Node):
                 # Nav2 processes being healthy does not mean a saved map is
                 # loaded. Reporting READY here made Center treat a registry
                 # assignment as an active map after every stack restart.
-                self.current_state = "NO_ACTIVE_MAP"
+                self._set_state("NO_ACTIVE_MAP", "nav2_ready_without_active_map")
         try:
             transform = self.tf_buffer.lookup_transform(
                 "map", "base_footprint", Time()
@@ -1714,7 +2000,7 @@ class NavigationAdapter(Node):
         self._stop_localization_rotation()
         self.localized = False
         self.localization_state = "VERIFYING"
-        self.current_state = "VERIFYING"
+        self._set_state("VERIFYING", "verify_existing_amcl_pose")
         self.localization_started_monotonic = now
         self.localization_phase_started_monotonic = now
         self.verification_started_monotonic = now
@@ -1758,12 +2044,12 @@ class NavigationAdapter(Node):
                 approximate=self.localization_seed_approximate,
             )
             self.localization_state = "LOCALIZING_LAST_POSE"
-            self.current_state = "LOCALIZING_LAST_POSE"
+            self._set_state("LOCALIZING_LAST_POSE", "recent_pose_seed")
         else:
             # Loading a map or opening Control must not start active global
             # localization. Auto Go (or the explicit UI action) authorizes it.
             self.localization_state = "LOCALIZATION_REQUIRED"
-            self.current_state = "LOCALIZATION_REQUIRED"
+            self._set_state("LOCALIZATION_REQUIRED", "global_rotation_not_authorized")
 
     def _start_global_localization(self) -> None:
         self._stop_localization_rotation()
@@ -1773,7 +2059,7 @@ class NavigationAdapter(Node):
             # action immediately instead of waiting for the 45-second timeout.
             self.global_search_requires_rotation = False
             self.localization_state = "LOCALIZATION_REQUIRED"
-            self.current_state = "LOCALIZATION_REQUIRED"
+            self._set_state("LOCALIZATION_REQUIRED", "global_rotation_not_authorized")
             return
         self._reset_localization_evidence()
         self.localization_settling_evidence_started = False
@@ -1786,7 +2072,7 @@ class NavigationAdapter(Node):
         self.global_search_requires_rotation = True
         if not self.global_localization_client.wait_for_service(timeout_sec=3.0):
             self.localization_state = "LOCALIZATION_FAILED"
-            self.current_state = "LOCALIZATION_FAILED"
+            self._set_state("LOCALIZATION_FAILED", "global_localization_service_unavailable")
             raise AdapterError(
                 "GLOBAL_LOCALIZATION_UNAVAILABLE",
                 "AMCL global localization service is unavailable",
@@ -1798,7 +2084,7 @@ class NavigationAdapter(Node):
         # and let the executor deliver the response asynchronously.
         self.localization_phase_started_monotonic = time.monotonic()
         self.localization_state = "LOCALIZING_GLOBAL"
-        self.current_state = "LOCALIZING_GLOBAL"
+        self._set_state("LOCALIZING_GLOBAL", "global_localization_started")
         self.initial_pose_requested = False
         future = self.global_localization_client.call_async(Empty.Request())
 
@@ -1809,7 +2095,7 @@ class NavigationAdapter(Node):
                 self.get_logger().error(f"global localization failed: {exc}")
                 self._stop_localization_rotation()
                 self.localization_state = "LOCALIZATION_FAILED"
-                self.current_state = "LOCALIZATION_FAILED"
+                self._set_state("LOCALIZATION_FAILED", "global_localization_call_failed")
 
         future.add_done_callback(completed)
 
@@ -1850,7 +2136,7 @@ class NavigationAdapter(Node):
         self.get_logger().error(f"localization degraded; stopping Nav2: {reason}")
         self.localized = False
         self.localization_state = "SENSOR_TIME_INVALID"
-        self.current_state = "SENSOR_TIME_INVALID"
+        self._set_state("SENSOR_TIME_INVALID", "sensor_time_invalid")
         handle = self.current_goal_handle
         self.current_goal_handle = None
         self.navigation_goal_generation += 1
@@ -1868,7 +2154,7 @@ class NavigationAdapter(Node):
         self.get_logger().error(f"localization lost; stopping Nav2: {reason}")
         self.localized = False
         self.localization_state = "LOCALIZATION_LOST"
-        self.current_state = "LOCALIZATION_LOST"
+        self._set_state("LOCALIZATION_LOST", "localization_evidence_lost")
         handle = self.current_goal_handle
         self.current_goal_handle = None
         self.navigation_goal_generation += 1
@@ -1887,12 +2173,17 @@ class NavigationAdapter(Node):
             self.get_logger().error(str(exc))
 
     def _localization_evidence_ready(self, now: float) -> bool:
+        required_scan_score = (
+            self.global_scan_map_threshold
+            if self.global_search_requires_rotation
+            else self.scan_map_threshold
+        )
         return (
             self.localization_confidence >= self.localization_confidence_threshold
             and self._pose_is_stable()
             and now - self.last_amcl_monotonic <= self.amcl_pose_freshness
             and self.scan_map_valid_beams >= self.scan_map_minimum_beams
-            and self.scan_map_score >= self.scan_map_threshold
+            and self.scan_map_score >= required_scan_score
             and now - self.last_scan_map_monotonic <= self.scan_map_freshness
             and now - self.last_scan_monotonic <= 0.30
             and now - self.last_map_tf_monotonic <= 0.60
@@ -1923,7 +2214,7 @@ class NavigationAdapter(Node):
         """Stop after the global sweep and wait for stationary AMCL samples."""
         self._stop_localization_rotation()
         self.localization_state = "LOCALIZING_SETTLING"
-        self.current_state = "LOCALIZING_SETTLING"
+        self._set_state("LOCALIZING_SETTLING", "rotation_sweep_complete")
         self.localization_phase_started_monotonic = now
         self.localization_settling_evidence_started = False
 
@@ -2098,6 +2389,22 @@ class NavigationAdapter(Node):
             self.last_nomotion_request_monotonic = now
             self.nomotion_update_client.call_async(Empty.Request())
         localization_ready = self._localization_evidence_ready(now)
+        if (
+            self.navigation_debug_enabled
+            and self.global_search_requires_rotation
+            and self.scan_map_valid_beams >= self.scan_map_minimum_beams
+            and now - self.last_localization_candidate_log_monotonic >= 1.0
+        ):
+            self._nav_debug(
+                "LOCALIZATION_CANDIDATE",
+                state=self.localization_state,
+                confidence=self.localization_confidence,
+                scan_score=self.scan_map_score,
+                scan_score_required=self.global_scan_map_threshold,
+                rotation_degrees=round(math.degrees(self.rotation_angle), 1),
+                accepted=localization_ready,
+            )
+            self.last_localization_candidate_log_monotonic = now
         if localization_ready:
             if self.ready_evidence_since is None:
                 self.ready_evidence_since = now
@@ -2114,7 +2421,20 @@ class NavigationAdapter(Node):
             self._stop_localization_rotation()
             self.localized = True
             self.localization_state = "READY"
-            self.current_state = "READY"
+            self._set_state("READY", "localization_verified")
+            self._nav_debug(
+                "LOCALIZATION",
+                state="READY",
+                confidence=self.localization_confidence,
+                pose=dict(self.pose or {}),
+                source="amcl",
+                scan_score=self.scan_map_score,
+                scan_score_required=(
+                    self.global_scan_map_threshold
+                    if self.global_search_requires_rotation
+                    else self.scan_map_threshold
+                ),
+            )
             self.low_confidence_since = None
             self.localization_seed_pose = None
             self.localization_rotation_authorized = False
@@ -2139,7 +2459,7 @@ class NavigationAdapter(Node):
             self._stop_localization_rotation()
             self.localized = False
             self.localization_state = "LOCALIZATION_FAILED"
-            self.current_state = "LOCALIZATION_FAILED"
+            self._set_state("LOCALIZATION_FAILED", "localization_timeout")
             return
         broad_seed = (
             self.localization_state == "LOCALIZING_APPROXIMATE_POSE"
@@ -2174,7 +2494,7 @@ class NavigationAdapter(Node):
                 # safety gate is withholding velocity ownership.
                 return
             self.localization_state = "LOCALIZING_ROTATING"
-            self.current_state = "LOCALIZING_ROTATING"
+            self._set_state("LOCALIZING_ROTATING", "global_search_needs_new_heading")
         if self.localization_state == "LOCALIZING_ROTATING":
             if self.rotation_angle >= self.rotation_max_angle:
                 # Completing the sweep is success of the observation phase,
@@ -2185,7 +2505,7 @@ class NavigationAdapter(Node):
             if not self._safe_to_rotate():
                 self._stop_localization_rotation()
                 self.localization_state = "LOCALIZING_GLOBAL"
-                self.current_state = "LOCALIZING_GLOBAL"
+                self._set_state("LOCALIZING_GLOBAL", "rotation_safety_gate_closed")
                 return
             delta = now - self.rotation_last_monotonic if self.rotation_last_monotonic else 0.0
             self.rotation_angle += abs(self.rotation_speed) * max(0.0, min(delta, 0.5))
@@ -2221,7 +2541,7 @@ class NavigationAdapter(Node):
                 self.active_map_path = None
                 self.localized = False
                 self.localization_state = "IDLE"
-                self.current_state = "NO_ACTIVE_MAP"
+                self._set_state("NO_ACTIVE_MAP", "map_load_rollback_without_map")
                 return
             rollback = LoadMap.Request()
             rollback.map_url = str(previous_path)
@@ -2235,9 +2555,12 @@ class NavigationAdapter(Node):
             self.active_map_path = previous_path
             self.localized = previous_localized
             self.localization_state = previous_localization_state
-            self.current_state = "READY" if previous_localized else previous_localization_state
+            self._set_state(
+                "READY" if previous_localized else previous_localization_state,
+                "map_load_rollback",
+            )
         with self.state_lock:
-            self.current_state = "MAP_LOADING"
+            self._set_state("MAP_LOADING", "map_load_requested")
             self.localization_state = "LOCALIZATION_INITIALIZING"
         load_started = time.monotonic()
         request = LoadMap.Request()
@@ -2249,7 +2572,7 @@ class NavigationAdapter(Node):
             try:
                 rollback_map()
             except AdapterError:
-                self.current_state = "FAILED"
+                self._set_state("FAILED", "map_load_and_rollback_failed")
             raise AdapterError("MAP_LOAD_FAILED", f"Map Server returned {response.result}")
         with self.state_lock:
             self.map_id = str(payload["map_id"])
@@ -2262,7 +2585,7 @@ class NavigationAdapter(Node):
             self.latest_global_path = []
             self.latest_dynamic_obstacles = []
             self.visualization_revision += 1
-            self.current_state = "LOCALIZATION_INITIALIZING"
+            self._set_state("LOCALIZATION_INITIALIZING", "map_loaded")
             self.localization_state = "LOCALIZATION_INITIALIZING"
         map_deadline = time.monotonic() + 3.0
         while self.map_received_monotonic < load_started and time.monotonic() < map_deadline:
@@ -2271,7 +2594,7 @@ class NavigationAdapter(Node):
             try:
                 rollback_map()
             except AdapterError:
-                self.current_state = "FAILED"
+                self._set_state("FAILED", "map_topic_and_rollback_failed")
             raise AdapterError("MAP_TOPIC_UNAVAILABLE", "Map Server did not publish /map")
         self._begin_auto_localization(payload.get("last_known_pose"))
         return {
@@ -2303,7 +2626,7 @@ class NavigationAdapter(Node):
         self.global_search_requires_rotation = False
         self._publish_initial_pose(operator_pose, approximate=True)
         self.localization_state = "LOCALIZING_APPROXIMATE_POSE"
-        self.current_state = "LOCALIZING_APPROXIMATE_POSE"
+        self._set_state("LOCALIZING_APPROXIMATE_POSE", "operator_pose_hint")
         return {
             "status": "accepted",
             "current_state": "LOCALIZING_APPROXIMATE_POSE",
@@ -2322,7 +2645,7 @@ class NavigationAdapter(Node):
         self.localization_rotation_authorized = False
         self.global_search_requires_rotation = False
         self.localization_state = "IDLE"
-        self.current_state = "NO_ACTIVE_MAP"
+        self._set_state("NO_ACTIVE_MAP", "map_deactivated")
         self.current_mission_id = ""
         self.latest_global_path = []
         self.latest_dynamic_obstacles = []
@@ -2433,21 +2756,59 @@ class NavigationAdapter(Node):
         resolved_goal: dict[str, Any],
         planning_started: float,
     ) -> None:
+        start_pose = dict(self.pose or {})
+        start_cost = (
+            self._global_cost_at(
+                float(start_pose.get("x", 0.0)),
+                float(start_pose.get("y", 0.0)),
+            )
+            if start_pose
+            else None
+        )
+        goal_cost = self._global_cost_at(
+            float(resolved_goal.get("x", 0.0)),
+            float(resolved_goal.get("y", 0.0)),
+        )
+        corridor_clearance = (
+            self.nearest_left_obstacle + self.nearest_right_obstacle
+            if math.isfinite(self.nearest_left_obstacle)
+            and math.isfinite(self.nearest_right_obstacle)
+            else math.inf
+        )
         details = {
             "code": error.code,
             "message": str(error),
             "map_id": self.map_id,
             "map_version": self.map_version,
-            "start_pose": dict(self.pose or {}),
+            "start_pose": start_pose,
             "requested_goal": dict(requested_goal),
             "resolved_goal": dict(resolved_goal),
+            "footprint": list(self.footprint),
+            "start_cell_cost": start_cost,
+            "goal_cell_cost": goal_cost,
+            "global_costmap_age_ms": self._age_milliseconds(
+                self.last_global_costmap_monotonic
+            ),
+            "scan_age_ms": self._age_milliseconds(self.last_scan_monotonic),
             "nearest_forward_obstacle_m": self._finite_metric(
                 self.nearest_forward_obstacle
             ),
+            "left_clearance_m": self._finite_metric(self.nearest_left_obstacle),
+            "right_clearance_m": self._finite_metric(self.nearest_right_obstacle),
+            "corridor_clearance_m": self._finite_metric(corridor_clearance),
             "nearest_rotation_obstacle_m": self._finite_metric(
                 self.nearest_rotation_obstacle
             ),
             "dynamic_obstacle_count": len(self.latest_dynamic_obstacles),
+            "scan_filter": dict(self.last_scan_filter_stats),
+            "near_start_cost_cells": (
+                self._nearby_global_cost_counts(
+                    float(start_pose.get("x", 0.0)),
+                    float(start_pose.get("y", 0.0)),
+                )
+                if start_pose
+                else {}
+            ),
             "latency_ms": round(
                 (time.monotonic() - planning_started) * 1000.0,
                 3,
@@ -2459,9 +2820,54 @@ class NavigationAdapter(Node):
             "planning failure "
             + json.dumps(details, ensure_ascii=False, separators=(",", ":"))
         )
+        self._nav_debug("PLAN_RESULT", status="FAILED", **details)
+
+    def _classify_empty_path(self, goal: dict[str, Any]) -> AdapterError:
+        pose = self.pose or {}
+        start_cost = (
+            self._global_cost_at(float(pose["x"]), float(pose["y"]))
+            if "x" in pose and "y" in pose
+            else None
+        )
+        goal_cost = self._global_cost_at(float(goal["x"]), float(goal["y"]))
+        costmap_ready = (
+            self.latest_global_costmap is not None
+            and time.monotonic() - self.last_global_costmap_monotonic <= 1.5
+        )
+        tf_ready = (
+            bool(pose)
+            and time.monotonic() - self.last_map_tf_monotonic <= 0.60
+            and self.tf_buffer.can_transform("map", "base_footprint", Time())
+        )
+        crosses_unknown = bool(
+            self.saved_map is not None
+            and pose
+            and self.saved_map.segment_crosses_unknown(
+                float(pose["x"]),
+                float(pose["y"]),
+                float(goal["x"]),
+                float(goal["y"]),
+            )
+        )
+        code = classify_planning_failure(
+            tf_ready=tf_ready,
+            costmap_ready=costmap_ready,
+            start_cost=start_cost,
+            goal_cost=goal_cost,
+            route_crosses_unknown=crosses_unknown,
+        )
+        messages = {
+            "START_BLOCKED": "Vùng xuất phát đang bị global costmap đánh dấu là vật cản.",
+            "GOAL_BLOCKED": "Điểm đến đang bị global costmap đánh dấu là vật cản.",
+            "UNKNOWN_SPACE": "Không thể lập đường vì lộ trình đi qua vùng chưa được lập bản đồ.",
+            "COSTMAP_NOT_READY": "Global costmap chưa có dữ liệu mới để lập đường.",
+            "TF_ERROR": "Không thể xác định transform map tới robot để lập đường.",
+            "NO_VALID_PATH": "Không tìm thấy đường hợp lệ tới điểm đích.",
+        }
+        return AdapterError(code, messages[code])
 
     def _refresh_global_costmap_for_planning(self) -> None:
-        """Rebuild the live start footprint before asking Nav2 for a path."""
+        """Clear only after a diagnosed failure, then await a real update."""
         if not self.clear_global_costmap_client.wait_for_service(timeout_sec=2.0):
             raise AdapterError(
                 "GLOBAL_COSTMAP_UNAVAILABLE",
@@ -2474,12 +2880,31 @@ class NavigationAdapter(Node):
             3.0,
             "GLOBAL_COSTMAP_RESET_TIMEOUT",
         )
-        # The global costmap runs at 5 Hz. Two updates repopulate the static
-        # and obstacle layers while clearing the robot's *current* footprint.
-        # Without this, a stationary AMCL refinement can leave the old
-        # footprint cell lethal and make a clear straight route report
-        # "start pose is an obstacle" until some unrelated map update occurs.
-        time.sleep(0.45)
+        self.global_costmap_update.clear()
+        if not self.global_costmap_update.wait(2.0):
+            raise AdapterError(
+                "COSTMAP_NOT_READY",
+                "Global costmap did not publish an update after reset",
+            )
+
+    def _request_path_once(self, goal: dict[str, Any]) -> list[dict[str, float]]:
+        request = ComputePathToPose.Goal()
+        request.goal = self._goal_pose(goal)
+        request.use_start = False
+        handle = self._wait(
+            self.compute_path_client.send_goal_async(request),
+            5,
+            "PLANNER_TIMEOUT",
+        )
+        if not handle.accepted:
+            raise AdapterError("PLAN_REJECTED", "Planner rejected goal")
+        wrapped = self._wait(
+            handle.get_result_async(), 15, "PLANNER_TIMEOUT"
+        )
+        return [
+            {"x": pose.pose.position.x, "y": pose.pose.position.y}
+            for pose in wrapped.result.path.poses
+        ]
 
     def _compute_path(self, payload: dict[str, Any]) -> dict[str, Any]:
         planning_started = time.monotonic()
@@ -2487,12 +2912,12 @@ class NavigationAdapter(Node):
         requested_goal = dict(payload["goal"])
         resolved_goal = dict(requested_goal)
 
-        def mark_plan_blocked() -> None:
-            # Never leave the previous preview visible beside a fresh NO_PATH
-            # result. That stale blue line made a blocked route look usable in
-            # Center even though Nav2 had correctly rejected the new plan.
+        def mark_plan_failed(reason: str) -> None:
+            # A preview failure occurs before motion and therefore leaves the
+            # robot READY. Only an exhausted active NavigateToPose recovery may
+            # enter BLOCKED.
             with self.state_lock:
-                self.current_state = "BLOCKED"
+                self._set_state("READY", reason)
                 if self.latest_global_path:
                     self.latest_global_path = []
                     self.visualization_revision += 1
@@ -2502,7 +2927,7 @@ class NavigationAdapter(Node):
                 requested_goal
             )
         except AdapterError as exc:
-            mark_plan_blocked()
+            mark_plan_failed(f"plan_preflight_failed:{exc.code}")
             self._record_planning_failure(
                 exc,
                 requested_goal,
@@ -2521,7 +2946,7 @@ class NavigationAdapter(Node):
                 "PLANNER_UNAVAILABLE",
                 "ComputePathToPose action unavailable",
             )
-            mark_plan_blocked()
+            mark_plan_failed("planner_unavailable")
             self._record_planning_failure(
                 error,
                 requested_goal,
@@ -2529,32 +2954,22 @@ class NavigationAdapter(Node):
                 planning_started,
             )
             raise error
-        try:
-            self._refresh_global_costmap_for_planning()
-        except AdapterError as exc:
-            mark_plan_blocked()
-            self._record_planning_failure(
-                exc,
-                requested_goal,
-                resolved_goal,
-                planning_started,
-            )
-            raise
         with self.state_lock:
             # Planning creates a new Center mission only after Nav2 returns a
             # path. Do not let interim READY telemetry mutate the prior goal.
             self.current_mission_id = ""
-            self.current_state = "PLANNING"
-
-        goal = ComputePathToPose.Goal()
-        goal.goal = self._goal_pose(resolved_goal)
-        goal.use_start = False
+            self._set_state("PLANNING", "manual_plan_request")
+        self._nav_debug(
+            "PLAN_REQUEST",
+            start=dict(self.pose or {}),
+            goal=resolved_goal,
+            planner="ThetaStar",
+            retry=0,
+        )
         try:
-            handle = self._wait(
-                self.compute_path_client.send_goal_async(goal), 5, "PLANNER_TIMEOUT"
-            )
+            points = self._request_path_once(resolved_goal)
         except AdapterError as exc:
-            mark_plan_blocked()
+            mark_plan_failed(f"plan_failed:{exc.code}")
             self._record_planning_failure(
                 exc,
                 requested_goal,
@@ -2562,53 +2977,63 @@ class NavigationAdapter(Node):
                 planning_started,
             )
             raise
-        if not handle.accepted:
-            error = AdapterError("PLAN_REJECTED", "Planner rejected goal")
-            mark_plan_blocked()
-            self._record_planning_failure(
-                error,
-                requested_goal,
-                resolved_goal,
-                planning_started,
-            )
-            raise error
-        try:
-            result = self._wait(handle.get_result_async(), 15, "PLANNER_TIMEOUT").result
-        except AdapterError as exc:
-            mark_plan_blocked()
-            self._record_planning_failure(
-                exc,
-                requested_goal,
-                resolved_goal,
-                planning_started,
-            )
-            raise
-        points = [
-            {"x": pose.pose.position.x, "y": pose.pose.position.y}
-            for pose in result.path.poses
-        ]
         if not points:
-            error = AdapterError("NO_PATH", "Nav2 returned an empty path")
-            mark_plan_blocked()
-            self._record_planning_failure(
-                error,
-                requested_goal,
-                resolved_goal,
-                planning_started,
-            )
-            raise error
+            first_error = self._classify_empty_path(resolved_goal)
+            if first_error.code in {"START_BLOCKED", "COSTMAP_NOT_READY"}:
+                self._nav_debug(
+                    "PLAN_RETRY",
+                    reason=first_error.code,
+                    action="CLEAR_GLOBAL_COSTMAP_ONCE",
+                )
+                try:
+                    self._refresh_global_costmap_for_planning()
+                    self._nav_debug(
+                        "PLAN_REQUEST",
+                        start=dict(self.pose or {}),
+                        goal=resolved_goal,
+                        planner="ThetaStar",
+                        retry=1,
+                    )
+                    points = self._request_path_once(resolved_goal)
+                except AdapterError as exc:
+                    mark_plan_failed(f"plan_retry_failed:{exc.code}")
+                    self._record_planning_failure(
+                        exc,
+                        requested_goal,
+                        resolved_goal,
+                        planning_started,
+                    )
+                    raise
+            if not points:
+                error = self._classify_empty_path(resolved_goal)
+                mark_plan_failed(f"plan_failed:{error.code}")
+                self._record_planning_failure(
+                    error,
+                    requested_goal,
+                    resolved_goal,
+                    planning_started,
+                )
+                raise error
         distance = sum(
             math.hypot(b["x"] - a["x"], b["y"] - a["y"])
             for a, b in zip(points, points[1:])
         )
         with self.state_lock:
-            self.current_state = "READY"
+            self._set_state("READY", "plan_success")
             self.latest_global_path = points
             self.visualization_revision += 1
             self.planner_latency_ms = round(
                 (time.monotonic() - planning_started) * 1000.0, 3
             )
             self.last_planning_failure = {}
+        self._nav_debug(
+            "PLAN_RESULT",
+            status="SUCCESS",
+            points=len(points),
+            length=round(distance, 3),
+            duration_ms=self.planner_latency_ms,
+            goal_adjusted=goal_adjusted,
+        )
         return {
             "status": "completed",
             "current_state": "READY",
@@ -2655,7 +3080,7 @@ class NavigationAdapter(Node):
             if not superseded:
                 self.current_goal_handle = handle
                 self.paused_goal = dict(goal_payload)
-                self.current_state = "NAVIGATING"
+                self._set_state("NAVIGATING", "navigation_goal_accepted")
                 self.motion_owner = "NAVIGATION"
         if superseded:
             # Manual takeover/cancel won the race while Nav2 was accepting the
@@ -2699,14 +3124,14 @@ class NavigationAdapter(Node):
             self.current_goal_handle = None
             self.motion_owner = "NONE"
             if status == GoalStatus.STATUS_SUCCEEDED:
-                self.current_state = "SUCCEEDED"
+                self._set_state("SUCCEEDED", "goal_reached")
                 self.paused_goal = None
                 self.latest_global_path = []
                 self.visualization_revision += 1
             elif status == GoalStatus.STATUS_CANCELED and self.current_state == "PAUSED":
                 pass
             elif status == GoalStatus.STATUS_CANCELED:
-                self.current_state = "CANCELED"
+                self._set_state("CANCELED", "nav2_goal_canceled")
                 self.paused_goal = None
             else:
                 recoveries = int(self.latest_feedback.get("recoveries", 0) or 0)
@@ -2714,12 +3139,14 @@ class NavigationAdapter(Node):
                 # code. A nonzero recovery count proves Nav2 already exhausted
                 # its bounded clear/spin/wait/backup sequence, so expose the
                 # actionable, safe state instead of the generic FAILED state.
-                self.current_state = navigation_abort_state(recoveries)
-                blocked = self.current_state == "BLOCKED"
+                terminal_state = navigation_abort_state(recoveries)
+                blocked = terminal_state == "BLOCKED"
+                terminal_reason = (
+                    "NO_SAFE_ROUTE_AFTER_RECOVERY" if blocked else "NAV2_ABORTED"
+                )
+                self._set_state(terminal_state, terminal_reason.lower())
                 self.latest_feedback["terminal_reason"] = (
-                    "NO_SAFE_ROUTE_AFTER_RECOVERY"
-                    if blocked
-                    else "NAV2_ABORTED"
+                    terminal_reason
                 )
                 self.paused_goal = None
                 self.latest_global_path = []
@@ -2730,7 +3157,7 @@ class NavigationAdapter(Node):
     def _cancel_navigation(self, target: str) -> dict[str, Any]:
         with self.state_lock:
             handle = self.current_goal_handle
-            self.current_state = target
+            self._set_state(target, "operator_navigation_command")
             self.motion_owner = "NONE"
         # Revoke ownership and inject zero before waiting for Nav2's
         # acknowledgement; cancel latency must never extend chassis motion.
@@ -3023,6 +3450,7 @@ class NavigationAdapter(Node):
         except OSError:
             pass
         self.socket_path.unlink(missing_ok=True)
+        self.navigation_debug_log.close()
         return super().destroy_node()
 
 

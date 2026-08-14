@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import logging
 import math
+import os
 import statistics
 from collections import deque
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -216,6 +220,191 @@ class ScanMapMatch:
     valid_beams: int
 
 
+@dataclass(frozen=True, slots=True)
+class PlanningScanFilter:
+    ranges: list[float]
+    total_beams: int
+    valid_beams: int
+    static_map_matches: int
+    dynamic_points_kept: int
+
+
+def environment_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class NavigationDebugLog:
+    """Small rotating navigation-only log guarded by one environment flag."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        path: str | Path,
+        max_bytes: int = 20 * 1024 * 1024,
+        backup_count: int = 5,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.path = Path(path)
+        self.logger: logging.Logger | None = None
+        if not self.enabled:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger(f"rovera.navigation.{id(self)}")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        handler = RotatingFileHandler(
+            self.path,
+            maxBytes=max(1024, int(max_bytes)),
+            backupCount=max(1, int(backup_count)),
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S%z"
+        ))
+        logger.addHandler(handler)
+        self.logger = logger
+
+    @staticmethod
+    def _value(value: Any) -> str:
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return "null"
+            return f"{value:.4f}".rstrip("0").rstrip(".")
+        if isinstance(value, (dict, list, tuple)):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return str(value).lower()
+        return json.dumps(str(value), ensure_ascii=False)
+
+    def event(self, event: str, **fields: Any) -> str:
+        if not self.enabled or self.logger is None:
+            return ""
+        message = " ".join(
+            [f"[NAV][{str(event).upper()}]"]
+            + [f"{key}={self._value(value)}" for key, value in fields.items()]
+        )
+        self.logger.info(message)
+        return message
+
+    def close(self) -> None:
+        if self.logger is None:
+            return
+        for handler in list(self.logger.handlers):
+            handler.close()
+            self.logger.removeHandler(handler)
+        self.logger = None
+
+
+def _scan_endpoints(
+    ranges: Iterable[float],
+    *,
+    angle_min: float,
+    angle_increment: float,
+    lower_range: float,
+    upper_range: float,
+    laser_x: float,
+    laser_y: float,
+    laser_yaw: float,
+    step: int = 1,
+) -> Iterable[tuple[int, float, float, float]]:
+    for index, raw_distance in enumerate(ranges):
+        if index % max(1, int(step)):
+            continue
+        distance = float(raw_distance)
+        if (
+            not math.isfinite(distance)
+            or distance < lower_range
+            or distance > upper_range
+        ):
+            continue
+        angle = laser_yaw + angle_min + index * angle_increment
+        yield (
+            index,
+            distance,
+            laser_x + distance * math.cos(angle),
+            laser_y + distance * math.sin(angle),
+        )
+
+
+def filter_static_map_scan(
+    saved_map: "SavedOccupancyMap",
+    ranges: Iterable[float],
+    *,
+    angle_min: float,
+    angle_increment: float,
+    range_min: float,
+    range_max: float,
+    laser_x: float,
+    laser_y: float,
+    laser_yaw: float,
+    endpoint_tolerance: float,
+    minimum_usable_range: float = 0.20,
+    maximum_usable_range: float = 6.0,
+) -> PlanningScanFilter:
+    """Mask saved-wall endpoints only in the scan consumed by global planning.
+
+    Infinite ranges remain clearing rays when the global ObstacleLayer enables
+    ``inf_is_valid``. AMCL, the local costmap and motion safety retain the
+    original scan and therefore never lose a physical obstacle return.
+    """
+    output = [float(value) for value in ranges]
+    lower = max(float(range_min), float(minimum_usable_range))
+    upper = min(float(range_max), float(maximum_usable_range))
+    valid = 0
+    static_matches = 0
+    for index, _, endpoint_x, endpoint_y in _scan_endpoints(
+        output,
+        angle_min=float(angle_min),
+        angle_increment=float(angle_increment),
+        lower_range=lower,
+        upper_range=upper,
+        laser_x=float(laser_x),
+        laser_y=float(laser_y),
+        laser_yaw=float(laser_yaw),
+    ):
+        valid += 1
+        if saved_map.occupied_within(
+            endpoint_x, endpoint_y, float(endpoint_tolerance)
+        ):
+            output[index] = math.inf
+            static_matches += 1
+    return PlanningScanFilter(
+        ranges=output,
+        total_beams=len(output),
+        valid_beams=valid,
+        static_map_matches=static_matches,
+        dynamic_points_kept=max(0, valid - static_matches),
+    )
+
+
+def classify_planning_failure(
+    *,
+    tf_ready: bool,
+    costmap_ready: bool,
+    start_cost: int | None,
+    goal_cost: int | None,
+    route_crosses_unknown: bool,
+) -> str:
+    """Best available diagnosis for Humble's error-code-free planner result."""
+    if not tf_ready:
+        return "TF_ERROR"
+    if not costmap_ready or start_cost is None or goal_cost is None:
+        return "COSTMAP_NOT_READY"
+    if start_cost < 0 or goal_cost < 0 or route_crosses_unknown:
+        return "UNKNOWN_SPACE"
+    if start_cost >= 99:
+        return "START_BLOCKED"
+    if goal_cost >= 99:
+        return "GOAL_BLOCKED"
+    return "NO_VALID_PATH"
+
+
 def scan_to_map_match(
     saved_map: "SavedOccupancyMap",
     ranges: Iterable[float],
@@ -241,13 +430,17 @@ def scan_to_map_match(
     upper = min(float(range_max), float(maximum_usable_range))
     matched = 0
     valid = 0
-    for index in range(0, len(measurements), step):
-        distance = float(measurements[index])
-        if not math.isfinite(distance) or distance < lower or distance > upper:
-            continue
-        angle = laser_yaw + angle_min + index * angle_increment
-        endpoint_x = laser_x + distance * math.cos(angle)
-        endpoint_y = laser_y + distance * math.sin(angle)
+    for _, _, endpoint_x, endpoint_y in _scan_endpoints(
+        measurements,
+        angle_min=angle_min,
+        angle_increment=angle_increment,
+        lower_range=lower,
+        upper_range=upper,
+        laser_x=laser_x,
+        laser_y=laser_y,
+        laser_yaw=laser_yaw,
+        step=step,
+    ):
         valid += 1
         if saved_map.occupied_within(endpoint_x, endpoint_y, endpoint_tolerance):
             matched += 1
@@ -423,6 +616,26 @@ class SavedOccupancyMap:
                     and self.value_at(check_column, check_row) >= 65
                 ):
                     return True
+        return False
+
+    def segment_crosses_unknown(
+        self,
+        start_x: float,
+        start_y: float,
+        goal_x: float,
+        goal_y: float,
+    ) -> bool:
+        """Sample a direct route for failure diagnostics, not path creation."""
+        distance = math.hypot(goal_x - start_x, goal_y - start_y)
+        samples = max(1, math.ceil(distance / max(0.001, self.resolution * 0.5)))
+        for index in range(samples + 1):
+            ratio = index / samples
+            cell = self.world_to_cell(
+                start_x + (goal_x - start_x) * ratio,
+                start_y + (goal_y - start_y) * ratio,
+            )
+            if cell is None or self.value_at(*cell) < 0:
+                return True
         return False
 
     def validate_goal(

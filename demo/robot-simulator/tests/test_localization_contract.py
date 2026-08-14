@@ -204,7 +204,8 @@ def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
 
     assert "self._pose_is_stable()" in evidence
     assert "self.amcl_pose_freshness" in evidence
-    assert "self.scan_map_score >= self.scan_map_threshold" in evidence
+    assert "self.global_scan_map_threshold" in evidence
+    assert "self.scan_map_score >= required_scan_score" in evidence
     assert "self._critical_sensor_time_healthy()" in evidence
     assert "self.global_observation_minimum_rotation" in evidence
     assert 'self.localization_state == "VERIFYING"' in tick
@@ -306,6 +307,7 @@ def test_sensor_recovery_replays_saved_pose_before_global_localization() -> None
 
 def test_compute_path_lets_live_nav2_costmap_validate_the_start_pose() -> None:
     compute_path = _method_source("_compute_path", "_navigate")
+    request_once = _method_source("_request_path_once", "_compute_path")
 
     # Saved maps are quantized to 5 cm and can overlap the already occupied
     # robot pose after a small SLAM/localization shift. Goal safety remains an
@@ -313,11 +315,11 @@ def test_compute_path_lets_live_nav2_costmap_validate_the_start_pose() -> None:
     # robot has a valid path out of its current footprint.
     assert "_validate_start_footprint" not in compute_path
     assert "resolved_goal, goal_adjusted = self._resolve_planning_goal" in compute_path
-    assert "goal.use_start = False" in compute_path
-    assert "self.compute_path_client.send_goal_async(goal)" in compute_path
+    assert "request.use_start = False" in request_once
+    assert "self.compute_path_client.send_goal_async(request)" in request_once
 
 
-def test_compute_path_rebuilds_current_footprint_before_planning() -> None:
+def test_compute_path_clears_only_after_diagnosed_failure_and_waits_for_update() -> None:
     refresh = _method_source(
         "_refresh_global_costmap_for_planning",
         "_compute_path",
@@ -326,7 +328,20 @@ def test_compute_path_rebuilds_current_footprint_before_planning() -> None:
 
     assert "ClearEntireCostmap.Request()" in refresh
     assert "self.clear_global_costmap_client.call_async" in refresh
-    assert "time.sleep(0.45)" in refresh
+    assert "time.sleep" not in refresh
+    assert "self.global_costmap_update.wait" in refresh
+    first_plan = compute_path.index("points = self._request_path_once(resolved_goal)")
     reset = compute_path.index("self._refresh_global_costmap_for_planning()")
-    plan = compute_path.index("self.compute_path_client.send_goal_async(goal)")
-    assert reset < plan
+    assert first_plan < reset
+    assert 'first_error.code in {"START_BLOCKED", "COSTMAP_NOT_READY"}' in compute_path
+    assert 'self._set_state("READY", reason)' in compute_path
+    assert 'self._set_state("BLOCKED"' not in compute_path
+
+
+def test_scan_filter_is_used_only_for_global_planning_topic() -> None:
+    scan = _method_source("_planning_scan_message", "_scan_callback")
+    callback = _method_source("_scan_callback", "_sensor_time_callback")
+
+    assert "filter_static_map_scan" in scan
+    assert "self.navigation_scan.publish(message)" in callback
+    assert "self.planning_scan.publish(self._planning_scan_message(message))" in callback

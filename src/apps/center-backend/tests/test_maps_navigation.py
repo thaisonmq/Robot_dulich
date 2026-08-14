@@ -75,7 +75,7 @@ def test_auto_navigation_can_request_fresh_global_localization() -> None:
     assert request.force_global is True
 
 
-def test_blocked_or_empty_navigation_mission_cannot_start() -> None:
+def test_plan_failed_or_empty_navigation_mission_cannot_start() -> None:
     blocked = NavigationMission(
         mission_id="mission-blocked-route",
         request_id="request-blocked-route",
@@ -83,7 +83,7 @@ def test_blocked_or_empty_navigation_mission_cannot_start() -> None:
         control_session_id="session-blocked-route",
         map_id="MAP-TEST",
         map_version=1,
-        status="BLOCKED",
+        status="PLAN_FAILED",
         goal={"x": 1.0, "y": 2.0, "yaw": 0.0},
         path=[],
         error_code="NO_PATH",
@@ -92,14 +92,14 @@ def test_blocked_or_empty_navigation_mission_cannot_start() -> None:
     rejection = _mission_start_rejection(blocked)
     assert rejection is not None
     assert rejection["code"] == "NO_PATH"
-    assert "lộ trình an toàn" in rejection["message"]
+    assert "đường hợp lệ" in rejection["message"]
 
     blocked.status = "READY"
     blocked.path = [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 2.0}]
     assert _mission_start_rejection(blocked) is None
 
 
-def test_blocked_mission_preserves_specific_footprint_diagnostic() -> None:
+def test_plan_failed_mission_preserves_specific_footprint_diagnostic() -> None:
     blocked = NavigationMission(
         mission_id="mission-footprint",
         request_id="request-footprint",
@@ -107,7 +107,7 @@ def test_blocked_mission_preserves_specific_footprint_diagnostic() -> None:
         control_session_id="session-footprint",
         map_id="MAP-TEST",
         map_version=1,
-        status="BLOCKED",
+        status="PLAN_FAILED",
         goal={"x": 1.0, "y": 1.0, "yaw": 0.0},
         path=[],
         error_code="GOAL_FOOTPRINT_BLOCKED",
@@ -117,8 +117,32 @@ def test_blocked_mission_preserves_specific_footprint_diagnostic() -> None:
     assert _mission_start_rejection(blocked) == {
         "code": "GOAL_FOOTPRINT_BLOCKED",
         "message": "Điểm đến không đủ khoảng trống cho toàn bộ thân robot.",
-        "status": "BLOCKED",
+        "status": "PLAN_FAILED",
     }
+
+
+def test_plan_failure_messages_distinguish_unknown_and_blocked_start() -> None:
+    mission = NavigationMission(
+        mission_id="mission-plan-diagnostic",
+        request_id="request-plan-diagnostic",
+        robot_id="ROBOT-001",
+        control_session_id="session-plan-diagnostic",
+        map_id="MAP-TEST",
+        map_version=1,
+        status="PLAN_FAILED",
+        goal={"x": 1.0, "y": 1.0, "yaw": 0.0},
+        path=[],
+        error_code="UNKNOWN_SPACE",
+        error_message="generic",
+    )
+    rejection = _mission_start_rejection(mission)
+    assert rejection is not None
+    assert "chưa được lập bản đồ" in rejection["message"]
+
+    mission.error_code = "START_BLOCKED"
+    rejection = _mission_start_rejection(mission)
+    assert rejection is not None
+    assert "vùng xuất phát" in rejection["message"]
 
 
 def bundle_bytes(*, unsafe: bool = False) -> bytes:
@@ -205,6 +229,7 @@ def test_mapping_and_navigation_state_machines_are_idempotent_and_strict() -> No
     with pytest.raises(InvalidTransition):
         mapping_transition("FINISHED", "MAPPING")
     assert navigation_transition("READY", "PLANNING") == "PLANNING"
+    assert navigation_transition("PLANNING", "PLAN_FAILED") == "PLAN_FAILED"
     assert navigation_transition("MAP_LOADING", "LOCALIZING_LAST_POSE") == "LOCALIZING_LAST_POSE"
     assert navigation_transition("LOCALIZING_LAST_POSE", "LOCALIZING_GLOBAL") == "LOCALIZING_GLOBAL"
     assert navigation_transition("LOCALIZING_GLOBAL", "LOCALIZING_ROTATING") == "LOCALIZING_ROTATING"

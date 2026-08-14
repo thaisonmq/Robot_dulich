@@ -55,12 +55,16 @@ describe("Control saved-map architecture", () => {
     expect(sendGoal).toContain("await api.relocalize({");
     expect(sendGoal).toContain("await waitForLocalizationReady(map.map_id, map.active_version)");
     expect(sendGoal).toContain("allow_rotation: true");
-    expect(sendGoal).toContain("force_global: true");
+    expect(sendGoal).toContain("force_global: false");
     expect(sendGoal).toContain("if (realRobot) {");
     expect(dashboard).toContain("allow_rotation: allowRotation");
+    expect(dashboard).toContain("allowRotation = false");
     expect(sendGoal).toContain("preparedRoute = null");
     expect(dashboard).not.toContain("setApproximatePose");
-    expect(dashboard).toContain("setSelectedDestination(null)");
+    const relocalize = dashboard.split("const relocalize = useMutation({", 2)[1]
+      .split("useEffect(() => {", 1)[0];
+    expect(relocalize).not.toContain("setSelectedDestination(null)");
+    expect(relocalize).toContain("setRoute(null)");
   });
 
   it("loads the navigable map catalogue and recovers from a stale robot map id", () => {

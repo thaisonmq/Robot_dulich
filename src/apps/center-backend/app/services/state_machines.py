@@ -57,7 +57,10 @@ NAVIGATION_TRANSITIONS: dict[str, frozenset[str]] = {
     "LOADING_MAP": frozenset({"LOCALIZING", "FAULT", "CANCELED"}),
     "LOCALIZING": frozenset({"READY", "FAULT", "CANCELED"}),
     "READY": frozenset({"PLANNING", "NAVIGATING", "FAULT", "CANCELED"}),
-    "PLANNING": frozenset({"READY", "NAVIGATING", "BLOCKED", "RECOVERY", "FAILED", "FAULT", "CANCELED"}),
+    "PLANNING": frozenset({
+        "READY", "NAVIGATING", "BLOCKED", "RECOVERY", "PLAN_FAILED",
+        "FAILED", "FAULT", "CANCELED",
+    }),
     "NAVIGATING": frozenset({
         "PAUSED", "BLOCKED", "RECOVERY", "LOCALIZATION_LOST", "SUCCEEDED",
         "ARRIVED", "CANCELED", "FAILED", "FAULT",
@@ -66,6 +69,7 @@ NAVIGATION_TRANSITIONS: dict[str, frozenset[str]] = {
     "BLOCKED": frozenset({"NAVIGATING", "PAUSED", "RECOVERY", "CANCELED", "FAILED", "FAULT"}),
     "RECOVERY": frozenset({"NAVIGATING", "BLOCKED", "CANCELED", "FAILED", "FAULT"}),
     "SUCCEEDED": frozenset(),
+    "PLAN_FAILED": frozenset(),
     "FAILED": frozenset({"CANCELED"}),
     "ARRIVED": frozenset(),
     "CANCELED": frozenset(),

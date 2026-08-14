@@ -78,6 +78,8 @@ services:
       ROVERA_MAP_ROOT: /var/lib/rovera/maps
       NAV2_MAP_YAML: ${NAV2_MAP_YAML:-/opt/rovera/config/bootstrap-map.yaml}
       REQUIRE_SENSOR_HEALTH: ${REQUIRE_SENSOR_HEALTH:-1}
+      NAVIGATION_DEBUG_LOG: "${NAVIGATION_DEBUG_LOG:-true}"
+      NAVIGATION_DEBUG_LOG_PATH: ${NAVIGATION_DEBUG_LOG_PATH:-/var/lib/rovera/navigation/logs/navigation-debug.log}
     volumes:
       - type: bind
         source: ${ROBOT_STATE_DIR:-./state}

@@ -11,9 +11,12 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parents[1] / "navigation-stack"))
 
 from navigation_core import (  # noqa: E402
+    NavigationDebugLog,
     SavedOccupancyMap,
     SensorClockEstimator,
+    classify_planning_failure,
     compact_lethal_cells,
+    filter_static_map_scan,
     localization_confidence,
     mask_scan_self_returns,
     navigation_abort_state,
@@ -69,6 +72,84 @@ def test_goal_validation_preserves_occupied_unknown_clearance_and_dynamic_cells(
         *free, clearance_m=0.05, lethal_world_cells=[free]
     ).code == "GOAL_LETHAL"
     assert saved.validate_goal(*free, clearance_m=0.05).valid
+
+
+def test_global_planning_scan_filters_saved_corridor_walls_but_keeps_new_object() -> None:
+    occupancy = [0] * (30 * 30)
+    occupancy[6 * 30 + 10] = 100
+    occupancy[14 * 30 + 10] = 100
+    saved = SavedOccupancyMap(30, 30, 0.1, 0, 0, 0, occupancy)
+
+    filtered = filter_static_map_scan(
+        saved,
+        [0.4, 0.5, 0.4],
+        angle_min=-math.pi / 2,
+        angle_increment=math.pi / 2,
+        range_min=0.1,
+        range_max=8.0,
+        laser_x=1.05,
+        laser_y=1.05,
+        laser_yaw=0.0,
+        endpoint_tolerance=0.08,
+    )
+
+    assert filtered.static_map_matches == 2
+    assert filtered.dynamic_points_kept == 1
+    assert math.isinf(filtered.ranges[0])
+    assert filtered.ranges[1] == 0.5  # New chair/obstacle in mapped free space.
+    assert math.isinf(filtered.ranges[2])
+
+
+def test_physical_footprint_still_rejects_a_genuinely_too_narrow_corridor() -> None:
+    occupancy = [0] * (30 * 30)
+    for column in range(30):
+        occupancy[8 * 30 + column] = 100
+        occupancy[12 * 30 + column] = 100
+    saved = SavedOccupancyMap(30, 30, 0.1, 0, 0, 0, occupancy)
+
+    validation = saved.validate_footprint(
+        1.05,
+        1.05,
+        0.0,
+        half_length=0.20,
+        half_width=0.18,
+    )
+
+    assert validation.code == "GOAL_FOOTPRINT_BLOCKED"
+
+
+@pytest.mark.parametrize(
+    ("inputs", "expected"),
+    [
+        ({"tf_ready": False, "costmap_ready": True, "start_cost": 0, "goal_cost": 0, "route_crosses_unknown": False}, "TF_ERROR"),
+        ({"tf_ready": True, "costmap_ready": False, "start_cost": None, "goal_cost": None, "route_crosses_unknown": False}, "COSTMAP_NOT_READY"),
+        ({"tf_ready": True, "costmap_ready": True, "start_cost": 100, "goal_cost": 0, "route_crosses_unknown": False}, "START_BLOCKED"),
+        ({"tf_ready": True, "costmap_ready": True, "start_cost": 0, "goal_cost": 100, "route_crosses_unknown": False}, "GOAL_BLOCKED"),
+        ({"tf_ready": True, "costmap_ready": True, "start_cost": 0, "goal_cost": 0, "route_crosses_unknown": True}, "UNKNOWN_SPACE"),
+        ({"tf_ready": True, "costmap_ready": True, "start_cost": 0, "goal_cost": 0, "route_crosses_unknown": False}, "NO_VALID_PATH"),
+    ],
+)
+def test_humble_planner_failure_diagnostics_are_specific(inputs: dict, expected: str) -> None:
+    assert classify_planning_failure(**inputs) == expected
+
+
+def test_navigation_debug_file_is_rotating_and_fully_disabled_by_config(tmp_path: Path) -> None:
+    disabled_path = tmp_path / "disabled.log"
+    disabled = NavigationDebugLog(enabled=False, path=disabled_path)
+    assert disabled.event("PLAN_RESULT", status="SUCCESS") == ""
+    assert not disabled_path.exists()
+
+    enabled_path = tmp_path / "enabled.log"
+    enabled = NavigationDebugLog(
+        enabled=True,
+        path=enabled_path,
+        max_bytes=1024,
+        backup_count=2,
+    )
+    message = enabled.event("STATE", **{"from": "READY", "to": "PLANNING", "reason": "test"})
+    enabled.close()
+    assert "[NAV][STATE]" in message
+    assert "reason=\"test\"" in enabled_path.read_text()
 
 
 def test_oriented_footprint_catches_collision_missed_by_center_clearance() -> None:
@@ -444,7 +525,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert follow["primary_controller"] == (
         "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
     )
-    assert 0.0 < follow["angular_dist_threshold"] <= math.radians(4)
+    # Small 5-10 degree errors remain with RPP; large initial reversals still
+    # select pure rotation.
+    assert math.radians(25) <= follow["angular_dist_threshold"] <= math.radians(35)
     assert 0.0 < follow["angular_disengage_threshold"] < follow["angular_dist_threshold"]
     assert follow["closed_loop"] is True
     assert follow["rotate_to_goal_heading"] is False
@@ -458,8 +541,8 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert 0.0 < planner["w_traversal_cost"] <= 0.05
     assert 0.20 <= follow["forward_sampling_distance"] <= 0.30
     assert 0.15 < follow["desired_linear_vel"] <= limits["max_velocity"][0]
-    assert 0.25 < follow["rotate_to_heading_angular_vel"] <= 0.40
-    assert follow["rotate_to_heading_angular_vel"] < limits["max_velocity"][2]
+    assert follow["rotate_to_heading_angular_vel"] == limits["max_velocity"][2]
+    assert follow["max_angular_accel"] == limits["max_accel"][2]
     assert follow["lookahead_dist"] >= 0.35
     assert follow["regulated_linear_scaling_min_speed"] >= 0.07
     assert follow["max_allowed_time_to_collision_up_to_carrot"] >= 0.5
@@ -468,13 +551,14 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     # Wide/right-angle corners must remain forward arcs, while an almost
     # opposite initial heading still selects the fast in-place turn.
     assert math.pi / 2 < follow["rotate_to_heading_min_angle"] < math.pi
-    assert follow["rotate_to_heading_angular_vel"] < limits["max_velocity"][2]
     assert global_costmap["update_frequency"] >= 5
     assert local_costmap["update_frequency"] > global_costmap["update_frequency"]
     assert global_costmap["obstacle_layer"]["combination_method"] == 1
-    assert global_costmap["footprint_padding"] == local_costmap["footprint_padding"] == 0.0
+    assert global_costmap["footprint_padding"] == 0.0
+    assert local_costmap["footprint_padding"] == -0.02
     assert global_costmap["static_layer"]["footprint_clearing_enabled"] is True
-    assert global_costmap["inflation_layer"]["inflation_radius"] >= 0.4
+    assert 0.25 <= global_costmap["inflation_layer"]["inflation_radius"] <= 0.30
+    assert local_costmap["inflation_layer"]["inflation_radius"] >= 0.4
     assert local_costmap["update_frequency"] >= 10
     assert local_costmap["resolution"] <= 0.025
     assert local_costmap["obstacle_layer"]["scan"]["observation_persistence"] == 0.0
@@ -487,6 +571,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
         assert scan["raytrace_max_range"] >= scan["obstacle_max_range"]
         assert scan["expected_update_rate"] <= 0.30
     assert global_costmap["obstacle_layer"]["scan"]["observation_persistence"] == 0.0
+    assert global_costmap["obstacle_layer"]["scan"]["topic"] == "/scan_planning"
+    assert global_costmap["obstacle_layer"]["scan"]["inf_is_valid"] is True
+    assert local_costmap["obstacle_layer"]["scan"]["topic"] == "/scan_navigation"
     assert 10.0 <= controller["controller_frequency"] <= local_costmap["update_frequency"]
     assert limits["smoothing_frequency"] >= controller["controller_frequency"]
     assert abs(limits["max_decel"][0]) >= 0.5
@@ -495,10 +582,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert localization["footprint_half_width"] == 0.18
     assert localization["localization_rotation_minimum_obstacle_distance"] == -0.07
     assert localization["planning_footprint_padding"] == global_costmap["footprint_padding"]
-    # Nav2's rasterized collision polygon has a bounded sub-cell allowance,
-    # while adapter preflight and UI retain the complete physical dimensions.
+    # The complete measured footprint is the single source of truth.
     expected_collision_footprint = (
-        "[[0.18, 0.16], [0.18, -0.16], [-0.18, -0.16], [-0.18, 0.16]]"
+        "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
     )
     assert local_costmap["footprint"] == expected_collision_footprint
     assert global_costmap["footprint"] == expected_collision_footprint
@@ -506,6 +592,10 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert behavior["rotational_acc_lim"] == limits["max_accel"][2]
     assert localization["scan_map_maximum_beams"] <= 120
     assert localization["scan_map_minimum_score"] > 0
+    assert localization["localization_global_scan_map_minimum_score"] >= 0.75
+    assert localization["auto_localization_max_angle_degrees"] >= 360.0
+    assert navigation["amcl"]["ros__parameters"]["max_particles"] >= 3000
+    assert navigation["amcl"]["ros__parameters"]["max_beams"] >= 90
     assert localization["localization_verify_timeout_seconds"] <= 3.0
     # This stale block was never launched; motion-safety owns the one smoother source of truth.
     assert "velocity_smoother" not in navigation
@@ -543,6 +633,7 @@ def test_all_auto_speed_profiles_are_centralized_and_within_manual_fast() -> Non
 
     assert profiles.default_mode == "NORMAL"
     assert profiles.get("slow").linear_max == 0.17
+    assert profiles.get("slow").collision_horizon == 0.50
     assert profiles.get("slow").min_lookahead_dist >= 0.50
     assert profiles.get("slow").lookahead_time >= 3.0
     assert profiles.get("normal").linear_max == 0.27
@@ -657,6 +748,24 @@ def test_navigation_image_installs_the_configured_planner() -> None:
 
     assert "ros-humble-nav2-smac-planner" in dockerfile
     assert "ros-humble-nav2-rotation-shim-controller" in dockerfile
+
+
+def test_navigation_debug_logging_defaults_on_and_uses_persistent_state_bind() -> None:
+    project = Path(__file__).parents[1]
+    compose = yaml.safe_load((project / "compose.navigation.yml").read_text())
+    navigation = compose["services"]["navigation-stack"]
+
+    assert navigation["environment"]["NAVIGATION_DEBUG_LOG"] == (
+        "${NAVIGATION_DEBUG_LOG:-true}"
+    )
+    assert navigation["environment"]["NAVIGATION_DEBUG_LOG_PATH"].startswith(
+        "${NAVIGATION_DEBUG_LOG_PATH:-/var/lib/rovera/navigation/logs/"
+    )
+    assert any(
+        volume.get("target") == "/var/lib/rovera"
+        for volume in navigation["volumes"]
+        if isinstance(volume, dict)
+    )
 
 
 def test_pi_dds_profile_rejects_incompatible_remote_participants() -> None:

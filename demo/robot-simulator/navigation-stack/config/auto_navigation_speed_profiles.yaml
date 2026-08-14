@@ -12,17 +12,16 @@ auto_navigation_speed_profiles:
     angular_accel_max: 2.00
     angular_decel_max: 2.00
 
-  # A new path is aligned once before forward motion. Keep this deliberately
-  # below the travel angular limit so the downstream smoother can stop the
-  # chassis accurately before FAST is allowed to accelerate in a straight
-  # line.
+  # A new path is aligned once before forward motion. Large error can use the
+  # proven Manual Fast ceiling; Rotation Shim and the downstream smoother
+  # reduce angular speed as the heading error closes.
   initial_alignment:
-    # The deployed 0.55 rad/s alignment crossed the target heading before the
-    # 10 Hz pose/controller loop observed that it was inside tolerance. RPP
-    # then spent several seconds steering back across the route. A slower,
-    # lower-acceleration one-time alignment removes that reversal.
-    angular_velocity: 0.35
-    angular_accel: 0.80
+    # Rotation Shim uses this as the large-error ceiling and brakes from
+    # sqrt(2*a*error) near the target. Pure rotation bypasses the Auto limiter's
+    # second slew stage, while the shared 2 rad/s² smoother and motion safety
+    # remain downstream exactly as for proven Manual Fast.
+    angular_velocity: 0.80
+    angular_accel: 2.00
 
   debug:
     # Keep detailed pipeline evidence during field tuning. Two samples/second
@@ -40,7 +39,12 @@ auto_navigation_speed_profiles:
       angular_decel: 1.50
       regulated_min_radius: 0.70
       regulated_min_speed: 0.08
-      collision_horizon: 0.70
+      # At 0.17 m/s, 0.70 s projected the complete footprint about 12 cm
+      # forward and repeatedly intersected isolated 28-30 cm scan cells in a
+      # corridor that the unchanged physical motion-safety footprint permits.
+      # Keep RPP collision checking enabled, but limit that projection to
+      # 8.5 cm so it does not reject the traversable corridor prematurely.
+      collision_horizon: 0.50
       # At 0.17 m/s the former velocity-scaled carrot was only ~0.25 m away,
       # causing RPP to chase centimetre-scale map/grid noise left then right.
       # A ~0.41 m carrot damps that noise while collision projection remains on.

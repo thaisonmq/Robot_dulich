@@ -486,7 +486,7 @@ async def delete_map(
     active_mission = database.scalar(
         select(NavigationMission.mission_id).where(
             NavigationMission.map_id == map_id,
-            NavigationMission.status.not_in(("ARRIVED", "CANCELED", "FAULT")),
+            NavigationMission.status.not_in(("ARRIVED", "CANCELED", "PLAN_FAILED", "FAULT")),
         )
     )
     affected_robots = database.scalars(
@@ -530,7 +530,9 @@ async def delete_map(
         for mission in database.scalars(
             select(NavigationMission).where(
                 NavigationMission.map_id == map_id,
-                NavigationMission.status.not_in(("SUCCEEDED", "ARRIVED", "CANCELED", "FAILED", "FAULT")),
+                NavigationMission.status.not_in(
+                    ("SUCCEEDED", "ARRIVED", "CANCELED", "PLAN_FAILED", "FAILED", "FAULT")
+                ),
             )
         ):
             mission.status = "CANCELED"

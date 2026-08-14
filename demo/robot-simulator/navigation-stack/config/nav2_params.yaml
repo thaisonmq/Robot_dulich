@@ -5,8 +5,12 @@ amcl:
     global_frame_id: map
     odom_frame_id: odom
     scan_topic: /scan_navigation
-    min_particles: 300
-    max_particles: 1200
+    # Global localization must cover the complete saved map densely enough to
+    # avoid collapsing onto a visually similar corridor. Adaptive sampling
+    # returns to the lower bound after convergence, so the higher ceiling is
+    # paid mainly during an explicit force rescan.
+    min_particles: 500
+    max_particles: 3000
     update_min_d: 0.05
     update_min_a: 0.05
     resample_interval: 1
@@ -19,7 +23,7 @@ amcl:
     beam_skip_distance: 0.50
     beam_skip_threshold: 0.30
     beam_skip_error_threshold: 0.90
-    max_beams: 60
+    max_beams: 90
     laser_max_range: 8.0
     laser_min_range: 0.12
     set_initial_pose: false
@@ -62,13 +66,21 @@ rovera_navigation_adapter:
     scan_map_maximum_beams: 90
     scan_map_minimum_valid_beams: 25
     scan_map_minimum_score: 0.35
+    # A force-global search needs much stronger evidence than verification of
+    # an already tracked pose. Field logs showed wrong hypotheses at 0.588-
+    # 0.663 and the correct pose at 0.9655; reject the ambiguous cluster.
+    localization_global_scan_map_minimum_score: 0.80
     scan_map_minimum_range: 0.20
     scan_map_maximum_range: 6.0
     scan_map_endpoint_tolerance: 0.12
     scan_map_freshness_seconds: 0.60
     sensor_time_invalid_grace_seconds: 1.0
     auto_localization_rotation_degrees_per_second: 45.0
-    auto_localization_max_angle_degrees: 270.0
+    # Complete one full observation sweep when an accurate hypothesis has not
+    # appeared earlier. The extra quarter-turn costs about two seconds at the
+    # configured speed and avoids requiring another operator rescan merely
+    # because the distinctive map view lay in the skipped 90-degree sector.
+    auto_localization_max_angle_degrees: 360.0
     # Wait for the chassis/smoother to stop before collecting the stationary
     # AMCL window used by the strict READY acquisition gate.
     localization_rotation_settle_seconds: 1.0
@@ -153,21 +165,25 @@ controller_server:
       # as continuous arcs instead of repeatedly entering stop-turn-go.
       plugin: nav2_rotation_shim_controller::RotationShimController
       primary_controller: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
-      # Do not release linear motion at the former ~10-degree error. Complete
-      # the one initial alignment to ~3 degrees, settle angular momentum, then
-      # hand the stable path to RPP.
-      angular_dist_threshold: 0.05
+      # Let RPP correct corridor-scale heading error while moving. Field logs
+      # showed a nearly straight path at 18.9 degrees crossing the old 20
+      # degree boundary on one sample; the resulting in-place turn overshot to
+      # roughly 32 degrees and only then collided with the corridor wall.
+      # Thirty degrees keeps 90/180-degree turns pure while avoiding that
+      # unnecessary rotation in an otherwise traversable passage.
+      angular_dist_threshold: 0.52
       # Humble keeps a separate in-rotation disengage threshold whose default
       # is 0.785 rad. Leaving that default in place made the shim rotate for
       # one controller tick, then hand RPP a path still misaligned by as much
-      # as 45 degrees. Keep rotating until roughly two degrees instead.
-      angular_disengage_threshold: 0.035
+      # as 45 degrees. Once a large turn starts, finish it to about five
+      # degrees before releasing linear motion.
+      angular_disengage_threshold: 0.087
       # Align to the immediate 25 cm path segment. Sampling 55 cm looked past
       # nearby corners and started an in-place turn while the straight escape
       # corridor directly in front of the robot was still clear.
       forward_sampling_distance: 0.25
-      rotate_to_heading_angular_vel: 0.35
-      max_angular_accel: 0.80
+      rotate_to_heading_angular_vel: 0.80
+      max_angular_accel: 2.00
       simulate_ahead_time: 1.20
       rotate_to_goal_heading: false
       closed_loop: true
@@ -214,13 +230,13 @@ local_costmap:
       # A 2.5 cm rolling grid avoids a full 5 cm aliasing error when a scan
       # endpoint lands on different cells in the global and local grids.
       resolution: 0.025
-      # Costmap cells are areas, but Humble's footprint checker tests their
-      # discrete lethal representatives. Inset the collision raster by 2 cm
-      # so a wall just outside the measured 0.40 x 0.36 m body is not aliased
-      # into a corner during an in-place turn. Adapter/UI validation continues
-      # to use the complete physical footprint below.
-      footprint: "[[0.18, 0.16], [0.18, -0.16], [-0.18, -0.16], [-0.18, 0.16]]"
-      footprint_padding: 0.0
+      # Keep the measured 0.40 x 0.36 m polygon as the source of truth. The
+      # local 2.5 cm raster can move a wall representative by almost one cell,
+      # so compensate that discretization explicitly. The adapter, global
+      # planner, raw-scan motion safety and stopping margin retain the complete
+      # physical footprint.
+      footprint: "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
+      footprint_padding: -0.02
       # The robot has a planar LaserScan, not a 3D point cloud. Use the same
       # 2D obstacle model as the global costmap so the planner and RPP do not
       # disagree about which cells are lethal.
@@ -264,10 +280,9 @@ global_costmap:
       robot_base_frame: base_footprint
       resolution: 0.05
       track_unknown_space: true
-      # The saved grid is coarser (5 cm), so use the same bounded 2 cm raster
-      # allowance as the local checker. The physical footprint remains 0.40 x
-      # 0.36 m for goal preflight, visualization and localization safety.
-      footprint: "[[0.18, 0.16], [0.18, -0.16], [-0.18, -0.16], [-0.18, 0.16]]"
+      # Keep the same measured 0.40 x 0.36 m body as every other navigation
+      # and safety layer; costmap margins are configured explicitly below.
+      footprint: "[[0.20, 0.18], [0.20, -0.18], [-0.20, -0.18], [-0.20, 0.18]]"
       footprint_padding: 0.0
       plugins: [static_layer, obstacle_layer, inflation_layer]
       static_layer:
@@ -289,10 +304,16 @@ global_costmap:
         combination_method: 1
         observation_sources: scan
         scan:
-          topic: /scan_navigation
+          # Saved-wall endpoints are masked only on this planning-only topic.
+          # AMCL, local costmap and motion safety continue to receive the full
+          # /scan_navigation or raw /scan streams.
+          topic: /scan_planning
           clearing: true
           marking: true
           data_type: LaserScan
+          # Masked static endpoints become +inf so they still clear stale
+          # dynamic cells without being marked a second time.
+          inf_is_valid: true
           raytrace_max_range: 4.0
           raytrace_min_range: 0.12
           obstacle_max_range: 3.5
@@ -303,10 +324,12 @@ global_costmap:
           expected_update_rate: 0.30
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
-        # Maintain a broad cost gradient so the cost-aware planner prefers
-        # open corridors and routes around dynamic obstacles when possible.
+        # The measured half-width is 0.18 m. A 0.28 m global radius keeps a
+        # 10 cm route-selection margin without declaring a physically valid
+        # indoor corridor impossible. Local inflation and motion safety stay
+        # unchanged as the final collision authorities.
         cost_scaling_factor: 3.0
-        inflation_radius: 0.45
+        inflation_radius: 0.28
       always_send_full_costmap: false
 
 bt_navigator:
