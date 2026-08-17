@@ -164,6 +164,9 @@ async def test_session_without_control_channel_releases_robot_lock() -> None:
     assert abandoned.end_reason == "control_connect_timeout"
     assert "ROBOT-001" not in hub.robot_session
     assert robot.availability == "available"
+    assert [item["message_type"] for item in sent[-3:]] == [
+        "navigation.cancel", "control.stop", "media.stop",
+    ]
     assert sent[-1]["message_type"] == "media.stop"
 
     replacement = await hub.create_session("ROBOT-001", "user-b", 60)

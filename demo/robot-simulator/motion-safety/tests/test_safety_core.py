@@ -157,18 +157,63 @@ def test_slow_zone_only_applies_to_commanded_direction() -> None:
     assert 0 < reverse.speed_scale < 1.0
 
 
-def test_front_left_obstacle_stops_translation_but_preserves_escape_turn() -> None:
+def test_side_obstacle_allows_translation_but_clips_unsafe_arc() -> None:
     decision = evaluate_scan(
         scan_with_points([(0.18, 0.13), (1.0, 0.0)]),
         linear_x=0.15,
         angular_z=-0.20,
         config=CONFIG,
     )
-    assert decision.speed_scale == 0.0
-    assert decision.angular_scale == 1.0
-    assert decision.blocked & Direction.FRONT
-    assert not decision.blocked & Direction.RIGHT
-    assert not decision.hard_stop
+    assert decision.speed_scale == 1.0
+    assert decision.angular_scale == 0.0
+    assert not decision.blocked & Direction.FRONT
+    assert decision.blocked & Direction.RIGHT
+    assert not decision.stop
+
+
+def test_close_parallel_wall_is_not_in_straight_braking_envelope() -> None:
+    decision = evaluate_scan(
+        scan_with_points([
+            (0.18, 0.12), (0.30, 0.12), (0.50, 0.12), (1.0, 0.0),
+        ]),
+        linear_x=0.12,
+        angular_z=0.0,
+        measured_linear_x=0.12,
+        config=CONFIG,
+    )
+    assert not decision.stop
+    assert not decision.blocked & Direction.FRONT
+    assert decision.speed_scale == 1.0
+
+
+def test_translation_block_reports_the_actual_front_beam() -> None:
+    scan = scan_with_points([(0.18, 0.0), (1.0, 0.5)])
+    decision = evaluate_scan(
+        scan,
+        linear_x=0.12,
+        angular_z=0.0,
+        measured_linear_x=0.12,
+        config=CONFIG,
+    )
+    assert decision.stop
+    assert decision.blocking_beam_index >= 0
+    assert decision.blocking_point_x is not None
+    assert decision.blocking_point_y is not None
+    assert decision.blocking_range == scan.ranges[decision.blocking_beam_index]
+    assert decision.predicted_swept_clearance == decision.front_clearance
+    assert decision.required_swept_clearance == decision.required_stop_distance
+
+
+def test_scan_points_are_transformed_from_laser_to_chassis_frame() -> None:
+    config = SafetyConfig(laser_x=-0.005)
+    decision = evaluate_scan(
+        scan_with_points([(0.30, 0.0)]),
+        linear_x=0.05,
+        angular_z=0.0,
+        measured_linear_x=0.0,
+        config=config,
+    )
+    assert math.isclose(decision.front_clearance, 0.145, abs_tol=1e-6)
 
 
 def test_obstacle_beyond_slow_envelope_does_not_create_far_stop() -> None:
@@ -305,3 +350,13 @@ def test_measured_angular_velocity_protects_sweep_after_command_slows() -> None:
     assert still_rotating.stop
     assert still_rotating.reason == "rotation_sweep_collision"
     assert still_rotating.blocked & Direction.LEFT
+    assert still_rotating.blocking_beam_index >= 0
+    assert still_rotating.blocking_point_x is not None
+    assert still_rotating.blocking_point_y is not None
+    assert still_rotating.blocking_range == scan.ranges[
+        still_rotating.blocking_beam_index
+    ]
+    assert still_rotating.requested_rotation_direction == "LEFT"
+    assert still_rotating.measured_angular_velocity == 0.8
+    assert still_rotating.predicted_swept_clearance is not None
+    assert still_rotating.required_swept_clearance == CONFIG.rotation_margin

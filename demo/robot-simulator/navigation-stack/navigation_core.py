@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import statistics
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
@@ -83,6 +84,261 @@ class StopTurnRoute:
     points: tuple[dict[str, float], ...]
     metadata: RouteMetadata
     heading_bins: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveSegment:
+    """Immutable control geometry for one stop-turn straight segment.
+
+    The preview route remains useful to the UI, but it is deliberately not
+    consulted after this object is created.  Re-anchoring creates a new
+    instance and token so every control/feedback path observes one geometry.
+    """
+
+    planned_start: dict[str, float]
+    effective_start: dict[str, float]
+    endpoint: dict[str, float]
+    fixed_heading: float
+    segment_length: float
+    segment_index: int
+    route_id: str
+    segment_token: int
+    narrow: bool
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        planned_start: dict[str, float],
+        effective_start: dict[str, float],
+        endpoint: dict[str, float],
+        segment_index: int,
+        route_id: str,
+        segment_token: int,
+        narrow: bool = False,
+    ) -> "ActiveSegment":
+        planned = {
+            "x": float(planned_start["x"]),
+            "y": float(planned_start["y"]),
+        }
+        effective = {
+            "x": float(effective_start["x"]),
+            "y": float(effective_start["y"]),
+        }
+        end = {"x": float(endpoint["x"]), "y": float(endpoint["y"])}
+        delta_x = end["x"] - effective["x"]
+        delta_y = end["y"] - effective["y"]
+        length = math.hypot(delta_x, delta_y)
+        if length <= 1e-9:
+            raise ValueError("Active segment must have non-zero length")
+        return cls(
+            planned_start=planned,
+            effective_start=effective,
+            endpoint=end,
+            fixed_heading=math.atan2(delta_y, delta_x),
+            segment_length=length,
+            segment_index=int(segment_index),
+            route_id=str(route_id),
+            segment_token=int(segment_token),
+            narrow=bool(narrow),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StraightSegmentProgress:
+    segment_length: float
+    along_track: float
+    remaining_longitudinal: float
+    signed_cross_track: float
+    endpoint_distance: float
+    passed_endpoint: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StraightControlDecision:
+    angular: float
+    forward_allowed: bool
+    heading_error: float
+    signed_cross_track: float
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentWatchdogDecision:
+    exceeded: bool
+    elapsed_limit: float
+    travel_limit: float
+    reason: str = ""
+
+
+def straight_segment_progress(
+    start: dict[str, float],
+    end: dict[str, float],
+    current_pose: dict[str, float],
+    *,
+    overshoot_epsilon: float = 1e-6,
+) -> StraightSegmentProgress:
+    """Project a pose onto a fixed finite segment without path look-ahead."""
+    start_x, start_y = float(start["x"]), float(start["y"])
+    end_x, end_y = float(end["x"]), float(end["y"])
+    delta_x, delta_y = end_x - start_x, end_y - start_y
+    length = math.hypot(delta_x, delta_y)
+    if length <= 1e-9:
+        raise ValueError("Straight segment must have non-zero length")
+    unit_x, unit_y = delta_x / length, delta_y / length
+    pose_delta_x = float(current_pose["x"]) - start_x
+    pose_delta_y = float(current_pose["y"]) - start_y
+    along = pose_delta_x * unit_x + pose_delta_y * unit_y
+    cross = unit_x * pose_delta_y - unit_y * pose_delta_x
+    remaining = length - along
+    endpoint_distance = math.hypot(
+        float(current_pose["x"]) - end_x,
+        float(current_pose["y"]) - end_y,
+    )
+    epsilon = max(0.0, float(overshoot_epsilon))
+    return StraightSegmentProgress(
+        segment_length=length,
+        along_track=along,
+        remaining_longitudinal=remaining,
+        signed_cross_track=cross,
+        endpoint_distance=endpoint_distance,
+        passed_endpoint=along > length + epsilon,
+    )
+
+
+def straight_heading_lock(
+    segment: ActiveSegment,
+    current_pose: dict[str, float],
+    *,
+    heading_kp: float,
+    cross_track_kp: float,
+    maximum_angular: float,
+    heading_deadband: float,
+    cross_track_deadband: float,
+    hard_heading_error: float,
+    hard_cross_track: float,
+) -> StraightControlDecision:
+    """Return bounded line-lock steering independent of RPP curvature."""
+    progress = straight_segment_progress(
+        segment.effective_start,
+        segment.endpoint,
+        current_pose,
+    )
+    heading_error = _angle_delta(
+        segment.fixed_heading,
+        float(current_pose.get("yaw", segment.fixed_heading)),
+    )
+    if abs(heading_error) > abs(float(hard_heading_error)):
+        return StraightControlDecision(
+            0.0,
+            False,
+            heading_error,
+            progress.signed_cross_track,
+            "HEADING_ERROR_HARD_LIMIT",
+        )
+    if abs(progress.signed_cross_track) > abs(float(hard_cross_track)):
+        return StraightControlDecision(
+            0.0,
+            False,
+            heading_error,
+            progress.signed_cross_track,
+            "CROSS_TRACK_HARD_LIMIT",
+        )
+    heading_term = (
+        0.0
+        if abs(heading_error) <= abs(float(heading_deadband))
+        else float(heading_kp) * heading_error
+    )
+    cross_term = (
+        0.0
+        if abs(progress.signed_cross_track) <= abs(float(cross_track_deadband))
+        else -float(cross_track_kp) * progress.signed_cross_track
+    )
+    maximum = abs(float(maximum_angular))
+    angular = max(-maximum, min(maximum, heading_term + cross_term))
+    return StraightControlDecision(
+        angular,
+        True,
+        heading_error,
+        progress.signed_cross_track,
+    )
+
+
+def endpoint_braking_speed_limit(
+    remaining_longitudinal: float,
+    *,
+    deceleration: float,
+    reaction_time: float,
+) -> float:
+    """Maximum speed whose conservative stop envelope fits before the end."""
+    remaining = max(0.0, float(remaining_longitudinal))
+    decel = max(1e-6, float(deceleration))
+    reaction = max(0.0, float(reaction_time))
+    # Solve v*t + v^2/(2*a) = remaining for its non-negative root.
+    return decel * (math.sqrt(reaction * reaction + 2.0 * remaining / decel) - reaction)
+
+
+def segment_travel_watchdog(
+    *,
+    segment_length: float,
+    elapsed: float,
+    positive_travel: float,
+    expected_speed: float,
+    settle_allowance: float,
+    travel_factor: float,
+    minimum_travel_slack: float,
+    time_factor: float,
+) -> SegmentWatchdogDecision:
+    """Bound controller lifetime and travel relative to active geometry."""
+    length = max(0.0, float(segment_length))
+    speed = max(0.05, abs(float(expected_speed)))
+    elapsed_limit = (
+        length / speed * max(1.0, float(time_factor))
+        + max(0.0, float(settle_allowance))
+    )
+    travel_limit = (
+        length * max(1.0, float(travel_factor))
+        + max(0.0, float(minimum_travel_slack))
+    )
+    if float(positive_travel) > travel_limit:
+        return SegmentWatchdogDecision(
+            True, elapsed_limit, travel_limit, "POSITIVE_TRAVEL_LIMIT"
+        )
+    if float(elapsed) > elapsed_limit:
+        return SegmentWatchdogDecision(
+            True, elapsed_limit, travel_limit, "ELAPSED_TIME_LIMIT"
+        )
+    return SegmentWatchdogDecision(False, elapsed_limit, travel_limit)
+
+
+def turn_hysteresis_transition(
+    phase: str,
+    heading_error: float,
+    *,
+    completion_tolerance: float,
+    reentry_tolerance: float,
+    stable_elapsed: float,
+    stable_dwell: float,
+) -> str:
+    """Pure TURN/TURN_SETTLING transition with distinct enter/exit bands.
+
+    The completion tolerance is the threshold for entering the zero-command
+    settling phase.  Once there, the wider re-entry tolerance is the stable
+    band: small passive drift must neither restart the motors nor prevent the
+    segment from completing forever.
+    """
+    error = abs(float(heading_error))
+    completion = abs(float(completion_tolerance))
+    reentry = max(completion, abs(float(reentry_tolerance)))
+    if phase == "TURN":
+        return "TURN_SETTLING" if error <= completion else "TURN"
+    if phase != "TURN_SETTLING":
+        raise ValueError(f"Unsupported turn phase {phase!r}")
+    if error > reentry:
+        return "TURN"
+    if float(stable_elapsed) >= max(0.0, float(stable_dwell)):
+        return "STRAIGHT_PREPARE"
+    return "TURN_SETTLING"
 
 
 def _finite_or_none(value: float) -> float | None:
@@ -624,6 +880,65 @@ def validate_rotation_sweep(
     return RotationSweepValidation(True, samples_checked=sample_count + 1)
 
 
+def validate_rotation_sweep_neighborhood(
+    saved_map: "SavedOccupancyMap",
+    x: float,
+    y: float,
+    start_yaw: float,
+    end_yaw: float,
+    *,
+    half_length: float,
+    half_width: float,
+    padding: float = 0.0,
+    robustness_radius: float = 0.0,
+    allow_unknown: bool = False,
+) -> RotationSweepValidation:
+    """Validate a turn at the nominal point and a small pose-error ring.
+
+    A route corner that is valid only at one exact floating-point position is
+    not executable on the real chassis: localization and braking leave a few
+    millimetres of position error.  The ring is intentionally independent of
+    footprint padding so straight travel in a narrow corridor keeps the
+    directional rectangular-footprint clearance it already proved.
+    """
+    radius = max(0.0, float(robustness_radius))
+    offsets = [(0.0, 0.0)]
+    if radius > 0.0:
+        diagonal = radius / math.sqrt(2.0)
+        offsets.extend((
+            (radius, 0.0),
+            (-radius, 0.0),
+            (0.0, radius),
+            (0.0, -radius),
+            (diagonal, diagonal),
+            (diagonal, -diagonal),
+            (-diagonal, diagonal),
+            (-diagonal, -diagonal),
+        ))
+    samples = 0
+    for offset_x, offset_y in offsets:
+        validation = validate_rotation_sweep(
+            saved_map,
+            float(x) + offset_x,
+            float(y) + offset_y,
+            start_yaw,
+            end_yaw,
+            half_length=half_length,
+            half_width=half_width,
+            padding=padding,
+            allow_unknown=allow_unknown,
+        )
+        samples += validation.samples_checked
+        if not validation.valid:
+            return RotationSweepValidation(
+                False,
+                "TURN_SWEEP_NOT_ROBUST",
+                samples,
+                validation.collision_yaw,
+            )
+    return RotationSweepValidation(True, samples_checked=samples)
+
+
 def validate_stop_turn_route(
     saved_map: "SavedOccupancyMap",
     points: Iterable[dict[str, float]],
@@ -631,6 +946,7 @@ def validate_stop_turn_route(
     half_length: float,
     half_width: float,
     padding: float = 0.0,
+    turn_robustness_radius: float = 0.0,
 ) -> ExecutablePathValidation:
     route = canonicalize_stop_turn_path(points)
     if len(route) < 2:
@@ -661,7 +977,7 @@ def validate_stop_turn_route(
             route[corner_index + 1]["y"] - route[corner_index]["y"],
             route[corner_index + 1]["x"] - route[corner_index]["x"],
         )
-        rotation = validate_rotation_sweep(
+        rotation = validate_rotation_sweep_neighborhood(
             saved_map,
             route[corner_index]["x"],
             route[corner_index]["y"],
@@ -670,6 +986,7 @@ def validate_stop_turn_route(
             half_length=half_length,
             half_width=half_width,
             padding=padding,
+            robustness_radius=turn_robustness_radius,
         )
         samples += rotation.samples_checked
         if not rotation.valid:
@@ -796,6 +1113,14 @@ def route_geometry_metadata(
         estimated_time=(
             total_length / max(0.01, linear_speed)
             + total_turn_angle / max(0.01, angular_speed)
+            # Every additional stop-turn corner also forces one complete
+            # translation decel/settle/accel cycle.  One footprint length at
+            # nominal speed is a geometry-scaled lower-bound for that cycle;
+            # accounting for it prevents tiny distance savings from adding
+            # chattering corners while still rewarding material oblique cuts.
+            + turn_count
+            * (2.0 * (half_length + padding))
+            / max(0.01, linear_speed)
         ),
         turn_safe=turn_safe,
     )
@@ -818,6 +1143,7 @@ class StopTurnStateLatticePlanner:
         linear_speed: float = 0.20,
         angular_speed: float = 0.60,
         max_expansions: int = 250_000,
+        turn_robustness_radius: float = 0.01,
     ) -> None:
         self.saved_map = saved_map
         self.geometry = geometry
@@ -832,7 +1158,29 @@ class StopTurnStateLatticePlanner:
         self.linear_speed = max(0.01, float(linear_speed))
         self.angular_speed = max(0.01, float(angular_speed))
         self.max_expansions = max(1, int(max_expansions))
+        self.turn_robustness_radius = max(0.0, float(turn_robustness_radius))
         self.heading_step = 2.0 * math.pi / self.HEADING_BINS
+
+    def _turn_valid(
+        self,
+        x: float,
+        y: float,
+        start_yaw: float,
+        end_yaw: float,
+        *,
+        robust: bool = True,
+    ) -> bool:
+        return validate_rotation_sweep_neighborhood(
+            self.saved_map,
+            x,
+            y,
+            start_yaw,
+            end_yaw,
+            half_length=self.half_length,
+            half_width=self.half_width,
+            padding=self.padding,
+            robustness_radius=(self.turn_robustness_radius if robust else 0.0),
+        ).valid
 
     def heading_bin(self, yaw: float) -> int:
         return int(round(float(yaw) / self.heading_step)) % self.HEADING_BINS
@@ -904,6 +1252,7 @@ class StopTurnStateLatticePlanner:
         start_cell: tuple[int, int],
         goal_cell: tuple[int, int],
         exclusions: tuple[tuple[float, float, float], ...],
+        deadline_monotonic: float | None = None,
     ) -> list[tuple[int, int]]:
         """Fast topology search; exact SE(2) checks remain authoritative."""
         start_index = self.geometry.index(*start_cell)
@@ -912,6 +1261,11 @@ class StopTurnStateLatticePlanner:
         costs = {start_index: 0.0}
         parents: dict[int, int | None] = {start_index: None}
         while queue:
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                return []
             _, index = heapq.heappop(queue)
             if index == goal_index:
                 break
@@ -970,6 +1324,7 @@ class StopTurnStateLatticePlanner:
         seed: list[tuple[int, int]],
         start: dict[str, float],
         goal: dict[str, float],
+        deadline_monotonic: float | None = None,
     ) -> list[dict[str, float]]:
         if len(seed) < 2:
             return []
@@ -987,11 +1342,21 @@ class StopTurnStateLatticePlanner:
         failed: set[tuple[int, int]] = set()
 
         def solve(index: int, incoming_yaw: float) -> list[int] | None:
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                return None
             incoming_bin = self.heading_bin(incoming_yaw)
             memo_key = (index, incoming_bin)
             if memo_key in failed:
                 return None
             for following in range(len(raw) - 1, index, -1):
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    return None
                 outgoing_yaw = math.atan2(
                     raw[following]["y"] - raw[index]["y"],
                     raw[following]["x"] - raw[index]["x"],
@@ -1000,16 +1365,13 @@ class StopTurnStateLatticePlanner:
                     turn_key = (index, self.heading_bin(outgoing_yaw))
                     turn_valid = turn_cache.get(turn_key)
                     if turn_valid is None:
-                        turn_valid = validate_rotation_sweep(
-                            self.saved_map,
+                        turn_valid = self._turn_valid(
                             raw[index]["x"],
                             raw[index]["y"],
                             incoming_yaw,
                             outgoing_yaw,
-                            half_length=self.half_length,
-                            half_width=self.half_width,
-                            padding=self.padding,
-                        ).valid
+                            robust=False,
+                        )
                         turn_cache[turn_key] = turn_valid
                     if not turn_valid:
                         continue
@@ -1106,6 +1468,7 @@ class StopTurnStateLatticePlanner:
         goal: dict[str, float],
         *,
         exclusions: Iterable[tuple[float, float, float]] = (),
+        deadline_monotonic: float | None = None,
     ) -> StopTurnRoute | None:
         start_x, start_y = float(start["x"]), float(start["y"])
         goal_x, goal_y = float(goal["x"]), float(goal["y"])
@@ -1126,12 +1489,21 @@ class StopTurnStateLatticePlanner:
         goal_yaw = (
             float(goal["yaw"]) if "yaw" in goal and goal["yaw"] is not None else None
         )
-        simple_routes: list[StopTurnRoute] = []
+        direct_points = [
+            {"x": start_x, "y": start_y},
+            {"x": goal_x, "y": goal_y},
+        ]
+        if not self._segment_excluded(direct_points[0], direct_points[1], forbidden):
+            direct = self._route_result(
+                direct_points, start_yaw=start_yaw, goal_yaw=goal_yaw
+            )
+            # Once every exact translation/start-turn/final-yaw constraint is
+            # satisfied, an extra stop-turn corner has no safety benefit.
+            if direct is not None:
+                return direct
+
+        candidate_pool: list[StopTurnRoute] = []
         for simple in (
-            [
-                {"x": start_x, "y": start_y},
-                {"x": goal_x, "y": goal_y},
-            ],
             [
                 {"x": start_x, "y": start_y},
                 {"x": goal_x, "y": start_y},
@@ -1153,17 +1525,36 @@ class StopTurnStateLatticePlanner:
                 canonical_simple, start_yaw=start_yaw, goal_yaw=goal_yaw
             )
             if result is not None:
-                simple_routes.append(result)
-        if simple_routes:
-            return min(simple_routes, key=self.ranking_key)
-        seed = self._grid_seed(start_cell, goal_cell, forbidden)
-        seeded_route = self._canonical_route_from_seed(seed, start, goal)
+                candidate_pool.append(result)
+        seed = self._grid_seed(
+            start_cell,
+            goal_cell,
+            forbidden,
+            deadline_monotonic,
+        )
+        seeded_route = self._canonical_route_from_seed(
+            seed,
+            start,
+            goal,
+            deadline_monotonic,
+        )
+        seeded_result: StopTurnRoute | None = None
         if seeded_route:
-            result = self._route_result(
+            seeded_result = self._route_result(
                 seeded_route, start_yaw=start_yaw, goal_yaw=goal_yaw
             )
-            if result is not None:
-                return result
+            if seeded_result is not None:
+                candidate_pool.append(seeded_result)
+        # The 8-connected topology seed exposes oblique alternatives to both
+        # Manhattan routes.  The full heading lattice is only needed if that
+        # exact candidate cannot be built.
+        if seeded_result is not None:
+            return min(candidate_pool, key=self.ranking_key)
+        if (
+            deadline_monotonic is not None
+            and time.monotonic() >= deadline_monotonic
+        ):
+            return min(candidate_pool, key=self.ranking_key) if candidate_pool else None
         start_heading = self.heading_bin(float(start.get("yaw", 0.0)))
         start_key = self._pose_key(start_x, start_y, start_heading)
         positions: dict[tuple[int, int, int], tuple[float, float]] = {
@@ -1188,7 +1579,14 @@ class StopTurnStateLatticePlanner:
         rotation_cache: dict[tuple[tuple[int, int, int], int], bool] = {}
         finish_key: tuple[int, int, int] | None = None
         expansions = 0
-        while queue and expansions < self.max_expansions:
+        while (
+            queue
+            and expansions < self.max_expansions
+            and (
+                deadline_monotonic is None
+                or time.monotonic() < deadline_monotonic
+            )
+        ):
             _, _, state = heapq.heappop(queue)
             state_cost = costs[state]
             x, y = positions[state]
@@ -1198,19 +1596,16 @@ class StopTurnStateLatticePlanner:
             goal_distance = math.hypot(goal_x - x, goal_y - y)
             if goal_distance <= self.primitive_length * 2.5:
                 goal_heading = math.atan2(goal_y - y, goal_x - x)
-                rotation = validate_rotation_sweep(
-                    self.saved_map,
+                rotation_valid = self._turn_valid(
                     x,
                     y,
                     yaw,
                     goal_heading,
-                    half_length=self.half_length,
-                    half_width=self.half_width,
-                    padding=self.padding,
+                    robust=False,
                 )
                 direct = {"x": goal_x, "y": goal_y}
                 if (
-                    rotation.valid
+                    rotation_valid
                     and not self._excluded(goal_x, goal_y, forbidden)
                     and self._translation_valid({"x": x, "y": y}, direct)
                 ):
@@ -1253,16 +1648,13 @@ class StopTurnStateLatticePlanner:
                 cache_key = (state, next_heading)
                 valid = rotation_cache.get(cache_key)
                 if valid is None:
-                    valid = validate_rotation_sweep(
-                        self.saved_map,
+                    valid = self._turn_valid(
                         x,
                         y,
                         yaw,
                         self.heading(next_heading),
-                        half_length=self.half_length,
-                        half_width=self.half_width,
-                        padding=self.padding,
-                    ).valid
+                        robust=False,
+                    )
                     rotation_cache[cache_key] = valid
                 if not valid:
                     continue
@@ -1276,7 +1668,7 @@ class StopTurnStateLatticePlanner:
                 heuristic = math.hypot(goal_x - x, goal_y - y) / self.linear_speed
                 heapq.heappush(queue, (next_cost + heuristic, sequence, next_key))
         if finish_key is None:
-            return None
+            return min(candidate_pool, key=self.ranking_key) if candidate_pool else None
         states: list[tuple[int, int, int]] = []
         cursor: tuple[int, int, int] | None = finish_key
         while cursor is not None:
@@ -1287,28 +1679,48 @@ class StopTurnStateLatticePlanner:
             {"x": positions[state][0], "y": positions[state][1]}
             for state in states
         )
-        return self._route_result(route, start_yaw=start_yaw, goal_yaw=goal_yaw)
+        lattice_result = self._route_result(
+            route, start_yaw=start_yaw, goal_yaw=goal_yaw
+        )
+        if lattice_result is not None:
+            candidate_pool.append(lattice_result)
+        return min(candidate_pool, key=self.ranking_key) if candidate_pool else None
 
     def ranking_key(
         self, route: StopTurnRoute
-    ) -> tuple[float, float, int, float, float]:
+    ) -> tuple[float, float, float, int, float, float, float, float]:
         metadata = route.metadata
-        # Clearance beyond that required to rotate the complete rectangular
-        # footprint is equally safe for this robot.  Saturating at that
-        # geometry-derived threshold prevents an open room's orientation from
-        # creating needless right-angle/S-shaped routes merely to maximize an
-        # already ample ray width.  Below the threshold, wider routes still
-        # rank first as required.
+        # Exact footprint and turn-sweep validation are hard filters before
+        # ranking.  Within the geometry-derived adequate band, execution time
+        # and turn complexity dominate; clearance is only a bounded tie-break.
         rotation_radius = math.hypot(
             self.half_length + self.padding,
             self.half_width + self.padding,
         )
+        required_passage = 2.0 * rotation_radius
+        passage_shortfall = max(
+            0.0,
+            required_passage - metadata.minimum_passage_width,
+        ) / max(1e-9, required_passage)
+        # Directional rectangle validation already proves translation safety;
+        # raw radial clearance can be below the corner radius beside a wall
+        # without making a straight passage unsafe. Passage width is the
+        # geometry-aware comfort band used here.
+        turn_shortfall = max(
+            0.0,
+            -metadata.minimum_turn_clearance,
+        ) / max(1e-9, rotation_radius)
+        safety_shortfall = passage_shortfall + turn_shortfall
+        safety_band = 0.0 if safety_shortfall <= 1e-9 else 1.0
         return (
-            -min(metadata.minimum_passage_width, 2.0 * rotation_radius),
-            -min(metadata.minimum_static_clearance, rotation_radius),
+            safety_band,
+            safety_shortfall,
+            metadata.estimated_time,
             metadata.turn_count,
             metadata.total_turn_angle,
             metadata.total_length,
+            -min(metadata.minimum_passage_width, required_passage),
+            -min(metadata.minimum_static_clearance, rotation_radius),
         )
 
     def plan_candidates(
@@ -1318,8 +1730,14 @@ class StopTurnStateLatticePlanner:
         *,
         maximum_candidates: int = 3,
         overlap_threshold: float = 0.80,
+        planning_time_budget: float | None = None,
     ) -> list[StopTurnRoute]:
-        primary = self.plan(start, goal)
+        deadline = (
+            None
+            if planning_time_budget is None
+            else time.monotonic() + max(0.0, float(planning_time_budget))
+        )
+        primary = self.plan(start, goal, deadline_monotonic=deadline)
         if primary is None:
             return []
         candidates = [primary]
@@ -1338,8 +1756,27 @@ class StopTurnStateLatticePlanner:
         for exclusion in attempts:
             if len(candidates) >= max(1, int(maximum_candidates)):
                 break
-            candidate = self.plan(start, goal, exclusions=(exclusion,))
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            candidate = self.plan(
+                start,
+                goal,
+                exclusions=(exclusion,),
+                deadline_monotonic=deadline,
+            )
             if candidate is None:
+                continue
+            if not validate_stop_turn_route(
+                self.saved_map,
+                candidate.points,
+                half_length=self.half_length,
+                half_width=self.half_width,
+                padding=self.padding,
+                turn_robustness_radius=self.turn_robustness_radius,
+            ).valid:
+                # Optional routes must retain a small position-error reserve at
+                # every corner. The primary remains available for genuinely
+                # narrow maps where no such optional alternative exists.
                 continue
             candidate_points = list(candidate.points)
             if any(
@@ -1349,7 +1786,9 @@ class StopTurnStateLatticePlanner:
             ):
                 continue
             candidates.append(candidate)
-        return sorted(candidates, key=self.ranking_key)
+        # plan() already enforces the direct-route primary rule.  Exclusion
+        # attempts provide optional alternatives and must not displace it.
+        return [primary, *sorted(candidates[1:], key=self.ranking_key)]
 
 
 @dataclass(frozen=True, slots=True)

@@ -444,6 +444,8 @@ export interface Route {
   map_version?: number;
   error_code?: string | null;
   error_message?: string | null;
+  candidates?: RouteCandidate[];
+  selected_route_id?: string;
 }
 
 export interface RouteCandidate {

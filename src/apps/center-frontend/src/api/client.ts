@@ -361,6 +361,7 @@ export const api = {
   }),
   startNavigation: (input: {
     request_id: string; robot_id: string; session_id: string; expected_state: string; mission_id: string;
+    route_id?: string;
   }) => request<Route>("/api/navigation/start", { method: "POST", body: JSON.stringify(input) }),
   missionAction: (
     action: "pause" | "resume" | "cancel" | "manual" | "alternatives" | "select-route" | "back",

@@ -9,6 +9,7 @@ import pytest
 from simulator.client import RobotConnectionClient, localization_pose_safe_to_persist
 from simulator.config import SimulatorConfig
 from simulator.media import MediaPublisher, SourceVideoProbe
+from simulator.messages import make_message
 
 
 def test_pose_persistence_requires_sustained_independent_localization_evidence() -> None:
@@ -109,7 +110,7 @@ async def test_live_camera_picker_returns_only_probed_working_sources(
 
 
 @pytest.mark.asyncio
-async def test_live_camera_picker_does_not_probe_selected_leased_camera(
+async def test_live_camera_picker_returns_selected_leased_camera_without_probe(
     monkeypatch,
 ) -> None:
     active = [
@@ -140,7 +141,55 @@ async def test_live_camera_picker_does_not_probe_selected_leased_camera(
 
     await client._camera_sources(Socket(), "request-camera-list")
 
-    assert calls == [{"/dev/video0"}]
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_slow_camera_inventory_does_not_block_command_receive_loop(
+    monkeypatch,
+) -> None:
+    client = RobotConnectionClient(SimulatorConfig())
+    camera_started = asyncio.Event()
+    release_camera = asyncio.Event()
+    ping_handled = asyncio.Event()
+
+    async def slow_camera_sources(_socket, _request_id: str) -> None:
+        camera_started.set()
+        await release_camera.wait()
+
+    async def diagnostics_result(
+        _socket, _request_id: str, _kind: str, _result: dict
+    ) -> None:
+        ping_handled.set()
+
+    monkeypatch.setattr(client, "_camera_sources", slow_camera_sources)
+    monkeypatch.setattr(client, "_diagnostics_result", diagnostics_result)
+
+    class Socket:
+        def __aiter__(self):
+            async def messages():
+                yield json.dumps(make_message(
+                    "media.cameras.get",
+                    client.config.robot_id,
+                    1,
+                    {"request_id": "camera-request"},
+                ))
+                yield json.dumps(make_message(
+                    "diagnostics.ping",
+                    client.config.robot_id,
+                    2,
+                    {"request_id": "ping-request"},
+                ))
+
+            return messages()
+
+    await client._receive_loop(Socket())
+    await asyncio.wait_for(camera_started.wait(), timeout=0.2)
+    await asyncio.wait_for(ping_handled.wait(), timeout=0.2)
+    assert not release_camera.is_set()
+
+    release_camera.set()
+    await asyncio.gather(*tuple(client._background_tasks))
 
 
 def test_configuration_is_owned_and_applied_by_simulator() -> None:

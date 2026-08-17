@@ -11,17 +11,22 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "navigation-stack"))
 
+import navigation_core  # noqa: E402
 from navigation_core import (  # noqa: E402
+    ActiveSegment,
     MapNavigationGeometry,
     NavigationDebugLog,
+    RouteMetadata,
     SavedOccupancyMap,
     SensorClockEstimator,
     StopTurnStateLatticePlanner,
+    StopTurnRoute,
     UnwrappedYawProgress,
     canonicalize_stop_turn_path,
     classify_planning_failure,
     compact_lethal_cells,
     densify_straight_segment,
+    endpoint_braking_speed_limit,
     evaluate_corridor,
     exact_euclidean_distance_transform,
     filter_static_map_scan,
@@ -33,8 +38,13 @@ from navigation_core import (  # noqa: E402
     pose_stability,
     rotation_swept_clearance,
     scan_to_map_match,
+    segment_travel_watchdog,
+    straight_heading_lock,
+    straight_segment_progress,
+    turn_hysteresis_transition,
     validate_executable_grid_path,
     validate_rotation_sweep,
+    validate_rotation_sweep_neighborhood,
     validate_stop_turn_route,
 )
 from speed_profiles import (  # noqa: E402
@@ -852,6 +862,205 @@ def test_dense_straight_segment_never_leaves_only_a_pose_behind_robot() -> None:
     )
 
 
+def test_active_vertical_segment_heading_never_chases_stale_start() -> None:
+    start = {"x": -0.400119, "y": 1.470302}
+    end = {"x": -0.400119, "y": 2.095102}
+    segment = ActiveSegment.create(
+        planned_start=start,
+        effective_start=start,
+        endpoint=end,
+        segment_index=0,
+        route_id="vertical-regression",
+        segment_token=7,
+    )
+    pose = {"x": -0.400119, "y": 1.70, "yaw": 1.5305}
+
+    decision = straight_heading_lock(
+        segment,
+        pose,
+        heading_kp=1.2,
+        cross_track_kp=1.0,
+        maximum_angular=0.18,
+        heading_deadband=math.radians(1.0),
+        cross_track_deadband=0.01,
+        hard_heading_error=math.radians(12.0),
+        hard_cross_track=0.08,
+    )
+
+    assert segment.fixed_heading == pytest.approx(math.pi / 2)
+    assert decision.heading_error == pytest.approx(math.pi / 2 - 1.5305)
+    assert decision.forward_allowed is True
+
+
+def test_reanchored_segment_uses_actual_pose_and_new_fixed_heading() -> None:
+    segment = ActiveSegment.create(
+        planned_start={"x": 0.0, "y": 0.0},
+        effective_start={"x": 0.05, "y": 0.02},
+        endpoint={"x": 1.0, "y": 0.0},
+        segment_index=1,
+        route_id="route",
+        segment_token=8,
+    )
+
+    assert segment.planned_start == {"x": 0.0, "y": 0.0}
+    assert segment.effective_start == {"x": 0.05, "y": 0.02}
+    assert segment.fixed_heading == pytest.approx(math.atan2(-0.02, 0.95))
+    assert segment.segment_length == pytest.approx(math.hypot(0.95, 0.02))
+
+
+def test_straight_large_heading_or_cross_track_error_blocks_forward() -> None:
+    segment = ActiveSegment.create(
+        planned_start={"x": 0.0, "y": 0.0},
+        effective_start={"x": 0.0, "y": 0.0},
+        endpoint={"x": 1.0, "y": 0.0},
+        segment_index=0,
+        route_id="route",
+        segment_token=1,
+    )
+    parameters = {
+        "heading_kp": 1.2,
+        "cross_track_kp": 1.0,
+        "maximum_angular": 0.18,
+        "heading_deadband": math.radians(1.0),
+        "cross_track_deadband": 0.01,
+        "hard_heading_error": math.radians(12.0),
+        "hard_cross_track": 0.08,
+    }
+
+    heading = straight_heading_lock(
+        segment, {"x": 0.1, "y": 0.0, "yaw": 0.5}, **parameters
+    )
+    cross = straight_heading_lock(
+        segment, {"x": 0.1, "y": 0.10, "yaw": 0.0}, **parameters
+    )
+
+    assert heading.forward_allowed is False
+    assert heading.reason == "HEADING_ERROR_HARD_LIMIT"
+    assert cross.forward_allowed is False
+    assert cross.reason == "CROSS_TRACK_HARD_LIMIT"
+
+
+def test_straight_small_error_ignores_rpp_curvature_direction() -> None:
+    segment = ActiveSegment.create(
+        planned_start={"x": 0.0, "y": 0.0},
+        effective_start={"x": 0.0, "y": 0.0},
+        endpoint={"x": 1.0, "y": 0.0},
+        segment_index=0,
+        route_id="route",
+        segment_token=2,
+    )
+    decision = straight_heading_lock(
+        segment,
+        {"x": 0.2, "y": 0.015, "yaw": 0.02},
+        heading_kp=1.2,
+        cross_track_kp=1.0,
+        maximum_angular=0.18,
+        heading_deadband=math.radians(1.0),
+        cross_track_deadband=0.005,
+        hard_heading_error=math.radians(12.0),
+        hard_cross_track=0.08,
+    )
+
+    assert decision.forward_allowed is True
+    assert -0.18 <= decision.angular < 0.0
+
+
+@pytest.mark.parametrize(
+    ("y", "remaining", "passed"),
+    [
+        (2.00, 0.095102, False),
+        (2.095102, 0.0, False),
+        (2.105, -0.009898, True),
+    ],
+)
+def test_vertical_segment_endpoint_progress(y: float, remaining: float, passed: bool) -> None:
+    progress = straight_segment_progress(
+        {"x": -0.400119, "y": 1.470302},
+        {"x": -0.400119, "y": 2.095102},
+        {"x": -0.400119, "y": y},
+    )
+
+    assert progress.remaining_longitudinal == pytest.approx(remaining)
+    assert progress.passed_endpoint is passed
+    assert progress.signed_cross_track == pytest.approx(0.0)
+
+
+def test_endpoint_braking_limit_scales_with_profile_deceleration() -> None:
+    remaining = 0.10
+    slow = endpoint_braking_speed_limit(
+        remaining, deceleration=0.45, reaction_time=0.15
+    )
+    normal = endpoint_braking_speed_limit(
+        remaining, deceleration=0.55, reaction_time=0.15
+    )
+    fast = endpoint_braking_speed_limit(
+        remaining, deceleration=0.60, reaction_time=0.15
+    )
+
+    assert 0.0 < slow < normal < fast
+    assert endpoint_braking_speed_limit(
+        0.0, deceleration=0.60, reaction_time=0.15
+    ) == 0.0
+
+
+def test_segment_watchdog_rejects_multi_meter_travel_for_short_segment() -> None:
+    decision = segment_travel_watchdog(
+        segment_length=0.625,
+        elapsed=15.0,
+        positive_travel=2.1,
+        expected_speed=0.17,
+        settle_allowance=2.0,
+        travel_factor=2.0,
+        minimum_travel_slack=0.30,
+        time_factor=3.0,
+    )
+
+    assert decision.exceeded is True
+    assert decision.reason == "POSITIVE_TRAVEL_LIMIT"
+    assert decision.travel_limit < 2.1
+
+
+def test_turn_hysteresis_does_not_chatter_inside_reentry_band() -> None:
+    completion = math.radians(3.0)
+    reentry = math.radians(6.0)
+    assert turn_hysteresis_transition(
+        "TURN",
+        math.radians(2.9),
+        completion_tolerance=completion,
+        reentry_tolerance=reentry,
+        stable_elapsed=0.0,
+        stable_dwell=0.4,
+    ) == "TURN_SETTLING"
+    assert turn_hysteresis_transition(
+        "TURN_SETTLING",
+        math.radians(4.5),
+        completion_tolerance=completion,
+        reentry_tolerance=reentry,
+        stable_elapsed=0.2,
+        stable_dwell=0.4,
+    ) == "TURN_SETTLING"
+    # Runtime regression: after entering settling at <=3 degrees, passive
+    # chassis drift repeatedly stopped near 5.8 degrees.  That is still inside
+    # the 6 degree Schmitt band and must finish after the zero-command dwell,
+    # not hang until an operator pauses/resumes the mission.
+    assert turn_hysteresis_transition(
+        "TURN_SETTLING",
+        math.radians(5.8),
+        completion_tolerance=completion,
+        reentry_tolerance=reentry,
+        stable_elapsed=0.4,
+        stable_dwell=0.4,
+    ) == "STRAIGHT_PREPARE"
+    assert turn_hysteresis_transition(
+        "TURN_SETTLING",
+        math.radians(6.1),
+        completion_tolerance=completion,
+        reentry_tolerance=reentry,
+        stable_elapsed=0.0,
+        stable_dwell=0.4,
+    ) == "TURN"
+
+
 def test_rotation_sweep_rejects_collision_missed_at_both_endpoint_headings() -> None:
     resolution = 0.01
     width = height = 80
@@ -877,6 +1086,40 @@ def test_rotation_sweep_rejects_collision_missed_at_both_endpoint_headings() -> 
         half_length=0.15,
         half_width=0.10,
     ).valid
+
+
+def test_rotation_neighborhood_rejects_a_zero_tolerance_corner() -> None:
+    resolution = 0.01
+    width = height = 80
+    occupancy = [0] * (width * height)
+    obstacle_column = round((0.17 + 0.40) / resolution - 0.5)
+    obstacle_row = round((0.06 + 0.40) / resolution - 0.5)
+    occupancy[obstacle_row * width + obstacle_column] = 100
+    saved = SavedOccupancyMap(
+        width, height, resolution, -0.40, -0.40, 0.0, occupancy
+    )
+
+    assert validate_rotation_sweep(
+        saved,
+        0.0,
+        0.0,
+        0.0,
+        math.pi / 2,
+        half_length=0.15,
+        half_width=0.10,
+    ).valid
+    robust = validate_rotation_sweep_neighborhood(
+        saved,
+        0.0,
+        0.0,
+        0.0,
+        math.pi / 2,
+        half_length=0.15,
+        half_width=0.10,
+        robustness_radius=0.01,
+    )
+    assert not robust.valid
+    assert robust.code == "TURN_SWEEP_NOT_ROBUST"
 
 
 def test_moving_scan_deskew_reduces_static_wall_geometry_error() -> None:
@@ -959,6 +1202,88 @@ def test_actual_project_map_rejects_direct_line_and_finds_exact_detour() -> None
     ).valid
 
 
+def test_actual_project_map_prefers_exact_valid_direct_route() -> None:
+    project = Path(__file__).parents[3]
+    saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
+    start = {"x": -3.265, "y": 4.415, "yaw": 0.0}
+    goal = {"x": -1.765, "y": 3.315}
+    direct = validate_stop_turn_route(
+        saved,
+        (start, goal),
+        half_length=0.15,
+        half_width=0.10,
+    )
+
+    route = StopTurnStateLatticePlanner(
+        saved, saved.navigation_geometry
+    ).plan(start, goal)
+
+    assert direct.valid
+    assert route is not None
+    assert len(route.points) == 2
+    assert route.points[0] == {"x": start["x"], "y": start["y"]}
+    assert route.points[-1] == goal
+
+
+def test_equally_safe_oblique_detour_beats_longer_right_angle_route() -> None:
+    free = _free_rectangle(2, 97, 2, 77) - _free_rectangle(30, 32, 20, 22)
+    saved = _manual_map(100, 80, free)
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    start = {"x": 0.50, "y": 0.50, "yaw": 0.0}
+    goal = {"x": 4.00, "y": 3.00}
+
+    route = planner.plan(start, goal)
+
+    assert route is not None
+    assert len(route.points) == 3
+    assert route.metadata.total_length < 5.0
+    headings = [
+        math.atan2(
+            right["y"] - left["y"],
+            right["x"] - left["x"],
+        )
+        for left, right in zip(route.points, route.points[1:])
+    ]
+    assert all(
+        not math.isclose(abs(heading), math.pi / 2, abs_tol=math.radians(1.0))
+        and not math.isclose(heading, 0.0, abs_tol=math.radians(1.0))
+        for heading in headings
+    )
+    assert validate_stop_turn_route(
+        saved,
+        route.points,
+        half_length=0.15,
+        half_width=0.10,
+    ).valid
+
+
+def test_adequate_clearance_ranking_does_not_reward_many_extra_turns() -> None:
+    saved = _manual_map(20, 20, _free_rectangle(1, 18, 1, 18))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+
+    def route(length: float, turns: int, estimated_time: float) -> StopTurnRoute:
+        return StopTurnRoute(
+            points=({"x": 0.0, "y": 0.0}, {"x": length, "y": 0.0}),
+            metadata=RouteMetadata(
+                total_length=length,
+                minimum_passage_width=0.50,
+                minimum_static_clearance=0.25,
+                minimum_turn_clearance=0.05,
+                turn_count=turns,
+                total_turn_angle=turns * math.pi / 4,
+                narrow_segments=(),
+                estimated_time=estimated_time,
+                turn_safe=True,
+            ),
+            heading_bins=(0,),
+        )
+
+    short = route(2.6, 2, 20.0)
+    long = route(5.4, 7, 45.0)
+
+    assert planner.ranking_key(short) < planner.ranking_key(long)
+
+
 def test_stop_turn_planner_handles_a_true_90_degree_l_route() -> None:
     free = (
         _free_rectangle(5, 45, 5, 14)
@@ -1003,7 +1328,9 @@ def test_narrow_straight_corridor_turns_in_room_then_drives_straight() -> None:
 def test_route_candidates_find_distinct_sides_without_persistent_exclusions() -> None:
     free = _free_rectangle(2, 67, 2, 57) - _free_rectangle(28, 35, 15, 45)
     saved = _manual_map(70, 60, free)
-    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    planner = StopTurnStateLatticePlanner(
+        saved, saved.navigation_geometry, turn_robustness_radius=0.0
+    )
     routes = planner.plan_candidates(
         {"x": 0.50, "y": 1.50, "yaw": 0.0},
         {"x": 3.00, "y": 1.50},
@@ -1018,6 +1345,83 @@ def test_route_candidates_find_distinct_sides_without_persistent_exclusions() ->
     assert min(middle_y) < 1.0
     assert max(middle_y) > 2.0
     assert path_overlap_ratio(list(routes[0].points), list(routes[1].points)) < 0.80
+
+
+def test_route_candidate_search_uses_one_shared_wall_clock_budget(monkeypatch) -> None:
+    saved = _manual_map(70, 30, _free_rectangle(2, 67, 2, 27))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    primary = StopTurnRoute(
+        points=({"x": 0.50, "y": 0.75}, {"x": 3.00, "y": 0.75}),
+        metadata=RouteMetadata(
+            total_length=2.5,
+            minimum_passage_width=1.0,
+            minimum_static_clearance=0.5,
+            minimum_turn_clearance=0.5,
+            turn_count=0,
+            total_turn_angle=0.0,
+            narrow_segments=(),
+            estimated_time=12.5,
+            turn_safe=True,
+        ),
+        heading_bins=(0,),
+    )
+    calls: list[float | None] = []
+
+    def plan(_start, _goal, *, exclusions=(), deadline_monotonic=None):
+        del exclusions
+        calls.append(deadline_monotonic)
+        return primary
+
+    clock = iter((100.0, 113.0))
+    monkeypatch.setattr(navigation_core.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(planner, "plan", plan)
+
+    routes = planner.plan_candidates(
+        {"x": 0.50, "y": 0.75, "yaw": 0.0},
+        {"x": 3.00, "y": 0.75},
+        maximum_candidates=3,
+        planning_time_budget=12.0,
+    )
+
+    assert routes == [primary]
+    assert calls == [112.0]
+
+
+def test_primary_only_candidate_request_never_searches_exclusions(monkeypatch) -> None:
+    saved = _manual_map(70, 30, _free_rectangle(2, 67, 2, 27))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    primary = StopTurnRoute(
+        points=({"x": 0.50, "y": 0.75}, {"x": 3.00, "y": 0.75}),
+        metadata=RouteMetadata(
+            total_length=2.5,
+            minimum_passage_width=1.0,
+            minimum_static_clearance=0.5,
+            minimum_turn_clearance=0.5,
+            turn_count=0,
+            total_turn_angle=0.0,
+            narrow_segments=(),
+            estimated_time=12.5,
+            turn_safe=True,
+        ),
+        heading_bins=(0,),
+    )
+    calls: list[tuple[tuple[float, float, float], ...]] = []
+
+    def plan(_start, _goal, *, exclusions=(), deadline_monotonic=None):
+        del deadline_monotonic
+        calls.append(tuple(exclusions))
+        return primary
+
+    monkeypatch.setattr(planner, "plan", plan)
+    routes = planner.plan_candidates(
+        {"x": 0.50, "y": 0.75, "yaw": 0.0},
+        {"x": 3.00, "y": 0.75},
+        maximum_candidates=1,
+        planning_time_budget=12.0,
+    )
+
+    assert routes == [primary]
+    assert calls == [()]
 
 
 def test_planner_rejects_free_goal_in_a_physically_disconnected_component() -> None:

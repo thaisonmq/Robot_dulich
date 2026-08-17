@@ -34,7 +34,11 @@ class MotionSafetyNode(Node):
         self.declare_parameter("half_width", 0.10)
         self.declare_parameter("clearance", 0.04)
         self.declare_parameter("side_margin", 0.04)
+        self.declare_parameter("translation_lateral_margin", 0.01)
         self.declare_parameter("rotation_margin", 0.03)
+        self.declare_parameter("laser_x", -0.0046412)
+        self.declare_parameter("laser_y", 0.0)
+        self.declare_parameter("laser_yaw", 0.0)
         self.declare_parameter("slow_extra", 0.10)
         self.declare_parameter("latency", 0.12)
         self.declare_parameter("braking_acceleration", 0.60)
@@ -46,6 +50,9 @@ class MotionSafetyNode(Node):
             half_width=float(self.get_parameter("half_width").value),
             clearance=float(self.get_parameter("clearance").value),
             side_margin=float(self.get_parameter("side_margin").value),
+            translation_lateral_margin=float(
+                self.get_parameter("translation_lateral_margin").value
+            ),
             rotation_margin=float(self.get_parameter("rotation_margin").value),
             slow_extra=float(self.get_parameter("slow_extra").value),
             latency_seconds=float(self.get_parameter("latency").value),
@@ -59,6 +66,9 @@ class MotionSafetyNode(Node):
             trajectory_samples=int(self.get_parameter("trajectory_samples").value),
             clear_hysteresis_seconds=float(self.get_parameter("clear_hysteresis").value),
             scan_timeout_seconds=float(self.get_parameter("scan_timeout").value),
+            laser_x=float(self.get_parameter("laser_x").value),
+            laser_y=float(self.get_parameter("laser_y").value),
+            laser_yaw=float(self.get_parameter("laser_yaw").value),
         )
         self.lidar_obstacle_avoidance_enabled = bool(
             self.get_parameter("lidar_obstacle_avoidance_enabled").value
@@ -266,6 +276,31 @@ class MotionSafetyNode(Node):
                 "required_stop_distance": getattr(
                     decision, "required_stop_distance", 0.0
                 ),
+                "blocking_beam_index": getattr(
+                    decision, "blocking_beam_index", -1
+                ),
+                "blocking_point_x": getattr(
+                    decision, "blocking_point_x", None
+                ),
+                "blocking_point_y": getattr(
+                    decision, "blocking_point_y", None
+                ),
+                "blocking_range": getattr(decision, "blocking_range", None),
+                "blocking_angle": getattr(decision, "blocking_angle", None),
+                "requested_rotation_direction": getattr(
+                    decision, "requested_rotation_direction", "NONE"
+                ),
+                "measured_angular_velocity": getattr(
+                    decision, "measured_angular_velocity", None
+                ),
+                "predicted_swept_clearance": getattr(
+                    decision, "predicted_swept_clearance", None
+                ),
+                "required_swept_clearance": getattr(
+                    decision, "required_swept_clearance", None
+                ),
+                "direction_mask": int(blocked),
+                "scan_age": max(0.0, time.monotonic() - self.last_scan),
                 "reason": getattr(decision, "reason", source),
             })
         rendered = " ".join(f"{key}={value}" for key, value in fields.items())

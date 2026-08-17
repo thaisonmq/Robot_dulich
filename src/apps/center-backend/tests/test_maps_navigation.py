@@ -15,7 +15,13 @@ from app.api.maps import (
 )
 from app.api import navigation as navigation_api
 from app.core.config import Settings
-from app.api.navigation import RelocalizeRequest, _mission_start_rejection, _robot_by_public_id
+from app.api.navigation import (
+    RelocalizeRequest,
+    _mission_start_rejection,
+    _normalized_route_candidates,
+    _robot_by_public_id,
+    _selected_candidate,
+)
 from app.api.websockets import persist_robot_runtime_event
 from app.models.database import Base, SessionLocal
 from app.models.entities import MapRecord, MappingSession, MapVersion, NavigationMission, Robot
@@ -57,6 +63,46 @@ def test_navigation_route_id_is_deterministic_from_executable_geometry() -> None
     assert navigation_api._route_id_for_path(path) != navigation_api._route_id_for_path(
         [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.6}]
     )
+
+
+def test_selected_preview_route_is_server_authoritative() -> None:
+    primary = [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}]
+    alternative = [
+        {"x": 0.0, "y": 0.0},
+        {"x": 0.5, "y": 0.5},
+        {"x": 1.0, "y": 0.0},
+    ]
+    candidates = _normalized_route_candidates([
+        {"route_id": "route-primary", "points": primary, "valid": True},
+        {
+            "route_id": "route-alternative",
+            "points": alternative,
+            "valid": True,
+            "minimum_static_clearance": 0.22,
+        },
+        {"route_id": "route-invalid", "points": alternative, "valid": False},
+    ])
+
+    route_id, points = _selected_candidate(
+        candidates,
+        "route-alternative",
+        primary,
+    )
+
+    assert route_id == "route-alternative"
+    assert points == alternative
+    assert candidates[1]["minimum_clearance"] == 0.22
+    with pytest.raises(ValueError, match="UNKNOWN_ROUTE_ID"):
+        _selected_candidate(candidates, "route-from-browser", primary)
+    legacy_route_id = navigation_api._route_id_for_path(primary)
+    assert _selected_candidate([], legacy_route_id, primary) == (
+        legacy_route_id,
+        primary,
+    )
+
+
+def test_navigation_planning_timeout_exceeds_pi_planner_budget() -> None:
+    assert Settings().navigation_planning_timeout_seconds == 30.0
 
 
 def test_relocalization_rotation_requires_explicit_authorization() -> None:
@@ -279,6 +325,8 @@ def test_mapping_and_navigation_state_machines_are_idempotent_and_strict() -> No
     with pytest.raises(InvalidTransition):
         mapping_transition("FINISHED", "MAPPING")
     assert navigation_transition("READY", "PLANNING") == "PLANNING"
+    assert navigation_transition("READY", "COMPUTING_ALTERNATIVES") == "COMPUTING_ALTERNATIVES"
+    assert navigation_transition("ROUTE_SELECTION", "READY") == "READY"
     assert navigation_transition("PLANNING", "PLAN_FAILED") == "PLAN_FAILED"
     assert navigation_transition("MAP_LOADING", "LOCALIZING_LAST_POSE") == "LOCALIZING_LAST_POSE"
     assert navigation_transition("LOCALIZING_LAST_POSE", "LOCALIZING_GLOBAL") == "LOCALIZING_GLOBAL"

@@ -501,6 +501,9 @@ export function MapPanel({
   const manualBypass = mapState === "MANUAL_BYPASS";
   const computingAlternatives = mapState === "COMPUTING_ALTERNATIVES";
   const routeSelection = mapState === "ROUTE_SELECTION";
+  const showRouteChoices = routeSelection || (
+    !moving && routeCandidates.length > 1
+  );
   const localizationFailed = localizationState === "LOCALIZATION_FAILED";
   const localizationInProgress = [
     "LOCALIZATION_INITIALIZING", "LOCALIZING", "LOCALIZING_LAST_POSE",
@@ -552,7 +555,8 @@ export function MapPanel({
     <div className="map-canvas map-canvas--mini" onDoubleClick={() => ready && setExpanded(true)}>
       <MapCanvas map={map} destinations={[]} pose={pose} route={liveRoute}
         routeCandidates={routeCandidates} selectedRouteId={selectedRouteId} selected={selected}
-        dynamicObstacles={obstacles} readOnly showRobot={showRobot} robotMoving={moving && ready}
+        dynamicObstacles={obstacles} readOnly={readOnly || loading || moving}
+        showRobot={showRobot} robotMoving={moving && ready}
         focus={followRobot || centerRobot ? pose : null} zoom={followRobot || centerRobot ? 2 : 1}
         onSelect={onSelect} onSelectRoute={onSelectRoute} />
       {!ready && <div className={`localization-overlay${showRecoveringPose ? " localization-overlay--with-pose" : ""}`}><Navigation />
@@ -594,9 +598,10 @@ export function MapPanel({
       <strong>{t("Đang tìm các tuyến đường khác tới cùng điểm đến…")}</strong>
       <span>{t("Robot vẫn dừng an toàn trong khi kiểm tra độ rộng và vật cản của từng tuyến.")}</span>
     </div>}
-    {routeSelection && <div className="route-candidate-list" role="list">
+    {showRouteChoices && <div className="route-candidate-list" role="list">
       {routeCandidates.map((candidate, index) => <button type="button" role="listitem"
         key={candidate.route_id} className={candidate.route_id === selectedRouteId ? "is-selected" : ""}
+        disabled={readOnly || loading || moving}
         onClick={() => onSelectRoute?.(candidate.route_id)}>
         <span>{t("Tuyến {number}", { number: index + 1 })}{candidate.recommended ? ` · ${t("Đề xuất")}` : ""}</span>
         <small>{Math.round(candidate.total_length)}m · {Math.max(1, Math.round(candidate.estimated_time / 60))} phút
@@ -627,6 +632,9 @@ export function MapPanel({
             onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button></>
         : <><button type="button" className="button button--primary" disabled={readOnly}
           onClick={() => setExpanded(true)}><Flag /> {t("Chọn điểm đến")}</button>
+          {(route?.points?.length ?? 0) >= 2 && onFindAlternatives && <button type="button"
+            disabled={readOnly || loading} onClick={onFindAlternatives}>
+            <RouteIcon /> {t("Tìm đường khác")}</button>}
           <button type="button" disabled={readOnly || loading || rescanBlocked || !onRetryLocalization}
             title={rescanBlocked ? t("Không thể quét lại khi robot đang di chuyển hoặc định vị.") : undefined}
             onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button></>}

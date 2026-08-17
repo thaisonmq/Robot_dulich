@@ -20,6 +20,7 @@ class SafetyConfig:
     half_width: float = 0.10
     clearance: float = 0.04
     side_margin: float = 0.04
+    translation_lateral_margin: float = 0.01
     rotation_margin: float = 0.03
     slow_extra: float = 0.10
     latency_seconds: float = 0.12
@@ -29,6 +30,9 @@ class SafetyConfig:
     trajectory_samples: int = 6
     clear_hysteresis_seconds: float = 0.20
     scan_timeout_seconds: float = 0.28
+    laser_x: float = 0.0
+    laser_y: float = 0.0
+    laser_yaw: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +58,15 @@ class SafetyDecision:
     right_clearance: float = math.inf
     required_stop_distance: float = 0.0
     hard_stop: bool = False
+    blocking_beam_index: int = -1
+    blocking_point_x: float | None = None
+    blocking_point_y: float | None = None
+    blocking_range: float | None = None
+    blocking_angle: float | None = None
+    requested_rotation_direction: str = "NONE"
+    measured_angular_velocity: float | None = None
+    predicted_swept_clearance: float | None = None
+    required_swept_clearance: float | None = None
 
 
 def stopping_clearance(speed: float, config: SafetyConfig) -> float:
@@ -106,7 +119,10 @@ def point_inside_footprint(x: float, y: float, config: SafetyConfig) -> bool:
     return abs(x) < config.half_length and abs(y) < config.half_width
 
 
-def valid_scan_points(scan: ScanSample) -> Iterable[tuple[float, float]]:
+def _valid_scan_beams(
+    scan: ScanSample,
+    config: SafetyConfig,
+) -> Iterable[tuple[int, float, float, float, float]]:
     for index, distance in enumerate(scan.ranges):
         if (
             not math.isfinite(distance)
@@ -114,8 +130,23 @@ def valid_scan_points(scan: ScanSample) -> Iterable[tuple[float, float]]:
             or distance > scan.range_max
         ):
             continue
-        angle = scan.angle_min + index * scan.angle_increment
-        yield distance * math.cos(angle), distance * math.sin(angle)
+        sensor_angle = scan.angle_min + index * scan.angle_increment
+        sensor_x = distance * math.cos(sensor_angle)
+        sensor_y = distance * math.sin(sensor_angle)
+        cosine = math.cos(config.laser_yaw)
+        sine = math.sin(config.laser_yaw)
+        point_x = config.laser_x + cosine * sensor_x - sine * sensor_y
+        point_y = config.laser_y + sine * sensor_x + cosine * sensor_y
+        yield index, float(distance), math.atan2(point_y, point_x), point_x, point_y
+
+
+def valid_scan_points(
+    scan: ScanSample,
+    config: SafetyConfig | None = None,
+) -> Iterable[tuple[float, float]]:
+    applied = SafetyConfig() if config is None else config
+    for _, _, _, point_x, point_y in _valid_scan_beams(scan, applied):
+        yield point_x, point_y
 
 
 def _point_in_pose_footprint(
@@ -189,6 +220,110 @@ def _rotation_direction_blocked(
     return False
 
 
+def _rotation_blocker_diagnostic(
+    scan: ScanSample,
+    *,
+    angular_z: float,
+    measured_angular_z: float | None,
+    config: SafetyConfig,
+) -> dict[str, float | int | str | None]:
+    """Reproduce the accepted sweep only to identify its blocking beam."""
+    effective_angular = float(angular_z)
+    if (
+        measured_angular_z is not None
+        and abs(float(measured_angular_z)) > abs(effective_angular)
+    ):
+        effective_angular = float(measured_angular_z)
+    speed = abs(effective_angular)
+    if speed <= 0.05:
+        return {}
+    angular_decel = max(1e-3, float(config.angular_braking_acceleration))
+    stop_angle = (
+        speed * config.latency_seconds
+        + speed * speed / (2.0 * angular_decel)
+    )
+    direction = 1.0 if effective_angular > 0 else -1.0
+    samples = max(2, int(config.trajectory_samples))
+    for sample in range(1, samples + 1):
+        yaw = (
+            direction
+            * max(config.rotation_preview_angle, stop_angle)
+            * sample
+            / samples
+        )
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        for index, distance, angle, point_x, point_y in _valid_scan_beams(
+            scan, config
+        ):
+            if point_inside_footprint(point_x, point_y, config):
+                continue
+            local_x = cosine * point_x + sine * point_y
+            local_y = -sine * point_x + cosine * point_y
+            if (
+                abs(local_x) <= config.half_length + config.rotation_margin
+                and abs(local_y) <= config.half_width + config.rotation_margin
+            ):
+                predicted = rectangle_clearance(
+                    local_x,
+                    local_y,
+                    half_length=config.half_length,
+                    half_width=config.half_width,
+                )
+                return {
+                    "blocking_beam_index": index,
+                    "blocking_point_x": point_x,
+                    "blocking_point_y": point_y,
+                    "blocking_range": float(distance),
+                    "blocking_angle": angle,
+                    "requested_rotation_direction": (
+                        "LEFT" if angular_z > 0.0 else "RIGHT"
+                    ),
+                    "measured_angular_velocity": measured_angular_z,
+                    "predicted_swept_clearance": predicted,
+                    "required_swept_clearance": config.rotation_margin,
+                }
+    return {}
+
+
+def _translation_blocker_diagnostic(
+    scan: ScanSample,
+    *,
+    linear_x: float,
+    required: float,
+    config: SafetyConfig,
+) -> dict[str, float | int | str | None]:
+    forward = linear_x > 0.0
+    best: tuple[float, int, float, float, float, float] | None = None
+    lateral_limit = config.half_width + config.translation_lateral_margin
+    for index, distance, angle, point_x, point_y in _valid_scan_beams(scan, config):
+        if point_inside_footprint(point_x, point_y, config):
+            continue
+        if abs(point_y) > lateral_limit:
+            continue
+        gap = (
+            point_x - config.half_length
+            if forward and point_x >= config.half_length
+            else -point_x - config.half_length
+            if not forward and point_x <= -config.half_length
+            else math.inf
+        )
+        if gap <= required and (best is None or gap < best[0]):
+            best = (gap, index, distance, angle, point_x, point_y)
+    if best is None:
+        return {}
+    gap, index, distance, angle, point_x, point_y = best
+    return {
+        "blocking_beam_index": index,
+        "blocking_point_x": point_x,
+        "blocking_point_y": point_y,
+        "blocking_range": distance,
+        "blocking_angle": angle,
+        "predicted_swept_clearance": gap,
+        "required_swept_clearance": required,
+    }
+
+
 def _arc_turn_blocked(
     points: tuple[tuple[float, float], ...],
     *,
@@ -252,7 +387,7 @@ def evaluate_scan(
     valid = 0
     points = tuple(
         (x, y)
-        for x, y in valid_scan_points(scan)
+        for x, y in valid_scan_points(scan, config)
         if not point_inside_footprint(x, y, config)
     )
     for x, y in points:
@@ -269,14 +404,17 @@ def evaluate_scan(
         # Translation uses a true swept rectangle. A side wall beyond the
         # lateral body + margin is not in the forward braking envelope even
         # when its point happens to have x > the front axle.
-        if x >= config.half_length and abs(y) <= config.half_width + config.side_margin:
+        if (
+            x >= config.half_length
+            and abs(y) <= config.half_width + config.translation_lateral_margin
+        ):
             forward_gap = x - config.half_length
             front_clearance = min(front_clearance, forward_gap)
             if forward_gap <= required:
                 point_mask |= Direction.FRONT
         if (
             x <= -config.half_length
-            and abs(y) <= config.half_width + config.side_margin
+            and abs(y) <= config.half_width + config.translation_lateral_margin
         ):
             rear_gap = -x - config.half_length
             rear_clearance = min(rear_clearance, rear_gap)
@@ -345,6 +483,24 @@ def evaluate_scan(
         turn_clamped = True
     if turn_clamped:
         blocked |= Direction.LEFT if effective_angular_z > 0 else Direction.RIGHT
+    blocker_diagnostic = (
+        _translation_blocker_diagnostic(
+            scan,
+            linear_x=linear_x,
+            required=required,
+            config=config,
+        )
+        if translation_blocked
+        else
+        _rotation_blocker_diagnostic(
+            scan,
+            angular_z=angular_z,
+            measured_angular_z=measured_angular_z,
+            config=config,
+        )
+        if turn_clamped
+        else {}
+    )
     hard_stop = translation_blocked and (
         abs(angular_z) <= 0.05 or turn_clamped
     ) or (abs(linear_x) <= 0.02 and turn_clamped)
@@ -371,6 +527,7 @@ def evaluate_scan(
         right_clearance=right_clearance,
         required_stop_distance=required,
         hard_stop=hard_stop,
+        **blocker_diagnostic,
     )
 
 

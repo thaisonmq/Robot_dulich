@@ -48,7 +48,7 @@ describe("Control saved-map architecture", () => {
       .split("const missionAction = useMutation({", 1)[0];
 
     expect(dashboard).toContain('type PoseVerificationState = "required"');
-    expect(dashboard).toContain('mapLocalized && poseVerificationState === "confirmed"');
+    expect(dashboard).toContain('mapLocalized && poseFresh && poseVerificationState === "confirmed"');
     expect(dashboard).toContain("runtimeLocalizationState === \"READY\" && health.localized");
     expect(dashboard).not.toContain("relocalize.mutate({ expectedState: runtimeState");
     expect(sendGoal).toContain("!hasReadyRuntimePose(map.map_id, map.active_version)");

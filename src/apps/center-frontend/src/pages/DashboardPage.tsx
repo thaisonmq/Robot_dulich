@@ -142,6 +142,7 @@ export function DashboardPage() {
     selectedRobot?.active_map_version ? "READY" : "NO_ACTIVE_MAP",
   );
   const [mapLocalized, setMapLocalized] = useState(false);
+  const [poseFresh, setPoseFresh] = useState(false);
   const [poseVerificationState, setPoseVerificationState] = useState<PoseVerificationState>("required");
   const [visualization, setVisualization] = useState<NavigationVisualization | null>(null);
   const [navigationFeedback, setNavigationFeedback] = useState<NavigationFeedback>({});
@@ -165,11 +166,14 @@ export function DashboardPage() {
     setPoseVerificationState(state);
   }, []);
   const poseVerified = isSpectator
-    ? mapLocalized
-    : mapLocalized && poseVerificationState === "confirmed";
+    ? mapLocalized && poseFresh
+    : mapLocalized && poseFresh && poseVerificationState === "confirmed";
 
   const telemetry = useMemo(() => new WebSocketTelemetryTransport({
-    onPose: setPose,
+    onPose: (nextPose) => {
+      setPose(nextPose);
+      setPoseFresh(true);
+    },
     onHealth: (nextHealth) => {
       setHealth(nextHealth);
       if (["SLOW", "NORMAL", "FAST"].includes(String(nextHealth.auto_speed_mode))) {
@@ -179,12 +183,14 @@ export function DashboardPage() {
       if (runtimeMapState) setMapState(runtimeMapState);
       if (nextHealth.route_candidates) {
         setRouteCandidates(nextHealth.route_candidates);
-        setSelectedRouteId(
-          nextHealth.selected_route_id
-          || nextHealth.route_candidates.find((item) => item.recommended)?.route_id
-          || nextHealth.route_candidates[0]?.route_id
-          || "",
-        );
+        setSelectedRouteId((current) => (
+          nextHealth.route_candidates!.some((item) => item.route_id === current)
+            ? current
+            : nextHealth.selected_route_id
+              || nextHealth.route_candidates!.find((item) => item.recommended)?.route_id
+              || nextHealth.route_candidates![0]?.route_id
+              || ""
+        ));
       }
       const localizationReady = Boolean(nextHealth.localized)
         && String(nextHealth.localization_state ?? runtimeMapState).toUpperCase() === "READY";
@@ -256,9 +262,11 @@ export function DashboardPage() {
     },
     onVisualization: (next) => setVisualization((previous) => {
       const sameMap = previous?.map_id === next.map_id && previous.map_version === next.map_version;
+      const sameRoute = sameMap && Boolean(next.route_id)
+        && next.route_id === previous?.route_id;
       return {
         ...next,
-        global_path: next.global_path ?? (sameMap ? previous?.global_path : []) ?? [],
+        global_path: next.global_path ?? (sameRoute ? previous?.global_path : []) ?? [],
         dynamic_obstacles: next.dynamic_obstacles ?? (sameMap ? previous?.dynamic_obstacles : []) ?? [],
       };
     }),
@@ -269,10 +277,14 @@ export function DashboardPage() {
       poseVerificationSawLocalizingRef.current = false;
       updatePoseVerification("required");
       setMapLocalized(false);
+      setPoseFresh(false);
       setSelectedDestination(null);
       setRoute(null);
       setRouteCandidates([]);
       setSelectedRouteId("");
+      setVisualization(null);
+      setNavigationFeedback({});
+      setNavigationState("idle");
       setConnectionState("reconnecting");
     },
     onReconnect: () => {
@@ -284,6 +296,18 @@ export function DashboardPage() {
       manager.clear("session_ended", false);
       setControlState("disabled");
       setConnectionState("offline");
+      poseVerificationKeyRef.current = "";
+      poseVerificationSawLocalizingRef.current = false;
+      updatePoseVerification("required");
+      setMapLocalized(false);
+      setPoseFresh(false);
+      setSelectedDestination(null);
+      setRoute(null);
+      setRouteCandidates([]);
+      setSelectedRouteId("");
+      setVisualization(null);
+      setNavigationFeedback({});
+      setNavigationState("idle");
       setSessionEndedReason(reason);
     },
   }), [
@@ -515,6 +539,15 @@ export function DashboardPage() {
         return;
       }
       setRoute(newRoute);
+      const candidates = newRoute.candidates ?? [];
+      setRouteCandidates(candidates);
+      setSelectedRouteId(
+        newRoute.selected_route_id
+        || candidates.find((item) => item.recommended)?.route_id
+        || candidates[0]?.route_id
+        || newRoute.route_id
+        || "",
+      );
       if (newRoute.goal) {
         const adjustment = Math.hypot(
           newRoute.goal.x - requestedDestination.x,
@@ -633,22 +666,21 @@ export function DashboardPage() {
         if (!selectedDestination) {
           throw new Error(t("Chưa chọn điểm đến"));
         }
-        if (realRobot && !hasReadyRuntimePose(map.map_id, map.active_version)) {
-          // First preserve and passively verify any current AMCL hypothesis.
-          // The adapter falls back to an authorized global scan only if that
-          // bounded verification fails.
-          await api.relocalize({
-            request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
-            expected_state: mapState, map_id: map.map_id, version: map.active_version,
-            allow_rotation: true,
-            force_global: false,
-          });
-          await waitForLocalizationReady(map.map_id, map.active_version);
-        }
         if (realRobot) {
-          // Always rebuild the route from the currently tracked pose. This
-          // refreshes a preview after manual motion without resetting AMCL.
-          preparedRoute = null;
+          if (!hasReadyRuntimePose(map.map_id, map.active_version)) {
+            // First preserve and passively verify any current AMCL hypothesis.
+            // The adapter falls back to an authorized global scan only if that
+            // bounded verification fails.
+            await api.relocalize({
+              request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
+              expected_state: mapState, map_id: map.map_id, version: map.active_version,
+              allow_rotation: true,
+              force_global: false,
+            });
+            await waitForLocalizationReady(map.map_id, map.active_version);
+            // The old preview was anchored to the pre-localization pose.
+            preparedRoute = null;
+          }
         }
         if (!preparedRoute) {
           preparedRoute = await api.computePath({
@@ -671,11 +703,12 @@ export function DashboardPage() {
             preparedRoute.error_message,
           )));
         }
-        await api.startNavigation({
+        const startedRoute = await api.startNavigation({
           request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
           expected_state: "READY", mission_id: preparedRoute.mission_id,
+          route_id: selectedRouteId || preparedRoute.selected_route_id || preparedRoute.route_id,
         });
-        return preparedRoute;
+        return startedRoute;
       }
       if (!preparedRoute) throw new Error(t("Chưa có lộ trình an toàn để bắt đầu"));
       await api.sendGoal(robotId, session!.session_id, preparedRoute.route_id);
@@ -831,8 +864,13 @@ export function DashboardPage() {
         poseVerificationSawLocalizingRef.current = false;
         updatePoseVerification(session!.mode === "spectator" ? "confirmed" : "required");
         setMapLocalized(false);
+        setPoseFresh(false);
         setSelectedDestination(null);
         setRoute(null);
+        setRouteCandidates([]);
+        setSelectedRouteId("");
+        setVisualization(null);
+        setNavigationFeedback({});
         setConnectionState("connecting");
         const channels = [
           telemetry.connect(session!.session_id, session!.telemetry_websocket_url),

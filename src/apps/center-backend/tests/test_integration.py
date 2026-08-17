@@ -726,6 +726,7 @@ def test_guest_control_camera_privacy_and_supervisor_force_end() -> None:
                 headers=operator_headers,
             )
             assert forced.status_code == 200
+            assert robot_ws.receive_json()["message_type"] == "navigation.cancel"
             assert robot_ws.receive_json()["message_type"] == "control.stop"
             assert robot_ws.receive_json()["message_type"] == "media.stop"
             assert client.get(

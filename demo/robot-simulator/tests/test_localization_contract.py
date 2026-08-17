@@ -208,6 +208,33 @@ def test_existing_amcl_pose_is_passively_verified_before_authorized_global_searc
     assert "self.global_search_requires_rotation = False" in verify
 
 
+def test_stop_turn_arrival_is_position_only_and_reanchor_is_bounded() -> None:
+    compute = _method_source("_compute_path", "_navigate")
+    navigate = _method_source("_navigate", "_segment_execution_tick")
+    begin_turn = _method_source("_begin_turn_or_settling", "_dispatch_prepared_segment")
+    complete = _method_source("_complete_active_segment", "_finish_execution_success")
+
+    assert "maximum_candidates=1" in compute
+    assert "self._execution_destination(goal_payload)" in navigate
+    assert "self.stop_turn_max_reanchors_per_segment" in begin_turn
+    assert "self.stop_turn_require_final_yaw" in complete
+
+
+def test_cancel_discards_transaction_local_route_and_destination_state() -> None:
+    cancel = _method_source("_cancel_navigation", "_pause_navigation")
+
+    for required in (
+        "self.paused_goal = None",
+        "self.execution_goal = None",
+        'self.execution_route_id = ""',
+        "self.route_candidates = {}",
+        'self.selected_route_id = ""',
+        'self.current_mission_id = ""',
+        "self.latest_global_path = []",
+    ):
+        assert required in cancel
+
+
 def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
     tick = _method_source("_localization_tick", "_load_map")
 
@@ -443,10 +470,14 @@ def test_sensor_time_diagnostics_identify_the_failing_critical_stream() -> None:
 
 def test_compute_path_uses_cached_stop_turn_geometry_and_live_validation() -> None:
     compute_path = _method_source("_compute_path", "_navigate")
+    serialize = _method_source(
+        "_serialize_stop_turn_candidates", "_compute_alternative_routes"
+    )
 
     assert "resolved_goal, goal_adjusted = self._resolve_planning_goal" in compute_path
     assert "self.stop_turn_planner.plan_candidates" in compute_path
-    assert "self._route_metadata(points, original=points)" in compute_path
+    assert "self._serialize_stop_turn_candidates(planned)" in compute_path
+    assert "self._route_metadata(points, original=points)" in serialize
     assert 'planner="StopTurnStateLattice24"' in compute_path
     assert "_request_path_once" not in compute_path
 
@@ -454,13 +485,16 @@ def test_compute_path_uses_cached_stop_turn_geometry_and_live_validation() -> No
 def test_raw_plan_never_replaces_validated_visualization_or_follow_path() -> None:
     callback = _method_source("_path_callback", "_path_length")
     compute = _method_source("_compute_path", "_navigate")
+    serialize = _method_source(
+        "_serialize_stop_turn_candidates", "_compute_alternative_routes"
+    )
     navigate = _method_source("_navigate", "_navigation_feedback")
 
     assert "self.latest_planner_raw_path = path" in callback
     assert "self.latest_global_path = path" not in callback
     assert "self.stop_turn_planner.plan_candidates" in compute
     assert '"PRE_FOLLOW_PATH"' in navigate
-    assert "metadata = self._route_metadata" in compute
+    assert "metadata = self._route_metadata" in serialize
     assert "points = self._ensure_executable_path" in navigate
 
 
@@ -558,6 +592,69 @@ def test_selected_preview_is_executed_as_isolated_straight_segments() -> None:
     assert "actual_execution_path_route_id=route_id" in navigate
 
 
+def test_active_segment_is_the_execution_geometry_authority() -> None:
+    heading = _method_source("_current_path_heading", "_speed_profile_state")
+    prepare = _method_source("_prepare_active_segment", "_begin_turn_or_settling")
+    sender = _method_source(
+        "_send_current_straight_segment", "_segment_callback_current"
+    )
+
+    assert "self.active_segment.fixed_heading" in heading
+    assert 'self.execution_phase in {"TURN", "TURN_SETTLING"}' in heading
+    assert "ActiveSegment.create" in prepare
+    assert 'context="STRAIGHT_REANCHOR"' in prepare
+    assert "validate_stop_turn_route" in prepare
+    assert '"REANCHOR_TRANSLATION_INVALID"' in prepare
+    assert "self._schedule_execution_replan" in prepare
+    assert "active.effective_start" in sender
+    assert "active.endpoint" in sender
+    assert "active.fixed_heading" in sender
+
+
+def test_straight_controller_and_endpoint_guards_are_independent_of_rpp_curvature() -> None:
+    velocity = _method_source("_auto_velocity_callback", "_update_motion_metrics")
+    tick = _method_source("_segment_execution_tick", "_fresh_execution_pose")
+
+    assert "straight_heading_lock" in velocity
+    assert "endpoint_braking_speed_limit" in velocity
+    assert "0.0 if straight_phase else message.angular.z" in velocity
+    assert 'linear = 0.0' in velocity
+    assert '"GEOMETRIC_ENDPOINT_STOP"' in velocity
+    assert "straight_segment_progress" in tick
+    assert "progress.passed_endpoint" in tick
+    assert "segment_travel_watchdog" in tick
+    assert '"ENDPOINT_OVERSHOOT_CROSS_TRACK"' in tick
+
+
+def test_segment_result_callbacks_require_generation_token_and_index() -> None:
+    sender = _method_source(
+        "_send_current_straight_segment", "_segment_callback_current"
+    )
+    guard = _method_source("_segment_callback_current", "_navigation_feedback")
+    result = _method_source("_navigation_result", "_set_recovery_terminal")
+
+    assert "token=segment_token" in sender
+    assert "index=segment_index" in sender
+    assert "active.segment_token == segment_token" in guard
+    assert "active.segment_index == segment_index" in guard
+    assert "self._segment_callback_current" in result
+    assert 'evidence_reason == "UNCONFIRMED"' in result
+    assert 'self._set_state("NAVIGATING", "automatic_segment_retry")' in result
+
+
+def test_turn_hysteresis_and_persistent_safety_block_are_bounded() -> None:
+    tick = _method_source("_segment_execution_tick", "_fresh_execution_pose")
+
+    assert "turn_hysteresis_transition" in tick
+    assert '"TURN_SETTLING"' in tick
+    assert "self.execution_turn_reentry_tolerance" in tick
+    assert "self.execution_turn_stable_dwell" in tick
+    assert "self.execution_turn_safety_block_timeout" in tick
+    assert '"PERSISTENT_SAFETY_BLOCK"' in tick
+    assert "self._schedule_execution_replan" in tick
+    assert '"TURN_CMD"' in tick
+
+
 def test_navigation_debug_events_cover_new_geometry_and_recovery_sources() -> None:
     for event in (
         '"LOCALIZATION_VERIFY"',
@@ -592,7 +689,8 @@ def test_initial_preview_produces_candidates_without_persistent_scratch_state() 
     assert "self.route_candidates =" in compute
     assert "self.failed_segments =" not in alternatives
     assert "_publish_failed_segments" not in alternatives
-    assert 'source="INITIAL_STOP_TURN_PREVIEW"' in alternatives
+    assert 'source="EXPLICIT_ALTERNATIVE_SEARCH"' in alternatives
+    assert "self.stop_turn_planner.plan_candidates" in alternatives
 
 
 def test_live_narrow_uncertainty_does_not_cancel_prevalidated_auto_route() -> None:

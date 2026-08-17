@@ -133,12 +133,46 @@ rovera_navigation_adapter:
     alternative_route_max_candidates: 3
     alternative_route_overlap_threshold: 0.85
     alternative_route_keepout_radius: 0.18
+    # One shared wall-clock budget covers the primary route and all optional
+    # alternatives.  Center waits longer than this, so a slow alternative
+    # search cannot produce a false command-ACK timeout.
+    stop_turn_planning_budget_seconds: 12.0
+    # Reject corners that work only at one exact localization coordinate.
+    # This affects in-place turns only; straight narrow-corridor clearance is
+    # still checked with the directional 0.30 x 0.20 m rectangle.
+    stop_turn_turn_robustness_radius: 0.01
+    # Arrival is position-based. The approach segment already determines a
+    # safe chassis heading, so no final in-place orientation adjustment runs.
+    stop_turn_require_final_yaw: false
+    stop_turn_max_reanchors_per_segment: 1
     stop_turn_settle_seconds: 0.20
     stop_turn_heading_tolerance_degrees: 3.0
+    # Separate completion/re-entry bands plus a stable dwell prevent the
+    # TURN_END/TURN_BEGIN chatter seen around one shared threshold.
+    stop_turn_heading_reentry_tolerance_degrees: 6.0
+    stop_turn_stable_dwell_seconds: 0.40
+    stop_turn_safety_block_timeout_seconds: 5.0
     stop_turn_heading_kp: 1.8
     stop_turn_max_angular_speed: 0.60
     straight_max_angular_correction: 0.18
     straight_path_pose_spacing: 0.05
+    execution_pose_freshness_seconds: 0.30
+    straight_heading_kp: 1.2
+    straight_cross_track_kp: 1.0
+    straight_heading_deadband_degrees: 1.0
+    straight_cross_track_deadband: 0.01
+    # Four times the existing 3 degree turn completion tolerance. Above this
+    # bounded correction region forward motion is forbidden and re-anchor is
+    # required. The lateral limit is at least one 5 cm map cell plus margin.
+    straight_hard_heading_error_degrees: 12.0
+    straight_hard_cross_track: 0.08
+    straight_endpoint_tolerance: 0.03
+    straight_overshoot_epsilon: 0.005
+    straight_endpoint_reaction_time_seconds: 0.15
+    segment_watchdog_settle_allowance_seconds: 2.0
+    segment_watchdog_time_factor: 3.0
+    segment_watchdog_travel_factor: 2.0
+    segment_watchdog_travel_slack: 0.30
 
 map_server:
   ros__parameters:

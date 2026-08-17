@@ -56,7 +56,9 @@ NAVIGATION_TRANSITIONS: dict[str, frozenset[str]] = {
     # Legacy aliases remain valid while old edge agents roll forward.
     "LOADING_MAP": frozenset({"LOCALIZING", "FAULT", "CANCELED"}),
     "LOCALIZING": frozenset({"READY", "FAULT", "CANCELED"}),
-    "READY": frozenset({"PLANNING", "NAVIGATING", "FAULT", "CANCELED"}),
+    "READY": frozenset({
+        "PLANNING", "NAVIGATING", "COMPUTING_ALTERNATIVES", "FAULT", "CANCELED",
+    }),
     "PLANNING": frozenset({
         "READY", "NAVIGATING", "BLOCKED", "RECOVERY", "PLAN_FAILED",
         "FAILED", "FAULT", "CANCELED",
@@ -74,7 +76,7 @@ NAVIGATION_TRANSITIONS: dict[str, frozenset[str]] = {
         "ROUTE_SELECTION", "NARROW_PATH_DECISION", "BLOCKED", "CANCELED",
     }),
     "ROUTE_SELECTION": frozenset({
-        "NAVIGATING", "NARROW_PATH_DECISION", "CANCELED", "FAULT",
+        "NAVIGATING", "NARROW_PATH_DECISION", "READY", "CANCELED", "FAULT",
     }),
     "PAUSED": frozenset({"NAVIGATING", "MANUAL_BYPASS", "CANCELED", "FAULT"}),
     "BLOCKED": frozenset({"NAVIGATING", "PAUSED", "RECOVERY", "CANCELED", "FAILED", "FAULT"}),

@@ -8,11 +8,17 @@ rovera_motion_safety:
     # center, so forward/rear range is converted to bumper clearance first.
     half_length: 0.15
     half_width: 0.10
-    # Side walls use only a lateral margin. Arc/rotation checks sample the
-    # rectangular footprint at future poses instead of applying braking range
-    # sideways.
+    # Straight translation uses only a 1 cm lateral reserve around the real
+    # 0.20 m body. The wider side margin remains exclusive to predicted arcs,
+    # so a parallel wall cannot masquerade as an obstacle in front.
+    translation_lateral_margin: 0.01
     side_margin: 0.04
     rotation_margin: 0.03
+    # URDF laser_joint transform into base_footprint. Safety evaluates every
+    # beam in the chassis frame instead of assuming the sensor is at (0, 0).
+    laser_x: -0.0046412
+    laser_y: 0.0
+    laser_yaw: 0.0
     clearance: 0.04
     slow_extra: 0.10
     latency: 0.12

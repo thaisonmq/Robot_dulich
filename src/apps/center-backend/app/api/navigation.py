@@ -107,9 +107,77 @@ def _route_id_for_path(path: list[dict[str, float]]) -> str:
     return f"route-{digest}"
 
 
-def _mission_view(mission: NavigationMission) -> dict:
+def _normalized_route_candidates(value: object) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    candidates: list[dict] = []
+    for raw in value:
+        if not isinstance(raw, dict) or raw.get("valid") is False:
+            continue
+        route_id = str(raw.get("route_id") or "")
+        points = raw.get("points")
+        if not route_id or not isinstance(points, list) or len(points) < 2:
+            continue
+        candidate = dict(raw)
+        candidate["route_id"] = route_id
+        candidate["points"] = list(points)
+        candidate.setdefault(
+            "minimum_clearance",
+            candidate.get("minimum_static_clearance"),
+        )
+        candidates.append(candidate)
+    return candidates
+
+
+def _mission_route_candidates(
+    database: Session,
+    mission: NavigationMission,
+) -> list[dict]:
+    """Read the authoritative preview candidates already persisted in its receipt."""
+    receipt = database.get(CommandReceipt, mission.request_id)
+    if receipt is None or receipt.command_type != "navigation.compute_path":
+        return []
+    response = receipt.response if isinstance(receipt.response, dict) else {}
+    return _normalized_route_candidates(
+        response.get("route_candidates") or response.get("candidates")
+    )
+
+
+def _selected_candidate(
+    candidates: list[dict],
+    route_id: str | None,
+    fallback_path: list[dict],
+) -> tuple[str, list[dict]]:
+    if route_id:
+        for candidate in candidates:
+            if candidate["route_id"] == route_id:
+                return route_id, list(candidate["points"])
+        # Compatibility for a READY mission previewed before candidate lists
+        # were exposed.  The deterministic ID still binds exactly to the
+        # server-persisted path; arbitrary browser IDs remain rejected.
+        if not candidates and route_id == _route_id_for_path(fallback_path):
+            return route_id, fallback_path
+        raise ValueError("UNKNOWN_ROUTE_ID")
+    for candidate in candidates:
+        if list(candidate["points"]) == fallback_path:
+            return str(candidate["route_id"]), fallback_path
+    return _route_id_for_path(fallback_path), fallback_path
+
+
+def _mission_view(
+    mission: NavigationMission,
+    *,
+    candidates: list[dict] | None = None,
+    selected_route_id: str | None = None,
+) -> dict:
+    candidate_views = list(candidates or [])
+    selected_id, _ = _selected_candidate(
+        candidate_views,
+        selected_route_id,
+        list(mission.path or []),
+    )
     return {
-        "route_id": _route_id_for_path(list(mission.path or [])),
+        "route_id": selected_id,
         "mission_id": mission.mission_id,
         "destination_id": "CUSTOM-GOAL",
         "request_id": mission.request_id,
@@ -124,6 +192,8 @@ def _mission_view(mission: NavigationMission) -> dict:
         "estimated_seconds": max(1, round(mission.distance_m / 0.15)),
         "error_code": mission.error_code,
         "error_message": mission.error_message,
+        "candidates": candidate_views,
+        "selected_route_id": selected_id,
         "created_at": mission.created_at.isoformat(),
         "updated_at": mission.updated_at.isoformat(),
     }
@@ -504,7 +574,10 @@ async def compute_path(
         select(NavigationMission).where(NavigationMission.request_id == body.request_id)
     )
     if existing is not None:
-        return _mission_view(existing)
+        return _mission_view(
+            existing,
+            candidates=_mission_route_candidates(database, existing),
+        )
     result = await _command(
         database,
         settings,
@@ -517,6 +590,7 @@ async def compute_path(
             "version": body.version,
             "goal": body.goal.model_dump(),
         },
+        timeout_seconds=settings.navigation_planning_timeout_seconds,
     )
     points = list(result.get("points") or result.get("path") or [])
     # Planning happens before the chassis moves. A failed route is mission
@@ -546,7 +620,12 @@ async def compute_path(
     database.add(mission)
     database.commit()
     database.refresh(mission)
-    return _mission_view(mission)
+    return _mission_view(
+        mission,
+        candidates=_normalized_route_candidates(
+            result.get("route_candidates") or result.get("candidates")
+        ),
+    )
 
 
 @router.post("/start")
@@ -576,6 +655,26 @@ async def start_navigation(
                 "failures": failures,
             },
         )
+    candidates = _mission_route_candidates(database, mission)
+    try:
+        selected_route_id, selected_points = _selected_candidate(
+            candidates,
+            body.route_id,
+            list(mission.path or []),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Tuyến đã chọn không thuộc kết quả preview hiện tại",
+        ) from exc
+    mission.path = selected_points
+    mission.distance_m = sum(
+        math.hypot(
+            float(right["x"]) - float(left["x"]),
+            float(right["y"]) - float(left["y"]),
+        )
+        for left, right in zip(selected_points, selected_points[1:])
+    )
     try:
         navigation_transition(mission.status, "NAVIGATING")
     except InvalidTransition as exc:
@@ -589,7 +688,7 @@ async def start_navigation(
         expected_state=body.expected_state,
         payload={
             "mission_id": mission.mission_id,
-            "route_id": _route_id_for_path(list(mission.path or [])),
+            "route_id": selected_route_id,
             "map_id": mission.map_id,
             "version": mission.map_version,
             "goal": mission.goal,
@@ -604,7 +703,11 @@ async def start_navigation(
         mission.error_code = result.get("error_code")
         mission.error_message = result.get("error_message")
     database.commit()
-    return _mission_view(mission)
+    return _mission_view(
+        mission,
+        candidates=candidates,
+        selected_route_id=selected_route_id,
+    )
 
 
 @router.post("/missions/{mission_id}/{action}")
@@ -699,7 +802,10 @@ async def mission_status(
     mission = database.get(NavigationMission, mission_id)
     if mission is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy mission")
-    return _mission_view(mission)
+    return _mission_view(
+        mission,
+        candidates=_mission_route_candidates(database, mission),
+    )
 
 
 # Backward-compatible endpoints used by the current Center UI and simulator.

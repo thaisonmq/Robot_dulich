@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     map_storage_dir: str = "./map-storage"
     map_bundle_max_bytes: int = 512 * 1024 * 1024
     robot_command_timeout_seconds: float = 15.0
+    # Stop-turn planning has its own bounded budget on the Pi. Keep a wider
+    # transport envelope so scheduling cannot turn a valid planner result into
+    # a false generic command-ACK timeout.
+    navigation_planning_timeout_seconds: float = 30.0
     # SLAM save/load serializes a pose-graph on the Pi and legitimately takes
     # longer than interactive motion/navigation commands.
     mapping_command_timeout_seconds: float = 90.0

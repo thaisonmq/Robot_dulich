@@ -99,6 +99,7 @@ class RobotConnectionClient:
         self.media_restart_requested = asyncio.Event()
         self.media_lease_changed = asyncio.Event()
         self.media_leases: dict[str, float] = {}
+        self._camera_inventory_cache: list[dict[str, Any]] = []
         self.robot_access_token = ""
         self._used_enrollment_token_hash = ""
         self._configured_robot_id = config.robot_id
@@ -768,9 +769,14 @@ class RobotConnectionClient:
                     )
                 )
             elif message.message_type == "media.cameras.get":
-                await self._camera_sources(
-                    socket,
-                    str(message.payload.get("request_id", "")),
+                # V4L2 probing may take several seconds.  Keeping it inline
+                # blocks this websocket's receive loop and can delay an
+                # unrelated navigation command beyond its ACK envelope.
+                self._spawn_background(
+                    self._camera_sources(
+                        socket,
+                        str(message.payload.get("request_id", "")),
+                    )
                 )
             elif message.message_type == "media.source.select":
                 request_id = str(message.payload.get("request_id", ""))
@@ -1034,6 +1040,39 @@ class RobotConnectionClient:
                 self.config.simulator_media_source
                 or self.config.simulator_camera_device
             )
+        if selected_source and self.media_leases:
+            # Never probe V4L2 while the active publisher owns the device.
+            # Return its known source immediately; a 4-second inventory probe
+            # previously looked like an unrelated robot command ACK failure.
+            selected = next(
+                (
+                    dict(source)
+                    for source in self._camera_inventory_cache
+                    if str(source.get("value", "")) == selected_source
+                ),
+                {
+                    "type": self.config.simulator_media_source_type,
+                    "value": selected_source,
+                    "label": self.config.camera_label,
+                    "ptz": {},
+                },
+            )
+            await socket.send(
+                json.dumps(
+                    make_message(
+                        "media.cameras",
+                        self.config.robot_id,
+                        self._next_sequence(),
+                        {
+                            "request_id": request_id,
+                            "ok": True,
+                            "video_sources": [selected],
+                            "selected_source": selected_source,
+                        },
+                    )
+                )
+            )
+            return
         # The live-view request and camera-list request arrive together when a
         # dashboard opens. Do not race the publisher by probing its exclusive
         # V4L2 device in another FFmpeg process. Other candidates are still
@@ -1071,6 +1110,7 @@ class RobotConnectionClient:
                     self.config.simulator_camera_fps or self.config.video_fps,
                     self.config.simulator_camera_format,
                 )
+        self._camera_inventory_cache = [dict(source) for source in sources]
         await socket.send(
             json.dumps(
                 make_message(

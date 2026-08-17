@@ -152,6 +152,23 @@ def camera_payload(
 
 
 async def load_camera_inventory(robot_id: str) -> dict:
+    cached = list(hub.camera_sources.get(robot_id, {}).values())
+    if cached:
+        return {
+            "ok": True,
+            "video_sources": [
+                {
+                    "type": source.source_type,
+                    "value": source.source,
+                    "label": source.label,
+                    "ptz": dict(source.ptz),
+                }
+                for source in cached
+            ],
+            "selected_source": next(
+                (source.source for source in cached if source.selected), ""
+            ),
+        }
     try:
         return await hub.request_robot(
             robot_id, "media.cameras.get", {}, timeout_seconds=4
@@ -399,20 +416,6 @@ async def force_end_guest_session(
             status_code=403,
             detail="Chỉ được kết thúc cưỡng bức phiên của tài khoản khách",
         )
-    await hub.forward_to_robot(
-        session.robot_id,
-        {
-            "message_id": session.session_id,
-            "schema_version": "1.0",
-            "message_type": "control.stop",
-            "robot_id": session.robot_id,
-            "session_id": session.session_id,
-            "sequence": session.last_sequence + 1,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "ttl_ms": 1000,
-            "payload": {"reason": "force_ended_by_supervisor"},
-        },
-    )
     if not await hub.close_session(
         session_id, reason="force_ended_by_supervisor"
     ):
@@ -598,22 +601,6 @@ async def delete_session(
     actor: User = Depends(authenticated_user),
     database: Session = Depends(get_db),
 ) -> dict:
-    session = hub.get_session(session_id, actor.id)
-    if session:
-        await hub.forward_to_robot(
-            session.robot_id,
-            {
-                "message_id": session.session_id,
-                "schema_version": "1.0",
-                "message_type": "control.stop",
-                "robot_id": session.robot_id,
-                "session_id": session.session_id,
-                "sequence": session.last_sequence + 1,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "ttl_ms": 1000,
-                "payload": {"reason": "session_ended"},
-            },
-        )
     if not await hub.close_session(
         session_id, actor.id, reason="session_ended"
     ):

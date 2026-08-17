@@ -262,6 +262,7 @@ class ConnectionHub:
             robot = self.robots.get(session.robot_id)
             if robot:
                 robot.availability = "available" if robot.status == "online" else "offline"
+        await self.stop_session_robot(closed_session)
         await self.set_media_lease(
             closed_session.robot_id,
             f"session:{closed_session.session_id}",
@@ -299,6 +300,7 @@ class ConnectionHub:
                 closed_sessions.append(session)
 
         for session in closed_sessions:
+            await self.stop_session_robot(session)
             await self.set_media_lease(
                 session.robot_id,
                 f"session:{session.session_id}",
@@ -358,6 +360,7 @@ class ConnectionHub:
                 closed_sessions.append(session)
 
         for session in closed_sessions:
+            await self.stop_session_robot(session)
             await self.set_media_lease(
                 session.robot_id,
                 f"session:{session.session_id}",
@@ -368,6 +371,7 @@ class ConnectionHub:
 
     def _expire_sessions(self) -> None:
         now = datetime.now(timezone.utc)
+        expired: list[SessionRuntime] = []
         for session in self.sessions.values():
             if (
                 session.status == "active"
@@ -383,6 +387,55 @@ class ConnectionHub:
                     robot.availability = (
                         "available" if robot.status == "online" else "offline"
                     )
+                expired.append(session)
+        if expired:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            for session in expired:
+                loop.create_task(self._finalize_expired_session(session))
+
+    async def _finalize_expired_session(self, session: SessionRuntime) -> None:
+        await self.stop_session_robot(session)
+        await self.set_media_lease(
+            session.robot_id,
+            f"session:{session.session_id}",
+            active=False,
+        )
+        await self.notify_session_ended(session)
+
+    async def stop_session_robot(self, session: SessionRuntime) -> None:
+        """Cancel autonomous state and then inject the immediate motion stop."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        common = {
+            "schema_version": "1.0",
+            "robot_id": session.robot_id,
+            "session_id": session.session_id,
+            "timestamp": timestamp,
+            "ttl_ms": 1000,
+        }
+        reason = session.end_reason or "session_ended"
+        await self.forward_to_robot(
+            session.robot_id,
+            {
+                **common,
+                "message_id": str(uuid4()),
+                "message_type": "navigation.cancel",
+                "sequence": session.last_sequence + 1,
+                "payload": {"reason": reason},
+            },
+        )
+        await self.forward_to_robot(
+            session.robot_id,
+            {
+                **common,
+                "message_id": str(uuid4()),
+                "message_type": "control.stop",
+                "sequence": session.last_sequence + 2,
+                "payload": {"reason": reason},
+            },
+        )
 
     async def notify_session_ended(self, session: SessionRuntime) -> None:
         message = {
