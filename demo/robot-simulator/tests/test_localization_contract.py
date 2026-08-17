@@ -228,6 +228,17 @@ def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
     assert "self.ready_evidence_invalid_since" in tick
 
 
+def test_verify_timeout_does_not_restart_an_accepted_candidate_during_ready_hold() -> None:
+    tick = _method_source("_localization_tick", "_load_map")
+    verify_timeout = tick.split(
+        'self.localization_state == "VERIFYING"', 1
+    )[1].split("if now - self.localization_started_monotonic", 1)[0]
+
+    assert "and not localization_ready" in verify_timeout
+    assert "and self.ready_evidence_since is None" in verify_timeout
+    assert "self._start_global_localization()" in verify_timeout
+
+
 def test_stationary_global_search_rejects_weak_alias_and_resamples_when_turn_blocked() -> None:
     evidence = _method_source("_localization_evidence_ready", "_localization_tick")
     tick = _method_source("_localization_tick", "_load_map")
@@ -366,22 +377,46 @@ def test_persistent_clock_failure_revokes_navigation_but_has_a_grace_period() ->
     degrade = _method_source("_degrade_localization", "_localization_lost")
 
     assert "self.sensor_time_invalid_grace" in tick
+    assert "self._critical_sensor_time_status()" in tick
+    assert "sensor_time_reason" in tick
     assert 'self.localization_state = "SENSOR_TIME_INVALID"' in degrade
     assert "handle.cancel_goal_async()" in degrade
     assert 'self.motion_owner = "NONE"' in degrade
+    assert "self.navigation_velocity.publish(Twist())" in degrade
     assert "self.localization_velocity.publish(Twist())" in degrade
+    assert "self.latest_global_path = []" not in degrade
+    assert "self.sensor_time_resume_context" in degrade
 
 
-def test_sensor_recovery_replays_saved_pose_before_global_localization() -> None:
-    tick = _method_source("_localization_tick", "_load_map")
+def test_transient_sensor_fault_keeps_context_then_replans_same_destination() -> None:
+    restore = _method_source(
+        "_restore_after_sensor_time_pause", "_fail_sustained_sensor_time_pause"
+    )
+    resume = _method_source(
+        "_resume_sensor_time_navigation_if_ready", "_localization_lost"
+    )
 
-    recovery = tick.split(
-        'if self.localization_state == "SENSOR_TIME_INVALID":', 1
-    )[1].split("self._refresh_localization_confidence()", 1)[0]
-    saved_pose = recovery.index("elif self.localization_seed_pose is not None")
-    replay = recovery.index("self._begin_auto_localization(seed_pose)", saved_pose)
-    global_search = recovery.index("self._start_global_localization()", replay)
-    assert saved_pose < replay < global_search
+    assert '"VERIFYING"' in restore
+    assert "self._begin_localization_verification(allow_rotation=False)" in restore
+    assert '"goal": dict(self.paused_goal)' in ADAPTER_SOURCE
+    assert "self._request_path_once(goal)" in resume
+    assert "self._navigate(" in resume
+    assert '"mission_id": mission_id' in resume
+    assert '"route_id": route_id' in resume
+
+
+def test_sensor_time_diagnostics_identify_the_failing_critical_stream() -> None:
+    timing = _method_source(
+        "_critical_sensor_time_status", "_critical_sensor_time_healthy"
+    )
+
+    for required in (
+        '"status_age_ms"', '"timestamp_age_ms"', '"arrival_fresh"',
+        '"timestamp_valid"', '"frame_valid"', '"clock_state"',
+        '"invalid_streak"', '"rejected_packets"', '"last_rejection"',
+        'f"{prefix}_ARRIVAL_STALE"', 'f"{prefix}_TIMESTAMP_INVALID"',
+    ):
+        assert required in timing
 
 
 def test_compute_path_lets_live_nav2_costmap_validate_the_start_pose() -> None:
@@ -398,6 +433,33 @@ def test_compute_path_lets_live_nav2_costmap_validate_the_start_pose() -> None:
     assert "self.compute_path_client.send_goal_async(request)" in request_once
 
 
+def test_raw_plan_never_replaces_validated_visualization_or_follow_path() -> None:
+    callback = _method_source("_path_callback", "_path_length")
+    compute = _method_source("_compute_path", "_navigate")
+    navigate = _method_source("_navigate", "_navigation_feedback")
+
+    assert "self.latest_planner_raw_path = path" in callback
+    assert "self.latest_global_path = path" not in callback
+    assert 'context="INITIAL_COMPUTE_PATH"' in compute
+    assert '"PRE_FOLLOW_PATH"' in navigate
+    assert "points = self._ensure_executable_path" in compute
+    assert "points = self._ensure_executable_path" in navigate
+
+
+def test_executable_validator_combines_live_master_and_saved_static_walls() -> None:
+    validate = _method_source(
+        "_validate_executable_path", "_path_after_initial_distance"
+    )
+
+    assert 'validation_source = "GLOBAL_MASTER_COSTMAP"' in validate
+    assert "self.saved_map.occupancy" in validate
+    assert "lethal_threshold=100" in validate
+    assert "inscribed_threshold=99" in validate
+    assert "lethal_threshold=65" in validate
+    assert 'validation_source = "SAVED_STATIC_MAP"' in validate
+    assert "self._path_after_initial_distance" in validate
+
+
 def test_compute_path_clears_only_after_diagnosed_failure_and_waits_for_update() -> None:
     refresh = _method_source(
         "_refresh_global_costmap_for_planning",
@@ -408,13 +470,24 @@ def test_compute_path_clears_only_after_diagnosed_failure_and_waits_for_update()
     assert "ClearEntireCostmap.Request()" in refresh
     assert "self.clear_global_costmap_client.call_async" in refresh
     assert "time.sleep" not in refresh
-    assert "self.global_costmap_update.wait" in refresh
+    assert "self._wait_for_global_costmap_after" in refresh
+    assert "self.global_costmap_update.wait" not in refresh
     first_plan = compute_path.index("points = self._request_path_once(resolved_goal)")
     reset = compute_path.index("self._refresh_global_costmap_for_planning()")
     assert first_plan < reset
     assert 'first_error.code in {"START_BLOCKED", "COSTMAP_NOT_READY"}' in compute_path
     assert 'self._set_state("READY", reason)' in compute_path
     assert 'self._set_state("BLOCKED"' not in compute_path
+
+
+def test_invalid_theta_path_uses_old_footprint_aware_route_selector() -> None:
+    ensure = _method_source("_ensure_executable_path", "_global_cost_at")
+    request = _method_source("_request_path_once", "_compute_path")
+
+    assert 'action="FOOTPRINT_AWARE_PLANNER"' in ensure
+    assert 'planner_id="FootprintGrid"' in ensure
+    assert 'planner_id: str = "GridBased"' in request
+    assert "request.planner_id = planner_id" in request
 
 
 def test_scan_filter_is_used_only_for_global_planning_topic() -> None:

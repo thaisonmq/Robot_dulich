@@ -1901,6 +1901,12 @@ class RobotConnectionClient:
                                 "sensor_time_healthy",
                                 self.config.motion_backend == "simulator",
                             ),
+                            "sensor_time_failure_reason": backend_state.get(
+                                "sensor_time_failure_reason", ""
+                            ),
+                            "sensor_time_diagnostics": backend_state.get(
+                                "sensor_time_diagnostics", {}
+                            ),
                             "scan_arrival_fresh": backend_state.get(
                                 "scan_arrival_fresh", False
                             ),

@@ -53,9 +53,17 @@ function navigationStateLabel(state: string, t: Translate): string {
 
 function sensorTimeFailureMessage(reason: string | undefined, t: Translate) {
   const messages: Record<string, [string, string]> = {
+    SCAN_ARRIVAL_STALE: [
+      "Dữ liệu LiDAR tạm thời không khả dụng.",
+      "Robot đã dừng an toàn và đang chờ LiDAR phục hồi.",
+    ],
     SCAN_STALE: [
       "Dữ liệu LiDAR tạm thời không khả dụng.",
       "Robot đã dừng an toàn và đang chờ LiDAR phục hồi.",
+    ],
+    ODOM_ARRIVAL_STALE: [
+      "Dữ liệu odometry tạm thời không khả dụng.",
+      "Robot đã dừng an toàn và đang chờ odometry phục hồi.",
     ],
     ODOM_STALE: [
       "Dữ liệu odometry tạm thời không khả dụng.",
@@ -64,6 +72,34 @@ function sensorTimeFailureMessage(reason: string | undefined, t: Translate) {
     SCAN_ODOM_STALE: [
       "Đã mất dữ liệu LiDAR và odometry từ bộ điều khiển robot.",
       "Robot đã dừng an toàn và đang chờ kết nối cảm biến phục hồi.",
+    ],
+    SCAN_ODOM_ARRIVAL_STALE: [
+      "Đã mất dữ liệu LiDAR và odometry từ bộ điều khiển robot.",
+      "Robot đã dừng an toàn và đang chờ kết nối cảm biến phục hồi.",
+    ],
+    SCAN_TIMESTAMP_INVALID: [
+      "Dấu thời gian LiDAR không hợp lệ.",
+      "Robot đã dừng an toàn và đang chờ dữ liệu LiDAR đồng bộ.",
+    ],
+    ODOM_TIMESTAMP_INVALID: [
+      "Dấu thời gian odometry không hợp lệ.",
+      "Robot đã dừng an toàn và đang chờ dữ liệu odometry đồng bộ.",
+    ],
+    SCAN_FRAME_INVALID: [
+      "Khung tọa độ LiDAR không hợp lệ.",
+      "Robot đã dừng an toàn và đang chờ dữ liệu LiDAR đúng khung tọa độ.",
+    ],
+    ODOM_FRAME_INVALID: [
+      "Khung tọa độ odometry không hợp lệ.",
+      "Robot đã dừng an toàn và đang chờ dữ liệu odometry đúng khung tọa độ.",
+    ],
+    STATUS_STALE: [
+      "Trạng thái thời gian cảm biến chưa được cập nhật.",
+      "Robot đã dừng an toàn và đang thử khôi phục dữ liệu định vị.",
+    ],
+    CLOCK_NOT_SYNCED: [
+      "Đồng hồ cảm biến chưa đồng bộ.",
+      "Robot đã dừng an toàn và đang thử đồng bộ lại dữ liệu định vị.",
     ],
     SENSOR_FRAME_INVALID: [
       "Khung tọa độ cảm biến không hợp lệ.",
@@ -76,7 +112,7 @@ function sensorTimeFailureMessage(reason: string | undefined, t: Translate) {
   };
   const [title, detail] = messages[reason ?? ""] ?? [
     "Dữ liệu định vị tạm thời không đồng bộ.",
-    "Robot đã dừng an toàn và đang thử khôi phục vị trí.",
+    "Robot đã dừng an toàn và đang thử khôi phục.",
   ];
   return { title: t(title), detail: t(detail) };
 }
@@ -480,6 +516,15 @@ export function MapPanel({
   const ready = localized && localizationState === "READY" && pose.map_id === map.map_id
     && (pose.map_version == null || pose.map_version === map.active_version)
     && (health?.map_version == null || health.map_version === map.active_version);
+  // A short sensor-time pause keeps the latest map-frame pose available while
+  // AMCL is being verified.  Render that marker as stationary rather than
+  // making the robot appear to vanish; controls still require READY.
+  const poseMatchesActiveMap = pose.map_id === map.map_id
+    && (pose.map_version == null || pose.map_version === map.active_version)
+    && Number.isFinite(pose.x) && Number.isFinite(pose.y) && Number.isFinite(pose.yaw);
+  const showRecoveringPose = poseMatchesActiveMap
+    && ["SENSOR_TIME_INVALID", "VERIFYING"].includes(localizationState);
+  const showRobot = ready || showRecoveringPose;
   const visualizationMatches = visualization?.map_id === map.map_id
     && visualization.map_version === map.active_version;
   const sensorTimeMessage = sensorTimeFailureMessage(
@@ -507,10 +552,10 @@ export function MapPanel({
     <div className="map-canvas map-canvas--mini" onDoubleClick={() => ready && setExpanded(true)}>
       <MapCanvas map={map} destinations={[]} pose={pose} route={liveRoute}
         routeCandidates={routeCandidates} selectedRouteId={selectedRouteId} selected={selected}
-        dynamicObstacles={obstacles} readOnly showRobot={ready} robotMoving={moving}
+        dynamicObstacles={obstacles} readOnly showRobot={showRobot} robotMoving={moving && ready}
         focus={followRobot || centerRobot ? pose : null} zoom={followRobot || centerRobot ? 2 : 1}
         onSelect={onSelect} onSelectRoute={onSelectRoute} />
-      {!ready && <div className="localization-overlay"><Navigation />
+      {!ready && <div className={`localization-overlay${showRecoveringPose ? " localization-overlay--with-pose" : ""}`}><Navigation />
         <strong>{localizationFailed
           ? t("Không thể tự xác định chính xác vị trí robot.")
           : localizationState === "SENSOR_TIME_INVALID"
@@ -593,7 +638,7 @@ export function MapPanel({
         <div className="map-modal__canvas"><MapCanvas map={map} destinations={destinations} pose={pose}
           route={liveRoute} routeCandidates={routeCandidates} selectedRouteId={selectedRouteId}
           selected={selected} dynamicObstacles={obstacles}
-          readOnly={readOnly || loading} showRobot={ready} robotMoving={moving}
+          readOnly={readOnly || loading} showRobot={showRobot} robotMoving={moving && ready}
           onSelect={onSelect} onSelectRoute={onSelectRoute} /></div>
         <footer><button type="button" onClick={() => setExpanded(false)}>{t("Hủy")}</button>
           <button type="button" className="button button--primary" disabled={!selected || !canStart || loading}

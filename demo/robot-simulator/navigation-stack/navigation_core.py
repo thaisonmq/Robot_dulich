@@ -23,6 +23,267 @@ class GoalValidation:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutablePathValidation:
+    valid: bool
+    code: str = ""
+    segment_index: int = -1
+    sample_x: float | None = None
+    sample_y: float | None = None
+    sample_yaw: float | None = None
+    cell_cost: int | None = None
+    samples_checked: int = 0
+    collision_x: float | None = None
+    collision_y: float | None = None
+    collision_cells: tuple[tuple[float, float, int], ...] = ()
+
+
+def validate_executable_grid_path(
+    points: Iterable[dict[str, float]],
+    *,
+    width: int,
+    height: int,
+    resolution: float,
+    origin_x: float,
+    origin_y: float,
+    origin_yaw: float,
+    data: Iterable[int],
+    half_length: float,
+    half_width: float,
+    allow_unknown: bool = False,
+    lethal_threshold: int = 99,
+    inscribed_threshold: int | None = None,
+) -> ExecutablePathValidation:
+    """Validate the oriented physical footprint over every path segment.
+
+    Segment centers are sampled at no more than half a costmap cell. At each
+    sample an exact separating-axis test checks the robot rectangle against
+    every intersecting costmap cell. This catches wall collisions that a free
+    centerline alone cannot detect, including on rotated occupancy grids.
+    """
+    route = [
+        {"x": float(point["x"]), "y": float(point["y"])}
+        for point in points
+    ]
+    costs = [int(value) for value in data]
+    width = int(width)
+    height = int(height)
+    resolution = float(resolution)
+    if (
+        len(route) < 2
+        or width <= 0
+        or height <= 0
+        or resolution <= 0.0
+        or len(costs) != width * height
+    ):
+        return ExecutablePathValidation(False, "PATH_OR_COSTMAP_INVALID")
+
+    grid_cosine = math.cos(float(origin_yaw))
+    grid_sine = math.sin(float(origin_yaw))
+    grid_axis_x = (grid_cosine, grid_sine)
+    grid_axis_y = (-grid_sine, grid_cosine)
+    cell_half = resolution / 2.0
+    footprint_radius = math.hypot(float(half_length), float(half_width))
+    candidate_radius = footprint_radius + math.sqrt(2.0) * cell_half
+    sample_spacing = resolution / 2.0
+    samples_checked = 0
+    first_collision: tuple[str, int, float, float, float, int, float, float] | None = None
+    collision_cells: dict[tuple[int, int], tuple[float, float, int]] = {}
+
+    def grid_coordinates(world_x: float, world_y: float) -> tuple[float, float]:
+        delta_x = world_x - float(origin_x)
+        delta_y = world_y - float(origin_y)
+        return (
+            grid_cosine * delta_x + grid_sine * delta_y,
+            -grid_sine * delta_x + grid_cosine * delta_y,
+        )
+
+    def cell_intersects_footprint(
+        column: int,
+        row: int,
+        center_x: float,
+        center_y: float,
+        path_yaw: float,
+    ) -> bool:
+        local_cell_x = (column + 0.5) * resolution
+        local_cell_y = (row + 0.5) * resolution
+        cell_x = (
+            float(origin_x)
+            + grid_cosine * local_cell_x
+            - grid_sine * local_cell_y
+        )
+        cell_y = (
+            float(origin_y)
+            + grid_sine * local_cell_x
+            + grid_cosine * local_cell_y
+        )
+        delta = (cell_x - center_x, cell_y - center_y)
+        robot_axis_x = (math.cos(path_yaw), math.sin(path_yaw))
+        robot_axis_y = (-robot_axis_x[1], robot_axis_x[0])
+
+        def dot(left: tuple[float, float], right: tuple[float, float]) -> float:
+            return left[0] * right[0] + left[1] * right[1]
+
+        for axis in (robot_axis_x, robot_axis_y, grid_axis_x, grid_axis_y):
+            distance = abs(dot(delta, axis))
+            robot_projection = (
+                float(half_length) * abs(dot(robot_axis_x, axis))
+                + float(half_width) * abs(dot(robot_axis_y, axis))
+            )
+            cell_projection = cell_half * (
+                abs(dot(grid_axis_x, axis)) + abs(dot(grid_axis_y, axis))
+            )
+            if distance > robot_projection + cell_projection + 1e-9:
+                return False
+        return True
+
+    for segment_index, (left, right) in enumerate(zip(route, route[1:])):
+        delta_x = right["x"] - left["x"]
+        delta_y = right["y"] - left["y"]
+        distance = math.hypot(delta_x, delta_y)
+        if distance <= 1e-9:
+            continue
+        yaw = math.atan2(delta_y, delta_x)
+        sample_count = max(1, math.ceil(distance / sample_spacing))
+        for sample_index in range(sample_count + 1):
+            ratio = sample_index / sample_count
+            sample_x = left["x"] + delta_x * ratio
+            sample_y = left["y"] + delta_y * ratio
+            local_x, local_y = grid_coordinates(sample_x, sample_y)
+            minimum_column = math.floor((local_x - candidate_radius) / resolution)
+            maximum_column = math.floor((local_x + candidate_radius) / resolution)
+            minimum_row = math.floor((local_y - candidate_radius) / resolution)
+            maximum_row = math.floor((local_y + candidate_radius) / resolution)
+            samples_checked += 1
+            if (
+                minimum_column < 0
+                or minimum_row < 0
+                or maximum_column >= width
+                or maximum_row >= height
+            ):
+                return ExecutablePathValidation(
+                    False,
+                    "PATH_FOOTPRINT_OUTSIDE_COSTMAP",
+                    segment_index,
+                    sample_x,
+                    sample_y,
+                    yaw,
+                    None,
+                    samples_checked,
+                )
+            center_column = math.floor(local_x / resolution)
+            center_row = math.floor(local_y / resolution)
+            center_cost = costs[center_row * width + center_column]
+            center_blocked = (
+                inscribed_threshold is not None
+                and center_cost >= int(inscribed_threshold)
+            ) or (center_cost < 0 and not allow_unknown)
+            if center_blocked:
+                local_cell_x = (center_column + 0.5) * resolution
+                local_cell_y = (center_row + 0.5) * resolution
+                collision_x = (
+                    float(origin_x)
+                    + grid_cosine * local_cell_x
+                    - grid_sine * local_cell_y
+                )
+                collision_y = (
+                    float(origin_y)
+                    + grid_sine * local_cell_x
+                    + grid_cosine * local_cell_y
+                )
+                code = (
+                    "PATH_UNKNOWN_COLLISION"
+                    if center_cost < 0
+                    else "PATH_FOOTPRINT_COLLISION"
+                )
+                collision_cells[(center_column, center_row)] = (
+                    collision_x,
+                    collision_y,
+                    center_cost,
+                )
+                if first_collision is None:
+                    first_collision = (
+                        code,
+                        segment_index,
+                        sample_x,
+                        sample_y,
+                        yaw,
+                        center_cost,
+                        collision_x,
+                        collision_y,
+                    )
+            for row in range(minimum_row, maximum_row + 1):
+                for column in range(minimum_column, maximum_column + 1):
+                    cost = costs[row * width + column]
+                    blocked = cost >= int(lethal_threshold) or (
+                        cost < 0 and not allow_unknown
+                    )
+                    if not blocked or not cell_intersects_footprint(
+                        column, row, sample_x, sample_y, yaw
+                    ):
+                        continue
+                    local_cell_x = (column + 0.5) * resolution
+                    local_cell_y = (row + 0.5) * resolution
+                    collision_x = (
+                        float(origin_x)
+                        + grid_cosine * local_cell_x
+                        - grid_sine * local_cell_y
+                    )
+                    collision_y = (
+                        float(origin_y)
+                        + grid_sine * local_cell_x
+                        + grid_cosine * local_cell_y
+                    )
+                    code = (
+                        "PATH_UNKNOWN_COLLISION"
+                        if cost < 0
+                        else "PATH_FOOTPRINT_COLLISION"
+                    )
+                    collision_cells[(column, row)] = (
+                        collision_x,
+                        collision_y,
+                        cost,
+                    )
+                    if first_collision is None:
+                        first_collision = (
+                            code,
+                            segment_index,
+                            sample_x,
+                            sample_y,
+                            yaw,
+                            cost,
+                            collision_x,
+                            collision_y,
+                        )
+    if first_collision is not None:
+        (
+            code,
+            segment_index,
+            sample_x,
+            sample_y,
+            sample_yaw,
+            cell_cost,
+            collision_x,
+            collision_y,
+        ) = first_collision
+        return ExecutablePathValidation(
+            False,
+            code,
+            segment_index,
+            sample_x,
+            sample_y,
+            sample_yaw,
+            cell_cost,
+            samples_checked,
+            collision_x,
+            collision_y,
+            tuple(collision_cells.values()),
+        )
+    if samples_checked == 0:
+        return ExecutablePathValidation(False, "PATH_HAS_NO_LENGTH")
+    return ExecutablePathValidation(True, samples_checked=samples_checked)
+
+
+@dataclass(frozen=True, slots=True)
 class ClockCorrection:
     accepted: bool
     corrected_nanoseconds: int | None

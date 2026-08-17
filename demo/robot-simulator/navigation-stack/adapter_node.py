@@ -45,6 +45,7 @@ from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from navigation_core import (
+    ExecutablePathValidation,
     NavigationDebugLog,
     PoseStability,
     SavedOccupancyMap,
@@ -59,6 +60,7 @@ from navigation_core import (
     pose_stability,
     rotation_swept_clearance,
     scan_to_map_match,
+    validate_executable_grid_path,
 )
 from speed_profiles import (
     AutoNavigationProfiles,
@@ -120,6 +122,18 @@ class NavigationAdapter(Node):
         self.sensor_time_status: dict[str, Any] = {}
         self.last_sensor_time_status_monotonic = 0.0
         self.sensor_time_invalid_since: float | None = None
+        # A source-clock fault suspends autonomous motion, but a short-lived
+        # transport/clock hiccup must not discard the mission that was already
+        # executing.  Keep the recovery data separate from normal pause/manual
+        # handoff state so only this fault path can resume it automatically.
+        self.sensor_time_failure_reason = ""
+        self.sensor_time_failure_diagnostics: dict[str, Any] = {}
+        self.sensor_time_pause_started_monotonic: float | None = None
+        self.sensor_time_previous_localization_state = ""
+        self.sensor_time_resume_context: dict[str, Any] | None = None
+        self.sensor_time_resume_in_progress = False
+        self.sensor_time_hard_failed = False
+        self.sensor_time_hard_failure_timeout = 15.0
         self.safety_health = "UNKNOWN"
         self.estop_active = False
         self.safety_direction_mask = 0
@@ -289,6 +303,9 @@ class NavigationAdapter(Node):
         self.sensor_time_invalid_grace = configured(
             "sensor_time_invalid_grace_seconds", 1.0
         )
+        self.sensor_time_hard_failure_timeout = configured(
+            "sensor_time_hard_failure_seconds", 15.0
+        )
         self.rotation_minimum_obstacle_distance = configured(
             "localization_rotation_minimum_obstacle_distance", 0.03
         )
@@ -379,10 +396,15 @@ class NavigationAdapter(Node):
             os.getenv("GOAL_SNAP_MAX_DISTANCE_METERS", "0.45")
         )
         self.latest_global_path: list[dict[str, float]] = []
+        # /plan is planner diagnostics only. A route becomes visible/executable
+        # exclusively after the maintained global-costmap footprint validator.
+        self.latest_planner_raw_path: list[dict[str, float]] = []
         self.latest_dynamic_obstacles: list[dict[str, float]] = []
         self.latest_global_costmap: OccupancyGrid | None = None
         self.latest_static_map: OccupancyGrid | None = None
         self.last_global_costmap_monotonic = 0.0
+        self.global_costmap_generation = 0
+        self.global_costmap_condition = threading.Condition()
         self.global_costmap_update = threading.Event()
         self.visualization_revision = 0
         self.mapping_started_monotonic = 0.0
@@ -1192,7 +1214,11 @@ class NavigationAdapter(Node):
             scan_time = self._sensor_entry("scan")
             odom_time = self._sensor_entry("odom")
             imu_time = self._sensor_entry("imu")
-            sensor_time_healthy = self._critical_sensor_time_healthy()
+            (
+                sensor_time_healthy,
+                current_sensor_time_reason,
+                current_sensor_time_diagnostics,
+            ) = self._critical_sensor_time_status()
             navigation_runtime_ready = (
                 self.mode == "NAVIGATION"
                 and self.map_load_client.service_is_ready()
@@ -1226,6 +1252,14 @@ class NavigationAdapter(Node):
                     "clock_state", "CLOCK_SYNCING"
                 ),
                 "sensor_time_healthy": sensor_time_healthy,
+                "sensor_time_failure_reason": (
+                    current_sensor_time_reason or self.sensor_time_failure_reason
+                ),
+                "sensor_time_diagnostics": (
+                    current_sensor_time_diagnostics
+                    if current_sensor_time_reason
+                    else dict(self.sensor_time_failure_diagnostics)
+                ),
                 "scan_clock_skew_seconds": round(self.scan_clock_skew_seconds, 3),
                 "scan_arrival_fresh": bool(scan_time.get("arrival_fresh")),
                 "scan_timestamp_valid": bool(scan_time.get("timestamp_valid")),
@@ -1620,17 +1654,62 @@ class NavigationAdapter(Node):
         entry = sensors.get(name)
         return entry if isinstance(entry, dict) else {}
 
-    def _critical_sensor_time_healthy(self) -> bool:
-        if time.monotonic() - self.last_sensor_time_status_monotonic > 0.60:
-            return False
-        if self.sensor_time_status.get("clock_state") != "SYNCED":
-            return False
-        return all(
-            bool(self._sensor_entry(name).get("arrival_fresh"))
-            and bool(self._sensor_entry(name).get("timestamp_valid"))
-            and bool(self._sensor_entry(name).get("frame_valid"))
-            for name in ("scan", "odom")
+    def _critical_sensor_time_status(self) -> tuple[bool, str, dict[str, Any]]:
+        """Return the safety decision plus the exact evidence behind it.
+
+        The adapter used to reduce every timing fault to one generic boolean.
+        That made a short status hiccup indistinguishable from a stale LiDAR
+        or odometry stream, and left neither the operator nor the recovery
+        state machine with enough information to act correctly.
+        """
+        status_age_ms = self._age_milliseconds(
+            self.last_sensor_time_status_monotonic
         )
+
+        def snapshot(name: str) -> dict[str, Any]:
+            entry = self._sensor_entry(name)
+            return {
+                "arrival_age_ms": entry.get("arrival_age_ms"),
+                "timestamp_age_ms": entry.get("corrected_age_ms"),
+                "arrival_fresh": bool(entry.get("arrival_fresh")),
+                "timestamp_valid": bool(entry.get("timestamp_valid")),
+                "frame_valid": bool(entry.get("frame_valid")),
+                "clock_state": str(entry.get("clock_state") or "UNKNOWN"),
+                "invalid_streak": int(entry.get("invalid_streak", 0) or 0),
+                "rejected_packets": int(entry.get("rejected_packets", 0) or 0),
+                "last_rejection": str(entry.get("last_rejection") or ""),
+            }
+
+        diagnostics = {
+            "status_age_ms": status_age_ms,
+            "clock_state": str(
+                self.sensor_time_status.get("clock_state") or "CLOCK_SYNCING"
+            ),
+            "scan": snapshot("scan"),
+            "odom": snapshot("odom"),
+        }
+        if (
+            self.last_sensor_time_status_monotonic <= 0.0
+            or status_age_ms is None
+            or status_age_ms > 600.0
+        ):
+            return False, "STATUS_STALE", diagnostics
+        if diagnostics["clock_state"] != "SYNCED":
+            return False, "CLOCK_NOT_SYNCED", diagnostics
+
+        for name, prefix in (("scan", "SCAN"), ("odom", "ODOM")):
+            entry = diagnostics[name]
+            if not entry["arrival_fresh"]:
+                return False, f"{prefix}_ARRIVAL_STALE", diagnostics
+            if not entry["timestamp_valid"]:
+                return False, f"{prefix}_TIMESTAMP_INVALID", diagnostics
+            if not entry["frame_valid"]:
+                return False, f"{prefix}_FRAME_INVALID", diagnostics
+        return True, "", diagnostics
+
+    def _critical_sensor_time_healthy(self) -> bool:
+        healthy, _, _ = self._critical_sensor_time_status()
+        return healthy
 
     def _refresh_localization_confidence(self) -> None:
         if not self.last_amcl_covariance:
@@ -1687,33 +1766,10 @@ class NavigationAdapter(Node):
             {"x": round(float(item.pose.position.x), 3), "y": round(float(item.pose.position.y), 3)}
             for item in message.poses
         ]
-        if path != self.latest_global_path:
-            had_previous_path = bool(self.latest_global_path)
-            previous_path = list(self.latest_global_path)
-            self.latest_global_path = path
-            if had_previous_path and not math.isfinite(
-                self.last_replan_obstacle_distance
-            ):
-                self.last_replan_obstacle_distance = self.nearest_forward_obstacle
-            self.visualization_revision += 1
-            if had_previous_path and self.current_state == "NAVIGATING":
-                recoveries = int(self.latest_feedback.get("recoveries", 0) or 0)
-                reason = (
-                    "RECOVERY"
-                    if recoveries > 0
-                    else "DYNAMIC_OBSTACLE"
-                    if self.nearest_forward_obstacle < 0.8
-                    else "COSTMAP_CHANGED"
-                )
-                self._nav_debug(
-                    "REPLAN",
-                    reason=reason,
-                    old_path_length=self._path_length(previous_path),
-                    new_path_length=self._path_length(path),
-                    nearest_forward_obstacle=self._finite_metric(
-                        self.nearest_forward_obstacle
-                    ),
-                )
+        # Nav2 publishes the raw planner candidate before this adapter can
+        # validate the 0.30 x 0.20 m swept footprint. Keep it for diagnostics,
+        # but never let it replace the frontend/FollowPath route.
+        self.latest_planner_raw_path = path
 
     @staticmethod
     def _path_length(path: list[dict[str, float]]) -> float:
@@ -1773,25 +1829,100 @@ class NavigationAdapter(Node):
     def _global_costmap_callback(self, message: OccupancyGrid) -> None:
         if int(message.info.width) <= 0 or int(message.info.height) <= 0:
             return
-        self.latest_global_costmap = message
-        self.last_global_costmap_monotonic = time.monotonic()
+        with self.global_costmap_condition:
+            self.latest_global_costmap = message
+            self.last_global_costmap_monotonic = time.monotonic()
+            self.global_costmap_generation += 1
+            self.global_costmap_condition.notify_all()
         self.global_costmap_update.set()
 
-    def _publish_failed_segments(self) -> None:
+    def _publish_failed_segments(self) -> bool:
         source = self.latest_static_map
         if source is None:
-            return
+            return False
         message = OccupancyGrid()
         message.header.stamp = self.get_clock().now().to_msg()
         message.header.frame_id = "map"
         message.info = source.info
         width = int(source.info.width)
         height = int(source.info.height)
-        message.data = [0] * (width * height)
         resolution = float(source.info.resolution)
+        message.data = [0] * (width * height)
         if self.saved_map is None or resolution <= 0:
             self.failed_segment_mask.publish(message)
-            return
+            return False
+
+        # This planning-only StaticLayer is also a redundant copy of the
+        # authoritative Saved Map. The ordinary Nav2 static layer remains in
+        # place, but a missed/stale merge there must never let ThetaStar plan
+        # through a wall that the executable-path validator will later reject.
+        source_origin = source.info.origin
+        geometry_matches = (
+            width == self.saved_map.width
+            and height == self.saved_map.height
+            and math.isclose(resolution, self.saved_map.resolution, abs_tol=1e-9)
+            and math.isclose(
+                float(source_origin.position.x),
+                self.saved_map.origin_x,
+                abs_tol=1e-6,
+            )
+            and math.isclose(
+                float(source_origin.position.y),
+                self.saved_map.origin_y,
+                abs_tol=1e-6,
+            )
+            and abs(self._yaw_delta(
+                self._yaw_from_quaternion(source_origin.orientation),
+                self.saved_map.origin_yaw,
+            )) <= 1e-6
+            and len(self.saved_map.occupancy) == width * height
+        )
+        if geometry_matches:
+            # Reproduce all Saved Map semantics in this planning authority.
+            # Unknown remains unknown, occupied remains lethal, and only known
+            # free cells are free.
+            message.data = [
+                100 if int(value) >= 65 else -1 if int(value) < 0 else 0
+                for value in self.saved_map.occupancy
+            ]
+
+            # Nav2's primary static layer clears the current footprint. Mirror
+            # that bounded behavior here so a one-cell SLAM/localization
+            # overlap cannot make the planner's start pose permanently lethal.
+            # This changes only the planning supplement, never the Saved Map.
+            if self.pose is not None:
+                center = self.saved_map.world_to_cell(
+                    float(self.pose["x"]), float(self.pose["y"])
+                )
+                if center is not None:
+                    # Remove source cells far enough from the occupied start
+                    # for Nav2's inscribed-cost band not to overlap the current
+                    # footprint. The final exact Saved Map validator resumes
+                    # after the smaller physical-footprint exemption below.
+                    clear_radius = (
+                        math.hypot(
+                            self.footprint_half_length,
+                            self.footprint_half_width,
+                        )
+                        + min(
+                            self.footprint_half_length,
+                            self.footprint_half_width,
+                        )
+                        + resolution * math.sqrt(2.0) / 2.0
+                    )
+                    cells = max(1, math.ceil(clear_radius / resolution))
+                    for offset_y in range(-cells, cells + 1):
+                        for offset_x in range(-cells, cells + 1):
+                            column = center[0] + offset_x
+                            row = center[1] + offset_y
+                            if (
+                                0 <= column < width
+                                and 0 <= row < height
+                                and math.hypot(offset_x, offset_y) * resolution
+                                <= clear_radius
+                            ):
+                                message.data[row * width + column] = 0
+
         for segment in self.failed_segments:
             center = self.saved_map.world_to_cell(
                 float(segment["x"]), float(segment["y"])
@@ -1811,6 +1942,29 @@ class NavigationAdapter(Node):
                     ):
                         message.data[row * width + column] = 100
         self.failed_segment_mask.publish(message)
+        return geometry_matches
+
+    def _sync_planning_static_mask(self) -> None:
+        """Wait until the planning master has consumed the Saved Map mask."""
+        baseline_generation = self.global_costmap_generation
+        if not self._publish_failed_segments():
+            raise AdapterError(
+                "COSTMAP_NOT_READY",
+                "Saved Map geometry is not ready for the planning costmap",
+            )
+        if not self._wait_for_global_costmap_after(baseline_generation, 2.0):
+            raise AdapterError(
+                "COSTMAP_NOT_READY",
+                "Global costmap did not consume the planning static mask",
+            )
+        # A publish can race with an update already being assembled. Waiting
+        # for one more 2 Hz full update closes that generation boundary.
+        first_generation = self.global_costmap_generation
+        if not self._wait_for_global_costmap_after(first_generation, 2.0):
+            raise AdapterError(
+                "COSTMAP_NOT_READY",
+                "Global costmap planning mask was not confirmed",
+            )
 
     def _failed_segment_tick(self) -> None:
         now = time.monotonic()
@@ -1828,7 +1982,7 @@ class NavigationAdapter(Node):
         if before > len(self.failed_segments):
             self._nav_debug(
                 "FAILED_SEGMENT",
-                event="EXPIRED",
+                action="EXPIRED",
                 remaining=len(self.failed_segments),
             )
 
@@ -1970,7 +2124,7 @@ class NavigationAdapter(Node):
             bx, by = float(right["x"]), float(right["y"])
             yaw = math.atan2(by - ay, bx - ax)
             distance = math.hypot(bx - ax, by - ay)
-            count = max(1, math.ceil(distance / max(0.02, spacing)))
+            count = max(1, math.ceil(distance / max(0.001, spacing)))
             output.extend(
                 (ax + (bx - ax) * index / count, ay + (by - ay) * index / count, yaw)
                 for index in range(count)
@@ -1985,8 +2139,23 @@ class NavigationAdapter(Node):
         *,
         original: list[dict[str, float]],
     ) -> dict[str, Any]:
-        samples = self._sample_route(path)
-        valid = bool(samples and self.saved_map is not None)
+        costmap_resolution = (
+            float(self.latest_global_costmap.info.resolution)
+            if self.latest_global_costmap is not None
+            else 0.05
+        )
+        samples = self._sample_route(
+            path,
+            spacing=max(0.001, costmap_resolution / 2.0),
+        )
+        try:
+            live_validation = self._validate_executable_path(
+                path,
+                context="ROUTE_METADATA",
+            )
+            valid = live_validation.valid
+        except AdapterError:
+            valid = False
         minimum_clearance = math.inf
         narrow_segments = 0
         inside_narrow = False
@@ -1997,8 +2166,7 @@ class NavigationAdapter(Node):
             )
             for x, y, yaw in samples:
                 cell = self.saved_map.world_to_cell(x, y)
-                if cell is None or self.saved_map.value_at(*cell) < 0:
-                    valid = False
+                if cell is None:
                     break
                 footprint = self.saved_map.validate_footprint(
                     x,
@@ -2012,7 +2180,6 @@ class NavigationAdapter(Node):
                     code_prefix="ROUTE",
                 )
                 if not footprint.valid:
-                    valid = False
                     break
                 nearest = self.saved_map.nearest_occupied_distance(
                     x, y, maximum_distance=1.0
@@ -2033,7 +2200,6 @@ class NavigationAdapter(Node):
                     + self.corridor_hard_side_margin
                     for obstacle_x, obstacle_y in dynamic
                 ):
-                    valid = False
                     break
         length = self._path_length(path)
         overlap = path_overlap_ratio(path, original)
@@ -2078,9 +2244,11 @@ class NavigationAdapter(Node):
             attempts = self.alternative_route_max_candidates + 2
             for _ in range(attempts):
                 self.failed_segments = original_segments + temporary_segments
-                self.global_costmap_update.clear()
+                baseline_generation = self.global_costmap_generation
                 self._publish_failed_segments()
-                self.global_costmap_update.wait(1.5)
+                self._wait_for_global_costmap_after(
+                    baseline_generation, 1.5
+                )
                 try:
                     path = self._request_path_once(dict(self.paused_goal))
                 except AdapterError:
@@ -2160,6 +2328,279 @@ class NavigationAdapter(Node):
             "destination": dict(self.paused_goal),
             "state": self._state(),
         }
+
+    def _wait_for_global_costmap_after(
+        self,
+        baseline_generation: int,
+        timeout: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        with self.global_costmap_condition:
+            while self.global_costmap_generation <= baseline_generation:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self.global_costmap_condition.wait(remaining)
+            return True
+
+    def _validate_executable_path(
+        self,
+        points: list[dict[str, float]],
+        *,
+        context: str,
+    ) -> ExecutablePathValidation:
+        message = self.latest_global_costmap
+        if (
+            message is None
+            or time.monotonic() - self.last_global_costmap_monotonic > 1.5
+        ):
+            raise AdapterError(
+                "COSTMAP_NOT_READY",
+                "Global costmap is not fresh enough to validate the route",
+            )
+        origin = message.info.origin
+        live_validation = validate_executable_grid_path(
+            points,
+            width=int(message.info.width),
+            height=int(message.info.height),
+            resolution=float(message.info.resolution),
+            origin_x=float(origin.position.x),
+            origin_y=float(origin.position.y),
+            origin_yaw=self._yaw_from_quaternion(origin.orientation),
+            data=message.data,
+            half_length=self.footprint_half_length,
+            half_width=self.footprint_half_width,
+            allow_unknown=False,
+            # OccupancyGrid 99 is Nav2 INSCRIBED and already represents body
+            # clearance around a lethal source. Check it at the path center;
+            # expanding the full body over it would count the footprint twice.
+            lethal_threshold=100,
+            inscribed_threshold=99,
+        )
+        validation = live_validation
+        validation_source = "GLOBAL_MASTER_COSTMAP"
+        if live_validation.valid and self.saved_map is not None:
+            # The live master is authoritative around the footprint the robot
+            # currently occupies: static-map quantization may overlap that
+            # already occupied pose by one cell. Beyond that bounded envelope,
+            # the exact Saved Map supplements the master so a missing/stale
+            # StaticLayer can never make a wall-crossing route executable.
+            static_exemption = (
+                math.hypot(
+                    self.footprint_half_length,
+                    self.footprint_half_width,
+                )
+                + self.saved_map.resolution * math.sqrt(2.0) / 2.0
+            )
+            static_points = self._path_after_initial_distance(
+                points,
+                static_exemption,
+            )
+            if len(static_points) >= 2:
+                static_validation = validate_executable_grid_path(
+                    static_points,
+                    width=self.saved_map.width,
+                    height=self.saved_map.height,
+                    resolution=self.saved_map.resolution,
+                    origin_x=self.saved_map.origin_x,
+                    origin_y=self.saved_map.origin_y,
+                    origin_yaw=self.saved_map.origin_yaw,
+                    data=self.saved_map.occupancy,
+                    half_length=self.footprint_half_length,
+                    half_width=self.footprint_half_width,
+                    allow_unknown=False,
+                    lethal_threshold=65,
+                )
+                if not static_validation.valid:
+                    validation = static_validation
+                    validation_source = "SAVED_STATIC_MAP"
+        self._nav_debug(
+            "PATH_VALIDATION",
+            context=context,
+            valid=validation.valid,
+            code=validation.code or "EXECUTABLE",
+            segment_index=validation.segment_index,
+            sample_x=validation.sample_x,
+            sample_y=validation.sample_y,
+            sample_yaw=validation.sample_yaw,
+            cell_cost=validation.cell_cost,
+            collision_x=validation.collision_x,
+            collision_y=validation.collision_y,
+            collision_cells=len(validation.collision_cells),
+            samples_checked=validation.samples_checked,
+            source=validation_source,
+            costmap_generation=self.global_costmap_generation,
+            costmap_age_ms=self._age_milliseconds(
+                self.last_global_costmap_monotonic
+            ),
+        )
+        return validation
+
+    @staticmethod
+    def _path_after_initial_distance(
+        points: list[dict[str, float]],
+        distance_to_skip: float,
+    ) -> list[dict[str, float]]:
+        if len(points) < 2 or distance_to_skip <= 0.0:
+            return [dict(point) for point in points]
+        remaining = float(distance_to_skip)
+        for index, (left, right) in enumerate(zip(points, points[1:])):
+            left_x, left_y = float(left["x"]), float(left["y"])
+            right_x, right_y = float(right["x"]), float(right["y"])
+            length = math.hypot(right_x - left_x, right_y - left_y)
+            if length <= 1e-9:
+                continue
+            if remaining >= length:
+                remaining -= length
+                continue
+            ratio = remaining / length
+            boundary = {
+                "x": left_x + (right_x - left_x) * ratio,
+                "y": left_y + (right_y - left_y) * ratio,
+            }
+            return [boundary] + [
+                dict(point) for point in points[index + 1:]
+            ]
+        return []
+
+    def _add_invalid_path_exclusion(
+        self,
+        validation: ExecutablePathValidation,
+    ) -> bool:
+        collision_centers = [
+            (float(x), float(y))
+            for x, y, _ in validation.collision_cells
+        ]
+        if not collision_centers:
+            exclusion_x = validation.collision_x
+            exclusion_y = validation.collision_y
+            if exclusion_x is None or exclusion_y is None:
+                exclusion_x = validation.sample_x
+                exclusion_y = validation.sample_y
+            if exclusion_x is not None and exclusion_y is not None:
+                collision_centers = [(exclusion_x, exclusion_y)]
+        if not collision_centers:
+            return False
+        now = time.monotonic()
+        # Put the temporary exclusion on the cell that the physical footprint
+        # actually hit. Centering it on the robot/path sample progressively
+        # blocked the escape corridor instead of expanding the real obstacle.
+        exclusion_radius = self.failed_segment_radius
+        exclusion_count = 0
+        for exclusion_x, exclusion_y in collision_centers:
+            for segment in self.failed_segments:
+                if math.hypot(
+                    float(segment["x"]) - exclusion_x,
+                    float(segment["y"]) - exclusion_y,
+                ) <= exclusion_radius:
+                    segment["expires_monotonic"] = now + self.failed_segment_ttl
+                    break
+            else:
+                self.failed_segments.append({
+                    "x": exclusion_x,
+                    "y": exclusion_y,
+                    "radius": exclusion_radius,
+                    "reason": validation.code,
+                    "created_monotonic": now,
+                    "expires_monotonic": now + self.failed_segment_ttl,
+                })
+                exclusion_count += 1
+        self._publish_failed_segments()
+        self._nav_debug(
+            "PLAN_RETRY",
+            reason=validation.code,
+            action="TEMPORARY_PATH_EXCLUSION",
+            segment_index=validation.segment_index,
+            center=collision_centers[0],
+            radius=exclusion_radius,
+            cells=len(collision_centers),
+            exclusions_added=exclusion_count,
+        )
+        # The exclusion is already latched on its transient-local planning
+        # topic. A diagnosed failure may now clear/rebuild the master grid;
+        # generation semantics accept updates during the service call.
+        self._refresh_global_costmap_for_planning()
+        return True
+
+    def _ensure_executable_path(
+        self,
+        points: list[dict[str, float]],
+        goal: dict[str, Any],
+        *,
+        context: str,
+    ) -> list[dict[str, float]]:
+        if len(points) < 2:
+            raise AdapterError("NO_VALID_PATH", "Planner returned no usable path")
+        active_planner = "GridBased"
+        try:
+            validation = self._validate_executable_path(points, context=context)
+        except AdapterError as exc:
+            if exc.code != "COSTMAP_NOT_READY":
+                raise
+            self._nav_debug(
+                "PLAN_RETRY",
+                reason=exc.code,
+                action="CLEAR_GLOBAL_COSTMAP_ONCE",
+            )
+            self._refresh_global_costmap_for_planning()
+            points = self._request_path_once(
+                goal,
+                sync_planning_mask=False,
+            )
+            validation = self._validate_executable_path(
+                points,
+                context=f"{context}_AFTER_COSTMAP_REFRESH",
+            )
+        if not validation.valid:
+            # The 12/08 route selector used State Lattice, which searches the
+            # oriented body instead of only a centerline. ThetaStar remains
+            # primary; use the proven selector only for this invalid candidate.
+            self._nav_debug(
+                "PLAN_RETRY",
+                reason=validation.code,
+                action="FOOTPRINT_AWARE_PLANNER",
+                planner="FootprintGrid",
+            )
+            fallback_points = self._request_path_once(
+                goal,
+                sync_planning_mask=False,
+                planner_id="FootprintGrid",
+            )
+            if len(fallback_points) >= 2:
+                points = fallback_points
+                validation = self._validate_executable_path(
+                    points,
+                    context=f"{context}_FOOTPRINT_AWARE",
+                )
+                active_planner = "FootprintGrid"
+        for retry_index in range(self.failed_segment_max_replans + 1):
+            if validation.valid:
+                return points
+            if retry_index >= self.failed_segment_max_replans:
+                raise AdapterError(
+                    "NO_VALID_PATH",
+                    f"Replanned route is not executable: {validation.code}",
+                )
+            if not self._add_invalid_path_exclusion(validation):
+                raise AdapterError(
+                    "NO_VALID_PATH",
+                    f"Route is not executable: {validation.code}",
+                )
+            points = self._request_path_once(
+                goal,
+                sync_planning_mask=False,
+                planner_id=active_planner,
+            )
+            if len(points) < 2:
+                raise AdapterError(
+                    "NO_VALID_PATH",
+                    "No executable route exists after excluding the invalid segment",
+                )
+            validation = self._validate_executable_path(
+                points,
+                context=f"{context}_BOUNDED_REPLAN_{retry_index + 1}",
+            )
+        raise AdapterError("NO_VALID_PATH", "No executable route exists")
 
     def _global_cost_at(self, x: float, y: float) -> int | None:
         message = self.latest_global_costmap
@@ -2841,6 +3282,11 @@ class NavigationAdapter(Node):
         """Verify the current AMCL cloud without resetting its particles."""
         now = time.monotonic()
         self._stop_localization_rotation()
+        # This verification begins only after autonomous motion has been
+        # revoked.  Its stability window must therefore contain fresh
+        # stationary AMCL samples, not the trailing samples from the route
+        # that was just paused.
+        self._reset_stationary_verification_evidence()
         self.localized = False
         self.localization_state = "VERIFYING"
         self._set_state("VERIFYING", "verify_existing_amcl_pose")
@@ -2980,23 +3426,212 @@ class NavigationAdapter(Node):
         if self.motion_owner == "LOCALIZATION":
             self.motion_owner = "NONE"
 
-    def _degrade_localization(self, reason: str) -> None:
+    def _degrade_localization(
+        self,
+        reason: str,
+        diagnostics: dict[str, Any],
+    ) -> None:
+        """Safely pause an active mission for a recoverable timing fault."""
         if self.localization_state == "SENSOR_TIME_INVALID":
             return
-        self.get_logger().error(f"localization degraded; stopping Nav2: {reason}")
-        self.localized = False
-        self.localization_state = "SENSOR_TIME_INVALID"
-        self._set_state("SENSOR_TIME_INVALID", "sensor_time_invalid")
-        handle = self.current_goal_handle
-        self.current_goal_handle = None
-        self.navigation_goal_generation += 1
+        now = time.monotonic()
+        self._stop_localization_rotation()
+        with self.state_lock:
+            handle = self.current_goal_handle
+            was_navigating = (
+                self.current_state == "NAVIGATING"
+                and handle is not None
+                and self.paused_goal is not None
+            )
+            if was_navigating:
+                self.sensor_time_resume_context = {
+                    "goal": dict(self.paused_goal),
+                    "mission_id": self.current_mission_id,
+                    "route_id": self.selected_route_id,
+                    "path": list(self.latest_global_path),
+                }
+            self.sensor_time_previous_localization_state = self.localization_state
+            self.sensor_time_pause_started_monotonic = now
+            self.sensor_time_failure_reason = reason
+            self.sensor_time_failure_diagnostics = dict(diagnostics)
+            self.sensor_time_resume_in_progress = False
+            self.sensor_time_hard_failed = False
+            self.localized = False
+            self.localization_state = "SENSOR_TIME_INVALID"
+            self._set_state("SENSOR_TIME_INVALID", "sensor_time_safe_pause")
+            self.latest_feedback["terminal_reason"] = f"SENSOR_TIME_PAUSED:{reason}"
+            self.current_goal_handle = None
+            self.navigation_goal_generation += 1
+            self.motion_owner = "NONE"
+
+        self.get_logger().error(
+            "localization timing fault; safely pausing navigation: "
+            f"reason={reason} diagnostics={json.dumps(diagnostics, sort_keys=True)}"
+        )
+        self._nav_debug(
+            "SENSOR_TIME_PAUSE",
+            reason=reason,
+            status_age_ms=diagnostics.get("status_age_ms"),
+            scan=diagnostics.get("scan"),
+            odom=diagnostics.get("odom"),
+            destination_preserved=bool(self.paused_goal),
+            mission_id=self.current_mission_id,
+            route_id=self.selected_route_id,
+        )
+        # Revoke Nav2 ownership before waiting for its asynchronous cancel
+        # result.  This makes stale controller messages harmless immediately.
+        self.navigation_velocity.publish(Twist())
+        self.localization_velocity.publish(Twist())
+        self.profile_limiter.reset()
         if handle is not None:
             handle.cancel_goal_async()
-        self.motion_owner = "NONE"
-        self.localization_velocity.publish(Twist())
-        self.latest_global_path = []
-        self.visualization_revision += 1
-        self.sensor_time_invalid_since = time.monotonic()
+        self.sensor_time_invalid_since = now
+
+    def _restore_after_sensor_time_pause(self, now: float) -> None:
+        """Resume verification only after synchronized sensor evidence returns."""
+        previous = self.sensor_time_previous_localization_state
+        paused_at = self.sensor_time_pause_started_monotonic
+        paused_duration = (
+            0.0 if paused_at is None else max(0.0, now - paused_at)
+        )
+        self.sensor_time_invalid_since = None
+        self.sensor_time_pause_started_monotonic = None
+        self.sensor_time_failure_reason = ""
+        self.sensor_time_failure_diagnostics = {}
+
+        # A Force Rescan may have already accepted a candidate/ready hold when
+        # a short timestamp glitch arrived.  Resume that exact evidence phase
+        # rather than discarding AMCL particles or the active ready hold.
+        preserved_verification_states = {
+            "VERIFYING",
+            "LOCALIZING_LAST_POSE",
+            "LOCALIZING_APPROXIMATE_POSE",
+            "LOCALIZING_GLOBAL",
+            "LOCALIZING_ROTATING",
+            "LOCALIZING_SETTLING",
+        }
+        if previous in preserved_verification_states:
+            if self.localization_phase_started_monotonic:
+                self.localization_phase_started_monotonic += paused_duration
+            if self.localization_started_monotonic:
+                self.localization_started_monotonic += paused_duration
+            if self.verification_started_monotonic:
+                self.verification_started_monotonic += paused_duration
+            if self.ready_evidence_since is not None:
+                self.ready_evidence_since += paused_duration
+            self.localization_state = previous
+            self._set_state(previous, "sensor_time_recovered_continue_verification")
+            self.sensor_time_previous_localization_state = ""
+            self._nav_debug(
+                "SENSOR_TIME_RECOVERED",
+                action="CONTINUE_VERIFICATION",
+                previous_localization_state=previous,
+                pause_ms=round(paused_duration * 1000.0, 1),
+            )
+            return
+
+        self.sensor_time_previous_localization_state = ""
+        if self.last_amcl_pose is not None:
+            # The FollowPath action is canceled above, so the fresh stationary
+            # window in _begin_localization_verification can safely replace
+            # moving samples from before the pause.
+            self._begin_localization_verification(allow_rotation=False)
+            self._nav_debug(
+                "SENSOR_TIME_RECOVERED",
+                action="VERIFY_CURRENT_AMCL_POSE",
+                pause_ms=round(paused_duration * 1000.0, 1),
+            )
+            return
+        self.localization_state = "LOCALIZATION_REQUIRED"
+        self._set_state("LOCALIZATION_REQUIRED", "sensor_time_recovered_without_amcl")
+
+    def _fail_sustained_sensor_time_pause(self, reason: str) -> None:
+        """Require operator localization after a bounded, sustained outage."""
+        self.sensor_time_resume_context = None
+        self.sensor_time_resume_in_progress = False
+        self.sensor_time_hard_failed = True
+        self.localized = False
+        self.localization_state = "LOCALIZATION_REQUIRED"
+        self._set_state("LOCALIZATION_REQUIRED", "sensor_time_sustained_failure")
+        self.latest_feedback["terminal_reason"] = f"SENSOR_TIME_SUSTAINED:{reason}"
+        self._nav_debug(
+            "SENSOR_TIME_FAILURE",
+            reason=reason,
+            action="LOCALIZATION_REQUIRED",
+            destination_preserved=bool(self.paused_goal),
+        )
+
+    def _resume_sensor_time_navigation_if_ready(self) -> None:
+        """Replan once from the verified current pose to the preserved goal."""
+        with self.state_lock:
+            context = self.sensor_time_resume_context
+            if (
+                context is None
+                or self.sensor_time_resume_in_progress
+                or not self.localized
+                or self.localization_state != "READY"
+                or not self._critical_sensor_time_healthy()
+            ):
+                return
+            self.sensor_time_resume_in_progress = True
+            goal = dict(context["goal"])
+            route_id = str(context.get("route_id") or "sensor-time-resume")
+            mission_id = str(context.get("mission_id") or self.current_mission_id)
+            self._set_state("PLANNING", "sensor_time_recovery_replan")
+
+        def resume() -> None:
+            try:
+                if (
+                    not self.localized
+                    or self.localization_state != "READY"
+                    or not self._critical_sensor_time_healthy()
+                ):
+                    raise AdapterError(
+                        "LOCALIZATION_UNRELIABLE",
+                        "Localization is not ready to resume the paused mission",
+                    )
+                points = self._request_path_once(goal)
+                if len(points) < 2:
+                    raise AdapterError(
+                        "NO_VALID_PATH",
+                        "No executable path remains to the preserved destination",
+                    )
+                self._navigate(
+                    goal,
+                    {
+                        "map_id": self.map_id,
+                        "version": self.map_version,
+                        "mission_id": mission_id,
+                        "route_id": route_id,
+                        "points": points,
+                    },
+                )
+            except AdapterError as exc:
+                with self.state_lock:
+                    self._set_state("PAUSED", "sensor_time_recovery_replan_failed")
+                    self.latest_feedback["terminal_reason"] = (
+                        f"SENSOR_TIME_RECOVERY_{exc.code}"
+                    )
+                    self.sensor_time_resume_context = None
+                    self.sensor_time_resume_in_progress = False
+                self._nav_debug(
+                    "SENSOR_TIME_RECOVERED",
+                    action="REPLAN_FAILED",
+                    error=exc.code,
+                )
+                return
+            with self.state_lock:
+                self.sensor_time_resume_context = None
+                self.sensor_time_resume_in_progress = False
+            self._nav_debug(
+                "SENSOR_TIME_RECOVERED",
+                action="REPLAN_RESUMED",
+                destination=goal,
+                route_id=route_id,
+                mission_id=mission_id,
+            )
+
+        threading.Thread(target=resume, daemon=True).start()
 
     def _localization_lost(self, reason: str) -> None:
         if not self.localized:
@@ -3123,6 +3758,11 @@ class NavigationAdapter(Node):
 
     def _start_localization_settling_evidence(self) -> None:
         """Discard moving samples without resetting AMCL's particle cloud."""
+        self._reset_stationary_verification_evidence()
+        self.localization_settling_evidence_started = True
+
+    def _reset_stationary_verification_evidence(self) -> None:
+        """Require a new stationary evidence window while retaining AMCL."""
         self.localization_confidence = 0.0
         self.last_amcl_monotonic = 0.0
         self.pose_window.clear()
@@ -3143,7 +3783,6 @@ class NavigationAdapter(Node):
         self.ready_evidence_invalid_since = None
         self.low_confidence_since = None
         self.last_nomotion_request_monotonic = 0.0
-        self.localization_settling_evidence_started = True
 
     def _nomotion_update_due(
         self,
@@ -3173,42 +3812,36 @@ class NavigationAdapter(Node):
         if self.mode != "NAVIGATION":
             return
         now = time.monotonic()
-        if self.map_id and not self._critical_sensor_time_healthy():
+        (
+            sensor_time_healthy,
+            sensor_time_reason,
+            sensor_time_diagnostics,
+        ) = self._critical_sensor_time_status()
+        if self.map_id and not sensor_time_healthy:
             if self.sensor_time_invalid_since is None:
                 self.sensor_time_invalid_since = now
             if (
                 now - self.sensor_time_invalid_since
                 >= self.sensor_time_invalid_grace
                 and self.localization_state not in {"IDLE", "SENSOR_TIME_INVALID"}
+                and not self.sensor_time_hard_failed
             ):
                 self._degrade_localization(
-                    "scan/odometry source clock is not synchronized"
+                    sensor_time_reason,
+                    sensor_time_diagnostics,
                 )
+            if (
+                self.localization_state == "SENSOR_TIME_INVALID"
+                and now - self.sensor_time_invalid_since
+                >= self.sensor_time_hard_failure_timeout
+            ):
+                self._fail_sustained_sensor_time_pause(sensor_time_reason)
             return
-        if self._critical_sensor_time_healthy():
+        if sensor_time_healthy:
             self.sensor_time_invalid_since = None
+            self.sensor_time_hard_failed = False
             if self.localization_state == "SENSOR_TIME_INVALID":
-                # Keep the AMCL cloud. Fresh synchronized sensor evidence must
-                # verify it before navigation resumes.
-                if self.last_amcl_pose is not None:
-                    self._begin_localization_verification(
-                        allow_rotation=self.localization_rotation_authorized
-                    )
-                elif self.localization_seed_pose is not None:
-                    # map.load can legitimately run before the USB MCU has
-                    # rejoined after a Pi reboot.  _degrade_localization keeps
-                    # the verified last-known pose, so replay that bounded
-                    # seed once scan + odometry become healthy instead of
-                    # discarding it into an unauthorized global search.  This
-                    # is stationary: only AMCL's /initialpose is republished.
-                    seed_pose = dict(self.localization_seed_pose)
-                    self._begin_auto_localization(seed_pose)
-                else:
-                    self.localization_started_monotonic = now
-                    try:
-                        self._start_global_localization()
-                    except AdapterError as exc:
-                        self.get_logger().error(str(exc))
+                self._restore_after_sensor_time_pause(now)
                 return
         self._refresh_localization_confidence()
         if self.localized and self.localization_state == "READY":
@@ -3415,11 +4048,19 @@ class NavigationAdapter(Node):
             self.verification_started_monotonic = 0.0
             self.verification_scan_count = 0
             self.ready_evidence_invalid_since = None
+            # A temporary clock fault may have paused an active FollowPath.
+            # Replan from this newly verified pose in a worker, never from the
+            # localization timer callback that owns AMCL service responses.
+            self._resume_sensor_time_navigation_if_ready()
             return
         if (
             self.localization_state == "VERIFYING"
             and now - self.localization_phase_started_monotonic
             >= self.localization_verify_timeout
+            # A candidate accepted at the timeout boundary still needs the
+            # READY hold.  It is evidence in progress, not a failed verify.
+            and not localization_ready
+            and self.ready_evidence_since is None
         ):
             # Verification never resets AMCL while evidence is good. A
             # bounded failure is the point where a real global search begins.
@@ -3921,6 +4562,7 @@ class NavigationAdapter(Node):
                 "GLOBAL_COSTMAP_UNAVAILABLE",
                 "Global costmap reset service is unavailable",
             )
+        baseline_generation = self.global_costmap_generation
         self._wait(
             self.clear_global_costmap_client.call_async(
                 ClearEntireCostmap.Request()
@@ -3928,17 +4570,25 @@ class NavigationAdapter(Node):
             3.0,
             "GLOBAL_COSTMAP_RESET_TIMEOUT",
         )
-        self.global_costmap_update.clear()
-        if not self.global_costmap_update.wait(2.0):
+        if not self._wait_for_global_costmap_after(baseline_generation, 2.0):
             raise AdapterError(
                 "COSTMAP_NOT_READY",
                 "Global costmap did not publish an update after reset",
             )
 
-    def _request_path_once(self, goal: dict[str, Any]) -> list[dict[str, float]]:
+    def _request_path_once(
+        self,
+        goal: dict[str, Any],
+        *,
+        sync_planning_mask: bool = True,
+        planner_id: str = "GridBased",
+    ) -> list[dict[str, float]]:
+        if sync_planning_mask:
+            self._sync_planning_static_mask()
         request = ComputePathToPose.Goal()
         request.goal = self._goal_pose(goal)
         request.use_start = False
+        request.planner_id = planner_id
         handle = self._wait(
             self.compute_path_client.send_goal_async(request),
             5,
@@ -4042,7 +4692,10 @@ class NavigationAdapter(Node):
                         planner="ThetaStar",
                         retry=1,
                     )
-                    points = self._request_path_once(resolved_goal)
+                    points = self._request_path_once(
+                        resolved_goal,
+                        sync_planning_mask=False,
+                    )
                 except AdapterError as exc:
                     mark_plan_failed(f"plan_retry_failed:{exc.code}")
                     self._record_planning_failure(
@@ -4062,6 +4715,21 @@ class NavigationAdapter(Node):
                     planning_started,
                 )
                 raise error
+        try:
+            points = self._ensure_executable_path(
+                points,
+                resolved_goal,
+                context="INITIAL_COMPUTE_PATH",
+            )
+        except AdapterError as exc:
+            mark_plan_failed(f"path_validation_failed:{exc.code}")
+            self._record_planning_failure(
+                exc,
+                requested_goal,
+                resolved_goal,
+                planning_started,
+            )
+            raise
         distance = sum(
             math.hypot(b["x"] - a["x"], b["y"] - a["y"])
             for a, b in zip(points, points[1:])
@@ -4120,6 +4788,17 @@ class NavigationAdapter(Node):
             points = self._request_path_once(goal_payload)
         if len(points) < 2:
             raise AdapterError("NO_VALID_PATH", "Selected route has no executable path")
+        # Revalidate immediately before FollowPath. A preview can age while an
+        # operator confirms it, and dynamic/master costmap cells may change.
+        points = self._ensure_executable_path(
+            points,
+            goal_payload,
+            context=(
+                "RECOVERY_FOLLOW_PATH"
+                if recovery_attempt
+                else "PRE_FOLLOW_PATH"
+            ),
+        )
         path = NavigationPath()
         path.header.frame_id = "map"
         path.header.stamp = self.get_clock().now().to_msg()
@@ -4372,10 +5051,13 @@ class NavigationAdapter(Node):
     ) -> None:
         if expected_generation != self.navigation_goal_generation:
             return
+        recovery_points = list(old_path)
         if segment is not None:
-            self.global_costmap_update.clear()
+            baseline_generation = self.global_costmap_generation
             self._publish_failed_segments()
-            if not self.global_costmap_update.wait(2.0):
+            if not self._wait_for_global_costmap_after(
+                baseline_generation, 2.0
+            ):
                 self._set_recovery_terminal(
                     "FAILED", "COSTMAP_NOT_READY", expected_generation
                 )
@@ -4407,6 +5089,7 @@ class NavigationAdapter(Node):
                     "BLOCKED", "NO_ALTERNATIVE_ROUTE", expected_generation
                 )
                 return
+            recovery_points = list(alternative)
             self._nav_debug(
                 "REPLAN",
                 reason="FAILED_SEGMENT",
@@ -4419,7 +5102,11 @@ class NavigationAdapter(Node):
         try:
             self._navigate(
                 goal,
-                {"map_id": self.map_id, "version": self.map_version},
+                {
+                    "map_id": self.map_id,
+                    "version": self.map_version,
+                    "points": recovery_points,
+                },
                 recovery_attempt=True,
             )
         except AdapterError as exc:
@@ -4442,6 +5129,8 @@ class NavigationAdapter(Node):
             self.current_goal_handle = None
             self.navigation_goal_generation += 1
             if target != "PAUSED":
+                self.sensor_time_resume_context = None
+                self.sensor_time_resume_in_progress = False
                 self.paused_goal = None
                 self.latest_global_path = []
                 self.visualization_revision += 1

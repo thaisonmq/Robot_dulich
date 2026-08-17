@@ -143,7 +143,7 @@ planner_server:
     # Diagnostic overrun threshold only. The generated BT computes once and
     # again only after controller/recovery failure; no timer drives replanning.
     expected_planner_frequency: 1.0
-    planner_plugins: [GridBased]
+    planner_plugins: [GridBased, FootprintGrid]
     GridBased:
       # Theta* connects grid cells by verified line of sight. In open space it
       # therefore emits one stable straight corridor instead of smoothing an
@@ -159,6 +159,38 @@ planner_server:
       # valid route pass through a genuinely narrow corridor.
       w_traversal_cost: 0.02
       use_final_approach_orientation: false
+    # Footprint-aware fallback retained from the proven 12/08 route selector.
+    # ThetaStar remains primary and is unchanged; this planner is requested
+    # only after its candidate fails executable-footprint validation.
+    FootprintGrid:
+      plugin: nav2_smac_planner/SmacPlannerLattice
+      tolerance: 0.20
+      downsample_costmap: false
+      downsampling_factor: 1
+      allow_unknown: false
+      max_iterations: 250000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      lattice_filepath: /opt/ros/humble/share/nav2_smac_planner/sample_primitives/5cm_resolution/0.5m_turning_radius/diff/output.json
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 1.5
+      reverse_penalty: 2.0
+      change_penalty: 0.0
+      non_straight_penalty: 1.05
+      cost_penalty: 3.0
+      rotation_penalty: 2.0
+      retrospective_penalty: 0.015
+      lookup_table_size: 5.0
+      cache_obstacle_heuristic: false
+      debug_visualizations: false
+      smooth_path: true
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+        do_refinement: true
+        refinement_num: 2
 
 controller_server:
   ros__parameters:
@@ -332,7 +364,11 @@ global_costmap:
         map_topic: /navigation/failed_segment_mask
         map_subscribe_transient_local: true
         subscribe_to_updates: false
-        use_maximum: true
+        # This layer carries the complete Saved Map plus temporary exclusions,
+        # so it is the final static planning authority before live obstacles.
+        # Overwrite prevents a stale primary StaticLayer merge from disagreeing
+        # with the artifact used by executable-path validation.
+        use_maximum: false
         trinary_costmap: true
         lethal_cost_threshold: 65
         unknown_cost_value: -1
@@ -371,7 +407,8 @@ global_costmap:
         # corridor; explicit Auto classification still requires its margins.
         cost_scaling_factor: 3.0
         inflation_radius: 0.18
-      always_send_full_costmap: false
+      # The adapter validates a complete generation, not partial update tiles.
+      always_send_full_costmap: true
 
 bt_navigator:
   ros__parameters:

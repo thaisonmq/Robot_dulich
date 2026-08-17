@@ -1,12 +1,17 @@
 import asyncio
+import logging
 import random
 import secrets
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
 from fastapi import WebSocket
+
+
+logger = logging.getLogger("center.robot.commands")
 
 
 @dataclass(slots=True)
@@ -603,6 +608,13 @@ class ConnectionHub:
         request_id = request_id or str(uuid4())
         if request_id in self.pending_robot_requests:
             raise RuntimeError("request_already_pending")
+        request_started = time.monotonic()
+        logger.info(
+            "stage=COMMAND_RECEIVED request_id=%s robot_id=%s command=%s",
+            request_id,
+            robot_id,
+            message_type,
+        )
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self.pending_robot_requests[request_id] = (robot_id, future)
         message = {
@@ -622,7 +634,33 @@ class ConnectionHub:
         try:
             if not await self.forward_to_robot(robot_id, message):
                 raise ConnectionError("robot_offline")
-            return await asyncio.wait_for(future, timeout=timeout_seconds)
+            logger.info(
+                "stage=COMMAND_DISPATCHED request_id=%s robot_id=%s command=%s duration_ms=%.1f",
+                request_id,
+                robot_id,
+                message_type,
+                (time.monotonic() - request_started) * 1000.0,
+            )
+            response = await asyncio.wait_for(future, timeout=timeout_seconds)
+            logger.info(
+                "stage=ACK_RECEIVED request_id=%s robot_id=%s command=%s status=%s error_code=%s duration_ms=%.1f",
+                request_id,
+                robot_id,
+                message_type,
+                response.get("status"),
+                response.get("error_code", ""),
+                (time.monotonic() - request_started) * 1000.0,
+            )
+            return response
+        except TimeoutError:
+            logger.warning(
+                "stage=ACK_TIMEOUT request_id=%s robot_id=%s command=%s duration_ms=%.1f",
+                request_id,
+                robot_id,
+                message_type,
+                (time.monotonic() - request_started) * 1000.0,
+            )
+            raise
         finally:
             self.pending_robot_requests.pop(request_id, None)
 

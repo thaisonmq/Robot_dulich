@@ -25,6 +25,7 @@ from navigation_core import (  # noqa: E402
     pose_stability,
     rotation_swept_clearance,
     scan_to_map_match,
+    validate_executable_grid_path,
 )
 from speed_profiles import (  # noqa: E402
     AutoNavigationProfiles,
@@ -48,6 +49,100 @@ def _saved_map(tmp_path: Path) -> SavedOccupancyMap:
 
 def _cell_center(saved: SavedOccupancyMap, column: int, row: int) -> tuple[float, float]:
     return saved.cell_center(column, row)
+
+
+def test_executable_path_rejects_free_centerline_when_physical_footprint_hits_wall() -> None:
+    width, height, resolution = 50, 30, 0.05
+    costs = [0] * (width * height)
+    # Horizontal wall whose cells do not contain the path centerline. The
+    # robot's 0.10 m half-width still overlaps it between sparse waypoints.
+    for column in range(20, 23):
+        costs[10 * width + column] = 100
+    result = validate_executable_grid_path(
+        [{"x": 0.25, "y": 0.43}, {"x": 2.20, "y": 0.43}],
+        width=width,
+        height=height,
+        resolution=resolution,
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+        data=costs,
+        half_length=0.15,
+        half_width=0.10,
+        allow_unknown=False,
+    )
+    assert result.valid is False
+    assert result.code == "PATH_FOOTPRINT_COLLISION"
+    assert result.cell_cost == 100
+    assert result.collision_x == pytest.approx(1.025)
+    assert result.collision_y == pytest.approx(0.525)
+
+
+def test_executable_path_accepts_full_footprint_through_wide_free_corridor() -> None:
+    width, height, resolution = 50, 30, 0.05
+    costs = [0] * (width * height)
+    for column in range(width):
+        costs[4 * width + column] = 100
+        costs[20 * width + column] = 100
+    result = validate_executable_grid_path(
+        [
+            {"x": 0.25, "y": 0.60},
+            {"x": 1.10, "y": 0.72},
+            {"x": 2.20, "y": 0.60},
+        ],
+        width=width,
+        height=height,
+        resolution=resolution,
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+        data=costs,
+        half_length=0.15,
+        half_width=0.10,
+        allow_unknown=False,
+    )
+    assert result.valid is True
+    assert result.samples_checked > 70
+
+
+def test_executable_path_does_not_expand_footprint_twice_over_inscribed_costs() -> None:
+    width, height, resolution = 50, 30, 0.05
+    costs = [0] * (width * height)
+    costs[10 * width + 20] = 99
+    beside_inscribed = validate_executable_grid_path(
+        [{"x": 0.25, "y": 0.43}, {"x": 2.20, "y": 0.43}],
+        width=width,
+        height=height,
+        resolution=resolution,
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+        data=costs,
+        half_length=0.15,
+        half_width=0.10,
+        allow_unknown=False,
+        lethal_threshold=100,
+        inscribed_threshold=99,
+    )
+    assert beside_inscribed.valid is True
+
+    through_inscribed = validate_executable_grid_path(
+        [{"x": 0.25, "y": 0.525}, {"x": 2.20, "y": 0.525}],
+        width=width,
+        height=height,
+        resolution=resolution,
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+        data=costs,
+        half_length=0.15,
+        half_width=0.10,
+        allow_unknown=False,
+        lethal_threshold=100,
+        inscribed_threshold=99,
+    )
+    assert through_inscribed.valid is False
+    assert through_inscribed.cell_cost == 99
 
 
 def test_exact_saved_grid_negative_rotated_origin_and_y_axis(tmp_path: Path) -> None:
@@ -681,7 +776,8 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     )["rovera_motion_safety"]["ros__parameters"]
     controller = navigation["controller_server"]["ros__parameters"]
     follow = controller["FollowPath"]
-    planner = navigation["planner_server"]["ros__parameters"]["GridBased"]
+    planner_server = navigation["planner_server"]["ros__parameters"]
+    planner = planner_server["GridBased"]
     global_costmap = navigation["global_costmap"]["global_costmap"]["ros__parameters"]
     local_costmap = navigation["local_costmap"]["local_costmap"]["ros__parameters"]
     behavior = navigation["behavior_server"]["ros__parameters"]
@@ -706,6 +802,11 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     # otherwise open straight route from becoming an S-shaped preview. The
     # footprint check, not a large soft cost, remains the collision authority.
     assert 0.0 < planner["w_traversal_cost"] <= 0.05
+    assert planner_server["planner_plugins"] == ["GridBased", "FootprintGrid"]
+    footprint_planner = planner_server["FootprintGrid"]
+    assert footprint_planner["plugin"] == "nav2_smac_planner/SmacPlannerLattice"
+    assert footprint_planner["allow_unknown"] is False
+    assert footprint_planner["downsample_costmap"] is False
     assert 0.20 <= follow["forward_sampling_distance"] <= 0.30
     assert 0.15 < follow["desired_linear_vel"] <= limits["max_velocity"][0]
     assert follow["rotate_to_heading_angular_vel"] == limits["max_velocity"][2]
@@ -748,8 +849,10 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert failed_layer["plugin"] == "nav2_costmap_2d::StaticLayer"
     assert failed_layer["map_topic"] == "/navigation/failed_segment_mask"
     assert failed_layer["map_subscribe_transient_local"] is True
-    assert failed_layer["use_maximum"] is True
+    assert failed_layer["use_maximum"] is False
     assert failed_layer["footprint_clearing_enabled"] is False
+    assert global_costmap["always_send_full_costmap"] is True
+    assert local_costmap["always_send_full_costmap"] is False
     assert local_costmap["obstacle_layer"]["scan"]["topic"] == "/scan_navigation"
     assert local_costmap["obstacle_layer"]["observation_sources"] == "scan"
     assert 10.0 <= controller["controller_frequency"] <= local_costmap["update_frequency"]

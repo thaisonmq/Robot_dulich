@@ -265,7 +265,7 @@ describe("MapPanel navigation controls", () => {
     });
 
     expect(screen.getByText(/Dữ liệu định vị tạm thời không đồng bộ/)).toBeInTheDocument();
-    expect(screen.getByText(/đang thử khôi phục vị trí/)).toBeInTheDocument();
+    expect(screen.getByText(/đang thử khôi phục\./)).toBeInTheDocument();
     expect(screen.queryByText(/Đã mất dữ liệu LiDAR và odometry/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Robot đang quét môi trường/)).not.toBeInTheDocument();
   });
@@ -275,7 +275,7 @@ describe("MapPanel navigation controls", () => {
       mapState: "SENSOR_TIME_INVALID",
       localizationState: "SENSOR_TIME_INVALID",
       localized: false,
-      health: { sensor_time_failure_reason: "SCAN_STALE" } as Health,
+      health: { sensor_time_failure_reason: "SCAN_ARRIVAL_STALE" } as Health,
     });
 
     expect(screen.getByText(/LiDAR tạm thời không khả dụng/)).toBeInTheDocument();
