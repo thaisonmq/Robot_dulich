@@ -79,6 +79,7 @@ class RobotConnectionClient:
             self.navigation,
             self.motion,
             config.navigation_socket_path,
+            motion_backend=config.motion_backend,
         )
         self.map_cache = RobotMapCacheManager(
             config.map_cache_dir,

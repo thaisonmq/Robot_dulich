@@ -39,8 +39,13 @@ class NavigationSimulator:
             return False
         target_yaw = math.atan2(dy, dx)
         error = normalize_yaw(target_yaw - self.motion.pose.yaw)
-        angular = max(-0.8, min(0.8, error * 2.2))
-        linear = min(0.35, distance) if abs(error) < 0.6 else 0.0
+        if abs(error) > 0.05:
+            # Stop first, then rotate in place. Never use forward velocity to
+            # round an internal corner in the simulator contract either.
+            linear = 0.0
+            angular = max(-0.8, min(0.8, error * 2.2))
+        else:
+            linear = min(0.35, distance)
+            angular = max(-0.18, min(0.18, error * 2.2))
         self.motion.set_velocity(linear, angular)
         return False
-

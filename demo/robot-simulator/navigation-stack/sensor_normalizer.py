@@ -14,7 +14,11 @@ from rclpy.time import Time
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import String
 
-from navigation_core import SensorClockEstimator, mask_scan_self_returns
+from navigation_core import (
+    SensorClockEstimator,
+    deskew_laser_scan_ranges,
+    mask_scan_self_returns,
+)
 
 
 class SensorNormalizer(Node):
@@ -39,6 +43,8 @@ class SensorNormalizer(Node):
         self.declare_parameter("scan_laser_x", -0.0046412)
         self.declare_parameter("scan_laser_y", 0.0)
         self.declare_parameter("scan_laser_yaw", 0.0)
+        self.declare_parameter("scan_deskew_minimum_linear_speed", 0.03)
+        self.declare_parameter("scan_deskew_minimum_angular_speed", 0.08)
         clock_options = {
             "minimum_sync_samples": int(self.get_parameter("minimum_sync_samples").value),
             "window_samples": int(self.get_parameter("window_samples").value),
@@ -54,11 +60,15 @@ class SensorNormalizer(Node):
                 self.get_parameter("invalid_debounce_samples").value
             ),
         }
-        # IMU is diagnostic-only on this chassis. Separate estimators ensure a
-        # malformed IMU clock can never reset valid scan/odom capture time.
+        # Scan and wheel odometry are stamped by one Yahboom MCU. A single
+        # estimator preserves their relative capture times even when their ROS
+        # callbacks have different transport latency. IMU stays diagnostic and
+        # isolated so malformed IMU timing cannot reset the navigation clock.
+        navigation_clock = SensorClockEstimator(**clock_options)
         self.clocks = {
-            sensor: SensorClockEstimator(**clock_options)
-            for sensor in self.SENSOR_NAMES
+            "scan": navigation_clock,
+            "odom": navigation_clock,
+            "imu": SensorClockEstimator(**clock_options),
         }
         self.arrival_timeouts = {
             "scan": float(self.get_parameter("scan_arrival_timeout_seconds").value),
@@ -85,6 +95,16 @@ class SensorNormalizer(Node):
             "laser_yaw": float(self.get_parameter("scan_laser_yaw").value),
         }
         self.last_scan_self_filtered_beams = 0
+        self.last_scan_deskewed_beams = 0
+        self.measured_linear_velocity = 0.0
+        self.measured_angular_velocity = 0.0
+        self.last_odometry_monotonic = 0.0
+        self.scan_deskew_minimum_linear_speed = float(
+            self.get_parameter("scan_deskew_minimum_linear_speed").value
+        )
+        self.scan_deskew_minimum_angular_speed = float(
+            self.get_parameter("scan_deskew_minimum_angular_speed").value
+        )
 
         self.scan_pub = self.create_publisher(
             LaserScan, "/scan/normalized", qos_profile_sensor_data
@@ -141,6 +161,45 @@ class SensorNormalizer(Node):
             return
         message = self._correct_stamp("scan", source)
         if message is not None:
+            self.last_scan_deskewed_beams = 0
+            if (
+                time.monotonic() - self.last_odometry_monotonic <= 0.30
+                and (
+                    abs(self.measured_linear_velocity)
+                    >= self.scan_deskew_minimum_linear_speed
+                    or abs(self.measured_angular_velocity)
+                    >= self.scan_deskew_minimum_angular_speed
+                )
+                and (float(message.time_increment) > 0.0 or float(message.scan_time) > 0.0)
+            ):
+                (
+                    message.ranges,
+                    self.last_scan_deskewed_beams,
+                ) = deskew_laser_scan_ranges(
+                    message.ranges,
+                    angle_min=float(message.angle_min),
+                    angle_increment=float(message.angle_increment),
+                    range_min=float(message.range_min),
+                    range_max=float(message.range_max),
+                    time_increment=float(message.time_increment),
+                    scan_time=float(message.scan_time),
+                    linear_velocity=self.measured_linear_velocity,
+                    angular_velocity=self.measured_angular_velocity,
+                    laser_x=self.scan_self_filter["laser_x"],
+                    laser_y=self.scan_self_filter["laser_y"],
+                    laser_yaw=self.scan_self_filter["laser_yaw"],
+                )
+                scan_duration = (
+                    float(message.time_increment) * max(0, len(message.ranges) - 1)
+                    if float(message.time_increment) > 0.0
+                    else max(0.0, float(message.scan_time))
+                )
+                message.header.stamp = Time(
+                    nanoseconds=(
+                        self._stamp_nanoseconds(message)
+                        + round(scan_duration * 1_000_000_000)
+                    )
+                ).to_msg()
             message.ranges, self.last_scan_self_filtered_beams = mask_scan_self_returns(
                 message.ranges,
                 angle_min=float(message.angle_min),
@@ -172,6 +231,9 @@ class SensorNormalizer(Node):
         if message is None:
             return
         message.header.frame_id = "odom"
+        self.measured_linear_velocity = float(message.twist.twist.linear.x)
+        self.measured_angular_velocity = float(message.twist.twist.angular.z)
+        self.last_odometry_monotonic = time.monotonic()
         # Vendor covariance is overly optimistic. Preserve measured planar
         # axes while keeping unobserved Z/roll/pitch unavailable to the EKF.
         message.pose.covariance[0] = max(message.pose.covariance[0], 0.01)
@@ -235,6 +297,7 @@ class SensorNormalizer(Node):
                 "frame_valid": self.frame_valid[sensor],
                 "arrival_age_ms": None if not math.isfinite(arrival_age) else round(arrival_age * 1000, 1),
                 "corrected_age_ms": self.last_corrected_age_ms[sensor],
+                "corrected_timestamp_age_ms": self.last_corrected_age_ms[sensor],
                 "clock_skew_ms": round(
                     self.clocks[sensor].last_raw_skew_seconds.get(sensor, 0.0) * 1000, 1
                 ),
@@ -242,6 +305,7 @@ class SensorNormalizer(Node):
                 "invalid_streak": self.clocks[sensor].invalid_streak,
                 "rejected_packets": self.sensor_rejections[sensor],
                 "last_rejection": self.last_rejection[sensor],
+                "last_rejection_reason": self.last_rejection[sensor],
             }
         critical_clock_state = (
             "SYNCED"
@@ -271,6 +335,7 @@ class SensorNormalizer(Node):
             ),
             "imu_diagnostic_health": sensors["imu"],
             "scan_self_filtered_beams": self.last_scan_self_filtered_beams,
+            "scan_deskewed_beams": self.last_scan_deskewed_beams,
             "sensors": sensors,
         }
         self.status_pub.publish(String(data=json.dumps(status, separators=(",", ":"))))

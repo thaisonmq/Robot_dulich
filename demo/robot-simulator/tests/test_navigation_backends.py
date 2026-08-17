@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from simulator.navigation_backends import (
     NavigationBackendError,
     Ros2NavigationBackend,
     SimulatorNavigationBackend,
+    build_navigation_backend,
 )
 
 
@@ -22,14 +24,19 @@ async def test_simulator_backend_uses_same_compute_start_pause_cancel_flow() -> 
     backend = SimulatorNavigationBackend(navigation, motion)
     loaded = await backend.execute("map.load", {"map_id": "MAP-NEW", "version": 3})
     assert loaded["current_state"] == "READY"
-    plan = await backend.execute(
-        "navigation.compute_path", {"goal": {"x": 6.5, "y": 6.0, "yaw": 0}}
-    )
-    assert plan["distance_m"] == 1.0
-    assert len(plan["points"]) > 2
+    with pytest.raises(NavigationBackendError) as error:
+        await backend.execute(
+            "navigation.compute_path", {"goal": {"x": 6.5, "y": 6.0, "yaw": 0}}
+        )
+    assert error.value.code == "MAP_VALIDATION_UNAVAILABLE"
+    points = [{"x": 5.5, "y": 6.0}, {"x": 6.5, "y": 6.0}]
     started = await backend.execute(
         "navigation.start",
-        {"mission_id": "mission-1", "goal": {"x": 6.5, "y": 6.0, "yaw": 0}},
+        {
+            "mission_id": "mission-1",
+            "goal": {"x": 6.5, "y": 6.0, "yaw": 0},
+            "points": points,
+        },
     )
     assert started["current_state"] == "NAVIGATING"
     assert (await backend.execute("navigation.pause", {}))["current_state"] == "PAUSED"
@@ -43,12 +50,45 @@ async def test_manual_takeover_cancels_without_auto_resume() -> None:
     backend = SimulatorNavigationBackend(navigation, motion)
     await backend.execute(
         "navigation.start",
-        {"mission_id": "mission-1", "goal": {"x": 8.0, "y": 6.0, "yaw": 0}},
+        {
+            "mission_id": "mission-1",
+            "goal": {"x": 8.0, "y": 6.0, "yaw": 0},
+            "points": [{"x": 5.5, "y": 6.0}, {"x": 8.0, "y": 6.0}],
+        },
     )
     await backend.manual_takeover()
     assert backend.current_state == "CANCELED"
     with pytest.raises(NavigationBackendError):
         await backend.execute("navigation.resume", {})
+
+
+def test_hardware_motion_cannot_silently_use_simulator_navigation() -> None:
+    motion = MotionSimulator(SimulatorConfig())
+    with pytest.raises(NavigationBackendError) as error:
+        build_navigation_backend(
+            "simulator",
+            NavigationSimulator(motion),
+            motion,
+            "/tmp/navigation.sock",
+            motion_backend="ros2",
+        )
+    assert error.value.code == "NAVIGATION_BACKEND_UNSAFE"
+
+
+def test_simulator_corner_contract_never_combines_turn_and_forward_arc() -> None:
+    motion = MotionSimulator(SimulatorConfig(initial_yaw=math.pi / 2))
+    navigation = NavigationSimulator(motion)
+    navigation.start(
+        "route",
+        [{"x": 5.5, "y": 6.0}, {"x": 6.5, "y": 6.0}],
+    )
+    navigation.update()
+    assert motion.linear_x == 0.0
+    assert abs(motion.angular_z) > 0.05
+    motion.pose.yaw = 0.02
+    navigation.update()
+    assert motion.linear_x > 0.0
+    assert abs(motion.angular_z) <= 0.18
 
 
 @pytest.mark.asyncio

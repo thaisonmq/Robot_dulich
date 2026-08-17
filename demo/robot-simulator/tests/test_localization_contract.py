@@ -322,7 +322,8 @@ def test_tracked_pose_does_not_apply_stationary_acquisition_gate() -> None:
     assert "navigation_in_progress = self._navigation_in_progress()" in tick
     assert "self._pose_is_stable()" not in tracking
     assert "self._localization_tracking_evidence_ready(now)" in tick
-    assert "max(fresh_scan_map_score, self.scan_map_threshold)" in confidence
+    assert "self.tracking_scan_map_sanity_threshold" in confidence
+    assert "max(fresh_scan_map_score, self.scan_map_threshold)" not in confidence
     assert "self._nomotion_update_due(" in tick
 
 
@@ -354,13 +355,34 @@ def test_imu_clock_failure_cannot_invalidate_scan_and_odom_timing() -> None:
     ).read_text()
 
     assert "self.clocks =" in normalizer
-    assert "for sensor in self.SENSOR_NAMES" in normalizer
+    assert "navigation_clock = SensorClockEstimator" in normalizer
+    assert '"scan": navigation_clock' in normalizer
+    assert '"odom": navigation_clock' in normalizer
+    assert '"imu": SensorClockEstimator' in normalizer
     critical = normalizer.split("critical_clock_state =", 1)[1].split(
         "status =", 1
     )[0]
     assert 'for name in ("scan", "odom")' in critical
     assert 'self.clocks["imu"]' not in critical
     assert '"imu_diagnostic_health": sensors["imu"]' in normalizer
+
+
+def test_runtime_deskews_only_with_fresh_measured_odometry() -> None:
+    normalizer = (
+        Path(__file__).parents[1] / "navigation-stack" / "sensor_normalizer.py"
+    ).read_text()
+    assert "deskew_laser_scan_ranges" in normalizer
+    assert "message.time_increment" in normalizer
+    assert "message.scan_time" in normalizer
+    assert "self.measured_linear_velocity" in normalizer
+    assert "self.measured_angular_velocity" in normalizer
+    assert "self.last_odometry_monotonic" in normalizer
+
+
+def test_localization_rotation_progress_comes_from_actual_unwrapped_yaw() -> None:
+    tick = _method_source("_localization_tick", "_load_map")
+    assert "self.rotation_yaw_progress.update" in tick
+    assert "self.rotation_angle += abs(self.rotation_speed)" not in tick
 
 
 def test_cancel_revokes_nav_velocity_ownership_before_waiting_for_ack() -> None:
@@ -399,7 +421,7 @@ def test_transient_sensor_fault_keeps_context_then_replans_same_destination() ->
     assert '"VERIFYING"' in restore
     assert "self._begin_localization_verification(allow_rotation=False)" in restore
     assert '"goal": dict(self.paused_goal)' in ADAPTER_SOURCE
-    assert "self._request_path_once(goal)" in resume
+    assert "self._plan_stop_turn_from_current(goal)" in resume
     assert "self._navigate(" in resume
     assert '"mission_id": mission_id' in resume
     assert '"route_id": route_id' in resume
@@ -419,18 +441,14 @@ def test_sensor_time_diagnostics_identify_the_failing_critical_stream() -> None:
         assert required in timing
 
 
-def test_compute_path_lets_live_nav2_costmap_validate_the_start_pose() -> None:
+def test_compute_path_uses_cached_stop_turn_geometry_and_live_validation() -> None:
     compute_path = _method_source("_compute_path", "_navigate")
-    request_once = _method_source("_request_path_once", "_compute_path")
 
-    # Saved maps are quantized to 5 cm and can overlap the already occupied
-    # robot pose after a small SLAM/localization shift. Goal safety remains an
-    # adapter preflight, but the live Nav2 costmap must decide whether the
-    # robot has a valid path out of its current footprint.
-    assert "_validate_start_footprint" not in compute_path
     assert "resolved_goal, goal_adjusted = self._resolve_planning_goal" in compute_path
-    assert "request.use_start = False" in request_once
-    assert "self.compute_path_client.send_goal_async(request)" in request_once
+    assert "self.stop_turn_planner.plan_candidates" in compute_path
+    assert "self._route_metadata(points, original=points)" in compute_path
+    assert 'planner="StopTurnStateLattice24"' in compute_path
+    assert "_request_path_once" not in compute_path
 
 
 def test_raw_plan_never_replaces_validated_visualization_or_follow_path() -> None:
@@ -440,9 +458,9 @@ def test_raw_plan_never_replaces_validated_visualization_or_follow_path() -> Non
 
     assert "self.latest_planner_raw_path = path" in callback
     assert "self.latest_global_path = path" not in callback
-    assert 'context="INITIAL_COMPUTE_PATH"' in compute
+    assert "self.stop_turn_planner.plan_candidates" in compute
     assert '"PRE_FOLLOW_PATH"' in navigate
-    assert "points = self._ensure_executable_path" in compute
+    assert "metadata = self._route_metadata" in compute
     assert "points = self._ensure_executable_path" in navigate
 
 
@@ -460,34 +478,23 @@ def test_executable_validator_combines_live_master_and_saved_static_walls() -> N
     assert "self._path_after_initial_distance" in validate
 
 
-def test_compute_path_clears_only_after_diagnosed_failure_and_waits_for_update() -> None:
-    refresh = _method_source(
-        "_refresh_global_costmap_for_planning",
-        "_compute_path",
-    )
+def test_compute_path_never_fabricates_or_mutates_a_failed_candidate() -> None:
     compute_path = _method_source("_compute_path", "_navigate")
 
-    assert "ClearEntireCostmap.Request()" in refresh
-    assert "self.clear_global_costmap_client.call_async" in refresh
-    assert "time.sleep" not in refresh
-    assert "self._wait_for_global_costmap_after" in refresh
-    assert "self.global_costmap_update.wait" not in refresh
-    first_plan = compute_path.index("points = self._request_path_once(resolved_goal)")
-    reset = compute_path.index("self._refresh_global_costmap_for_planning()")
-    assert first_plan < reset
-    assert 'first_error.code in {"START_BLOCKED", "COSTMAP_NOT_READY"}' in compute_path
-    assert 'self._set_state("READY", reason)' in compute_path
+    assert '"GOAL_PHYSICALLY_UNREACHABLE"' in compute_path
+    assert "self.failed_segments =" not in compute_path
+    assert "_request_path_once" not in compute_path
+    assert "_refresh_global_costmap_for_planning" not in compute_path
     assert 'self._set_state("BLOCKED"' not in compute_path
 
 
-def test_invalid_theta_path_uses_old_footprint_aware_route_selector() -> None:
+def test_invalid_preview_never_falls_back_to_a_curved_planner() -> None:
     ensure = _method_source("_ensure_executable_path", "_global_cost_at")
-    request = _method_source("_request_path_once", "_compute_path")
 
-    assert 'action="FOOTPRINT_AWARE_PLANNER"' in ensure
-    assert 'planner_id="FootprintGrid"' in ensure
-    assert 'planner_id: str = "GridBased"' in request
-    assert "request.planner_id = planner_id" in request
+    assert "validate_stop_turn_route" in ensure
+    assert "canonicalize_stop_turn_path" in ensure
+    assert "_request_path_once" not in ensure
+    assert "FOOTPRINT_AWARE_PLANNER" not in ensure
 
 
 def test_scan_filter_is_used_only_for_global_planning_topic() -> None:
@@ -509,19 +516,14 @@ def test_navigation_abort_uses_confirmed_corridor_then_preserves_user_choice() -
     evidence = _method_source("_corridor_failure_evidence", "_mark_failed_segment")
 
     assert "self._corridor_failure_evidence()" in result
-    assert 'evidence_reason == "CORRIDOR_CLEAR"' in result
-    assert '"NARROW_OR_UNCERTAIN"' in result
+    assert '"CORRIDOR_CLEAR", "NARROW_OR_UNCERTAIN"' in result
     assert '"PHYSICALLY_BLOCKED"' in result
-    assert 'self._set_state("NARROW_PATH_DECISION"' in result
-    assert "self.paused_goal = None" not in result.split(
-        'self._set_state("NARROW_PATH_DECISION"', 1
-    )[1].split("else:", 1)[0]
+    assert 'self._set_state("BLOCKED", "confirmed_physical_blockage")' in result
+    assert 'self._set_state("NAVIGATING", "automatic_segment_retry")' in result
     assert "self.corridor_confirmation_samples" in evidence
     assert "self.corridor_confirmation_duration" in evidence
-    assert "self._request_path_once(goal)" in recover
-    assert "recoveries > 0" not in result
     assert "localization_reliable" in result
-    assert 'terminal_reason = "LOCALIZATION_UNRELIABLE"' in result
+    assert '"LOCALIZATION_UNRELIABLE"' in result
 
 
 def test_manual_handoff_preserves_goal_and_resume_replans_from_current_pose() -> None:
@@ -532,20 +534,26 @@ def test_manual_handoff_preserves_goal_and_resume_replans_from_current_pose() ->
     assert "self.paused_goal = None" not in handoff
     assert '"destination_preserved": True' in handoff
     assert 'self.localization_state != "READY"' in resume
-    assert "points = self._request_path_once(goal)" in resume
+    assert "points = self._plan_stop_turn_from_current(goal)" in resume
     assert 'self._set_state("PLANNING", "resume_from_current_pose")' in resume
 
 
-def test_selected_preview_polyline_is_executed_by_follow_path_without_replanning() -> None:
+def test_selected_preview_is_executed_as_isolated_straight_segments() -> None:
     selected = _method_source("_start_selected_route", "_mapping_command")
     navigate = _method_source("_navigate", "_navigation_feedback")
 
     assert 'points = list(candidate["points"])' in selected
     assert '"points": points' in selected
     assert "self._request_path_once" not in selected
-    assert "goal = FollowPath.Goal()" in navigate
-    assert "goal.path = path" in navigate
-    assert "self.follow_path_client.send_goal_async" in navigate
+    assert "canonicalize_stop_turn_path" in navigate
+    assert 'executor="StopTurnSegmentExecutor"' in navigate
+    sender = _method_source("_send_current_straight_segment", "_navigation_feedback")
+    assert "densify_straight_segment" in sender
+    assert "for point in segment_points" in sender
+    assert 'action_goal.goal_checker_id = "segment_goal_checker"' in sender
+    assert "self.follow_path_client.send_goal_async" in sender
+    assert 'phase="TURN_BEGIN"' in navigate
+    assert "command.linear.x = 0.0" in navigate
     assert "NavigateToPose" not in navigate
     assert "actual_execution_path_route_id=route_id" in navigate
 
@@ -572,3 +580,23 @@ def test_failed_segment_ttl_clears_only_the_dedicated_mask() -> None:
     assert "self._publish_failed_segments()" in tick
     assert "message.data = [0] * (width * height)" in publish
     assert '"/map", self._map_callback, transient_map_qos' in ADAPTER_SOURCE
+
+
+def test_initial_preview_produces_candidates_without_persistent_scratch_state() -> None:
+    compute = _method_source("_compute_path", "_navigate")
+    alternatives = _method_source(
+        "_compute_alternative_routes", "_wait_for_global_costmap_after"
+    )
+    assert "plan_candidates" in compute
+    assert '"route_candidates": candidates' in compute
+    assert "self.route_candidates =" in compute
+    assert "self.failed_segments =" not in alternatives
+    assert "_publish_failed_segments" not in alternatives
+    assert 'source="INITIAL_STOP_TURN_PREVIEW"' in alternatives
+
+
+def test_live_narrow_uncertainty_does_not_cancel_prevalidated_auto_route() -> None:
+    callback = _method_source("_scan_callback", "_sensor_time_callback")
+    decision = callback.split("self._corridor_failure_evidence()", 1)[1]
+    assert 'if evidence_reason == "PHYSICALLY_BLOCKED"' in decision
+    assert 'evidence_reason in {"NARROW_OR_UNCERTAIN"' not in decision

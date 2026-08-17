@@ -64,6 +64,7 @@ rovera_navigation_adapter:
     scan_map_maximum_beams: 90
     scan_map_minimum_valid_beams: 25
     scan_map_minimum_score: 0.35
+    localization_tracking_scan_map_sanity_score: 0.12
     # A stationary global search has no heading diversity, so only accept a
     # distinctly strong map match. Weaker aliases still qualify for the
     # rotation-assisted path below, where the normal 0.35 score is combined
@@ -132,6 +133,12 @@ rovera_navigation_adapter:
     alternative_route_max_candidates: 3
     alternative_route_overlap_threshold: 0.85
     alternative_route_keepout_radius: 0.18
+    stop_turn_settle_seconds: 0.20
+    stop_turn_heading_tolerance_degrees: 3.0
+    stop_turn_heading_kp: 1.8
+    stop_turn_max_angular_speed: 0.60
+    straight_max_angular_correction: 0.18
+    straight_path_pose_spacing: 0.05
 
 map_server:
   ros__parameters:
@@ -143,26 +150,11 @@ planner_server:
     # Diagnostic overrun threshold only. The generated BT computes once and
     # again only after controller/recovery failure; no timer drives replanning.
     expected_planner_frequency: 1.0
-    planner_plugins: [GridBased, FootprintGrid]
+    planner_plugins: [GridBased, ThetaDiagnostic]
     GridBased:
-      # Theta* connects grid cells by verified line of sight. In open space it
-      # therefore emits one stable straight corridor instead of smoothing an
-      # 8-connected A* staircase into a left/right S-curve.
-      plugin: nav2_theta_star_planner/ThetaStarPlanner
-      how_many_corners: 8
-      allow_unknown: false
-      w_euc_cost: 1.0
-      # Distance is the primary objective: in open space Theta* must retain a
-      # direct line instead of weaving between small inflation-cost changes.
-      # This stays non-zero so equal-length candidates prefer clearance, while
-      # the footprint collision check still protects corners and lets the only
-      # valid route pass through a genuinely narrow corridor.
-      w_traversal_cost: 0.02
-      use_final_approach_orientation: false
-    # Footprint-aware fallback retained from the proven 12/08 route selector.
-    # ThetaStar remains primary and is unchanged; this planner is requested
-    # only after its candidate fails executable-footprint validation.
-    FootprintGrid:
+      # Execution-authority lattice: forward straight translation and pure
+      # in-place rotation only. The adapter additionally validates every
+      # rectangular translation and complete corner rotation sweep.
       plugin: nav2_smac_planner/SmacPlannerLattice
       tolerance: 0.20
       downsample_costmap: false
@@ -171,9 +163,10 @@ planner_server:
       max_iterations: 250000
       max_on_approach_iterations: 1000
       max_planning_time: 2.0
-      lattice_filepath: /opt/ros/humble/share/nav2_smac_planner/sample_primitives/5cm_resolution/0.5m_turning_radius/diff/output.json
-      analytic_expansion_ratio: 3.5
-      analytic_expansion_max_length: 1.5
+      lattice_filepath: /opt/rovera/control_sets/rovera_5cm_24_heading_stop_turn.json
+      analytic_expansion_ratio: -1.0
+      analytic_expansion_max_length: 0.0
+      allow_reverse_expansion: false
       reverse_penalty: 2.0
       change_penalty: 0.0
       non_straight_penalty: 1.05
@@ -183,7 +176,7 @@ planner_server:
       lookup_table_size: 5.0
       cache_obstacle_heuristic: false
       debug_visualizations: false
-      smooth_path: true
+      smooth_path: false
       smoother:
         max_iterations: 1000
         w_smooth: 0.3
@@ -191,6 +184,16 @@ planner_server:
         tolerance: 1.0e-10
         do_refinement: true
         refinement_num: 2
+    # Theta* remains available only for diagnostics/comparison. Its polyline
+    # is never previewed or executed without stop-turn canonicalization and
+    # exact swept-footprint validation.
+    ThetaDiagnostic:
+      plugin: nav2_theta_star_planner/ThetaStarPlanner
+      how_many_corners: 8
+      allow_unknown: false
+      w_euc_cost: 1.0
+      w_traversal_cost: 0.02
+      use_final_approach_orientation: false
 
 controller_server:
   ros__parameters:
@@ -211,7 +214,7 @@ controller_server:
     # whose next attempt computes a fresh path instead of timer replanning.
     failure_tolerance: 1.0
     progress_checker_plugin: progress_checker
-    goal_checker_plugins: [goal_checker]
+    goal_checker_plugins: [goal_checker, segment_goal_checker]
     controller_plugins: [FollowPath]
     progress_checker:
       plugin: nav2_controller::SimpleProgressChecker
@@ -225,34 +228,21 @@ controller_server:
       plugin: nav2_controller::SimpleGoalChecker
       xy_goal_tolerance: 0.12
       yaw_goal_tolerance: 0.18
+    segment_goal_checker:
+      stateful: true
+      plugin: nav2_controller::SimpleGoalChecker
+      # Internal turn points use a tight XY bound because the exact rotation
+      # sweep is validated around that point. The final public destination may
+      # retain the ordinary checker above for UI semantics.
+      xy_goal_tolerance: 0.03
+      yaw_goal_tolerance: 0.08
     FollowPath:
-      # Rotation Shim handles only the heading of a newly received path. Once
-      # it has aligned, RPP owns the complete path and drives ordinary corners
-      # as continuous arcs instead of repeatedly entering stop-turn-go.
-      plugin: nav2_rotation_shim_controller::RotationShimController
-      primary_controller: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
-      # Let RPP correct corridor-scale heading error while moving. Field logs
-      # showed a nearly straight path at 18.9 degrees crossing the old 20
-      # degree boundary on one sample; the resulting in-place turn overshot to
-      # roughly 32 degrees and only then collided with the corridor wall.
-      # Thirty degrees keeps 90/180-degree turns pure while avoiding that
-      # unnecessary rotation in an otherwise traversable passage.
-      angular_dist_threshold: 0.52
-      # Humble keeps a separate in-rotation disengage threshold whose default
-      # is 0.785 rad. Leaving that default in place made the shim rotate for
-      # one controller tick, then hand RPP a path still misaligned by as much
-      # as 45 degrees. Once a large turn starts, finish it to about five
-      # degrees before releasing linear motion.
-      angular_disengage_threshold: 0.087
-      # Align to the immediate 25 cm path segment. Sampling 55 cm looked past
-      # nearby corners and started an in-place turn while the straight escape
-      # corridor directly in front of the robot was still clear.
-      forward_sampling_distance: 0.25
+      # The adapter owns every in-place turn and sends one densely sampled,
+      # collinear segment at a time. Dense samples prevent Humble RPP from
+      # pruning a two-pose path back to the start pose behind the robot.
+      plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
       rotate_to_heading_angular_vel: 0.80
       max_angular_accel: 2.00
-      simulate_ahead_time: 1.20
-      rotate_to_goal_heading: false
-      closed_loop: true
       # NORMAL startup values. The adapter applies the selected SLOW/NORMAL/
       # FAST profile atomically at runtime and keeps this controller, behavior
       # server and the Auto-only pre-mux limiter synchronized.
@@ -274,12 +264,13 @@ controller_server:
       cost_scaling_dist: 0.18
       cost_scaling_gain: 0.80
       inflation_cost_scaling_factor: 3.0
-      use_rotate_to_heading: true
+      # Rotation is exclusively the adapter's TURN phase. RPP may only follow
+      # the current line with the adapter's small angular correction clamp.
+      use_rotate_to_heading: false
       allow_reversing: false
-      # Rotation Shim already handles the start. Inside the route, RPP keeps
-      # forward velocity through ordinary and right-angle corners. Only a
-      # near-reversal is sharp enough to require an in-place turn.
-      rotate_to_heading_min_angle: 2.35
+      # RPP sees no internal corner. While straight, the adapter additionally
+      # clamps angular correction so wheel/odometry drift cannot become an arc.
+      rotate_to_heading_min_angle: 0.10
       # RPP uses angular error plus this acceleration bound to run fast over
       # the large part of a turn and brake only near the requested heading.
 

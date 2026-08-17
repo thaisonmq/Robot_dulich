@@ -304,7 +304,7 @@ async def test_disabled_motion_backend_rejects_web_velocity(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ros2_backend_routes_velocity_and_stop_without_navigation(
+async def test_ros2_backends_route_velocity_and_stop_without_simulator_fallback(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -315,6 +315,7 @@ async def test_ros2_backend_routes_velocity_and_stop_without_navigation(
     client = RobotConnectionClient(
         SimulatorConfig(
             motion_backend="ros2",
+            navigation_backend="ros2",
             robot_state_file=str(tmp_path / "missing-device.json"),
         )
     )
@@ -336,21 +337,13 @@ async def test_ros2_backend_routes_velocity_and_stop_without_navigation(
                 "session-1",
                 300,
             ),
-            make_message(
-                "navigation.goal",
-                "ROBOT-001",
-                3,
-                {"route_id": "route-1", "points": [{"x": 1.0, "y": 1.0}]},
-                "session-1",
-                1_000,
-            ),
         ]
     )
 
     await client._receive_loop(socket)
 
     assert driver.velocities == [(0.2, -0.4)]
-    assert driver.stops == ["input_released", "navigation_unsupported"]
+    assert driver.stops == ["input_released"]
     acknowledgements = [
         message
         for message in socket.sent
@@ -359,9 +352,8 @@ async def test_ros2_backend_routes_velocity_and_stop_without_navigation(
     assert [message["payload"]["status"] for message in acknowledgements] == [
         "accepted",
         "completed",
-        "rejected",
     ]
-    assert client.navigation.status == "failed"
+    assert client.navigation.status == "idle"
 
 
 @pytest.mark.asyncio
@@ -377,6 +369,7 @@ async def test_ros2_backend_samples_control_dispatch_latency(
     client = RobotConnectionClient(
         SimulatorConfig(
             motion_backend="ros2",
+            navigation_backend="ros2",
             robot_state_file=str(tmp_path / "missing-device.json"),
         )
     )
@@ -412,6 +405,7 @@ async def test_ros2_backend_rejects_non_finite_velocity(
     client = RobotConnectionClient(
         SimulatorConfig(
             motion_backend="ros2",
+            navigation_backend="ros2",
             robot_state_file=str(tmp_path / "missing-device.json"),
         )
     )

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import heapq
 import logging
 import math
 import os
 import statistics
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Iterable
@@ -37,6 +38,124 @@ class ExecutablePathValidation:
     collision_cells: tuple[tuple[float, float, int], ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class RotationSweepValidation:
+    valid: bool
+    code: str = ""
+    samples_checked: int = 0
+    collision_yaw: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RouteMetadata:
+    total_length: float
+    minimum_passage_width: float
+    minimum_static_clearance: float
+    minimum_turn_clearance: float
+    turn_count: int
+    total_turn_angle: float
+    narrow_segments: tuple[dict[str, float], ...]
+    estimated_time: float
+    turn_safe: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "total_length": round(self.total_length, 4),
+            "minimum_passage_width": _finite_or_none(
+                self.minimum_passage_width
+            ),
+            "minimum_static_clearance": _finite_or_none(
+                self.minimum_static_clearance
+            ),
+            "minimum_turn_clearance": _finite_or_none(
+                self.minimum_turn_clearance
+            ),
+            "turn_count": self.turn_count,
+            "total_turn_angle": round(self.total_turn_angle, 4),
+            "narrow_segments": [dict(item) for item in self.narrow_segments],
+            "estimated_time": round(self.estimated_time, 3),
+            "turn_safe": self.turn_safe,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class StopTurnRoute:
+    points: tuple[dict[str, float], ...]
+    metadata: RouteMetadata
+    heading_bins: tuple[int, ...]
+
+
+def _finite_or_none(value: float) -> float | None:
+    return round(float(value), 4) if math.isfinite(float(value)) else None
+
+
+def _angle_delta(target: float, current: float) -> float:
+    return math.atan2(math.sin(target - current), math.cos(target - current))
+
+
+def canonicalize_stop_turn_path(
+    points: Iterable[dict[str, float]],
+    *,
+    angular_tolerance: float = math.radians(1.0),
+) -> list[dict[str, float]]:
+    """Remove duplicate and collinear points without rounding corner geometry."""
+    route: list[dict[str, float]] = []
+    for point in points:
+        candidate = {"x": float(point["x"]), "y": float(point["y"])}
+        if route and math.hypot(
+            candidate["x"] - route[-1]["x"],
+            candidate["y"] - route[-1]["y"],
+        ) <= 1e-8:
+            continue
+        route.append(candidate)
+    if len(route) < 3:
+        return route
+    output = [route[0]]
+    for index in range(1, len(route) - 1):
+        previous = output[-1]
+        current = route[index]
+        following = route[index + 1]
+        incoming = math.atan2(
+            current["y"] - previous["y"], current["x"] - previous["x"]
+        )
+        outgoing = math.atan2(
+            following["y"] - current["y"], following["x"] - current["x"]
+        )
+        if abs(_angle_delta(outgoing, incoming)) <= angular_tolerance:
+            continue
+        output.append(current)
+    output.append(route[-1])
+    return output
+
+
+def densify_straight_segment(
+    start: dict[str, float],
+    end: dict[str, float],
+    *,
+    spacing: float,
+) -> list[dict[str, float]]:
+    """Sample one straight segment densely without changing its geometry.
+
+    RPP prunes a path to its nearest pose.  A path containing only its two
+    endpoints can therefore switch to the far endpoint while the start pose
+    is already behind the robot, making the local path point backwards.  A
+    dense collinear path keeps a nearby forward sample available throughout.
+    """
+    start_x, start_y = float(start["x"]), float(start["y"])
+    end_x, end_y = float(end["x"]), float(end["y"])
+    distance = math.hypot(end_x - start_x, end_y - start_y)
+    if distance <= 1e-9:
+        return [{"x": start_x, "y": start_y}]
+    sample_count = max(1, math.ceil(distance / max(0.01, float(spacing))))
+    return [
+        {
+            "x": start_x + (end_x - start_x) * index / sample_count,
+            "y": start_y + (end_y - start_y) * index / sample_count,
+        }
+        for index in range(sample_count + 1)
+    ]
+
+
 def validate_executable_grid_path(
     points: Iterable[dict[str, float]],
     *,
@@ -64,7 +183,7 @@ def validate_executable_grid_path(
         {"x": float(point["x"]), "y": float(point["y"])}
         for point in points
     ]
-    costs = [int(value) for value in data]
+    costs = data if isinstance(data, list) else [int(value) for value in data]
     width = int(width)
     height = int(height)
     resolution = float(resolution)
@@ -283,6 +402,956 @@ def validate_executable_grid_path(
     return ExecutablePathValidation(True, samples_checked=samples_checked)
 
 
+def _squared_edt_1d(values: list[float]) -> list[float]:
+    """Exact squared Euclidean distance transform for one grid axis."""
+    finite_sites = [index for index, value in enumerate(values) if math.isfinite(value)]
+    if not finite_sites:
+        return [math.inf] * len(values)
+    vertices = [finite_sites[0]]
+    boundaries = [-math.inf, math.inf]
+    for site in finite_sites[1:]:
+        while True:
+            previous = vertices[-1]
+            crossing = (
+                (values[site] + site * site)
+                - (values[previous] + previous * previous)
+            ) / (2.0 * (site - previous))
+            if crossing > boundaries[-2]:
+                break
+            vertices.pop()
+            boundaries.pop(-2)
+        vertices.append(site)
+        boundaries.insert(-1, crossing)
+    output = [0.0] * len(values)
+    vertex_index = 0
+    for coordinate in range(len(values)):
+        while boundaries[vertex_index + 1] < coordinate:
+            vertex_index += 1
+        site = vertices[vertex_index]
+        output[coordinate] = (
+            (coordinate - site) * (coordinate - site) + values[site]
+        )
+    return output
+
+
+def exact_euclidean_distance_transform(
+    blocked: Iterable[bool],
+    *,
+    width: int,
+    height: int,
+) -> list[float]:
+    """Return exact cell-center distances to blocked cells in O(width*height)."""
+    mask = [bool(value) for value in blocked]
+    if width <= 0 or height <= 0 or len(mask) != width * height:
+        raise ValueError("blocked mask dimensions do not match")
+    row_pass: list[float] = [math.inf] * len(mask)
+    for row in range(height):
+        start = row * width
+        transformed = _squared_edt_1d([
+            0.0 if mask[start + column] else math.inf
+            for column in range(width)
+        ])
+        row_pass[start:start + width] = transformed
+    squared: list[float] = [math.inf] * len(mask)
+    for column in range(width):
+        transformed = _squared_edt_1d([
+            row_pass[row * width + column] for row in range(height)
+        ])
+        for row, value in enumerate(transformed):
+            squared[row * width + column] = value
+    return [math.sqrt(value) if math.isfinite(value) else math.inf for value in squared]
+
+
+@dataclass(slots=True)
+class MapNavigationGeometry:
+    """Static, map-version-scoped geometry shared by planning and ranking."""
+
+    width: int
+    height: int
+    resolution: float
+    blocked: tuple[bool, ...]
+    distance_cells: tuple[float, ...]
+    static_clearance: tuple[float, ...]
+    robot_navigable_mask: tuple[bool, ...]
+    component_ids: tuple[int, ...]
+    turn_safe_mask: tuple[bool, ...]
+    identity: str
+    _robot_shape: tuple[float, float, float] = field(default=(0.15, 0.10, 0.0))
+
+    @classmethod
+    def build(
+        cls,
+        saved_map: "SavedOccupancyMap",
+        *,
+        half_length: float = 0.15,
+        half_width: float = 0.10,
+        padding: float = 0.0,
+    ) -> "MapNavigationGeometry":
+        blocked = tuple(value < 0 or value >= 65 for value in saved_map.occupancy)
+        distances = exact_euclidean_distance_transform(
+            blocked, width=saved_map.width, height=saved_map.height
+        )
+        half_cell_diagonal = saved_map.resolution / math.sqrt(2.0)
+        clearance = tuple(
+            math.inf
+            if not math.isfinite(distance)
+            else max(0.0, distance * saved_map.resolution - half_cell_diagonal)
+            for distance in distances
+        )
+        minimum_radius = float(half_width) + float(padding)
+        turn_radius = math.hypot(
+            float(half_length) + float(padding),
+            float(half_width) + float(padding),
+        )
+        navigable = tuple(
+            not is_blocked and cell_clearance + 1e-9 >= minimum_radius
+            for is_blocked, cell_clearance in zip(blocked, clearance)
+        )
+        turn_safe = tuple(
+            not is_blocked and cell_clearance + 1e-9 >= turn_radius
+            for is_blocked, cell_clearance in zip(blocked, clearance)
+        )
+        components = cls._components(
+            navigable, width=saved_map.width, height=saved_map.height
+        )
+        identity_payload = (
+            f"{saved_map.width}:{saved_map.height}:{saved_map.resolution}:"
+            + ",".join(str(value) for value in saved_map.occupancy)
+        )
+        import hashlib
+        return cls(
+            width=saved_map.width,
+            height=saved_map.height,
+            resolution=saved_map.resolution,
+            blocked=blocked,
+            distance_cells=tuple(distances),
+            static_clearance=clearance,
+            robot_navigable_mask=navigable,
+            component_ids=components,
+            turn_safe_mask=turn_safe,
+            identity=hashlib.sha256(identity_payload.encode()).hexdigest(),
+            _robot_shape=(float(half_length), float(half_width), float(padding)),
+        )
+
+    @staticmethod
+    def _components(
+        mask: tuple[bool, ...], *, width: int, height: int
+    ) -> tuple[int, ...]:
+        components = [-1] * len(mask)
+        component = 0
+        for start, free in enumerate(mask):
+            if not free or components[start] >= 0:
+                continue
+            components[start] = component
+            pending = deque([start])
+            while pending:
+                index = pending.popleft()
+                row, column = divmod(index, width)
+                for delta_x, delta_y in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    next_column = column + delta_x
+                    next_row = row + delta_y
+                    if not (
+                        0 <= next_column < width and 0 <= next_row < height
+                    ):
+                        continue
+                    neighbor = next_row * width + next_column
+                    if mask[neighbor] and components[neighbor] < 0:
+                        components[neighbor] = component
+                        pending.append(neighbor)
+            component += 1
+        return tuple(components)
+
+    def index(self, column: int, row: int) -> int:
+        return row * self.width + column
+
+    def clearance_at_cell(self, column: int, row: int) -> float:
+        if not (0 <= column < self.width and 0 <= row < self.height):
+            return 0.0
+        return self.static_clearance[self.index(column, row)]
+
+    def same_component(
+        self, left: tuple[int, int], right: tuple[int, int]
+    ) -> bool:
+        left_id = self.component_ids[self.index(*left)]
+        right_id = self.component_ids[self.index(*right)]
+        return left_id >= 0 and left_id == right_id
+
+
+def validate_rotation_sweep(
+    saved_map: "SavedOccupancyMap",
+    x: float,
+    y: float,
+    start_yaw: float,
+    end_yaw: float,
+    *,
+    half_length: float,
+    half_width: float,
+    padding: float = 0.0,
+    allow_unknown: bool = False,
+) -> RotationSweepValidation:
+    """Exact sampled rectangular footprint check for an in-place rotation.
+
+    The angular interval is bounded so the furthest chassis corner travels no
+    more than half a map cell between samples.
+    """
+    delta = _angle_delta(float(end_yaw), float(start_yaw))
+    radius = math.hypot(
+        float(half_length) + float(padding),
+        float(half_width) + float(padding),
+    )
+    maximum_step = (
+        math.pi
+        if radius <= 1e-9
+        else min(math.pi, saved_map.resolution * 0.5 / radius)
+    )
+    sample_count = max(1, math.ceil(abs(delta) / max(1e-6, maximum_step)))
+    for index in range(sample_count + 1):
+        yaw = float(start_yaw) + delta * index / sample_count
+        validation = saved_map.validate_footprint(
+            float(x),
+            float(y),
+            yaw,
+            half_length=float(half_length),
+            half_width=float(half_width),
+            padding=float(padding),
+            allow_unknown=allow_unknown,
+            code_prefix="TURN",
+        )
+        if not validation.valid:
+            return RotationSweepValidation(
+                False, "TURN_SWEEP_COLLISION", index + 1, yaw
+            )
+    return RotationSweepValidation(True, samples_checked=sample_count + 1)
+
+
+def validate_stop_turn_route(
+    saved_map: "SavedOccupancyMap",
+    points: Iterable[dict[str, float]],
+    *,
+    half_length: float,
+    half_width: float,
+    padding: float = 0.0,
+) -> ExecutablePathValidation:
+    route = canonicalize_stop_turn_path(points)
+    if len(route) < 2:
+        return ExecutablePathValidation(False, "PATH_HAS_NO_LENGTH")
+    translation = validate_executable_grid_path(
+        route,
+        width=saved_map.width,
+        height=saved_map.height,
+        resolution=saved_map.resolution,
+        origin_x=saved_map.origin_x,
+        origin_y=saved_map.origin_y,
+        origin_yaw=saved_map.origin_yaw,
+        data=saved_map.occupancy,
+        half_length=float(half_length) + float(padding),
+        half_width=float(half_width) + float(padding),
+        allow_unknown=False,
+        lethal_threshold=65,
+    )
+    if not translation.valid:
+        return translation
+    samples = translation.samples_checked
+    for corner_index in range(1, len(route) - 1):
+        incoming = math.atan2(
+            route[corner_index]["y"] - route[corner_index - 1]["y"],
+            route[corner_index]["x"] - route[corner_index - 1]["x"],
+        )
+        outgoing = math.atan2(
+            route[corner_index + 1]["y"] - route[corner_index]["y"],
+            route[corner_index + 1]["x"] - route[corner_index]["x"],
+        )
+        rotation = validate_rotation_sweep(
+            saved_map,
+            route[corner_index]["x"],
+            route[corner_index]["y"],
+            incoming,
+            outgoing,
+            half_length=half_length,
+            half_width=half_width,
+            padding=padding,
+        )
+        samples += rotation.samples_checked
+        if not rotation.valid:
+            return ExecutablePathValidation(
+                False,
+                rotation.code,
+                corner_index,
+                route[corner_index]["x"],
+                route[corner_index]["y"],
+                rotation.collision_yaw,
+                samples_checked=samples,
+            )
+    return ExecutablePathValidation(True, samples_checked=samples)
+
+
+def route_geometry_metadata(
+    saved_map: "SavedOccupancyMap",
+    geometry: MapNavigationGeometry,
+    points: Iterable[dict[str, float]],
+    *,
+    half_length: float,
+    half_width: float,
+    padding: float = 0.0,
+    linear_speed: float = 0.20,
+    angular_speed: float = 0.60,
+) -> RouteMetadata:
+    route = canonicalize_stop_turn_path(points)
+    total_length = 0.0
+    minimum_clearance = math.inf
+    minimum_passage_width = math.inf
+    minimum_turn_clearance = math.inf
+    narrow_segments: list[dict[str, float]] = []
+    turn_count = 0
+    total_turn_angle = 0.0
+    turn_safe = True
+    rotation_diameter = 2.0 * math.hypot(
+        half_length + padding, half_width + padding
+    )
+    for segment_index, (left, right) in enumerate(zip(route, route[1:])):
+        distance = math.hypot(right["x"] - left["x"], right["y"] - left["y"])
+        segment_yaw = math.atan2(
+            right["y"] - left["y"], right["x"] - left["x"]
+        )
+        total_length += distance
+        count = max(1, math.ceil(distance / max(0.001, saved_map.resolution / 2.0)))
+        segment_width = math.inf
+        for sample in range(count + 1):
+            ratio = sample / count
+            x = left["x"] + (right["x"] - left["x"]) * ratio
+            y = left["y"] + (right["y"] - left["y"]) * ratio
+            cell = saved_map.world_to_cell(x, y)
+            clearance = 0.0 if cell is None else geometry.clearance_at_cell(*cell)
+            minimum_clearance = min(minimum_clearance, clearance)
+            ray_limit = saved_map.resolution * math.hypot(
+                saved_map.width, saved_map.height
+            ) + saved_map.resolution
+            left_width = saved_map.raycast_static_range(
+                x,
+                y,
+                segment_yaw + math.pi / 2.0,
+                minimum_range=0.0,
+                maximum_range=ray_limit,
+                unknown_is_blocked=True,
+            )
+            right_width = saved_map.raycast_static_range(
+                x,
+                y,
+                segment_yaw - math.pi / 2.0,
+                minimum_range=0.0,
+                maximum_range=ray_limit,
+                unknown_is_blocked=True,
+            )
+            passage_width = (
+                0.0
+                if left_width is None or right_width is None
+                else left_width + right_width
+            )
+            segment_width = min(segment_width, passage_width)
+        minimum_passage_width = min(minimum_passage_width, segment_width)
+        if segment_width < rotation_diameter:
+            narrow_segments.append({
+                "segment_index": segment_index,
+                "passage_width": round(segment_width, 4),
+                "length": round(distance, 4),
+            })
+    for index in range(1, len(route) - 1):
+        incoming = math.atan2(
+            route[index]["y"] - route[index - 1]["y"],
+            route[index]["x"] - route[index - 1]["x"],
+        )
+        outgoing = math.atan2(
+            route[index + 1]["y"] - route[index]["y"],
+            route[index + 1]["x"] - route[index]["x"],
+        )
+        angle = abs(_angle_delta(outgoing, incoming))
+        if angle <= 1e-6:
+            continue
+        turn_count += 1
+        total_turn_angle += angle
+        cell = saved_map.world_to_cell(route[index]["x"], route[index]["y"])
+        clearance = 0.0 if cell is None else geometry.clearance_at_cell(*cell)
+        turn_clearance = clearance - math.hypot(
+            half_length + padding, half_width + padding
+        )
+        minimum_turn_clearance = min(minimum_turn_clearance, turn_clearance)
+        turn_safe = turn_safe and validate_rotation_sweep(
+            saved_map,
+            route[index]["x"],
+            route[index]["y"],
+            incoming,
+            outgoing,
+            half_length=half_length,
+            half_width=half_width,
+            padding=padding,
+        ).valid
+    return RouteMetadata(
+        total_length=total_length,
+        minimum_passage_width=minimum_passage_width,
+        minimum_static_clearance=minimum_clearance,
+        minimum_turn_clearance=minimum_turn_clearance,
+        turn_count=turn_count,
+        total_turn_angle=total_turn_angle,
+        narrow_segments=tuple(narrow_segments),
+        estimated_time=(
+            total_length / max(0.01, linear_speed)
+            + total_turn_angle / max(0.01, angular_speed)
+        ),
+        turn_safe=turn_safe,
+    )
+
+
+class StopTurnStateLatticePlanner:
+    """24-heading lattice containing only forward and in-place primitives."""
+
+    HEADING_BINS = 24
+
+    def __init__(
+        self,
+        saved_map: "SavedOccupancyMap",
+        geometry: MapNavigationGeometry,
+        *,
+        half_length: float = 0.15,
+        half_width: float = 0.10,
+        padding: float = 0.0,
+        primitive_length: float | None = None,
+        linear_speed: float = 0.20,
+        angular_speed: float = 0.60,
+        max_expansions: int = 250_000,
+    ) -> None:
+        self.saved_map = saved_map
+        self.geometry = geometry
+        self.half_length = float(half_length)
+        self.half_width = float(half_width)
+        self.padding = float(padding)
+        self.primitive_length = (
+            max(saved_map.resolution, float(primitive_length))
+            if primitive_length is not None
+            else saved_map.resolution * 2.0
+        )
+        self.linear_speed = max(0.01, float(linear_speed))
+        self.angular_speed = max(0.01, float(angular_speed))
+        self.max_expansions = max(1, int(max_expansions))
+        self.heading_step = 2.0 * math.pi / self.HEADING_BINS
+
+    def heading_bin(self, yaw: float) -> int:
+        return int(round(float(yaw) / self.heading_step)) % self.HEADING_BINS
+
+    def heading(self, heading_bin: int) -> float:
+        return (int(heading_bin) % self.HEADING_BINS) * self.heading_step
+
+    def _pose_key(self, x: float, y: float, heading_bin: int) -> tuple[int, int, int]:
+        quantum = self.saved_map.resolution * 0.5
+        return (
+            round((float(x) - self.saved_map.origin_x) / quantum),
+            round((float(y) - self.saved_map.origin_y) / quantum),
+            int(heading_bin) % self.HEADING_BINS,
+        )
+
+    @staticmethod
+    def _excluded(
+        x: float, y: float, exclusions: tuple[tuple[float, float, float], ...]
+    ) -> bool:
+        return any(
+            math.hypot(float(x) - center_x, float(y) - center_y) <= radius
+            for center_x, center_y, radius in exclusions
+        )
+
+    @staticmethod
+    def _segment_excluded(
+        left: dict[str, float],
+        right: dict[str, float],
+        exclusions: tuple[tuple[float, float, float], ...],
+    ) -> bool:
+        delta_x = right["x"] - left["x"]
+        delta_y = right["y"] - left["y"]
+        denominator = delta_x * delta_x + delta_y * delta_y
+        for center_x, center_y, radius in exclusions:
+            ratio = 0.0 if denominator <= 1e-12 else max(
+                0.0,
+                min(1.0, (
+                    (center_x - left["x"]) * delta_x
+                    + (center_y - left["y"]) * delta_y
+                ) / denominator),
+            )
+            if math.hypot(
+                left["x"] + ratio * delta_x - center_x,
+                left["y"] + ratio * delta_y - center_y,
+            ) <= radius:
+                return True
+        return False
+
+    def _translation_valid(
+        self, left: dict[str, float], right: dict[str, float]
+    ) -> bool:
+        return validate_executable_grid_path(
+            (left, right),
+            width=self.saved_map.width,
+            height=self.saved_map.height,
+            resolution=self.saved_map.resolution,
+            origin_x=self.saved_map.origin_x,
+            origin_y=self.saved_map.origin_y,
+            origin_yaw=self.saved_map.origin_yaw,
+            data=self.saved_map.occupancy,
+            half_length=self.half_length + self.padding,
+            half_width=self.half_width + self.padding,
+            allow_unknown=False,
+            lethal_threshold=65,
+        ).valid
+
+    def _grid_seed(
+        self,
+        start_cell: tuple[int, int],
+        goal_cell: tuple[int, int],
+        exclusions: tuple[tuple[float, float, float], ...],
+    ) -> list[tuple[int, int]]:
+        """Fast topology search; exact SE(2) checks remain authoritative."""
+        start_index = self.geometry.index(*start_cell)
+        goal_index = self.geometry.index(*goal_cell)
+        queue: list[tuple[float, int]] = [(0.0, start_index)]
+        costs = {start_index: 0.0}
+        parents: dict[int, int | None] = {start_index: None}
+        while queue:
+            _, index = heapq.heappop(queue)
+            if index == goal_index:
+                break
+            row, column = divmod(index, self.saved_map.width)
+            for delta_x, delta_y in (
+                (1, 0), (-1, 0), (0, 1), (0, -1),
+                (1, 1), (1, -1), (-1, 1), (-1, -1),
+            ):
+                next_column = column + delta_x
+                next_row = row + delta_y
+                if not (
+                    0 <= next_column < self.saved_map.width
+                    and 0 <= next_row < self.saved_map.height
+                ):
+                    continue
+                next_index = self.geometry.index(next_column, next_row)
+                if (
+                    next_index not in {start_index, goal_index}
+                    and not self.geometry.robot_navigable_mask[next_index]
+                ):
+                    continue
+                if delta_x and delta_y:
+                    side_a = self.geometry.index(column + delta_x, row)
+                    side_b = self.geometry.index(column, row + delta_y)
+                    if not (
+                        self.geometry.robot_navigable_mask[side_a]
+                        and self.geometry.robot_navigable_mask[side_b]
+                    ):
+                        continue
+                world_x, world_y = self.saved_map.cell_center(next_column, next_row)
+                if self._excluded(world_x, world_y, exclusions):
+                    continue
+                step = math.hypot(delta_x, delta_y)
+                next_cost = costs[index] + step
+                if next_cost + 1e-9 >= costs.get(next_index, math.inf):
+                    continue
+                costs[next_index] = next_cost
+                parents[next_index] = index
+                heuristic = math.hypot(
+                    goal_cell[0] - next_column, goal_cell[1] - next_row
+                )
+                heapq.heappush(queue, (next_cost + heuristic, next_index))
+        if goal_index not in parents:
+            return []
+        output: list[tuple[int, int]] = []
+        cursor: int | None = goal_index
+        while cursor is not None:
+            row, column = divmod(cursor, self.saved_map.width)
+            output.append((column, row))
+            cursor = parents[cursor]
+        output.reverse()
+        return output
+
+    def _canonical_route_from_seed(
+        self,
+        seed: list[tuple[int, int]],
+        start: dict[str, float],
+        goal: dict[str, float],
+    ) -> list[dict[str, float]]:
+        if len(seed) < 2:
+            return []
+        raw = [{"x": float(start["x"]), "y": float(start["y"])}]
+        raw.extend(
+            {"x": point[0], "y": point[1]}
+            for point in (
+                self.saved_map.cell_center(column, row)
+                for column, row in seed[1:-1]
+            )
+        )
+        raw.append({"x": float(goal["x"]), "y": float(goal["y"])})
+        translation_cache: dict[tuple[int, int], bool] = {}
+        turn_cache: dict[tuple[int, int], bool] = {}
+        failed: set[tuple[int, int]] = set()
+
+        def solve(index: int, incoming_yaw: float) -> list[int] | None:
+            incoming_bin = self.heading_bin(incoming_yaw)
+            memo_key = (index, incoming_bin)
+            if memo_key in failed:
+                return None
+            for following in range(len(raw) - 1, index, -1):
+                outgoing_yaw = math.atan2(
+                    raw[following]["y"] - raw[index]["y"],
+                    raw[following]["x"] - raw[index]["x"],
+                )
+                if index > 0 and abs(_angle_delta(outgoing_yaw, incoming_yaw)) > math.radians(1.0):
+                    turn_key = (index, self.heading_bin(outgoing_yaw))
+                    turn_valid = turn_cache.get(turn_key)
+                    if turn_valid is None:
+                        turn_valid = validate_rotation_sweep(
+                            self.saved_map,
+                            raw[index]["x"],
+                            raw[index]["y"],
+                            incoming_yaw,
+                            outgoing_yaw,
+                            half_length=self.half_length,
+                            half_width=self.half_width,
+                            padding=self.padding,
+                        ).valid
+                        turn_cache[turn_key] = turn_valid
+                    if not turn_valid:
+                        continue
+                edge = (index, following)
+                edge_valid = translation_cache.get(edge)
+                if edge_valid is None:
+                    edge_valid = self._translation_valid(raw[index], raw[following])
+                    translation_cache[edge] = edge_valid
+                if not edge_valid:
+                    continue
+                if following == len(raw) - 1:
+                    return [index, following]
+                suffix = solve(following, outgoing_yaw)
+                if suffix is not None:
+                    return [index, *suffix]
+            failed.add(memo_key)
+            return None
+
+        initial_yaw = float(start.get("yaw", 0.0))
+        indices = solve(0, initial_yaw)
+        if indices is None:
+            return []
+        return canonicalize_stop_turn_path(raw[index] for index in indices)
+
+    def _route_result(
+        self,
+        route: list[dict[str, float]],
+        *,
+        start_yaw: float | None = None,
+        goal_yaw: float | None = None,
+    ) -> StopTurnRoute | None:
+        if len(route) < 2:
+            return None
+        first_heading = math.atan2(
+            route[1]["y"] - route[0]["y"],
+            route[1]["x"] - route[0]["x"],
+        )
+        if start_yaw is not None and not validate_rotation_sweep(
+            self.saved_map,
+            route[0]["x"],
+            route[0]["y"],
+            float(start_yaw),
+            first_heading,
+            half_length=self.half_length,
+            half_width=self.half_width,
+            padding=self.padding,
+        ).valid:
+            return None
+        last_heading = math.atan2(
+            route[-1]["y"] - route[-2]["y"],
+            route[-1]["x"] - route[-2]["x"],
+        )
+        if goal_yaw is not None and not validate_rotation_sweep(
+            self.saved_map,
+            route[-1]["x"],
+            route[-1]["y"],
+            last_heading,
+            float(goal_yaw),
+            half_length=self.half_length,
+            half_width=self.half_width,
+            padding=self.padding,
+        ).valid:
+            return None
+        validation = validate_stop_turn_route(
+            self.saved_map,
+            route,
+            half_length=self.half_length,
+            half_width=self.half_width,
+            padding=self.padding,
+        )
+        if not validation.valid:
+            return None
+        metadata = route_geometry_metadata(
+            self.saved_map,
+            self.geometry,
+            route,
+            half_length=self.half_length,
+            half_width=self.half_width,
+            padding=self.padding,
+            linear_speed=self.linear_speed,
+            angular_speed=self.angular_speed,
+        )
+        headings = tuple(
+            self.heading_bin(math.atan2(
+                right["y"] - left["y"], right["x"] - left["x"]
+            ))
+            for left, right in zip(route, route[1:])
+        )
+        return StopTurnRoute(tuple(route), metadata, headings)
+
+    def plan(
+        self,
+        start: dict[str, float],
+        goal: dict[str, float],
+        *,
+        exclusions: Iterable[tuple[float, float, float]] = (),
+    ) -> StopTurnRoute | None:
+        start_x, start_y = float(start["x"]), float(start["y"])
+        goal_x, goal_y = float(goal["x"]), float(goal["y"])
+        start_cell = self.saved_map.world_to_cell(start_x, start_y)
+        goal_cell = self.saved_map.world_to_cell(goal_x, goal_y)
+        if start_cell is None or goal_cell is None:
+            return None
+        # This conservative component test catches physically disconnected
+        # clicks quickly. The oriented lattice below remains the authority for
+        # narrow straight passages that are not turn-safe.
+        if not self.geometry.same_component(start_cell, goal_cell):
+            return None
+        forbidden = tuple(
+            (float(x), float(y), max(0.0, float(radius)))
+            for x, y, radius in exclusions
+        )
+        start_yaw = float(start.get("yaw", 0.0))
+        goal_yaw = (
+            float(goal["yaw"]) if "yaw" in goal and goal["yaw"] is not None else None
+        )
+        simple_routes: list[StopTurnRoute] = []
+        for simple in (
+            [
+                {"x": start_x, "y": start_y},
+                {"x": goal_x, "y": goal_y},
+            ],
+            [
+                {"x": start_x, "y": start_y},
+                {"x": goal_x, "y": start_y},
+                {"x": goal_x, "y": goal_y},
+            ],
+            [
+                {"x": start_x, "y": start_y},
+                {"x": start_x, "y": goal_y},
+                {"x": goal_x, "y": goal_y},
+            ],
+        ):
+            canonical_simple = canonicalize_stop_turn_path(simple)
+            if any(
+                self._segment_excluded(left, right, forbidden)
+                for left, right in zip(canonical_simple, canonical_simple[1:])
+            ):
+                continue
+            result = self._route_result(
+                canonical_simple, start_yaw=start_yaw, goal_yaw=goal_yaw
+            )
+            if result is not None:
+                simple_routes.append(result)
+        if simple_routes:
+            return min(simple_routes, key=self.ranking_key)
+        seed = self._grid_seed(start_cell, goal_cell, forbidden)
+        seeded_route = self._canonical_route_from_seed(seed, start, goal)
+        if seeded_route:
+            result = self._route_result(
+                seeded_route, start_yaw=start_yaw, goal_yaw=goal_yaw
+            )
+            if result is not None:
+                return result
+        start_heading = self.heading_bin(float(start.get("yaw", 0.0)))
+        start_key = self._pose_key(start_x, start_y, start_heading)
+        positions: dict[tuple[int, int, int], tuple[float, float]] = {
+            start_key: (start_x, start_y)
+        }
+        parents: dict[
+            tuple[int, int, int], tuple[int, int, int] | None
+        ] = {start_key: None}
+        costs = {start_key: 0.0}
+        queue: list[tuple[float, int, tuple[int, int, int]]] = []
+        sequence = 0
+        heapq.heappush(
+            queue,
+            (
+                math.hypot(goal_x - start_x, goal_y - start_y)
+                / self.linear_speed,
+                sequence,
+                start_key,
+            ),
+        )
+        edge_cache: dict[tuple[tuple[int, int, int], tuple[int, int, int]], bool] = {}
+        rotation_cache: dict[tuple[tuple[int, int, int], int], bool] = {}
+        finish_key: tuple[int, int, int] | None = None
+        expansions = 0
+        while queue and expansions < self.max_expansions:
+            _, _, state = heapq.heappop(queue)
+            state_cost = costs[state]
+            x, y = positions[state]
+            heading_bin = state[2]
+            yaw = self.heading(heading_bin)
+            expansions += 1
+            goal_distance = math.hypot(goal_x - x, goal_y - y)
+            if goal_distance <= self.primitive_length * 2.5:
+                goal_heading = math.atan2(goal_y - y, goal_x - x)
+                rotation = validate_rotation_sweep(
+                    self.saved_map,
+                    x,
+                    y,
+                    yaw,
+                    goal_heading,
+                    half_length=self.half_length,
+                    half_width=self.half_width,
+                    padding=self.padding,
+                )
+                direct = {"x": goal_x, "y": goal_y}
+                if (
+                    rotation.valid
+                    and not self._excluded(goal_x, goal_y, forbidden)
+                    and self._translation_valid({"x": x, "y": y}, direct)
+                ):
+                    goal_bin = self.heading_bin(goal_heading)
+                    finish_key = self._pose_key(goal_x, goal_y, goal_bin)
+                    positions[finish_key] = (goal_x, goal_y)
+                    parents[finish_key] = state
+                    break
+
+            next_x = x + self.primitive_length * math.cos(yaw)
+            next_y = y + self.primitive_length * math.sin(yaw)
+            next_cell = self.saved_map.world_to_cell(next_x, next_y)
+            if (
+                next_cell is not None
+                and not self._excluded(next_x, next_y, forbidden)
+            ):
+                next_key = self._pose_key(next_x, next_y, heading_bin)
+                edge = (state, next_key)
+                valid = edge_cache.get(edge)
+                if valid is None:
+                    valid = self._translation_valid(
+                        {"x": x, "y": y}, {"x": next_x, "y": next_y}
+                    )
+                    edge_cache[edge] = valid
+                if valid:
+                    next_cost = state_cost + self.primitive_length / self.linear_speed
+                    if next_cost + 1e-9 < costs.get(next_key, math.inf):
+                        costs[next_key] = next_cost
+                        parents[next_key] = state
+                        positions[next_key] = (next_x, next_y)
+                        sequence += 1
+                        heuristic = math.hypot(goal_x - next_x, goal_y - next_y) / self.linear_speed
+                        heapq.heappush(
+                            queue, (next_cost + heuristic, sequence, next_key)
+                        )
+
+            for direction in (-1, 1):
+                next_heading = (heading_bin + direction) % self.HEADING_BINS
+                next_key = self._pose_key(x, y, next_heading)
+                cache_key = (state, next_heading)
+                valid = rotation_cache.get(cache_key)
+                if valid is None:
+                    valid = validate_rotation_sweep(
+                        self.saved_map,
+                        x,
+                        y,
+                        yaw,
+                        self.heading(next_heading),
+                        half_length=self.half_length,
+                        half_width=self.half_width,
+                        padding=self.padding,
+                    ).valid
+                    rotation_cache[cache_key] = valid
+                if not valid:
+                    continue
+                next_cost = state_cost + self.heading_step / self.angular_speed
+                if next_cost + 1e-9 >= costs.get(next_key, math.inf):
+                    continue
+                costs[next_key] = next_cost
+                parents[next_key] = state
+                positions[next_key] = (x, y)
+                sequence += 1
+                heuristic = math.hypot(goal_x - x, goal_y - y) / self.linear_speed
+                heapq.heappush(queue, (next_cost + heuristic, sequence, next_key))
+        if finish_key is None:
+            return None
+        states: list[tuple[int, int, int]] = []
+        cursor: tuple[int, int, int] | None = finish_key
+        while cursor is not None:
+            states.append(cursor)
+            cursor = parents[cursor]
+        states.reverse()
+        route = canonicalize_stop_turn_path(
+            {"x": positions[state][0], "y": positions[state][1]}
+            for state in states
+        )
+        return self._route_result(route, start_yaw=start_yaw, goal_yaw=goal_yaw)
+
+    def ranking_key(
+        self, route: StopTurnRoute
+    ) -> tuple[float, float, int, float, float]:
+        metadata = route.metadata
+        # Clearance beyond that required to rotate the complete rectangular
+        # footprint is equally safe for this robot.  Saturating at that
+        # geometry-derived threshold prevents an open room's orientation from
+        # creating needless right-angle/S-shaped routes merely to maximize an
+        # already ample ray width.  Below the threshold, wider routes still
+        # rank first as required.
+        rotation_radius = math.hypot(
+            self.half_length + self.padding,
+            self.half_width + self.padding,
+        )
+        return (
+            -min(metadata.minimum_passage_width, 2.0 * rotation_radius),
+            -min(metadata.minimum_static_clearance, rotation_radius),
+            metadata.turn_count,
+            metadata.total_turn_angle,
+            metadata.total_length,
+        )
+
+    def plan_candidates(
+        self,
+        start: dict[str, float],
+        goal: dict[str, float],
+        *,
+        maximum_candidates: int = 3,
+        overlap_threshold: float = 0.80,
+    ) -> list[StopTurnRoute]:
+        primary = self.plan(start, goal)
+        if primary is None:
+            return []
+        candidates = [primary]
+        attempts: list[tuple[float, float, float]] = []
+        points = list(primary.points)
+        if len(points) >= 2:
+            sampled = _resample_path(points, spacing=max(0.10, self.primitive_length))
+            radius = max(0.20, 2.0 * self.half_width + 2.0 * self.padding)
+            for fraction in (0.50, 0.35, 0.65, 0.25, 0.75):
+                index = min(len(sampled) - 1, max(0, round((len(sampled) - 1) * fraction)))
+                x, y = sampled[index]
+                if math.hypot(x - float(start["x"]), y - float(start["y"])) > radius * 1.5 and math.hypot(
+                    x - float(goal["x"]), y - float(goal["y"])
+                ) > radius * 1.5:
+                    attempts.append((x, y, radius))
+        for exclusion in attempts:
+            if len(candidates) >= max(1, int(maximum_candidates)):
+                break
+            candidate = self.plan(start, goal, exclusions=(exclusion,))
+            if candidate is None:
+                continue
+            candidate_points = list(candidate.points)
+            if any(
+                path_overlap_ratio(candidate_points, list(existing.points))
+                >= float(overlap_threshold)
+                for existing in candidates
+            ):
+                continue
+            candidates.append(candidate)
+        return sorted(candidates, key=self.ranking_key)
+
+
 @dataclass(frozen=True, slots=True)
 class ClockCorrection:
     accepted: bool
@@ -412,6 +1481,25 @@ class SensorClockEstimator:
         self.last_reason = ""
         self.last_corrected_nanoseconds[sensor] = corrected
         return ClockCorrection(True, corrected, raw_skew_seconds, self.state)
+
+
+@dataclass(slots=True)
+class UnwrappedYawProgress:
+    """Accumulate physical yaw from odometry without command integration."""
+
+    last_yaw: float | None = None
+    total: float = 0.0
+
+    def reset(self, yaw: float | None = None) -> None:
+        self.last_yaw = None if yaw is None else float(yaw)
+        self.total = 0.0
+
+    def update(self, yaw: float) -> float:
+        value = float(yaw)
+        if self.last_yaw is not None:
+            self.total += abs(_angle_delta(value, self.last_yaw))
+        self.last_yaw = value
+        return self.total
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,22 +1660,47 @@ def evaluate_corridor(
         and not (abs(float(x)) < length and abs(float(y)) < width)
     ]
 
-    side_window = [
-        (x, y) for x, y in values
-        if -length <= x <= forward_limit
+    side_window = [(x, y) for x, y in values if -length <= x <= forward_limit]
+    # Pair walls in the same longitudinal bin. Combining a left return near
+    # the robot with a right return at a different X creates a fictitious
+    # corridor width. Medians reject isolated glass/noise returns.
+    bin_size = 0.10
+    side_bins: dict[int, dict[str, list[float]]] = {}
+    for point_x, point_y in side_window:
+        key = math.floor((point_x + length) / bin_size)
+        group = side_bins.setdefault(key, {"left": [], "right": []})
+        if point_y >= width:
+            group["left"].append(point_y)
+        elif point_y <= -width:
+            group["right"].append(-point_y)
+    paired = [
+        (statistics.median(group["left"]), statistics.median(group["right"]))
+        for group in side_bins.values()
+        if group["left"] and group["right"]
     ]
-    left_center = min((y for _, y in side_window if y >= width), default=math.inf)
-    right_center = min((-y for _, y in side_window if y <= -width), default=math.inf)
+    paired.sort(key=lambda item: item[0] + item[1])
+    if paired:
+        # A low percentile stays conservative while a single isolated return
+        # cannot define the whole route width.
+        selected = paired[min(len(paired) - 1, max(0, len(paired) // 5))]
+        left_center, right_center = selected
+    else:
+        left_center = min(
+            (y for _, y in side_window if y >= width), default=math.nan
+        )
+        right_center = min(
+            (-y for _, y in side_window if y <= -width), default=math.nan
+        )
     left_clearance = (
-        max(0.0, left_center - width) if math.isfinite(left_center) else math.inf
+        max(0.0, left_center - width) if math.isfinite(left_center) else 0.0
     )
     right_clearance = (
-        max(0.0, right_center - width) if math.isfinite(right_center) else math.inf
+        max(0.0, right_center - width) if math.isfinite(right_center) else 0.0
     )
     available_width = (
         left_center + right_center
         if math.isfinite(left_center) and math.isfinite(right_center)
-        else math.inf
+        else 0.0
     )
     hard_margin = max(0.0, float(hard_side_margin))
     uncertainty = max(0.0, float(localization_uncertainty))
@@ -612,12 +1725,20 @@ def evaluate_corridor(
         and right_clearance >= auto_side_requirement
     )
     front_clear = front_clearance > forward_required
+    both_sides_observed = bool(paired)
     physically_passable = (
         hard_side_clear
         and available_width >= hard_required_width
         and front_clear
     )
-    if not physically_passable:
+    if not both_sides_observed and front_clear:
+        # Missing live wall data is uncertainty, not infinite clearance and
+        # not proof of a physical blockage. The prevalidated static route is
+        # authoritative; motion-safety still handles every live return.
+        physically_passable = True
+        classification = "NARROW_OR_UNCERTAIN"
+        reason = "LIVE_SIDE_INCOMPLETE"
+    elif not physically_passable:
         classification = "PHYSICALLY_BLOCKED"
         reason = (
             "FRONT_CLEARANCE"
@@ -633,7 +1754,7 @@ def evaluate_corridor(
     else:
         classification = "CLEAR"
         reason = "AUTO_CLEARANCE_CONFIRMED"
-    can_go_straight = classification == "CLEAR"
+    can_go_straight = physically_passable
 
     rotate_margin = margin if rotation_margin is None else max(
         0.0, float(rotation_margin)
@@ -774,6 +1895,124 @@ class NavigationDebugLog:
             handler.close()
             self.logger.removeHandler(handler)
         self.logger = None
+
+
+def deskew_scan_points(
+    ranges: Iterable[float],
+    *,
+    angle_min: float,
+    angle_increment: float,
+    range_min: float,
+    range_max: float,
+    time_increment: float,
+    scan_time: float,
+    linear_velocity: float,
+    angular_velocity: float,
+    laser_x: float = 0.0,
+    laser_y: float = 0.0,
+    laser_yaw: float = 0.0,
+) -> list[tuple[int, float, float]]:
+    """Transform each moving-scan return into the final-beam laser frame."""
+    measurements = [float(value) for value in ranges]
+    if not measurements:
+        return []
+    increment = float(time_increment)
+    if increment <= 0.0:
+        increment = max(0.0, float(scan_time)) / max(1, len(measurements) - 1)
+    duration = increment * max(0, len(measurements) - 1)
+    velocity = float(linear_velocity)
+    yaw_rate = float(angular_velocity)
+
+    def base_pose(timestamp: float) -> tuple[float, float, float]:
+        yaw = yaw_rate * timestamp
+        if abs(yaw_rate) <= 1e-9:
+            return velocity * timestamp, 0.0, yaw
+        radius = velocity / yaw_rate
+        return radius * math.sin(yaw), radius * (1.0 - math.cos(yaw)), yaw
+
+    reference_x, reference_y, reference_yaw = base_pose(duration)
+    reference_laser_x = (
+        reference_x
+        + math.cos(reference_yaw) * float(laser_x)
+        - math.sin(reference_yaw) * float(laser_y)
+    )
+    reference_laser_y = (
+        reference_y
+        + math.sin(reference_yaw) * float(laser_x)
+        + math.cos(reference_yaw) * float(laser_y)
+    )
+    reference_laser_yaw = reference_yaw + float(laser_yaw)
+    reference_cosine = math.cos(reference_laser_yaw)
+    reference_sine = math.sin(reference_laser_yaw)
+    output: list[tuple[int, float, float]] = []
+    for index, distance in enumerate(measurements):
+        if (
+            not math.isfinite(distance)
+            or distance < float(range_min)
+            or distance > float(range_max)
+        ):
+            continue
+        pose_x, pose_y, pose_yaw = base_pose(index * increment)
+        beam = float(angle_min) + index * float(angle_increment) + float(laser_yaw)
+        local_x = float(laser_x) + distance * math.cos(beam)
+        local_y = float(laser_y) + distance * math.sin(beam)
+        world_x = pose_x + math.cos(pose_yaw) * local_x - math.sin(pose_yaw) * local_y
+        world_y = pose_y + math.sin(pose_yaw) * local_x + math.cos(pose_yaw) * local_y
+        delta_x = world_x - reference_laser_x
+        delta_y = world_y - reference_laser_y
+        corrected_x = reference_cosine * delta_x + reference_sine * delta_y
+        corrected_y = -reference_sine * delta_x + reference_cosine * delta_y
+        output.append((index, corrected_x, corrected_y))
+    return output
+
+
+def deskew_laser_scan_ranges(
+    ranges: Iterable[float],
+    *,
+    angle_min: float,
+    angle_increment: float,
+    range_min: float,
+    range_max: float,
+    time_increment: float,
+    scan_time: float,
+    linear_velocity: float,
+    angular_velocity: float,
+    laser_x: float = 0.0,
+    laser_y: float = 0.0,
+    laser_yaw: float = 0.0,
+) -> tuple[list[float], int]:
+    """Re-bin deskewed endpoints while retaining original unmatched beams."""
+    output = [float(value) for value in ranges]
+    corrected = [math.inf] * len(output)
+    count = 0
+    for _, point_x, point_y in deskew_scan_points(
+        output,
+        angle_min=angle_min,
+        angle_increment=angle_increment,
+        range_min=range_min,
+        range_max=range_max,
+        time_increment=time_increment,
+        scan_time=scan_time,
+        linear_velocity=linear_velocity,
+        angular_velocity=angular_velocity,
+        laser_x=laser_x,
+        laser_y=laser_y,
+        laser_yaw=laser_yaw,
+    ):
+        angle = math.atan2(point_y, point_x)
+        if abs(float(angle_increment)) <= 1e-12:
+            continue
+        target = round((angle - float(angle_min)) / float(angle_increment))
+        if not (0 <= target < len(corrected)):
+            continue
+        distance = math.hypot(point_x, point_y)
+        if float(range_min) <= distance <= float(range_max):
+            corrected[target] = min(corrected[target], distance)
+            count += 1
+    for index, distance in enumerate(corrected):
+        if math.isfinite(distance):
+            output[index] = distance
+    return output, count
 
 
 def _scan_endpoints(
@@ -1007,6 +2246,9 @@ class SavedOccupancyMap:
     origin_y: float
     origin_yaw: float
     occupancy: list[int]
+    navigation_geometry: MapNavigationGeometry | None = field(
+        default=None, repr=False
+    )
 
     @classmethod
     def load(cls, map_yaml: str | Path) -> "SavedOccupancyMap":
@@ -1053,7 +2295,7 @@ class SavedOccupancyMap:
                     ))
                 else:
                     occupancy.append(-1)
-        return cls(
+        saved_map = cls(
             width=image.width,
             height=image.height,
             resolution=resolution,
@@ -1062,6 +2304,8 @@ class SavedOccupancyMap:
             origin_yaw=float(origin[2]),
             occupancy=occupancy,
         )
+        saved_map.navigation_geometry = MapNavigationGeometry.build(saved_map)
+        return saved_map
 
     def world_to_cell(self, x: float, y: float) -> tuple[int, int] | None:
         delta_x = x - self.origin_x
@@ -1136,6 +2380,7 @@ class SavedOccupancyMap:
         *,
         minimum_range: float,
         maximum_range: float,
+        unknown_is_blocked: bool = False,
     ) -> float | None:
         """Return expected range to the first known occupied map cell.
 
@@ -1144,32 +2389,73 @@ class SavedOccupancyMap:
         """
         lower = max(0.0, float(minimum_range))
         upper = max(lower, float(maximum_range))
-        # Half-cell sampling cannot skip a grid cell along either axis and
-        # keeps the per-scan raycast bounded on the Pi.
-        step = max(0.005, self.resolution * 0.5)
-        cosine, sine = math.cos(angle), math.sin(angle)
-        distance = lower
-        visited: set[tuple[int, int]] = set()
-        while distance <= upper:
-            cell = self.world_to_cell(
-                float(x) + distance * cosine,
-                float(y) + distance * sine,
-            )
-            if cell is None:
-                return None
-            if cell not in visited:
-                visited.add(cell)
-                value = self.value_at(*cell)
-                if value < 0:
-                    return None
-                if value >= 65:
-                    center_x, center_y = self.cell_center(*cell)
-                    projected = (
-                        (center_x - float(x)) * cosine
-                        + (center_y - float(y)) * sine
-                    )
-                    return max(lower, projected)
-            distance += step
+        # Amanatides-Woo traversal visits every crossed cell exactly once.
+        # Unlike the former half-cell Python march, its work is proportional
+        # to crossed grid cells and it cannot skip a thin wall.
+        map_cosine = math.cos(self.origin_yaw)
+        map_sine = math.sin(self.origin_yaw)
+        delta_x = float(x) - self.origin_x
+        delta_y = float(y) - self.origin_y
+        local_origin_x = map_cosine * delta_x + map_sine * delta_y
+        local_origin_y = -map_sine * delta_x + map_cosine * delta_y
+        local_angle = float(angle) - self.origin_yaw
+        direction_x = math.cos(local_angle)
+        direction_y = math.sin(local_angle)
+        ray_x = local_origin_x + lower * direction_x
+        ray_y = local_origin_y + lower * direction_y
+        column = math.floor(ray_x / self.resolution)
+        row = math.floor(ray_y / self.resolution)
+        if not (0 <= column < self.width and 0 <= row < self.height):
+            return None
+        step_x = 1 if direction_x > 0 else -1
+        step_y = 1 if direction_y > 0 else -1
+        delta_t_x = (
+            math.inf if abs(direction_x) <= 1e-12
+            else self.resolution / abs(direction_x)
+        )
+        delta_t_y = (
+            math.inf if abs(direction_y) <= 1e-12
+            else self.resolution / abs(direction_y)
+        )
+        next_boundary_x = (
+            (column + 1) * self.resolution
+            if direction_x > 0 else column * self.resolution
+        )
+        next_boundary_y = (
+            (row + 1) * self.resolution
+            if direction_y > 0 else row * self.resolution
+        )
+        max_t_x = (
+            math.inf if abs(direction_x) <= 1e-12
+            else (next_boundary_x - local_origin_x) / direction_x
+        )
+        max_t_y = (
+            math.inf if abs(direction_y) <= 1e-12
+            else (next_boundary_y - local_origin_y) / direction_y
+        )
+        entered_at = lower
+        while entered_at <= upper:
+            if not (0 <= column < self.width and 0 <= row < self.height):
+                return entered_at if unknown_is_blocked else None
+            value = self.value_at(column, row)
+            if value < 0:
+                return entered_at if unknown_is_blocked else None
+            if value >= 65:
+                return max(lower, entered_at)
+            if max_t_x < max_t_y:
+                entered_at = max_t_x
+                max_t_x += delta_t_x
+                column += step_x
+            elif max_t_y < max_t_x:
+                entered_at = max_t_y
+                max_t_y += delta_t_y
+                row += step_y
+            else:
+                entered_at = max_t_x
+                max_t_x += delta_t_x
+                max_t_y += delta_t_y
+                column += step_x
+                row += step_y
         return None
 
     def segment_crosses_unknown(
@@ -1346,6 +2632,7 @@ class SavedOccupancyMap:
         footprint_half_length: float | None = None,
         footprint_half_width: float | None = None,
         footprint_padding: float = 0.0,
+        reachable_from: tuple[float, float] | None = None,
     ) -> tuple[float, float] | None:
         """Find the closest safe cell center to a requested in-map goal.
 
@@ -1359,6 +2646,16 @@ class SavedOccupancyMap:
         dynamic_obstacles = tuple(lethal_world_cells)
         radius = max(0, math.ceil(max_distance_m / self.resolution))
         requested_column, requested_row = requested_cell
+        reachable_component: int | None = None
+        if reachable_from is not None and self.navigation_geometry is not None:
+            start_cell = self.world_to_cell(*reachable_from)
+            if start_cell is None:
+                return None
+            reachable_component = self.navigation_geometry.component_ids[
+                self.navigation_geometry.index(*start_cell)
+            ]
+            if reachable_component < 0:
+                return None
         candidates: list[tuple[float, int, int, float, float]] = []
         for offset_y in range(-radius, radius + 1):
             for offset_x in range(-radius, radius + 1):
@@ -1367,6 +2664,14 @@ class SavedOccupancyMap:
                 if not (0 <= column < self.width and 0 <= row < self.height):
                     continue
                 candidate_x, candidate_y = self.cell_center(column, row)
+                if (
+                    reachable_component is not None
+                    and self.navigation_geometry is not None
+                    and self.navigation_geometry.component_ids[
+                        self.navigation_geometry.index(column, row)
+                    ] != reachable_component
+                ):
+                    continue
                 distance = math.hypot(candidate_x - x, candidate_y - y)
                 if distance > max_distance_m:
                     continue

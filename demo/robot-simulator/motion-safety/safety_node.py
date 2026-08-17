@@ -102,6 +102,7 @@ class MotionSafetyNode(Node):
         self.scan: ScanSample | None = None
         self.last_scan = 0.0
         self.measured_linear_x = 0.0
+        self.measured_angular_z = 0.0
         self.last_odometry = 0.0
         self.estop = False
         self.cliff = False
@@ -171,6 +172,7 @@ class MotionSafetyNode(Node):
 
     def _on_odometry(self, message: Odometry) -> None:
         self.measured_linear_x = float(message.twist.twist.linear.x)
+        self.measured_angular_z = float(message.twist.twist.angular.z)
         self.last_odometry = time.monotonic()
 
     def _on_estop(self, message: Bool) -> None:
@@ -402,6 +404,11 @@ class MotionSafetyNode(Node):
                 self.measured_linear_x
                 if now - self.last_odometry <= 0.30
                 else candidate.linear.x
+            ),
+            measured_angular_z=(
+                self.measured_angular_z
+                if now - self.last_odometry <= 0.30
+                else candidate.angular.z
             ),
         )
         if decision.reason == "empty_scan":

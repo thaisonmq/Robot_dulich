@@ -283,3 +283,25 @@ def test_external_direction_mask_blocks_only_matching_motion() -> None:
         -0.2,
         Direction.REAR | Direction.RIGHT,
     )
+
+
+def test_measured_angular_velocity_protects_sweep_after_command_slows() -> None:
+    scan = scan_with_points([(0.115, 0.14), (2.0, 0.0)])
+    commanded_only = evaluate_scan(
+        scan,
+        linear_x=0.0,
+        angular_z=0.04,
+        measured_angular_z=0.04,
+        config=CONFIG,
+    )
+    still_rotating = evaluate_scan(
+        scan,
+        linear_x=0.0,
+        angular_z=0.04,
+        measured_angular_z=0.8,
+        config=CONFIG,
+    )
+    assert not commanded_only.stop
+    assert still_rotating.stop
+    assert still_rotating.reason == "rotation_sweep_collision"
+    assert still_rotating.blocked & Direction.LEFT

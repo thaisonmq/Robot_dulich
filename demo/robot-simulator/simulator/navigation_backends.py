@@ -86,33 +86,21 @@ class SimulatorNavigationBackend:
             return {"status": "completed", "current_state": "READY", "localized": True}
         if command == "navigation.compute_path":
             self._validate_map_identity(payload)
-            goal = dict(payload["goal"])
-            start = {"x": self.motion.pose.x, "y": self.motion.pose.y}
-            end = {"x": float(goal["x"]), "y": float(goal["y"])}
-            distance = math.hypot(end["x"] - start["x"], end["y"] - start["y"])
-            steps = max(1, math.ceil(distance / 0.25))
-            points = [
-                {
-                    "x": start["x"] + (end["x"] - start["x"]) * index / steps,
-                    "y": start["y"] + (end["y"] - start["y"]) * index / steps,
-                }
-                for index in range(steps + 1)
-            ]
-            self.current_state = "READY"
-            return {
-                "status": "completed",
-                "current_state": "READY",
-                "points": points,
-                "distance_m": round(distance, 3),
-            }
+            raise NavigationBackendError(
+                "MAP_VALIDATION_UNAVAILABLE",
+                "Simulator backend cannot validate a saved occupancy map; no direct-line fallback is allowed",
+                current_state="READY",
+            )
         if command in {"navigation.start", "navigation.goal"}:
             self._validate_map_identity(payload)
             if command == "navigation.start":
-                goal = dict(payload["goal"])
-                points = [
-                    {"x": self.motion.pose.x, "y": self.motion.pose.y},
-                    {"x": float(goal["x"]), "y": float(goal["y"])},
-                ]
+                points = list(payload.get("points") or [])
+                if len(points) < 2:
+                    raise NavigationBackendError(
+                        "VALIDATED_ROUTE_REQUIRED",
+                        "Simulator navigation.start requires validated preview geometry",
+                        current_state="READY",
+                    )
                 route_id = str(payload.get("mission_id", ""))
             else:
                 points = list(payload.get("points") or [])
@@ -474,6 +462,8 @@ def build_navigation_backend(
     navigation: NavigationSimulator,
     motion: MotionSimulator,
     socket_path: str,
+    *,
+    motion_backend: str = "simulator",
 ) -> NavigationBackend:
     if backend == "ros2":
         return Ros2NavigationBackend(
@@ -485,5 +475,10 @@ def build_navigation_backend(
             mode_switch_timeout_seconds=float(
                 os.getenv("NAVIGATION_MODE_SWITCH_TIMEOUT_SECONDS", "60")
             ),
+        )
+    if motion_backend == "ros2" or os.getenv("ROVERA_HARDWARE_MODE", "").lower() == "managed":
+        raise NavigationBackendError(
+            "NAVIGATION_BACKEND_UNSAFE",
+            "Hardware motion requires NAVIGATION_BACKEND=ros2; simulator navigation is forbidden",
         )
     return SimulatorNavigationBackend(navigation, motion)

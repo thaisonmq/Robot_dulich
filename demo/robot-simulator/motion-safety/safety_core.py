@@ -146,10 +146,17 @@ def _rotation_direction_blocked(
     points: tuple[tuple[float, float], ...],
     *,
     angular_z: float,
+    measured_angular_z: float | None,
     config: SafetyConfig,
 ) -> bool:
     """Check only the commanded rotation sweep, not a directionless circle."""
-    speed = abs(float(angular_z))
+    effective_angular = float(angular_z)
+    if (
+        measured_angular_z is not None
+        and abs(float(measured_angular_z)) > abs(effective_angular)
+    ):
+        effective_angular = float(measured_angular_z)
+    speed = abs(effective_angular)
     if speed <= 0.05:
         return False
     angular_decel = max(1e-3, float(config.angular_braking_acceleration))
@@ -157,7 +164,7 @@ def _rotation_direction_blocked(
         speed * config.latency_seconds
         + speed * speed / (2.0 * angular_decel)
     )
-    direction = 1.0 if angular_z > 0 else -1.0
+    direction = 1.0 if effective_angular > 0 else -1.0
     samples = max(2, int(config.trajectory_samples))
     for sample in range(1, samples + 1):
         # Preview enough of a sustained in-place command to cover the long
@@ -229,6 +236,7 @@ def evaluate_scan(
     angular_z: float,
     config: SafetyConfig,
     measured_linear_x: float | None = None,
+    measured_angular_z: float | None = None,
 ) -> SafetyDecision:
     braking_speed = (
         linear_x if measured_linear_x is None else measured_linear_x
@@ -313,15 +321,22 @@ def evaluate_scan(
         (linear_x > 0 and bool(blocked & Direction.FRONT))
         or (linear_x < 0 and bool(blocked & Direction.REAR))
     )
+    effective_angular_z = (
+        float(measured_angular_z)
+        if measured_angular_z is not None
+        and abs(float(measured_angular_z)) > abs(float(angular_z))
+        else float(angular_z)
+    )
     turn_clamped = _rotation_direction_blocked(
         points,
         angular_z=angular_z,
+        measured_angular_z=measured_angular_z,
         config=config,
     )
     if not translation_blocked and not turn_clamped and _arc_turn_blocked(
         points,
         linear_x=linear_x,
-        angular_z=angular_z,
+        angular_z=effective_angular_z,
         travel_distance=required,
         config=config,
     ):
@@ -329,7 +344,7 @@ def evaluate_scan(
         # rectangular footprint into the obstacle.
         turn_clamped = True
     if turn_clamped:
-        blocked |= Direction.LEFT if angular_z > 0 else Direction.RIGHT
+        blocked |= Direction.LEFT if effective_angular_z > 0 else Direction.RIGHT
     hard_stop = translation_blocked and (
         abs(angular_z) <= 0.05 or turn_clamped
     ) or (abs(linear_x) <= 0.02 and turn_clamped)

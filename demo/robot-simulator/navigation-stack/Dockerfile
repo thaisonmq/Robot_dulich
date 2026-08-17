@@ -37,6 +37,7 @@ WORKDIR /ws
 RUN . /opt/ros/humble/setup.sh && colcon build --packages-select rovera_navigation_adapter
 
 COPY config /opt/rovera/config
+COPY control_sets /opt/rovera/control_sets
 COPY launch /opt/rovera/launch
 COPY scripts /opt/rovera/scripts
 RUN chmod +x /opt/rovera/scripts/*.sh

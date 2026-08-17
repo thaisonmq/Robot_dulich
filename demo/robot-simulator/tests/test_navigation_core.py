@@ -1,3 +1,4 @@
+import json
 import math
 import sys
 from pathlib import Path
@@ -11,14 +12,21 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parents[1] / "navigation-stack"))
 
 from navigation_core import (  # noqa: E402
+    MapNavigationGeometry,
     NavigationDebugLog,
     SavedOccupancyMap,
     SensorClockEstimator,
+    StopTurnStateLatticePlanner,
+    UnwrappedYawProgress,
+    canonicalize_stop_turn_path,
     classify_planning_failure,
     compact_lethal_cells,
+    densify_straight_segment,
     evaluate_corridor,
+    exact_euclidean_distance_transform,
     filter_static_map_scan,
     heading_diversity,
+    deskew_scan_points,
     localization_confidence,
     mask_scan_self_returns,
     path_overlap_ratio,
@@ -26,6 +34,8 @@ from navigation_core import (  # noqa: E402
     rotation_swept_clearance,
     scan_to_map_match,
     validate_executable_grid_path,
+    validate_rotation_sweep,
+    validate_stop_turn_route,
 )
 from speed_profiles import (  # noqa: E402
     AutoNavigationProfiles,
@@ -49,6 +59,46 @@ def _saved_map(tmp_path: Path) -> SavedOccupancyMap:
 
 def _cell_center(saved: SavedOccupancyMap, column: int, row: int) -> tuple[float, float]:
     return saved.cell_center(column, row)
+
+
+def _manual_map(
+    width: int,
+    height: int,
+    free_cells: set[tuple[int, int]],
+    *,
+    resolution: float = 0.05,
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+) -> SavedOccupancyMap:
+    occupancy = [
+        0 if (column, row) in free_cells else 100
+        for row in range(height)
+        for column in range(width)
+    ]
+    saved = SavedOccupancyMap(
+        width,
+        height,
+        resolution,
+        origin_x,
+        origin_y,
+        0.0,
+        occupancy,
+    )
+    saved.navigation_geometry = MapNavigationGeometry.build(saved)
+    return saved
+
+
+def _free_rectangle(
+    minimum_column: int,
+    maximum_column: int,
+    minimum_row: int,
+    maximum_row: int,
+) -> set[tuple[int, int]]:
+    return {
+        (column, row)
+        for row in range(minimum_row, maximum_row + 1)
+        for column in range(minimum_column, maximum_column + 1)
+    }
 
 
 def test_executable_path_rejects_free_centerline_when_physical_footprint_hits_wall() -> None:
@@ -685,7 +735,7 @@ def test_corridor_geometry_reports_all_three_decision_states() -> None:
     )
     assert uncertain.physically_passable
     assert uncertain.classification == "NARROW_OR_UNCERTAIN"
-    assert not uncertain.can_go_straight
+    assert uncertain.can_go_straight
     assert not physically_blocked.physically_passable
     assert physically_blocked.classification == "PHYSICALLY_BLOCKED"
     assert front_blocked.front_clearance == pytest.approx(0.13)
@@ -744,6 +794,274 @@ def test_rotation_clearance_uses_the_complete_rectangular_body_sweep() -> None:
     ) == pytest.approx(0.30 - corner_radius)
 
 
+def test_exact_edt_matches_brute_force_reference_on_small_grid() -> None:
+    width, height = 7, 5
+    blocked_cells = {(1, 1), (5, 3), (0, 4)}
+    blocked = [
+        (column, row) in blocked_cells
+        for row in range(height)
+        for column in range(width)
+    ]
+    actual = exact_euclidean_distance_transform(
+        blocked, width=width, height=height
+    )
+    expected = [
+        min(math.hypot(column - bx, row - by) for bx, by in blocked_cells)
+        for row in range(height)
+        for column in range(width)
+    ]
+    assert actual == pytest.approx(expected)
+
+
+def test_sixty_degree_heading_is_an_exact_lattice_bin_and_stays_straight() -> None:
+    saved = _manual_map(50, 50, _free_rectangle(1, 48, 1, 48))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    start = {"x": 0.50, "y": 0.50, "yaw": 0.0}
+    goal = {
+        "x": start["x"] + 0.80 * math.cos(math.radians(60)),
+        "y": start["y"] + 0.80 * math.sin(math.radians(60)),
+    }
+    route = planner.plan(start, goal)
+    assert route is not None
+    assert route.heading_bins == (4,)
+    assert len(route.points) == 2
+    assert validate_rotation_sweep(
+        saved,
+        start["x"],
+        start["y"],
+        0.0,
+        math.radians(60),
+        half_length=0.15,
+        half_width=0.10,
+    ).valid
+
+
+def test_dense_straight_segment_never_leaves_only_a_pose_behind_robot() -> None:
+    points = densify_straight_segment(
+        {"x": -0.24, "y": 0.65},
+        {"x": -0.24, "y": 2.08},
+        spacing=0.05,
+    )
+    assert points[0] == {"x": -0.24, "y": 0.65}
+    assert points[-1] == {"x": -0.24, "y": 2.08}
+    assert len(points) > 20
+    assert all(point["x"] == pytest.approx(-0.24) for point in points)
+    assert all(
+        0.0 < right["y"] - left["y"] <= 0.05 + 1e-9
+        for left, right in zip(points, points[1:])
+    )
+
+
+def test_rotation_sweep_rejects_collision_missed_at_both_endpoint_headings() -> None:
+    resolution = 0.01
+    width = height = 80
+    occupancy = [0] * (width * height)
+    obstacle_column = round((0.035 + 0.40) / resolution - 0.5)
+    obstacle_row = round((0.175 + 0.40) / resolution - 0.5)
+    occupancy[obstacle_row * width + obstacle_column] = 100
+    saved = SavedOccupancyMap(
+        width, height, resolution, -0.40, -0.40, 0.0, occupancy
+    )
+    assert saved.validate_footprint(
+        0.0, 0.0, 0.0, half_length=0.15, half_width=0.10
+    ).valid
+    assert saved.validate_footprint(
+        0.0, 0.0, math.pi / 2, half_length=0.15, half_width=0.10
+    ).valid
+    assert not validate_rotation_sweep(
+        saved,
+        0.0,
+        0.0,
+        0.0,
+        math.pi / 2,
+        half_length=0.15,
+        half_width=0.10,
+    ).valid
+
+
+def test_moving_scan_deskew_reduces_static_wall_geometry_error() -> None:
+    beam_count = 61
+    angle_min = -0.60
+    angle_increment = 1.20 / (beam_count - 1)
+    scan_time = 0.20
+    linear_velocity = 0.30
+    angular_velocity = 0.40
+    time_increment = scan_time / (beam_count - 1)
+    ranges = []
+    for index in range(beam_count):
+        timestamp = index * time_increment
+        yaw = angular_velocity * timestamp
+        radius = linear_velocity / angular_velocity
+        pose_x = radius * math.sin(yaw)
+        beam_world = yaw + angle_min + index * angle_increment
+        ranges.append((2.0 - pose_x) / math.cos(beam_world))
+    corrected = deskew_scan_points(
+        ranges,
+        angle_min=angle_min,
+        angle_increment=angle_increment,
+        range_min=0.05,
+        range_max=8.0,
+        time_increment=time_increment,
+        scan_time=scan_time,
+        linear_velocity=linear_velocity,
+        angular_velocity=angular_velocity,
+    )
+    final_yaw = angular_velocity * scan_time
+    radius = linear_velocity / angular_velocity
+    final_x = radius * math.sin(final_yaw)
+    final_y = radius * (1.0 - math.cos(final_yaw))
+
+    def world_x(point_x: float, point_y: float) -> float:
+        return final_x + math.cos(final_yaw) * point_x - math.sin(final_yaw) * point_y
+
+    deskew_error = sum(abs(world_x(x, y) - 2.0) for _, x, y in corrected) / len(corrected)
+    no_deskew_error = sum(
+        abs(world_x(
+            distance * math.cos(angle_min + index * angle_increment),
+            distance * math.sin(angle_min + index * angle_increment),
+        ) - 2.0)
+        for index, distance in enumerate(ranges)
+    ) / len(ranges)
+    assert deskew_error < 1e-6
+    assert deskew_error < no_deskew_error * 0.05
+
+
+def test_global_rotation_progress_uses_unwrapped_measured_yaw() -> None:
+    progress = UnwrappedYawProgress()
+    progress.reset(math.radians(170))
+    assert progress.update(math.radians(179)) == pytest.approx(math.radians(9))
+    assert progress.update(math.radians(-170)) == pytest.approx(math.radians(20))
+    # No odometry change means no progress even if a turn command persists.
+    assert progress.update(math.radians(-170)) == pytest.approx(math.radians(20))
+
+
+def test_actual_project_map_rejects_direct_line_and_finds_exact_detour() -> None:
+    project = Path(__file__).parents[3]
+    saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
+    start = {"x": 1.685, "y": 1.415, "yaw": 0.0}
+    goal = {"x": -0.065, "y": -3.135}
+    direct = validate_stop_turn_route(
+        saved,
+        (start, goal),
+        half_length=0.15,
+        half_width=0.10,
+    )
+    assert not direct.valid
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    route = planner.plan(start, goal)
+    assert route is not None
+    assert len(route.points) > 2
+    assert validate_stop_turn_route(
+        saved,
+        route.points,
+        half_length=0.15,
+        half_width=0.10,
+    ).valid
+
+
+def test_stop_turn_planner_handles_a_true_90_degree_l_route() -> None:
+    free = (
+        _free_rectangle(5, 45, 5, 14)
+        | _free_rectangle(36, 45, 5, 50)
+        | _free_rectangle(30, 46, 5, 23)
+    )
+    saved = _manual_map(60, 60, free)
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    route = planner.plan(
+        {"x": 0.50, "y": 0.625, "yaw": 0.0},
+        {"x": 1.925, "y": 2.30},
+    )
+    assert route is not None
+    assert route.heading_bins == (0, 6)
+    assert len(route.points) == 3
+    assert route.metadata.turn_count == 1
+    assert route.metadata.total_turn_angle == pytest.approx(math.pi / 2)
+    assert route.metadata.turn_safe is True
+
+
+def test_narrow_straight_corridor_turns_in_room_then_drives_straight() -> None:
+    free = (
+        _free_rectangle(4, 18, 4, 28)
+        | _free_rectangle(16, 54, 14, 19)
+    )
+    saved = _manual_map(60, 40, free)
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    route = planner.plan(
+        {"x": 0.50, "y": 0.50, "yaw": math.pi / 2},
+        {"x": 2.50, "y": 0.825},
+    )
+    assert route is not None
+    assert route.heading_bins == (6, 0)
+    assert route.metadata.turn_safe is True
+    assert route.metadata.narrow_segments == ({
+        "segment_index": 1,
+        "passage_width": pytest.approx(0.30),
+        "length": pytest.approx(2.0),
+    },)
+
+
+def test_route_candidates_find_distinct_sides_without_persistent_exclusions() -> None:
+    free = _free_rectangle(2, 67, 2, 57) - _free_rectangle(28, 35, 15, 45)
+    saved = _manual_map(70, 60, free)
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    routes = planner.plan_candidates(
+        {"x": 0.50, "y": 1.50, "yaw": 0.0},
+        {"x": 3.00, "y": 1.50},
+        maximum_candidates=3,
+    )
+    assert len(routes) == 2
+    middle_y = [
+        sum(point["y"] for point in route.points[1:-1])
+        / len(route.points[1:-1])
+        for route in routes
+    ]
+    assert min(middle_y) < 1.0
+    assert max(middle_y) > 2.0
+    assert path_overlap_ratio(list(routes[0].points), list(routes[1].points)) < 0.80
+
+
+def test_planner_rejects_free_goal_in_a_physically_disconnected_component() -> None:
+    free = (
+        _free_rectangle(2, 22, 2, 22)
+        | _free_rectangle(37, 57, 2, 22)
+    )
+    saved = _manual_map(60, 30, free)
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    assert saved.occupancy[12 * saved.width + 47] == 0
+    assert planner.plan(
+        {"x": 0.625, "y": 0.625, "yaw": 0.0},
+        {"x": 2.375, "y": 0.625},
+    ) is None
+
+
+def test_committed_humble_control_set_has_only_straight_and_rotation_primitives() -> None:
+    project = Path(__file__).parents[1]
+    control_set = json.loads((
+        project
+        / "navigation-stack/control_sets/rovera_5cm_24_heading_stop_turn.json"
+    ).read_text())
+    metadata = control_set["lattice_metadata"]
+    assert metadata["grid_resolution"] == 0.05
+    assert metadata["num_of_headings"] == 24
+    assert metadata["heading_angles"][2] == pytest.approx(math.radians(30))
+    assert metadata["heading_angles"][3] == pytest.approx(math.radians(45))
+    assert metadata["heading_angles"][4] == pytest.approx(math.radians(60))
+    assert metadata["heading_angles"][6] == pytest.approx(math.radians(90))
+    assert len(control_set["primitives"]) == metadata["number_of_trajectories"]
+    for primitive in control_set["primitives"]:
+        translation = primitive["trajectory_length"] > 0.0
+        if translation:
+            assert primitive["start_angle_index"] == primitive["end_angle_index"]
+            assert all(
+                pose[2] == pytest.approx(
+                    metadata["heading_angles"][primitive["start_angle_index"]]
+                )
+                for pose in primitive["poses"]
+            )
+        else:
+            assert all(pose[0] == pose[1] == 0.0 for pose in primitive["poses"])
+
+
 def test_scan_self_filter_masks_only_points_inside_calibrated_body() -> None:
     ranges = [0.09, 0.30, 1.0, math.inf]
     filtered, masked = mask_scan_self_returns(
@@ -784,30 +1102,17 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     limits = smoother["velocity_smoother"]["ros__parameters"]
 
     assert controller["odom_topic"] == "/odometry/filtered"
-    assert follow["plugin"] == "nav2_rotation_shim_controller::RotationShimController"
-    assert follow["primary_controller"] == (
+    assert follow["plugin"] == (
         "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
     )
-    # Small 5-10 degree errors remain with RPP; large initial reversals still
-    # select pure rotation.
-    assert math.radians(25) <= follow["angular_dist_threshold"] <= math.radians(35)
-    assert 0.0 < follow["angular_disengage_threshold"] < follow["angular_dist_threshold"]
-    assert follow["closed_loop"] is True
-    assert follow["rotate_to_goal_heading"] is False
-    assert planner["plugin"] == "nav2_theta_star_planner/ThetaStarPlanner"
+    assert follow["use_rotate_to_heading"] is False
+    assert planner["plugin"] == "nav2_smac_planner/SmacPlannerLattice"
     assert planner["allow_unknown"] is False
-    assert planner["how_many_corners"] == 8
-    assert planner["w_euc_cost"] == 1.0
-    # Euclidean distance dominates small inflation changes, preventing an
-    # otherwise open straight route from becoming an S-shaped preview. The
-    # footprint check, not a large soft cost, remains the collision authority.
-    assert 0.0 < planner["w_traversal_cost"] <= 0.05
-    assert planner_server["planner_plugins"] == ["GridBased", "FootprintGrid"]
-    footprint_planner = planner_server["FootprintGrid"]
-    assert footprint_planner["plugin"] == "nav2_smac_planner/SmacPlannerLattice"
-    assert footprint_planner["allow_unknown"] is False
-    assert footprint_planner["downsample_costmap"] is False
-    assert 0.20 <= follow["forward_sampling_distance"] <= 0.30
+    assert planner["smooth_path"] is False
+    assert planner["allow_reverse_expansion"] is False
+    assert planner["analytic_expansion_ratio"] < 0
+    assert planner["lattice_filepath"].startswith("/opt/rovera/control_sets/")
+    assert planner_server["planner_plugins"] == ["GridBased", "ThetaDiagnostic"]
     assert 0.15 < follow["desired_linear_vel"] <= limits["max_velocity"][0]
     assert follow["rotate_to_heading_angular_vel"] == limits["max_velocity"][2]
     assert follow["max_angular_accel"] == limits["max_accel"][2]
@@ -816,9 +1121,7 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert follow["max_allowed_time_to_collision_up_to_carrot"] >= 0.5
     assert 10.0 <= controller["progress_checker"]["movement_time_allowance"] <= 15.0
     assert controller["failure_tolerance"] <= 1.0
-    # Wide/right-angle corners must remain forward arcs, while an almost
-    # opposite initial heading still selects the fast in-place turn.
-    assert math.pi / 2 < follow["rotate_to_heading_min_angle"] < math.pi
+    assert follow["rotate_to_heading_min_angle"] <= math.radians(6)
     assert global_costmap["update_frequency"] >= 5
     assert local_costmap["update_frequency"] > global_costmap["update_frequency"]
     assert global_costmap["obstacle_layer"]["combination_method"] == 1
