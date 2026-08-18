@@ -9,6 +9,7 @@ from safety_core import (
     evaluate_scan,
     motion_blocked_by_mask,
     maximum_safe_speed,
+    safety_snapshot_payload,
     stopping_clearance,
 )
 
@@ -360,3 +361,49 @@ def test_measured_angular_velocity_protects_sweep_after_command_slows() -> None:
     assert still_rotating.measured_angular_velocity == 0.8
     assert still_rotating.predicted_swept_clearance is not None
     assert still_rotating.required_swept_clearance == CONFIG.rotation_margin
+
+
+def test_zero_command_still_reports_prospective_turn_blockage() -> None:
+    decision = evaluate_scan(
+        scan_with_points([(0.115, 0.14), (2.0, 0.0)]),
+        linear_x=0.0,
+        angular_z=0.0,
+        measured_linear_x=0.0,
+        measured_angular_z=0.0,
+        config=CONFIG,
+    )
+    assert not decision.stop
+    assert decision.rotation_left_blocked
+    assert not decision.rotation_right_blocked
+
+
+def test_atomic_snapshot_reuses_one_decision_sequence_and_diagnostics() -> None:
+    decision = evaluate_scan(
+        scan_with_points([(0.18, 0.0), (1.0, 0.5)]),
+        linear_x=0.12,
+        angular_z=0.0,
+        measured_linear_x=0.12,
+        measured_angular_z=0.0,
+        config=CONFIG,
+    )
+    payload = safety_snapshot_payload(
+        sequence=123,
+        stamp=10.5,
+        health="BLOCKED:front_sweep_collision",
+        stop=True,
+        reason=decision.reason,
+        source="MOTION_SAFETY",
+        direction_mask=int(decision.blocked),
+        input_linear=0.12,
+        input_angular=0.0,
+        output_linear=0.0,
+        output_angular=0.0,
+        measured_linear=0.12,
+        measured_angular=0.0,
+        decision=decision,
+    )
+    assert payload["seq"] == 123
+    assert payload["reason"] == "FRONT_SWEEP_COLLISION"
+    assert payload["direction_mask"] == int(decision.blocked)
+    assert payload["output_v"] == payload["output_w"] == 0.0
+    assert payload["blocking_beam_index"] == decision.blocking_beam_index

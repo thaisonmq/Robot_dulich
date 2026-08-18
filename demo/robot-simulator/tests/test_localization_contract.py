@@ -552,7 +552,8 @@ def test_navigation_abort_uses_confirmed_corridor_then_preserves_user_choice() -
     assert "self._corridor_failure_evidence()" in result
     assert '"CORRIDOR_CLEAR", "NARROW_OR_UNCERTAIN"' in result
     assert '"PHYSICALLY_BLOCKED"' in result
-    assert 'self._set_state("BLOCKED", "confirmed_physical_blockage")' in result
+    assert 'self._enter_dynamic_wait("CONFIRMED_DYNAMIC_ROUTE_BLOCK")' in result
+    assert '"CONFIRMED_STATIC_PHYSICAL_BLOCKAGE", goal_generation' in result
     assert 'self._set_state("NAVIGATING", "automatic_segment_retry")' in result
     assert "self.corridor_confirmation_samples" in evidence
     assert "self.corridor_confirmation_duration" in evidence

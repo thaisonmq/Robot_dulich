@@ -46,21 +46,26 @@ from tf2_ros import Buffer, TransformException, TransformListener
 
 from navigation_core import (
     ActiveSegment,
+    DynamicObstacleOverlay,
     ExecutablePathValidation,
     MapNavigationGeometry,
     NavigationDebugLog,
     PoseStability,
     SavedOccupancyMap,
     StopTurnStateLatticePlanner,
+    TurnBlockTracker,
     UnwrappedYawProgress,
     canonicalize_stop_turn_path,
     classify_planning_failure,
     compact_lethal_cells,
+    choose_turn_direction,
     densify_straight_segment,
+    dynamic_exclusions_intersect_route,
     endpoint_braking_speed_limit,
     environment_flag,
     evaluate_corridor,
     filter_static_map_scan,
+    find_start_escape,
     heading_diversity,
     localization_confidence,
     path_overlap_ratio,
@@ -153,6 +158,9 @@ class NavigationAdapter(Node):
         self.safety_health = "UNKNOWN"
         self.estop_active = False
         self.safety_direction_mask = 0
+        self.safety_snapshot: dict[str, Any] = {}
+        self.safety_snapshot_sequence = -1
+        self.safety_snapshot_monotonic = 0.0
         self.last_manual_takeover_monotonic = 0.0
         self.pose: dict[str, float] | None = None
         self.trail: list[dict[str, float]] = []
@@ -315,6 +323,27 @@ class NavigationAdapter(Node):
         self.dynamic_overlay_static_tolerance = configured(
             "dynamic_overlay_static_tolerance", 0.08
         )
+        self.dynamic_overlay_ttl = configured(
+            "dynamic_overlay_ttl_seconds", 2.0
+        )
+        self.dynamic_overlay_cluster_distance = configured(
+            "dynamic_overlay_cluster_distance", 0.12
+        )
+        self.dynamic_obstacle_wait = configured(
+            "dynamic_obstacle_persistence_seconds", 1.5
+        )
+        self.dynamic_clear_dwell = configured(
+            "dynamic_obstacle_clear_dwell_seconds", 0.40
+        )
+        self.dynamic_replan_retry = configured(
+            "dynamic_replan_retry_seconds", 2.0
+        )
+        self.start_escape_max_distance = configured(
+            "start_escape_max_distance", 0.60
+        )
+        self.turn_bay_max_distance = configured(
+            "turn_bay_max_relocation_distance", 0.80
+        )
         self.scan_tf_wait = configured("scan_tf_wait_seconds", 0.02)
         self.scan_tf_fallback_max_age = configured(
             "scan_tf_fallback_max_age_seconds", 0.12
@@ -380,6 +409,9 @@ class NavigationAdapter(Node):
         self.corridor_hard_side_margin = configured(
             "corridor_hard_side_margin", 0.02
         )
+        self.translation_lateral_margin = configured(
+            "translation_lateral_margin", 0.01
+        )
         self.corridor_side_margin = configured("corridor_side_margin", 0.05)
         self.corridor_localization_uncertainty_max = configured(
             "corridor_localization_uncertainty_max", 0.04
@@ -434,6 +466,13 @@ class NavigationAdapter(Node):
         # exclusively after the maintained global-costmap footprint validator.
         self.latest_planner_raw_path: list[dict[str, float]] = []
         self.latest_dynamic_obstacles: list[dict[str, float]] = []
+        self.dynamic_overlay = DynamicObstacleOverlay(
+            ttl_seconds=self.dynamic_overlay_ttl,
+            cluster_distance=self.dynamic_overlay_cluster_distance,
+        )
+        self.dynamic_wait_started: float | None = None
+        self.dynamic_clear_started: float | None = None
+        self.dynamic_last_replan = 0.0
         self.latest_global_costmap: OccupancyGrid | None = None
         self.latest_static_map: OccupancyGrid | None = None
         self.last_global_costmap_monotonic = 0.0
@@ -452,6 +491,7 @@ class NavigationAdapter(Node):
             front_clearance_required=self.corridor_front_clearance,
             rotation_margin=self.rotation_minimum_obstacle_distance,
             hard_side_margin=self.corridor_hard_side_margin,
+            translation_lateral_margin=self.translation_lateral_margin,
         )
         self.last_corridor_log_monotonic = 0.0
         self.failed_segments: list[dict[str, Any]] = []
@@ -474,10 +514,15 @@ class NavigationAdapter(Node):
         self.execution_target_heading = 0.0
         self.execution_turn_stable_since: float | None = None
         self.execution_turn_blocked_since: float | None = None
+        self.execution_turn_direction = 0
+        self.turn_block_tracker = TurnBlockTracker(clear_dwell_seconds=0.30)
         self.execution_reanchor_after_turn = False
         self.execution_segment_reanchors = 0
         self.execution_final_turn = False
         self.execution_goal: dict[str, float] | None = None
+        self.execution_relocation_reason = ""
+        self.execution_relocation_plan: list[dict[str, float]] = []
+        self.pending_start_escape: dict[str, Any] | None = None
         self.execution_route_id = ""
         self.execution_pose_monotonic = 0.0
         self.segment_started_monotonic = 0.0
@@ -744,6 +789,9 @@ class NavigationAdapter(Node):
         )
         self.create_subscription(String, "/safety/health", self._safety_callback, 1)
         self.create_subscription(
+            String, "/safety/status", self._safety_status_callback, 1
+        )
+        self.create_subscription(
             String, "/safety/stop_source", self._safety_source_callback, 1
         )
         self.create_subscription(Bool, "/safety/estop", self._estop_callback, 1)
@@ -773,6 +821,7 @@ class NavigationAdapter(Node):
         )
         self.create_timer(0.2, self._cmd_vel_debug_tick)
         self.create_timer(0.05, self._segment_execution_tick)
+        self.create_timer(0.20, self._dynamic_recovery_tick)
         self.get_logger().info(
             f"navigation adapter ready mode={self.mode} socket={self.socket_path} "
             f"auto_speed_mode={self.auto_speed_mode}"
@@ -2030,22 +2079,56 @@ class NavigationAdapter(Node):
                 # Never draw or validate against odom-frame cells as though
                 # they were map-frame coordinates.
                 return
-        # The black Saved Map already displays permanent walls. Sending the
-        # same LiDAR returns again as red "dynamic obstacles" made open routes
-        # look blocked and also made goal validation overly conservative.
-        if self.saved_map is not None:
-            obstacles = [
-                item
-                for item in obstacles
-                if not self.saved_map.occupied_within(
-                    float(item["x"]),
-                    float(item["y"]),
-                    self.dynamic_overlay_static_tolerance,
-                )
-            ]
+        self.dynamic_overlay.observe(
+            ((float(item["x"]), float(item["y"])) for item in obstacles),
+            now=time.monotonic(),
+            saved_map=self.saved_map,
+            static_tolerance=self.dynamic_overlay_static_tolerance,
+        )
+        self._refresh_dynamic_obstacle_view()
+
+    def _refresh_dynamic_obstacle_view(self) -> None:
+        obstacles = [
+            {
+                "id": int(item.id),
+                "x": round(item.center_x, 3),
+                "y": round(item.center_y, 3),
+                "radius": round(item.radius, 3),
+                "first_seen": item.first_seen,
+                "last_seen": item.last_seen,
+                "observation_count": int(item.observation_count),
+                "confidence": round(item.confidence, 3),
+            }
+            for item in self.dynamic_overlay.snapshot(time.monotonic())
+        ]
         if obstacles != self.latest_dynamic_obstacles:
             self.latest_dynamic_obstacles = obstacles
             self.visualization_revision += 1
+
+    def _dynamic_exclusions(self) -> tuple[tuple[float, float, float], ...]:
+        return self.dynamic_overlay.exclusions(
+            time.monotonic(),
+            inflation=(
+                self.footprint_half_width
+                + self.planning_footprint_padding
+                + self.corridor_hard_side_margin
+            ),
+            minimum_observations=1,
+        )
+
+    def _dynamic_affects_remaining_route(self) -> bool:
+        if self.pose is None or not self.execution_points:
+            return False
+        remaining = [
+            {"x": float(self.pose["x"]), "y": float(self.pose["y"])}
+        ]
+        remaining.extend(
+            dict(point)
+            for point in self.execution_points[self.execution_segment_index + 1:]
+        )
+        return dynamic_exclusions_intersect_route(
+            remaining, self._dynamic_exclusions(), horizon=2.0
+        )
 
     def _global_costmap_callback(self, message: OccupancyGrid) -> None:
         if int(message.info.width) <= 0 or int(message.info.height) <= 0:
@@ -3124,6 +3207,7 @@ class NavigationAdapter(Node):
             lookahead=self.corridor_lookahead,
             rotation_margin=self.rotation_minimum_obstacle_distance,
             hard_side_margin=self.corridor_hard_side_margin,
+            translation_lateral_margin=self.translation_lateral_margin,
             localization_uncertainty=localization_uncertainty,
         )
         self.latest_corridor = corridor
@@ -3197,15 +3281,67 @@ class NavigationAdapter(Node):
         scan = self._sensor_entry("scan")
         self.scan_clock_skew_seconds = float(scan.get("clock_skew_ms", 0.0)) / 1000.0
     def _safety_callback(self, message: String) -> None:
-        self.safety_health = message.data
-        if self.safety_health.startswith("BLOCKED:"):
-            self.safety_stop_reason = self.safety_health.split(":", 1)[1].upper()
-        elif self.safety_health.startswith("FAULT:"):
-            self.safety_stop_reason = self.safety_health.split(":", 1)[1].upper()
-        elif self.safety_health.startswith("HEALTHY"):
-            self.safety_stop_reason = "NONE"
+        # Kept for external compatibility only. Navigation decisions are made
+        # exclusively from /safety/status so reason/mask/output share one seq.
+        if self.safety_snapshot_sequence < 0:
+            self.safety_health = str(message.data)
+
+    def _safety_status_callback(self, message: String) -> None:
+        try:
+            snapshot = json.loads(message.data)
+            sequence = int(snapshot["seq"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        if sequence <= self.safety_snapshot_sequence:
+            return
+        self.safety_snapshot = dict(snapshot)
+        self.safety_snapshot_sequence = sequence
+        self.safety_snapshot_monotonic = time.monotonic()
+        self.safety_health = str(snapshot.get("health") or "UNKNOWN")
+        self.safety_stop_reason = str(snapshot.get("reason") or "UNKNOWN").upper()
+        self.safety_stop_source = str(snapshot.get("source") or "UNKNOWN")
+        self.safety_direction_mask = int(snapshot.get("direction_mask") or 0)
+
+        blocker_x = snapshot.get("blocking_point_x")
+        blocker_y = snapshot.get("blocking_point_y")
+        if (
+            blocker_x is not None
+            and blocker_y is not None
+            and self.pose is not None
+            and self.safety_stop_source == "MOTION_SAFETY"
+        ):
+            yaw = float(self.pose.get("yaw", 0.0))
+            cosine, sine = math.cos(yaw), math.sin(yaw)
+            map_x = float(self.pose["x"]) + cosine * float(blocker_x) - sine * float(blocker_y)
+            map_y = float(self.pose["y"]) + sine * float(blocker_x) + cosine * float(blocker_y)
+            self.dynamic_overlay.observe(
+                ((map_x, map_y),),
+                now=time.monotonic(),
+                saved_map=self.saved_map,
+                static_tolerance=self.dynamic_overlay_static_tolerance,
+            )
+            self._refresh_dynamic_obstacle_view()
+
+        dynamic_stop = (
+            bool(snapshot.get("stop"))
+            and self.safety_stop_source == "MOTION_SAFETY"
+            and self.safety_stop_reason in {
+                "FRONT_SWEEP_COLLISION",
+                "REAR_SWEEP_COLLISION",
+                "LEFT_TURN_CLEARANCE",
+                "RIGHT_TURN_CLEARANCE",
+            }
+        )
+        if (
+            dynamic_stop
+            and self.current_state == "NAVIGATING"
+            and self.execution_phase in {"STRAIGHT", "NARROW_STRAIGHT"}
+        ):
+            self._enter_dynamic_wait("MOTION_SAFETY_DYNAMIC_BLOCK")
 
     def _safety_source_callback(self, message: String) -> None:
+        if self.safety_snapshot_sequence >= 0:
+            return
         source = str(message.data or "UNKNOWN")
         self.safety_stop_source = source
         if (
@@ -3248,7 +3384,23 @@ class NavigationAdapter(Node):
                 handle.cancel_goal_async()
 
     def _direction_mask_callback(self, message: UInt8) -> None:
-        self.safety_direction_mask = int(message.data)
+        if self.safety_snapshot_sequence < 0:
+            self.safety_direction_mask = int(message.data)
+
+    def _atomic_safety_fresh(self, now: float | None = None) -> bool:
+        timestamp = time.monotonic() if now is None else float(now)
+        return (
+            self.safety_snapshot_sequence >= 0
+            and timestamp - self.safety_snapshot_monotonic <= 0.35
+        )
+
+    def _safety_blocks_turn(self, direction: int) -> bool:
+        key = "rotation_left_blocked" if int(direction) > 0 else "rotation_right_blocked"
+        mask = 4 if int(direction) > 0 else 8
+        return bool(
+            self.safety_snapshot.get(key, False)
+            or self.safety_direction_mask & mask
+        )
 
     def _manual_takeover_callback(self, message: Bool) -> None:
         if message.data:
@@ -4469,6 +4621,10 @@ class NavigationAdapter(Node):
             self.current_mission_id = ""
             self.latest_global_path = []
             self.latest_dynamic_obstacles = []
+            self.dynamic_overlay = DynamicObstacleOverlay(
+                ttl_seconds=self.dynamic_overlay_ttl,
+                cluster_distance=self.dynamic_overlay_cluster_distance,
+            )
             self.visualization_revision += 1
             self._set_state("LOCALIZATION_INITIALIZING", "map_loaded")
             self.localization_state = "LOCALIZATION_INITIALIZING"
@@ -4540,6 +4696,10 @@ class NavigationAdapter(Node):
         self.current_mission_id = ""
         self.latest_global_path = []
         self.latest_dynamic_obstacles = []
+        self.dynamic_overlay = DynamicObstacleOverlay(
+            ttl_seconds=self.dynamic_overlay_ttl,
+            cluster_distance=self.dynamic_overlay_cluster_distance,
+        )
         self.visualization_revision += 1
         return {"status": "completed", "current_state": "NO_ACTIVE_MAP", "state": self._state()}
 
@@ -4878,42 +5038,64 @@ class NavigationAdapter(Node):
             planner="StopTurnStateLattice24",
             retry=0,
         )
-        planned = self.stop_turn_planner.plan_candidates(
-            dict(self.pose),
+        start_pose = dict(self.pose)
+        live_start_clear = bool(
+            self._atomic_safety_fresh()
+            and not (self.safety_direction_mask & 1)
+            and not self.estop_active
+        )
+        planner_result = self.stop_turn_planner.plan_result(
+            start_pose,
             resolved_goal,
-            # The preview is latency-sensitive. Alternatives are a separate,
-            # explicit action and must never hold the first safe route hostage.
-            maximum_candidates=1,
-            overlap_threshold=self.alternative_route_overlap_threshold,
+            exclusions=self._dynamic_exclusions(),
             planning_time_budget=self.stop_turn_planning_budget,
+            allow_start_escape=True,
+            maximum_start_escape_distance=self.start_escape_max_distance,
+            live_start_clear=live_start_clear,
+        )
+        planned = (
+            []
+            if planner_result.route is None
+            else self.stop_turn_planner.plan_candidates(
+                start_pose,
+                resolved_goal,
+                # Preview stays latency-sensitive; explicit alternatives are
+                # still requested separately.
+                maximum_candidates=1,
+                overlap_threshold=self.alternative_route_overlap_threshold,
+                planning_time_budget=self.stop_turn_planning_budget,
+                exclusions=self._dynamic_exclusions(),
+                primary_route=planner_result.route,
+            )
         )
         candidates = self._serialize_stop_turn_candidates(planned)
+        if candidates and planner_result.start_escape is not None:
+            escape = planner_result.start_escape
+            planned_points = list(candidates[0]["points"])
+            display_points = [dict(escape.start), dict(escape.end)]
+            display_points.extend(planned_points[1:])
+            candidates[0]["planned_points_after_escape"] = planned_points
+            candidates[0]["points"] = canonicalize_stop_turn_path(display_points)
+            candidates[0]["start_escape"] = {
+                "start": dict(escape.start),
+                "end": dict(escape.end),
+                "yaw": escape.yaw,
+                "distance": escape.distance,
+                "initial_overlap_cells": [list(cell) for cell in escape.initial_overlap_cells],
+            }
+            candidates[0]["total_length"] = round(
+                float(candidates[0]["total_length"]) + escape.distance, 4
+            )
         if not candidates:
-            start_cell = self.saved_map.world_to_cell(
-                float(self.pose["x"]), float(self.pose["y"])
-            ) if self.saved_map is not None else None
-            goal_cell = self.saved_map.world_to_cell(
-                float(resolved_goal["x"]), float(resolved_goal["y"])
-            ) if self.saved_map is not None else None
-            same_component = bool(
-                start_cell is not None
-                and goal_cell is not None
-                and self.map_navigation_geometry is not None
-                and self.map_navigation_geometry.same_component(
-                    start_cell, goal_cell
-                )
+            code = planner_result.reason or planner_result.status
+            public_code = (
+                "GOAL_PHYSICALLY_UNREACHABLE"
+                if code == "GOAL_DISCONNECTED"
+                else code
             )
             error = AdapterError(
-                (
-                    "PLANNER_SEARCH_FAILED"
-                    if same_component
-                    else "GOAL_PHYSICALLY_UNREACHABLE"
-                ),
-                (
-                    "Stop-turn search exhausted its bounded search inside the reachable component"
-                    if same_component
-                    else "Goal is outside the robot-navigable reachable component"
-                ),
+                public_code,
+                planner_result.message or "No exact stop-turn route is available",
             )
             mark_plan_failed("stop_turn_no_valid_path")
             self._record_planning_failure(
@@ -4984,6 +5166,13 @@ class NavigationAdapter(Node):
         points = list(command_payload.get("points") or [])
         if candidate is not None:
             points = list(candidate.get("points") or [])
+            if candidate.get("start_escape"):
+                return self._start_escape_execution(
+                    goal_payload,
+                    route_id=route_id,
+                    display_points=points,
+                    recovery_attempt=recovery_attempt,
+                )
         if not points and route_id == self.selected_route_id:
             points = list(self.latest_global_path)
         points = canonicalize_stop_turn_path(points)
@@ -5013,7 +5202,6 @@ class NavigationAdapter(Node):
             raise AdapterError("ROUTE_INVALIDATED", "Selected route is no longer safe")
         with self.state_lock:
             self.navigation_goal_generation += 1
-            goal_generation = self.navigation_goal_generation
             self.latest_feedback = {
                 "recoveries": 0,
                 "execution_phase": "STRAIGHT_PREPARE",
@@ -5040,6 +5228,8 @@ class NavigationAdapter(Node):
             self.straight_recovery_requested = ""
             self.execution_final_turn = False
             self.execution_goal = dict(goal_payload)
+            self.execution_relocation_reason = ""
+            self.execution_relocation_plan = []
             self.execution_route_id = route_id
             self.execution_narrow_segments = {
                 int(item["segment_index"])
@@ -5068,6 +5258,85 @@ class NavigationAdapter(Node):
             "route_id": route_id,
             "points": points,
             "goal": dict(goal_payload),
+            "state": self._state(),
+        }
+
+    def _start_escape_execution(
+        self,
+        goal: dict[str, Any],
+        *,
+        route_id: str,
+        display_points: list[dict[str, float]],
+        recovery_attempt: bool,
+    ) -> dict[str, Any]:
+        if self.saved_map is None or self.pose is None:
+            raise AdapterError("PLANNER_NOT_READY", "Saved Map or current pose is unavailable")
+        if (
+            not self._atomic_safety_fresh()
+            or self.estop_active
+            or self.safety_direction_mask & 1
+        ):
+            self.navigation_velocity.publish(Twist())
+            raise AdapterError(
+                "START_ESCAPE_UNAVAILABLE",
+                "Forward start escape is blocked by current live safety",
+            )
+        escape = find_start_escape(
+            self.saved_map,
+            dict(self.pose),
+            half_length=self.footprint_half_length,
+            half_width=self.footprint_half_width,
+            padding=self.planning_footprint_padding,
+            maximum_distance=self.start_escape_max_distance,
+        )
+        if escape is None:
+            raise AdapterError(
+                "START_ESCAPE_UNAVAILABLE",
+                "No monotonic-overlap forward escape remains from the current pose",
+            )
+        with self.state_lock:
+            self.navigation_goal_generation += 1
+            self.execution_segment_token += 1
+            self.active_segment = None
+            self.execution_points = [dict(escape.start), dict(escape.end)]
+            self.execution_segment_index = 0
+            self.execution_phase = "STRAIGHT_PREPARE"
+            self.execution_phase_started = time.monotonic()
+            self.execution_goal = dict(goal)
+            self.paused_goal = dict(goal)
+            self.execution_route_id = route_id
+            self.execution_relocation_reason = "START_ESCAPE"
+            self.execution_relocation_plan = list(display_points)
+            self.execution_narrow_segments = set()
+            self.latest_global_path = list(display_points)
+            self.selected_route_id = route_id
+            self.current_goal_handle = None
+            self.motion_owner = "NONE"
+            self.latest_feedback = {
+                "recoveries": int(recovery_attempt),
+                "execution_phase": "START_ESCAPE",
+                "recovery_reason": "START_STATIC_OVERLAP",
+            }
+            self._set_state("NAVIGATING", "start_escape_accepted")
+            self.visualization_revision += 1
+        self.navigation_velocity.publish(Twist())
+        self._nav_debug(
+            "START_ESCAPE",
+            status="BEGIN",
+            route_id=route_id,
+            start=escape.start,
+            end=escape.end,
+            yaw=escape.yaw,
+            distance=escape.distance,
+            initial_overlap_cells=escape.initial_overlap_cells,
+        )
+        return {
+            "status": "accepted",
+            "current_state": "NAVIGATING",
+            "route_id": route_id,
+            "points": list(display_points),
+            "goal": dict(goal),
+            "recovery": "START_ESCAPE",
             "state": self._state(),
         }
 
@@ -5160,7 +5429,9 @@ class NavigationAdapter(Node):
                 self._schedule_execution_replan(watchdog.reason, generation)
             return
 
-        if self.execution_phase not in {"TURN", "TURN_SETTLING"}:
+        if self.execution_phase not in {
+            "TURN", "TURN_SETTLING", "WAIT_FOR_TURN_CLEAR"
+        }:
             return
         target = self.execution_target_heading
         current_yaw = float(pose.get("yaw", target))
@@ -5227,16 +5498,27 @@ class NavigationAdapter(Node):
                 self._dispatch_prepared_segment(generation)
             return
 
-        direction_mask = 4 if error > 0.0 else 8
-        live_safe = (
+        direction = self.execution_turn_direction or (1 if error > 0.0 else -1)
+        atomic_fresh = self._atomic_safety_fresh(now)
+        live_safe_sample = (
             now - self.last_scan_monotonic <= 0.30
             and self._critical_sensor_time_healthy()
             and not self.estop_active
-            and not (self.safety_direction_mask & direction_mask)
-            and self.safety_health.startswith(("HEALTHY", "BLOCKED"))
+            and atomic_fresh
+            and not self._safety_blocks_turn(direction)
             and now - self.last_manual_takeover_monotonic > 0.5
         )
-        if not live_safe:
+        held_blocked = (
+            not atomic_fresh
+            or self.turn_block_tracker.update(
+                sequence=self.safety_snapshot_sequence,
+                blocked=not live_safe_sample,
+                now=now,
+            )
+        )
+        if held_blocked:
+            self.execution_phase = "WAIT_FOR_TURN_CLEAR"
+            self.latest_feedback["execution_phase"] = "WAIT_FOR_TURN_CLEAR"
             self.motion_owner = "NONE"
             self.last_turn_command = (0.0, 0.0)
             self.navigation_velocity.publish(Twist())
@@ -5246,28 +5528,37 @@ class NavigationAdapter(Node):
                 now - self.execution_turn_blocked_since
                 >= self.execution_turn_safety_block_timeout
             ):
-                static_valid = bool(
-                    self.saved_map is not None
-                    and validate_rotation_sweep(
-                        self.saved_map,
-                        float(pose["x"]),
-                        float(pose["y"]),
-                        current_yaw,
-                        target,
-                        half_length=self.footprint_half_length,
-                        half_width=self.footprint_half_width,
-                        padding=self.planning_footprint_padding,
-                    ).valid
+                self._nav_debug(
+                    "TURN_RECOVERY",
+                    reason="PERSISTENT_SAFETY_BLOCK",
+                    blocked_since=self.execution_turn_blocked_since,
+                    safety_sequence=self.safety_snapshot_sequence,
                 )
-                self._schedule_execution_replan(
-                    (
-                        "PERSISTENT_SAFETY_BLOCK"
-                        if static_valid
-                        else "TURN_SWEEP_INVALIDATED"
-                    ),
-                    generation,
+                opposite = -direction
+                opposite_safe = bool(
+                    self._turn_static_safe(pose, target, opposite)
+                    and atomic_fresh
+                    and not self._safety_blocks_turn(opposite)
                 )
+                if opposite_safe:
+                    self.execution_turn_direction = opposite
+                    self.execution_turn_blocked_since = None
+                    self.turn_block_tracker = TurnBlockTracker(
+                        clear_dwell_seconds=0.30
+                    )
+                    self.execution_phase = "TURN"
+                    self.latest_feedback["execution_phase"] = "TURN"
+                    self._nav_debug(
+                        "TURN_RECOVERY",
+                        action="ALTERNATIVE_DIRECTION",
+                        direction=opposite,
+                        target_heading=target,
+                    )
+                else:
+                    self._start_turn_bay_recovery(pose, generation)
             return
+        self.execution_phase = "TURN"
+        self.latest_feedback["execution_phase"] = "TURN"
         self.execution_turn_blocked_since = None
         transition = turn_hysteresis_transition(
             "TURN",
@@ -5288,9 +5579,9 @@ class NavigationAdapter(Node):
             return
         command = Twist()
         command.linear.x = 0.0
-        command.angular.z = max(
-            -self.execution_turn_max_speed,
-            min(self.execution_turn_max_speed, self.execution_turn_kp * error),
+        command.angular.z = direction * min(
+            self.execution_turn_max_speed,
+            max(0.08, self.execution_turn_kp * abs(error)),
         )
         self.motion_owner = "NAVIGATION"
         self.last_turn_command = (0.0, float(command.angular.z))
@@ -5308,6 +5599,115 @@ class NavigationAdapter(Node):
                 final_output_angular=(None if measured is None else measured[1]),
             )
             self.last_turn_command_log_monotonic = now
+
+    def _start_turn_bay_recovery(
+        self, pose: dict[str, float], goal_generation: int
+    ) -> None:
+        if (
+            goal_generation != self.navigation_goal_generation
+            or self.execution_phase == "TURN_BAY_SEARCH"
+        ):
+            return
+        self.execution_phase = "TURN_BAY_SEARCH"
+        self.latest_feedback["execution_phase"] = "TURN_BAY_RECOVERY"
+        self.motion_owner = "NONE"
+        self.navigation_velocity.publish(Twist())
+        self._set_state("TURN_BAY_RECOVERY", "persistent_turn_safety_block")
+        threading.Thread(
+            target=self._find_and_start_turn_bay,
+            args=(dict(pose), goal_generation),
+            daemon=True,
+        ).start()
+
+    def _find_and_start_turn_bay(
+        self, pose: dict[str, float], goal_generation: int
+    ) -> None:
+        planner = self.stop_turn_planner
+        saved_map = self.saved_map
+        goal = dict(self.execution_goal or self.paused_goal or {})
+        if planner is None or saved_map is None or not goal:
+            return
+        if (
+            not self._atomic_safety_fresh()
+            or self.safety_direction_mask & 1
+            or self.estop_active
+        ):
+            self._set_state(
+                "WAITING_FOR_DYNAMIC_CLEAR", "turn_bay_front_safety_blocked"
+            )
+            self.dynamic_wait_started = time.monotonic()
+            return
+        yaw = float(pose.get("yaw", 0.0))
+        step = max(saved_map.resolution, 0.025)
+        exclusions = self._dynamic_exclusions()
+        selected: tuple[dict[str, float], Any] | None = None
+        for index in range(1, math.floor(self.turn_bay_max_distance / step) + 1):
+            distance = index * step
+            candidate = {
+                "x": float(pose["x"]) + distance * math.cos(yaw),
+                "y": float(pose["y"]) + distance * math.sin(yaw),
+                "yaw": yaw,
+            }
+            straight = validate_stop_turn_route(
+                saved_map,
+                (pose, candidate),
+                half_length=self.footprint_half_length,
+                half_width=self.footprint_half_width,
+                padding=self.planning_footprint_padding,
+            )
+            if not straight.valid or planner._segment_excluded(pose, candidate, exclusions):
+                continue
+            result = planner.plan_result(
+                candidate,
+                goal,
+                exclusions=exclusions,
+                planning_time_budget=min(3.0, self.stop_turn_planning_budget),
+            )
+            if result.success:
+                selected = (candidate, result.route)
+                break
+        if goal_generation != self.navigation_goal_generation:
+            return
+        if selected is None:
+            self.execution_phase = "WAITING_FOR_DYNAMIC_CLEAR"
+            self.latest_feedback["execution_phase"] = "WAITING_FOR_DYNAMIC_CLEAR"
+            self.latest_feedback["recovery_reason"] = (
+                "TURN_BLOCKED_NO_SAFE_RELOCATION"
+            )
+            self.dynamic_wait_started = time.monotonic()
+            self._set_state(
+                "WAITING_FOR_DYNAMIC_CLEAR", "turn_blocked_no_safe_relocation"
+            )
+            self._nav_debug(
+                "TURN_BAY_RECOVERY",
+                result="WAIT",
+                reason="TURN_BLOCKED_NO_SAFE_RELOCATION",
+                destination_preserved=True,
+            )
+            return
+        candidate, continuation = selected
+        display = [dict(pose), dict(candidate), *[dict(p) for p in continuation.points[1:]]]
+        self.execution_segment_token += 1
+        self.active_segment = None
+        self.execution_points = [dict(pose), dict(candidate)]
+        self.execution_segment_index = 0
+        self.execution_phase = "STRAIGHT_PREPARE"
+        self.execution_phase_started = time.monotonic()
+        self.execution_relocation_reason = "TURN_BAY"
+        self.execution_relocation_plan = canonicalize_stop_turn_path(display)
+        self.execution_narrow_segments = set()
+        self.latest_global_path = list(self.execution_relocation_plan)
+        self._set_state("NAVIGATING", "move_to_turn_bay")
+        self._nav_debug(
+            "TURN_BAY_RECOVERY",
+            result="MOVE_TO_TURN_BAY",
+            candidate=candidate,
+            distance=math.hypot(
+                candidate["x"] - float(pose["x"]),
+                candidate["y"] - float(pose["y"]),
+            ),
+            destination=goal,
+        )
 
     def _fresh_execution_pose(self) -> dict[str, float] | None:
         try:
@@ -5375,6 +5775,21 @@ class NavigationAdapter(Node):
             {"x": float(pose["x"]), "y": float(pose["y"])},
             {"x": float(endpoint["x"]), "y": float(endpoint["y"])},
         ]
+        start_escape = self.execution_relocation_reason == "START_ESCAPE"
+        if start_escape and self.saved_map is not None:
+            refreshed_escape = find_start_escape(
+                self.saved_map,
+                pose,
+                half_length=self.footprint_half_length,
+                half_width=self.footprint_half_width,
+                padding=self.planning_footprint_padding,
+                maximum_distance=self.start_escape_max_distance,
+            )
+            if refreshed_escape is None:
+                self._enter_dynamic_wait("START_ESCAPE_LIVE_OR_STATIC_BLOCK")
+                return
+            candidate[1] = dict(refreshed_escape.end)
+            self.execution_points[1] = dict(refreshed_escape.end)
         try:
             live_validation = self._validate_executable_path(
                 candidate, context="STRAIGHT_REANCHOR"
@@ -5386,7 +5801,7 @@ class NavigationAdapter(Node):
             return
         static_validation = (
             None
-            if self.saved_map is None
+            if self.saved_map is None or start_escape
             else validate_stop_turn_route(
                 self.saved_map,
                 candidate,
@@ -5397,8 +5812,10 @@ class NavigationAdapter(Node):
         )
         if (
             not live_validation.valid
-            or static_validation is None
-            or not static_validation.valid
+            or (
+                not start_escape
+                and (static_validation is None or not static_validation.valid)
+            )
         ):
             self._schedule_execution_replan(
                 "REANCHOR_TRANSLATION_INVALID", goal_generation
@@ -5416,6 +5833,24 @@ class NavigationAdapter(Node):
             narrow=self.execution_segment_index in self.execution_narrow_segments,
         )
         current_yaw = float(pose.get("yaw", active.fixed_heading))
+        if start_escape:
+            if abs(self._yaw_delta(active.fixed_heading, current_yaw)) > self.execution_turn_tolerance:
+                self.navigation_velocity.publish(Twist())
+                self._enter_dynamic_wait("START_ESCAPE_HEADING_CHANGED")
+                return
+            self.active_segment = active
+            self.execution_target_heading = active.fixed_heading
+            self.execution_phase = "DISPATCHING_STRAIGHT"
+            self.latest_feedback["execution_phase"] = "START_ESCAPE"
+            self._nav_debug(
+                "START_ESCAPE",
+                status="VALIDATED",
+                start=active.effective_start,
+                end=active.endpoint,
+                fixed_heading=active.fixed_heading,
+            )
+            self._dispatch_prepared_segment(goal_generation)
+            return
         start_turn = validate_rotation_sweep(
             self.saved_map,
             float(pose["x"]),
@@ -5482,42 +5917,77 @@ class NavigationAdapter(Node):
         error = self._yaw_delta(target, current_yaw)
         now = time.monotonic()
         if abs(error) > self.execution_turn_tolerance:
-            if self.saved_map is None or not validate_rotation_sweep(
-                self.saved_map,
-                float(pose["x"]),
-                float(pose["y"]),
-                current_yaw,
-                target,
-                half_length=self.footprint_half_length,
-                half_width=self.footprint_half_width,
-                padding=self.planning_footprint_padding,
-            ).valid:
+            left_static = self._turn_static_safe(pose, target, 1)
+            right_static = self._turn_static_safe(pose, target, -1)
+            snapshot_fresh = self._atomic_safety_fresh(now)
+            left_live = snapshot_fresh and not self._safety_blocks_turn(1)
+            right_live = snapshot_fresh and not self._safety_blocks_turn(-1)
+            direction = choose_turn_direction(
+                error,
+                left_static_safe=left_static,
+                right_static_safe=right_static,
+                left_live_safe=left_live,
+                right_live_safe=right_live,
+            )
+            if not left_static and not right_static:
                 self._schedule_execution_replan(
-                    "TURN_SWEEP_INVALIDATED", goal_generation
+                    "START_TURN_BLOCKED_STATIC", goal_generation
                 )
                 return
-            self.execution_phase = "TURN"
+            self.execution_turn_direction = (
+                direction if direction else (1 if error > 0.0 else -1)
+            )
+            self.execution_phase = "TURN" if direction else "WAIT_FOR_TURN_CLEAR"
             self.execution_phase_started = now
             self.execution_turn_stable_since = None
-            self.execution_turn_blocked_since = None
+            self.execution_turn_blocked_since = None if direction else now
+            self.turn_block_tracker = TurnBlockTracker(clear_dwell_seconds=0.30)
             self.execution_reanchor_after_turn = (
                 self.execution_segment_reanchors
                 < self.stop_turn_max_reanchors_per_segment
             )
-            self.latest_feedback["execution_phase"] = "TURN"
+            self.latest_feedback["execution_phase"] = self.execution_phase
             self.motion_owner = "NAVIGATION"
-            self._nav_debug(
-                "EXECUTION_PHASE",
-                phase="TURN_BEGIN",
-                segment_index=self.execution_segment_index,
-                target_heading=target,
-            )
+            if direction:
+                self._nav_debug(
+                    "EXECUTION_PHASE",
+                    phase="TURN_BEGIN",
+                    segment_index=self.execution_segment_index,
+                    target_heading=target,
+                    direction=self.execution_turn_direction,
+                )
+            else:
+                self._nav_debug(
+                    "EXECUTION_PHASE",
+                    phase="WAIT_FOR_TURN_CLEAR",
+                    segment_index=self.execution_segment_index,
+                    target_heading=target,
+                    direction=self.execution_turn_direction,
+                )
             return
         self.execution_phase = "TURN_SETTLING"
         self.execution_phase_started = now
         self.execution_turn_stable_since = now
         self.execution_reanchor_after_turn = False
         self.latest_feedback["execution_phase"] = "TURN_SETTLING"
+
+    def _turn_static_safe(
+        self, pose: dict[str, float], target: float, direction: int
+    ) -> bool:
+        return bool(
+            self.saved_map is not None
+            and validate_rotation_sweep(
+                self.saved_map,
+                float(pose["x"]),
+                float(pose["y"]),
+                float(pose.get("yaw", target)),
+                target,
+                half_length=self.footprint_half_length,
+                half_width=self.footprint_half_width,
+                padding=self.planning_footprint_padding,
+                direction=direction,
+            ).valid
+        )
 
     def _dispatch_prepared_segment(self, goal_generation: int) -> None:
         active = self.active_segment
@@ -5572,6 +6042,26 @@ class NavigationAdapter(Node):
         )
         if cancel_action and handle is not None:
             handle.cancel_goal_async()
+        relocation_reason = self.execution_relocation_reason
+        if (
+            relocation_reason
+            and self.execution_segment_index >= len(self.execution_points) - 1
+        ):
+            self.execution_relocation_reason = ""
+            self.execution_relocation_plan = []
+            self.execution_phase = "RECOVERING"
+            self.latest_feedback["execution_phase"] = "DYNAMIC_REPLAN"
+            self._nav_debug(
+                relocation_reason,
+                status="COMPLETE",
+                action="REPLAN_ORIGINAL_DESTINATION",
+            )
+            threading.Thread(
+                target=self._replan_execution_from_current,
+                args=(f"{relocation_reason}_COMPLETE", goal_generation),
+                daemon=True,
+            ).start()
+            return
         if (
             self.execution_segment_index >= len(self.execution_points) - 1
             and not self.execution_final_turn
@@ -5656,6 +6146,131 @@ class NavigationAdapter(Node):
             daemon=True,
         ).start()
 
+    def _enter_dynamic_wait(self, reason: str) -> None:
+        if self.current_state in {
+            "WAIT_FOR_DYNAMIC_CLEAR", "WAITING_FOR_DYNAMIC_CLEAR", "DYNAMIC_REPLAN"
+        }:
+            return
+        handle = self.current_goal_handle
+        self.current_goal_handle = None
+        self.execution_segment_token += 1
+        self.active_segment = None
+        self.execution_phase = "WAIT_FOR_DYNAMIC_CLEAR"
+        self.latest_feedback["execution_phase"] = "WAIT_FOR_DYNAMIC_CLEAR"
+        self.latest_feedback["recovery_reason"] = reason
+        self.motion_owner = "NONE"
+        self.dynamic_wait_started = time.monotonic()
+        self.dynamic_clear_started = None
+        self._set_state("WAIT_FOR_DYNAMIC_CLEAR", reason.lower())
+        self.navigation_velocity.publish(Twist())
+        if handle is not None:
+            handle.cancel_goal_async()
+        self._nav_debug(
+            "DYNAMIC_OBSTACLE",
+            action="WAIT_FOR_DYNAMIC_CLEAR",
+            reason=reason,
+            destination=self.execution_goal or self.paused_goal,
+            route_id=self.execution_route_id,
+        )
+
+    def _dynamic_recovery_tick(self) -> None:
+        now = time.monotonic()
+        self._refresh_dynamic_obstacle_view()
+        if self.current_state not in {
+            "WAIT_FOR_DYNAMIC_CLEAR",
+            "WAITING_FOR_DYNAMIC_CLEAR",
+        }:
+            return
+        self.navigation_velocity.publish(Twist())
+        snapshot = self.safety_snapshot
+        fresh = self._atomic_safety_fresh(now)
+        dynamic_blocked = bool(
+            fresh
+            and snapshot.get("stop")
+            and snapshot.get("source") == "MOTION_SAFETY"
+            and str(snapshot.get("reason") or "").upper() in {
+                "FRONT_SWEEP_COLLISION",
+                "REAR_SWEEP_COLLISION",
+                "LEFT_TURN_CLEARANCE",
+                "RIGHT_TURN_CLEARANCE",
+            }
+        )
+        if dynamic_blocked or not fresh:
+            self.dynamic_clear_started = None
+        elif self.dynamic_clear_started is None:
+            self.dynamic_clear_started = now
+        clear_dwelled = bool(
+            self.dynamic_clear_started is not None
+            and now - self.dynamic_clear_started >= self.dynamic_clear_dwell
+        )
+        persistent = bool(
+            self.dynamic_wait_started is not None
+            and now - self.dynamic_wait_started >= self.dynamic_obstacle_wait
+        )
+        retry_due = now - self.dynamic_last_replan >= self.dynamic_replan_retry
+        if not retry_due or (not clear_dwelled and not persistent):
+            return
+        self.dynamic_last_replan = now
+        self._set_state("DYNAMIC_REPLAN", "dynamic_replan_due")
+        self.latest_feedback["execution_phase"] = "DYNAMIC_REPLAN"
+        generation = self.navigation_goal_generation
+        threading.Thread(
+            target=self._attempt_dynamic_replan,
+            args=(generation, clear_dwelled),
+            daemon=True,
+        ).start()
+
+    def _attempt_dynamic_replan(
+        self, expected_generation: int, obstacle_cleared: bool
+    ) -> None:
+        if expected_generation != self.navigation_goal_generation:
+            return
+        goal = dict(self.execution_goal or self.paused_goal or {})
+        try:
+            points = self._plan_stop_turn_from_current(goal)
+            digest = hashlib.sha1(
+                json.dumps(points, sort_keys=True).encode()
+            ).hexdigest()[:10]
+            route_id = f"{self.execution_route_id}-dynamic-{digest}"
+            if self.pending_start_escape is not None:
+                self.route_candidates[route_id] = {
+                    "route_id": route_id,
+                    **self.pending_start_escape,
+                }
+            self._nav_debug(
+                "DYNAMIC_REPLAN",
+                result="SUCCESS",
+                obstacle_cleared=obstacle_cleared,
+                route_id=route_id,
+                destination=goal,
+            )
+            self._navigate(
+                goal,
+                {
+                    "map_id": self.map_id,
+                    "version": self.map_version,
+                    "route_id": route_id,
+                    "points": points,
+                },
+                recovery_attempt=True,
+            )
+        except AdapterError as exc:
+            if expected_generation != self.navigation_goal_generation:
+                return
+            self._set_state(
+                "WAITING_FOR_DYNAMIC_CLEAR", "dynamic_routes_temporarily_blocked"
+            )
+            self.execution_phase = "WAITING_FOR_DYNAMIC_CLEAR"
+            self.latest_feedback["execution_phase"] = "WAITING_FOR_DYNAMIC_CLEAR"
+            self.latest_feedback["recovery_reason"] = exc.code
+            self._nav_debug(
+                "DYNAMIC_REPLAN",
+                result="WAIT",
+                error=exc.code,
+                destination=goal,
+                destination_preserved=True,
+            )
+
     def _replan_execution_from_current(
         self,
         reason: str,
@@ -5673,6 +6288,11 @@ class NavigationAdapter(Node):
                 json.dumps(points, sort_keys=True).encode()
             ).hexdigest()[:10]
             route_id = f"{old_route_id}-replan-{digest}"
+            if self.pending_start_escape is not None:
+                self.route_candidates[route_id] = {
+                    "route_id": route_id,
+                    **self.pending_start_escape,
+                }
             self._nav_debug(
                 "REPLAN",
                 reason=reason,
@@ -5692,9 +6312,23 @@ class NavigationAdapter(Node):
                 recovery_attempt=True,
             )
         except AdapterError as exc:
-            self._set_recovery_terminal(
-                "FAILED", "NO_VALID_REPLAN", goal_generation
-            )
+            if exc.code == "DYNAMICALLY_BLOCKED":
+                self.dynamic_wait_started = time.monotonic()
+                self.dynamic_clear_started = None
+                self.execution_phase = "WAITING_FOR_DYNAMIC_CLEAR"
+                self.latest_feedback["execution_phase"] = (
+                    "WAITING_FOR_DYNAMIC_CLEAR"
+                )
+                self.latest_feedback["recovery_reason"] = exc.code
+                self._set_state(
+                    "WAITING_FOR_DYNAMIC_CLEAR",
+                    "dynamic_routes_temporarily_blocked",
+                )
+                self.navigation_velocity.publish(Twist())
+            else:
+                self._set_recovery_terminal(
+                    "FAILED", exc.code or "NO_VALID_REPLAN", goal_generation
+                )
             self._nav_debug(
                 "REPLAN",
                 reason=reason,
@@ -5886,6 +6520,23 @@ class NavigationAdapter(Node):
                 current_turn_command=self.last_turn_command,
                 final_output_command=final,
             )
+            atomic_dynamic_block = bool(
+                self._atomic_safety_fresh()
+                and self.safety_snapshot.get("stop")
+                and self.safety_snapshot.get("source") == "MOTION_SAFETY"
+                and str(self.safety_snapshot.get("reason") or "").upper()
+                in {
+                    "FRONT_SWEEP_COLLISION",
+                    "REAR_SWEEP_COLLISION",
+                    "LEFT_TURN_CLEARANCE",
+                    "RIGHT_TURN_CLEARANCE",
+                }
+            )
+            if atomic_dynamic_block and localization_reliable:
+                self._enter_dynamic_wait("CONTROLLER_ABORT_DYNAMIC_BLOCK")
+                self.profile_limiter.reset()
+                self.navigation_velocity.publish(Twist())
+                return
             recoverable_evidence = (
                 evidence_reason in {"CORRIDOR_CLEAR", "NARROW_OR_UNCERTAIN"}
                 or evidence_reason == "UNCONFIRMED"
@@ -5906,12 +6557,13 @@ class NavigationAdapter(Node):
                     f"CONTROLLER_ABORT:{evidence_reason}", goal_generation
                 )
             elif evidence_reason == "PHYSICALLY_BLOCKED" and localization_reliable:
-                self._mark_failed_segment(evidence_reason, corridor)
-                self.execution_segment_token += 1
-                self.active_segment = None
-                self.execution_phase = "IDLE"
-                self._set_state("BLOCKED", "confirmed_physical_blockage")
-                self.latest_feedback["terminal_reason"] = "PHYSICALLY_BLOCKED"
+                if self._dynamic_affects_remaining_route():
+                    self._enter_dynamic_wait("CONFIRMED_DYNAMIC_ROUTE_BLOCK")
+                else:
+                    self._mark_failed_segment(evidence_reason, corridor)
+                    self._schedule_execution_replan(
+                        "CONFIRMED_STATIC_PHYSICAL_BLOCKAGE", goal_generation
+                    )
             else:
                 self.execution_segment_token += 1
                 self.active_segment = None
@@ -6104,13 +6756,45 @@ class NavigationAdapter(Node):
     ) -> list[dict[str, float]]:
         if self.stop_turn_planner is None or self.pose is None:
             raise AdapterError("PLANNER_NOT_READY", "Stop-turn planner is unavailable")
-        route = self.stop_turn_planner.plan(dict(self.pose), goal)
-        if route is None:
+        result = self.stop_turn_planner.plan_result(
+            dict(self.pose),
+            goal,
+            exclusions=self._dynamic_exclusions(),
+            planning_time_budget=self.stop_turn_planning_budget,
+            allow_start_escape=True,
+            maximum_start_escape_distance=self.start_escape_max_distance,
+            live_start_clear=bool(
+                self._atomic_safety_fresh()
+                and not (self.safety_direction_mask & 1)
+                and not self.estop_active
+            ),
+        )
+        if result.route is None:
+            code = result.reason or result.status
             raise AdapterError(
-                "GOAL_PHYSICALLY_UNREACHABLE",
-                "No exact footprint-valid stop-turn path remains",
+                (
+                    "GOAL_PHYSICALLY_UNREACHABLE"
+                    if code == "GOAL_DISCONNECTED"
+                    else code
+                ),
+                result.message or "No exact footprint-valid stop-turn path remains",
             )
-        return [dict(point) for point in route.points]
+        route_points = [dict(point) for point in result.route.points]
+        self.pending_start_escape = None
+        if result.start_escape is not None:
+            escape = result.start_escape
+            display = [dict(escape.start), dict(escape.end), *route_points[1:]]
+            self.pending_start_escape = {
+                "points": canonicalize_stop_turn_path(display),
+                "start_escape": {
+                    "start": dict(escape.start),
+                    "end": dict(escape.end),
+                    "yaw": escape.yaw,
+                    "distance": escape.distance,
+                },
+            }
+            return list(self.pending_start_escape["points"])
+        return route_points
 
     def _resume_auto_from_current_pose(self) -> dict[str, Any]:
         if self.paused_goal is None:
@@ -6137,6 +6821,11 @@ class NavigationAdapter(Node):
             self._set_state("MANUAL_BYPASS", "resume_path_unavailable")
             raise AdapterError("NO_VALID_PATH", "No safe path from current pose")
         route_id = f"resume-{hashlib.sha1(json.dumps(points, sort_keys=True).encode()).hexdigest()[:10]}"
+        if self.pending_start_escape is not None:
+            self.route_candidates[route_id] = {
+                "route_id": route_id,
+                **self.pending_start_escape,
+            }
         self.manual_handoff_reason = ""
         return self._navigate(
             goal,

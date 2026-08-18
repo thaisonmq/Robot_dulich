@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -19,6 +20,7 @@ from safety_core import (
     StopHysteresis,
     clip_motion_by_mask,
     evaluate_scan,
+    safety_snapshot_payload,
 )
 
 
@@ -78,12 +80,18 @@ class MotionSafetyNode(Node):
         self.direction_state = self.create_publisher(UInt8, "/safety/directional_mask", 1)
         self.health = self.create_publisher(String, "/safety/health", 1)
         self.stop_source = self.create_publisher(String, "/safety/stop_source", 1)
+        self.status_state = self.create_publisher(String, "/safety/status", 1)
         self.manual_takeover = self.create_publisher(Bool, "/safety/manual_takeover", 1)
         self.create_subscription(Twist, "/cmd_vel_smoothed", self._on_command, 1)
         self.create_subscription(Twist, "/cmd_vel_muxed", self._on_muxed, 1)
         self.create_subscription(Twist, "/cmd_vel_joy", self._on_joy, 1)
         self.create_subscription(Twist, "/cmd_vel_web", self._on_web, 1)
-        self.create_subscription(LaserScan, "/scan", self._on_scan, qos_profile_sensor_data)
+        # Safety consumes exactly the timestamp-corrected, deskewed and
+        # self-return-masked stream used by navigation.  A stale normalized
+        # stream fails closed below; there is deliberately no raw fallback.
+        self.create_subscription(
+            LaserScan, "/scan/normalized", self._on_scan, qos_profile_sensor_data
+        )
         self.create_subscription(
             Odometry,
             "/odometry/filtered",
@@ -140,6 +148,7 @@ class MotionSafetyNode(Node):
         ).strip().lower() in {"1", "true", "yes", "on"}
         self.last_safety_log_monotonic = 0.0
         self.last_safety_log_signature: tuple[object, ...] | None = None
+        self.safety_sequence = 0
         self.create_timer(0.02, self._tick)
         if not self.lidar_obstacle_avoidance_enabled:
             self.get_logger().warning(
@@ -320,6 +329,41 @@ class MotionSafetyNode(Node):
         self.fault_hysteresis.update(True, now)
         self._publish_zero(reason, blocked)
 
+    def _publish_atomic_status(
+        self,
+        *,
+        health: str,
+        stop: bool,
+        reason: str,
+        source: str,
+        blocked: Direction,
+        output_linear: float,
+        output_angular: float,
+        decision: object | None = None,
+        hard_stop: bool | None = None,
+    ) -> None:
+        self.safety_sequence += 1
+        payload = safety_snapshot_payload(
+            sequence=self.safety_sequence,
+            stamp=self.get_clock().now().nanoseconds / 1_000_000_000.0,
+            health=health,
+            stop=stop,
+            reason=reason,
+            source=source,
+            direction_mask=int(blocked),
+            input_linear=float(self.command.linear.x),
+            input_angular=float(self.command.angular.z),
+            output_linear=float(output_linear),
+            output_angular=float(output_angular),
+            measured_linear=float(self.measured_linear_x),
+            measured_angular=float(self.measured_angular_z),
+            decision=decision,
+            hard_stop=hard_stop,
+        )
+        self.status_state.publish(String(data=json.dumps(
+            payload, separators=(",", ":"), allow_nan=False
+        )))
+
     def _publish_zero(self, reason: str, blocked: Direction, *, healthy_idle: bool = False) -> None:
         self.output.publish(Twist())
         self.stop_state.publish(Bool(data=True))
@@ -354,6 +398,16 @@ class MotionSafetyNode(Node):
             reason, reason.upper()
         )
         self.stop_source.publish(String(data=source))
+        self._publish_atomic_status(
+            health=status,
+            stop=not healthy_idle,
+            reason=reason,
+            source=source,
+            blocked=blocked,
+            output_linear=0.0,
+            output_angular=0.0,
+            hard_stop=not healthy_idle,
+        )
 
     def _tick(self) -> None:
         now = time.monotonic()
@@ -416,6 +470,16 @@ class MotionSafetyNode(Node):
             self.direction_state.publish(UInt8(data=int(self.external_directions)))
             self.health.publish(String(data="HEALTHY:LIDAR_AVOIDANCE_DISABLED"))
             self.stop_source.publish(String(data="NONE"))
+            self._publish_atomic_status(
+                health="HEALTHY:LIDAR_AVOIDANCE_DISABLED",
+                stop=False,
+                reason="NONE",
+                source="NONE",
+                blocked=self.external_directions,
+                output_linear=candidate.linear.x,
+                output_angular=candidate.angular.z,
+                hard_stop=False,
+            )
             if masked_linear != self.command.linear.x or masked_angular != self.command.angular.z:
                 self._log_safety(
                     input_linear=self.command.linear.x,
@@ -481,16 +545,28 @@ class MotionSafetyNode(Node):
             abs(safe.linear.x - self.command.linear.x) > 1e-4
             or abs(safe.angular.z - self.command.angular.z) > 1e-4
         )
-        self.health.publish(String(data=(
+        health = (
             f"BLOCKED:{decision.reason or 'direction_hysteresis'}"
             if all_requested_components_blocked
             else "HEALTHY:CLIPPED"
             if modified
             else "HEALTHY"
-        )))
-        self.stop_source.publish(String(data=(
+        )
+        source = (
             "MOTION_SAFETY" if all_requested_components_blocked else "NONE"
-        )))
+        )
+        self.health.publish(String(data=health))
+        self.stop_source.publish(String(data=source))
+        self._publish_atomic_status(
+            health=health,
+            stop=all_requested_components_blocked,
+            reason=(decision.reason or "NONE"),
+            source=source,
+            blocked=held_blocked,
+            output_linear=safe.linear.x,
+            output_angular=safe.angular.z,
+            decision=decision,
+        )
         if modified:
             self._log_safety(
                 input_linear=self.command.linear.x,

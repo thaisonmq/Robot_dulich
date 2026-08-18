@@ -524,3 +524,17 @@ def test_mode_supervisor_rejects_managed_motion_without_safety(
 
     with pytest.raises(RuntimeError, match="motion_safety=0"):
         module.validate_base_runtime()
+
+
+def test_motion_safety_uses_only_normalized_scan_and_publishes_atomic_status() -> None:
+    project = Path(__file__).parents[1]
+    safety_node = (project / "motion-safety/safety_node.py").read_text()
+    adapter = (project / "navigation-stack/adapter_node.py").read_text()
+
+    assert 'LaserScan, "/scan/normalized"' in safety_node
+    assert 'LaserScan, "/scan", self._on_scan' not in safety_node
+    assert 'String, "/safety/status"' in adapter
+    assert 'self.status_state = self.create_publisher(String, "/safety/status"' in safety_node
+    # Compatibility topics remain available for non-navigation consumers.
+    assert '"/safety/health"' in safety_node
+    assert '"/safety/directional_mask"' in safety_node

@@ -64,9 +64,85 @@ class SafetyDecision:
     blocking_range: float | None = None
     blocking_angle: float | None = None
     requested_rotation_direction: str = "NONE"
+    rotation_left_blocked: bool = False
+    rotation_right_blocked: bool = False
+    measured_linear_velocity: float | None = None
     measured_angular_velocity: float | None = None
     predicted_swept_clearance: float | None = None
     required_swept_clearance: float | None = None
+
+
+def safety_snapshot_payload(
+    *,
+    sequence: int,
+    stamp: float,
+    health: str,
+    stop: bool,
+    reason: str,
+    source: str,
+    direction_mask: int,
+    input_linear: float,
+    input_angular: float,
+    output_linear: float,
+    output_angular: float,
+    measured_linear: float,
+    measured_angular: float,
+    decision: SafetyDecision | None = None,
+    hard_stop: bool | None = None,
+) -> dict[str, float | int | bool | str | None]:
+    """Serialize one atomic safety decision without recomputing collision."""
+    def finite(value: float | None) -> float | None:
+        if value is None or not math.isfinite(float(value)):
+            return None
+        return float(value)
+
+    return {
+        "seq": int(sequence),
+        "stamp": float(stamp),
+        "health": str(health),
+        "stop": bool(stop),
+        "reason": str(reason).upper(),
+        "source": str(source),
+        "direction_mask": int(direction_mask),
+        "input_v": float(input_linear),
+        "input_w": float(input_angular),
+        "output_v": float(output_linear),
+        "output_w": float(output_angular),
+        "hard_stop": bool(
+            hard_stop
+            if hard_stop is not None
+            else decision is not None and decision.hard_stop
+        ),
+        "blocking_beam_index": int(
+            -1 if decision is None else decision.blocking_beam_index
+        ),
+        "blocking_point_x": finite(
+            None if decision is None else decision.blocking_point_x
+        ),
+        "blocking_point_y": finite(
+            None if decision is None else decision.blocking_point_y
+        ),
+        "blocking_range": finite(
+            None if decision is None else decision.blocking_range
+        ),
+        "blocking_angle": finite(
+            None if decision is None else decision.blocking_angle
+        ),
+        "measured_linear": float(measured_linear),
+        "measured_angular": float(measured_angular),
+        "predicted_swept_clearance": finite(
+            None if decision is None else decision.predicted_swept_clearance
+        ),
+        "required_swept_clearance": finite(
+            None if decision is None else decision.required_swept_clearance
+        ),
+        "rotation_left_blocked": bool(
+            decision is not None and decision.rotation_left_blocked
+        ),
+        "rotation_right_blocked": bool(
+            decision is not None and decision.rotation_right_blocked
+        ),
+    }
 
 
 def stopping_clearance(speed: float, config: SafetyConfig) -> float:
@@ -390,6 +466,18 @@ def evaluate_scan(
         for x, y in valid_scan_points(scan, config)
         if not point_inside_footprint(x, y, config)
     )
+    prospective_left_blocked = _rotation_direction_blocked(
+        points,
+        angular_z=0.60,
+        measured_angular_z=None,
+        config=config,
+    )
+    prospective_right_blocked = _rotation_direction_blocked(
+        points,
+        angular_z=-0.60,
+        measured_angular_z=None,
+        config=config,
+    )
     for x, y in points:
         valid += 1
         clearance = rectangle_clearance(
@@ -527,6 +615,9 @@ def evaluate_scan(
         right_clearance=right_clearance,
         required_stop_distance=required,
         hard_stop=hard_stop,
+        rotation_left_blocked=prospective_left_blocked,
+        rotation_right_blocked=prospective_right_blocked,
+        measured_linear_velocity=measured_linear_x,
         **blocker_diagnostic,
     )
 

@@ -89,6 +89,13 @@ rovera_navigation_adapter:
     # with a map raycast, and never reuse the localization coarse tolerance.
     planning_static_match_tolerance: 0.08
     dynamic_overlay_static_tolerance: 0.08
+    dynamic_overlay_ttl_seconds: 2.0
+    dynamic_overlay_cluster_distance: 0.12
+    dynamic_obstacle_persistence_seconds: 1.5
+    dynamic_obstacle_clear_dwell_seconds: 0.40
+    dynamic_replan_retry_seconds: 2.0
+    start_escape_max_distance: 0.60
+    turn_bay_max_relocation_distance: 0.80
     # Prefer capture-time TF, wait briefly for normal listener jitter, then
     # accept the nearest transform only inside this explicit age budget.
     scan_tf_wait_seconds: 0.02
@@ -120,6 +127,9 @@ rovera_navigation_adapter:
     # not shrink or enlarge the collision footprint silently.
     planning_footprint_padding: 0.0
     corridor_hard_side_margin: 0.02
+    # Must match motion-safety's hard straight swept-body envelope. The wider
+    # corridor_side_margin below remains comfort/narrow metadata only.
+    translation_lateral_margin: 0.01
     corridor_side_margin: 0.05
     corridor_localization_uncertainty_max: 0.04
     corridor_front_clearance: 0.14

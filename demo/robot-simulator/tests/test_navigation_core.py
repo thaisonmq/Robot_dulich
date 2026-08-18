@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "navigation-stack"))
 import navigation_core  # noqa: E402
 from navigation_core import (  # noqa: E402
     ActiveSegment,
+    DynamicObstacleOverlay,
     MapNavigationGeometry,
     NavigationDebugLog,
     RouteMetadata,
@@ -21,15 +22,18 @@ from navigation_core import (  # noqa: E402
     SensorClockEstimator,
     StopTurnStateLatticePlanner,
     StopTurnRoute,
+    TurnBlockTracker,
     UnwrappedYawProgress,
     canonicalize_stop_turn_path,
     classify_planning_failure,
     compact_lethal_cells,
     densify_straight_segment,
+    dynamic_exclusions_intersect_route,
     endpoint_braking_speed_limit,
     evaluate_corridor,
     exact_euclidean_distance_transform,
     filter_static_map_scan,
+    find_start_escape,
     heading_diversity,
     deskew_scan_points,
     localization_confidence,
@@ -753,6 +757,20 @@ def test_corridor_geometry_reports_all_three_decision_states() -> None:
     assert front_blocked.reason == "FRONT_CLEARANCE"
 
 
+def test_corridor_comfort_margin_does_not_expand_hard_front_envelope() -> None:
+    assessment = evaluate_corridor(
+        [(0.0, -0.20), (0.0, 0.20), (0.24, 0.13)],
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.05,
+        hard_side_margin=0.02,
+        translation_lateral_margin=0.01,
+        front_clearance_required=0.14,
+    )
+    assert assessment.front_clearance == math.inf
+    assert assessment.reason != "FRONT_CLEARANCE"
+
+
 def test_route_overlap_rejects_near_duplicates_but_keeps_distinct_corridors() -> None:
     original = [{"x": 0.0, "y": 0.0}, {"x": 2.0, "y": 0.0}]
     near_duplicate = [{"x": 0.0, "y": 0.05}, {"x": 2.0, "y": 0.05}]
@@ -1225,6 +1243,195 @@ def test_actual_project_map_prefers_exact_valid_direct_route() -> None:
     assert route.points[-1] == goal
 
 
+def test_actual_runtime_start_overlap_is_classified_and_escapes_forward() -> None:
+    project = Path(__file__).parents[3]
+    saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    start = {
+        "x": 0.7174204546654707,
+        "y": 1.4057562960543704,
+        "yaw": 2.8682432380132292,
+    }
+    goal = {"x": -1.903265306122449, "y": 2.1532653061224494}
+
+    start_cell = saved.world_to_cell(start["x"], start["y"])
+    goal_cell = saved.world_to_cell(goal["x"], goal["y"])
+    assert start_cell is not None and goal_cell is not None
+    assert saved.navigation_geometry.same_component(start_cell, goal_cell)
+    assert planner._grid_seed(start_cell, goal_cell, ())
+    assert not saved.validate_footprint(
+        **start, half_length=0.15, half_width=0.10, code_prefix="START"
+    ).valid
+
+    classified = planner.plan_result(start, goal, planning_time_budget=12.0)
+    assert classified.status == "START_STATIC_OVERLAP"
+    assert classified.status != "SEARCH_TIME_BUDGET_EXCEEDED"
+    assert classified.start_escape is not None
+
+    recovered = planner.plan_result(
+        start,
+        goal,
+        planning_time_budget=12.0,
+        allow_start_escape=True,
+    )
+    assert recovered.success
+    assert recovered.start_escape is not None
+    assert recovered.start_escape.distance <= 0.60
+    assert recovered.start_escape.yaw == pytest.approx(start["yaw"])
+    assert saved.validate_footprint(
+        recovered.start_escape.end["x"],
+        recovered.start_escape.end["y"],
+        start["yaw"],
+        half_length=0.15,
+        half_width=0.10,
+        code_prefix="START",
+    ).valid
+    assert recovered.route is not None
+    assert recovered.route.points[-1] == goal
+
+
+def test_start_escape_rejects_a_new_static_overlap_cell() -> None:
+    free = _free_rectangle(1, 38, 1, 18)
+    free.remove((10, 8))   # Initial side overlap that persists while moving.
+    free.remove((14, 10))  # A new wall cell immediately ahead.
+    saved = _manual_map(40, 20, free)
+    start = {"x": 0.525, "y": 0.525, "yaw": 0.0}
+
+    assert saved.footprint_overlap_cells(
+        **start, half_length=0.15, half_width=0.10
+    )
+    assert find_start_escape(
+        saved,
+        start,
+        half_length=0.15,
+        half_width=0.10,
+        maximum_distance=0.50,
+    ) is None
+
+
+def test_dynamic_overlay_clusters_points_filters_static_wall_and_expires() -> None:
+    free = _free_rectangle(1, 38, 1, 28)
+    for row in range(1, 29):
+        free.discard((20, row))
+    saved = _manual_map(40, 30, free)
+    overlay = DynamicObstacleOverlay(
+        ttl_seconds=1.0, cluster_distance=0.10, association_distance=0.20
+    )
+    snapshot = overlay.observe(
+        [
+            (1.04, 0.50),  # Saved wall plus small localization/raster offset.
+            (0.76, 0.48), (0.78, 0.50), (0.80, 0.52),  # One person.
+        ],
+        now=10.0,
+        saved_map=saved,
+        static_tolerance=0.08,
+    )
+    assert len(snapshot) == 1
+    assert snapshot[0].observation_count == 1
+    moved = overlay.observe(
+        [(0.82, 0.50), (0.84, 0.52)],
+        now=10.2,
+        saved_map=saved,
+        static_tolerance=0.08,
+    )
+    assert len(moved) == 1
+    assert moved[0].id == snapshot[0].id
+    assert moved[0].observation_count == 2
+    assert overlay.snapshot(11.3) == ()
+
+
+def test_dynamic_exclusion_detours_without_mutating_saved_map() -> None:
+    free = _free_rectangle(2, 67, 2, 57) - _free_rectangle(28, 35, 15, 45)
+    saved = _manual_map(70, 60, free)
+    before = tuple(saved.occupancy)
+    planner = StopTurnStateLatticePlanner(
+        saved, saved.navigation_geometry, turn_robustness_radius=0.0
+    )
+    start = {"x": 0.50, "y": 1.50, "yaw": 0.0}
+    goal = {"x": 3.00, "y": 1.50}
+    direct = planner.plan(start, goal)
+    assert direct is not None
+
+    result = planner.plan_result(
+        start,
+        goal,
+        exclusions=((1.20, 0.70, 0.35),),
+        planning_time_budget=5.0,
+    )
+    assert result.success
+    assert result.route is not None
+    assert result.route.points != direct.points
+    assert tuple(saved.occupancy) == before
+
+
+def test_all_routes_temporarily_blocked_is_not_static_unreachable() -> None:
+    free = _free_rectangle(2, 57, 8, 15)
+    saved = _manual_map(60, 24, free)
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    start = {"x": 0.30, "y": 0.575, "yaw": 0.0}
+    goal = {"x": 2.70, "y": 0.575}
+    assert planner.plan(start, goal) is not None
+
+    result = planner.plan_result(
+        start,
+        goal,
+        exclusions=((1.50, 0.575, 0.45),),
+        planning_time_budget=5.0,
+    )
+    assert result.status == "DYNAMICALLY_BLOCKED"
+    assert result.status != "GOAL_DISCONNECTED"
+
+
+def test_dynamic_obstacles_only_affect_the_upcoming_route_horizon() -> None:
+    route = [
+        {"x": 0.0, "y": 0.0},
+        {"x": 2.0, "y": 0.0},
+        {"x": 4.0, "y": 0.0},
+    ]
+    assert dynamic_exclusions_intersect_route(
+        route, ((1.0, 0.0, 0.20),), horizon=2.0
+    )
+    assert not dynamic_exclusions_intersect_route(
+        route, ((-0.40, 0.0, 0.20),), horizon=2.0
+    )
+    assert not dynamic_exclusions_intersect_route(
+        route, ((1.0, 0.80, 0.20),), horizon=2.0
+    )
+    assert not dynamic_exclusions_intersect_route(
+        route, ((3.0, 0.0, 0.20),), horizon=2.0
+    )
+
+
+def test_real_expansion_bound_has_a_search_limit_reason(monkeypatch) -> None:
+    free = _free_rectangle(2, 47, 2, 37) - _free_rectangle(22, 27, 10, 30)
+    saved = _manual_map(50, 40, free)
+    planner = StopTurnStateLatticePlanner(
+        saved, saved.navigation_geometry, max_expansions=1
+    )
+    monkeypatch.setattr(planner, "_grid_seed", lambda *args, **kwargs: [])
+    result = planner.plan_result(
+        {"x": 0.30, "y": 1.00, "yaw": 0.0},
+        {"x": 2.20, "y": 1.00},
+        planning_time_budget=5.0,
+    )
+    assert result.status == "SEARCH_EXPANSION_LIMIT"
+    assert result.expansions == 1
+
+
+def test_turn_block_tracker_requires_atomic_clear_dwell() -> None:
+    tracker = TurnBlockTracker(clear_dwell_seconds=0.30)
+    assert tracker.update(sequence=10, blocked=True, now=1.0)
+    original = tracker.blocked_since
+    assert tracker.update(sequence=11, blocked=False, now=1.1)
+    assert tracker.blocked_since == original
+    assert tracker.update(sequence=11, blocked=False, now=1.5)
+    assert tracker.blocked_since == original
+    assert tracker.update(sequence=12, blocked=True, now=1.6)
+    assert tracker.blocked_since == original
+    assert tracker.update(sequence=13, blocked=False, now=1.7)
+    assert not tracker.update(sequence=14, blocked=False, now=2.01)
+
+
 def test_equally_safe_oblique_detour_beats_longer_right_angle_route() -> None:
     free = _free_rectangle(2, 97, 2, 77) - _free_rectangle(30, 32, 20, 22)
     saved = _manual_map(100, 80, free)
@@ -1538,6 +1745,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     ]["inflation_radius"]
     assert local_costmap["update_frequency"] >= 10
     assert local_costmap["resolution"] <= 0.025
+    assert navigation["rovera_navigation_adapter"]["ros__parameters"][
+        "translation_lateral_margin"
+    ] == safety["translation_lateral_margin"]
     assert local_costmap["obstacle_layer"]["scan"]["observation_persistence"] == 0.0
     assert local_costmap["obstacle_layer"]["plugin"] == "nav2_costmap_2d::ObstacleLayer"
     for costmap in (global_costmap, local_costmap):

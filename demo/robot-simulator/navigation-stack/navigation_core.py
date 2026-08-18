@@ -87,6 +87,237 @@ class StopTurnRoute:
 
 
 @dataclass(frozen=True, slots=True)
+class StartEscape:
+    """One bounded, forward-only motion that leaves initial map overlap."""
+
+    start: dict[str, float]
+    end: dict[str, float]
+    yaw: float
+    distance: float
+    initial_overlap_cells: tuple[tuple[int, int], ...]
+    samples_checked: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerResult:
+    """Structured result shared by initial planning and every recovery flow."""
+
+    status: str
+    route: StopTurnRoute | None = None
+    reason: str = ""
+    message: str = ""
+    start_escape: StartEscape | None = None
+    expansions: int = 0
+    elapsed_seconds: float = 0.0
+
+    @property
+    def success(self) -> bool:
+        return self.status == "SUCCESS" and self.route is not None
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicObstacle:
+    id: int
+    center_x: float
+    center_y: float
+    radius: float
+    bounds: tuple[float, float, float, float]
+    first_seen: float
+    last_seen: float
+    observation_count: int
+    confidence: float
+
+
+class DynamicObstacleOverlay:
+    """TTL-scoped clustered runtime obstacles; never mutates the Saved Map."""
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = 2.0,
+        cluster_distance: float = 0.12,
+        association_distance: float = 0.20,
+        observation_radius: float = 0.025,
+    ) -> None:
+        self.ttl_seconds = max(0.05, float(ttl_seconds))
+        self.cluster_distance = max(0.001, float(cluster_distance))
+        self.association_distance = max(
+            self.cluster_distance, float(association_distance)
+        )
+        self.observation_radius = max(0.0, float(observation_radius))
+        self._next_id = 1
+        self._obstacles: dict[int, DynamicObstacle] = {}
+
+    @staticmethod
+    def _clusters(
+        points: tuple[tuple[float, float], ...], distance: float
+    ) -> list[list[tuple[float, float]]]:
+        remaining = set(range(len(points)))
+        clusters: list[list[tuple[float, float]]] = []
+        while remaining:
+            seed = remaining.pop()
+            indices = [seed]
+            pending = [seed]
+            while pending:
+                current = pending.pop()
+                joined = [
+                    index
+                    for index in remaining
+                    if math.hypot(
+                        points[index][0] - points[current][0],
+                        points[index][1] - points[current][1],
+                    ) <= distance
+                ]
+                for index in joined:
+                    remaining.remove(index)
+                    indices.append(index)
+                    pending.append(index)
+            clusters.append([points[index] for index in indices])
+        return clusters
+
+    def expire(self, now: float) -> None:
+        cutoff = float(now) - self.ttl_seconds
+        self._obstacles = {
+            obstacle_id: obstacle
+            for obstacle_id, obstacle in self._obstacles.items()
+            if obstacle.last_seen >= cutoff
+        }
+
+    def observe(
+        self,
+        points: Iterable[tuple[float, float]],
+        *,
+        now: float,
+        saved_map: "SavedOccupancyMap | None" = None,
+        static_tolerance: float = 0.08,
+    ) -> tuple[DynamicObstacle, ...]:
+        timestamp = float(now)
+        self.expire(timestamp)
+        filtered = tuple(
+            (float(x), float(y))
+            for x, y in points
+            if math.isfinite(float(x)) and math.isfinite(float(y))
+            and (
+                saved_map is None
+                or not saved_map.occupied_within(
+                    float(x), float(y), max(0.0, float(static_tolerance))
+                )
+            )
+        )
+        for cluster in self._clusters(filtered, self.cluster_distance):
+            minimum_x = min(point[0] for point in cluster)
+            maximum_x = max(point[0] for point in cluster)
+            minimum_y = min(point[1] for point in cluster)
+            maximum_y = max(point[1] for point in cluster)
+            center_x = sum(point[0] for point in cluster) / len(cluster)
+            center_y = sum(point[1] for point in cluster) / len(cluster)
+            radius = max(
+                self.observation_radius,
+                max(
+                    math.hypot(x - center_x, y - center_y)
+                    for x, y in cluster
+                ) + self.observation_radius,
+            )
+            associated = min(
+                (
+                    obstacle
+                    for obstacle in self._obstacles.values()
+                    if math.hypot(
+                        obstacle.center_x - center_x,
+                        obstacle.center_y - center_y,
+                    ) <= self.association_distance + obstacle.radius + radius
+                ),
+                key=lambda obstacle: math.hypot(
+                    obstacle.center_x - center_x,
+                    obstacle.center_y - center_y,
+                ),
+                default=None,
+            )
+            if associated is None:
+                obstacle_id = self._next_id
+                self._next_id += 1
+                first_seen = timestamp
+                count = 1
+            else:
+                obstacle_id = associated.id
+                first_seen = associated.first_seen
+                count = associated.observation_count + 1
+                # A rolling center rejects one noisy costmap cell while still
+                # following a moving person/trolley.
+                weight = min(0.75, 1.0 / max(1, count))
+                center_x = associated.center_x * (1.0 - weight) + center_x * weight
+                center_y = associated.center_y * (1.0 - weight) + center_y * weight
+                minimum_x = min(minimum_x, associated.bounds[0])
+                minimum_y = min(minimum_y, associated.bounds[1])
+                maximum_x = max(maximum_x, associated.bounds[2])
+                maximum_y = max(maximum_y, associated.bounds[3])
+                radius = max(radius, associated.radius)
+            self._obstacles[obstacle_id] = DynamicObstacle(
+                obstacle_id,
+                center_x,
+                center_y,
+                radius,
+                (minimum_x, minimum_y, maximum_x, maximum_y),
+                first_seen,
+                timestamp,
+                count,
+                min(1.0, count / 3.0),
+            )
+        return self.snapshot(timestamp)
+
+    def snapshot(self, now: float) -> tuple[DynamicObstacle, ...]:
+        self.expire(now)
+        return tuple(sorted(self._obstacles.values(), key=lambda item: item.id))
+
+    def exclusions(
+        self,
+        now: float,
+        *,
+        inflation: float = 0.0,
+        minimum_observations: int = 1,
+    ) -> tuple[tuple[float, float, float], ...]:
+        return tuple(
+            (
+                obstacle.center_x,
+                obstacle.center_y,
+                obstacle.radius + max(0.0, float(inflation)),
+            )
+            for obstacle in self.snapshot(now)
+            if obstacle.observation_count >= max(1, int(minimum_observations))
+        )
+
+
+@dataclass(slots=True)
+class TurnBlockTracker:
+    """Atomic-sequence turn-block timer with a clear dwell."""
+
+    clear_dwell_seconds: float
+    blocked_since: float | None = None
+    clear_since: float | None = None
+    last_sequence: int = -1
+
+    def update(self, *, sequence: int, blocked: bool, now: float) -> bool:
+        if int(sequence) <= self.last_sequence:
+            return self.blocked_since is not None
+        self.last_sequence = int(sequence)
+        if blocked:
+            if self.blocked_since is None:
+                self.blocked_since = float(now)
+            self.clear_since = None
+            return True
+        if self.blocked_since is None:
+            return False
+        if self.clear_since is None:
+            self.clear_since = float(now)
+            return True
+        if float(now) - self.clear_since < max(0.0, self.clear_dwell_seconds):
+            return True
+        self.blocked_since = None
+        self.clear_since = None
+        return False
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveSegment:
     """Immutable control geometry for one stop-turn straight segment.
 
@@ -844,6 +1075,7 @@ def validate_rotation_sweep(
     half_width: float,
     padding: float = 0.0,
     allow_unknown: bool = False,
+    direction: int = 0,
 ) -> RotationSweepValidation:
     """Exact sampled rectangular footprint check for an in-place rotation.
 
@@ -851,6 +1083,10 @@ def validate_rotation_sweep(
     more than half a map cell between samples.
     """
     delta = _angle_delta(float(end_yaw), float(start_yaw))
+    if int(direction) > 0 and delta < 0.0:
+        delta += 2.0 * math.pi
+    elif int(direction) < 0 and delta > 0.0:
+        delta -= 2.0 * math.pi
     radius = math.hypot(
         float(half_length) + float(padding),
         float(half_width) + float(padding),
@@ -878,6 +1114,27 @@ def validate_rotation_sweep(
                 False, "TURN_SWEEP_COLLISION", index + 1, yaw
             )
     return RotationSweepValidation(True, samples_checked=sample_count + 1)
+
+
+def choose_turn_direction(
+    angular_error: float,
+    *,
+    left_static_safe: bool,
+    right_static_safe: bool,
+    left_live_safe: bool,
+    right_live_safe: bool,
+) -> int:
+    """Choose shortest safe direction, then the statically/live-safe opposite."""
+    preferred = 1 if float(angular_error) >= 0.0 else -1
+    safe = {
+        1: bool(left_static_safe and left_live_safe),
+        -1: bool(right_static_safe and right_live_safe),
+    }
+    if safe[preferred]:
+        return preferred
+    if safe[-preferred]:
+        return -preferred
+    return 0
 
 
 def validate_rotation_sweep_neighborhood(
@@ -1324,6 +1581,7 @@ class StopTurnStateLatticePlanner:
         seed: list[tuple[int, int]],
         start: dict[str, float],
         goal: dict[str, float],
+        exclusions: tuple[tuple[float, float, float], ...] = (),
         deadline_monotonic: float | None = None,
     ) -> list[dict[str, float]]:
         if len(seed) < 2:
@@ -1361,7 +1619,11 @@ class StopTurnStateLatticePlanner:
                     raw[following]["y"] - raw[index]["y"],
                     raw[following]["x"] - raw[index]["x"],
                 )
+                if self._segment_excluded(raw[index], raw[following], exclusions):
+                    continue
                 if index > 0 and abs(_angle_delta(outgoing_yaw, incoming_yaw)) > math.radians(1.0):
+                    if self._excluded(raw[index]["x"], raw[index]["y"], exclusions):
+                        continue
                     turn_key = (index, self.heading_bin(outgoing_yaw))
                     turn_valid = turn_cache.get(turn_key)
                     if turn_valid is None:
@@ -1470,6 +1732,8 @@ class StopTurnStateLatticePlanner:
         exclusions: Iterable[tuple[float, float, float]] = (),
         deadline_monotonic: float | None = None,
     ) -> StopTurnRoute | None:
+        self._last_plan_expansions = 0
+        self._last_plan_limit = ""
         start_x, start_y = float(start["x"]), float(start["y"])
         goal_x, goal_y = float(goal["x"]), float(goal["y"])
         start_cell = self.saved_map.world_to_cell(start_x, start_y)
@@ -1536,6 +1800,7 @@ class StopTurnStateLatticePlanner:
             seed,
             start,
             goal,
+            forbidden,
             deadline_monotonic,
         )
         seeded_result: StopTurnRoute | None = None
@@ -1593,6 +1858,7 @@ class StopTurnStateLatticePlanner:
             heading_bin = state[2]
             yaw = self.heading(heading_bin)
             expansions += 1
+            self._last_plan_expansions = expansions
             goal_distance = math.hypot(goal_x - x, goal_y - y)
             if goal_distance <= self.primitive_length * 2.5:
                 goal_heading = math.atan2(goal_y - y, goal_x - x)
@@ -1607,6 +1873,9 @@ class StopTurnStateLatticePlanner:
                 if (
                     rotation_valid
                     and not self._excluded(goal_x, goal_y, forbidden)
+                    and not self._segment_excluded(
+                        {"x": x, "y": y}, direct, forbidden
+                    )
                     and self._translation_valid({"x": x, "y": y}, direct)
                 ):
                     goal_bin = self.heading_bin(goal_heading)
@@ -1621,6 +1890,11 @@ class StopTurnStateLatticePlanner:
             if (
                 next_cell is not None
                 and not self._excluded(next_x, next_y, forbidden)
+                and not self._segment_excluded(
+                    {"x": x, "y": y},
+                    {"x": next_x, "y": next_y},
+                    forbidden,
+                )
             ):
                 next_key = self._pose_key(next_x, next_y, heading_bin)
                 edge = (state, next_key)
@@ -1643,6 +1917,8 @@ class StopTurnStateLatticePlanner:
                         )
 
             for direction in (-1, 1):
+                if self._excluded(x, y, forbidden):
+                    continue
                 next_heading = (heading_bin + direction) % self.HEADING_BINS
                 next_key = self._pose_key(x, y, next_heading)
                 cache_key = (state, next_heading)
@@ -1668,6 +1944,13 @@ class StopTurnStateLatticePlanner:
                 heuristic = math.hypot(goal_x - x, goal_y - y) / self.linear_speed
                 heapq.heappush(queue, (next_cost + heuristic, sequence, next_key))
         if finish_key is None:
+            if expansions >= self.max_expansions:
+                self._last_plan_limit = "SEARCH_EXPANSION_LIMIT"
+            elif (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                self._last_plan_limit = "SEARCH_TIME_BUDGET_EXCEEDED"
             return min(candidate_pool, key=self.ranking_key) if candidate_pool else None
         states: list[tuple[int, int, int]] = []
         cursor: tuple[int, int, int] | None = finish_key
@@ -1685,6 +1968,233 @@ class StopTurnStateLatticePlanner:
         if lattice_result is not None:
             candidate_pool.append(lattice_result)
         return min(candidate_pool, key=self.ranking_key) if candidate_pool else None
+
+    def plan_result(
+        self,
+        start: dict[str, float],
+        goal: dict[str, float],
+        *,
+        exclusions: Iterable[tuple[float, float, float]] = (),
+        planning_time_budget: float | None = None,
+        allow_start_escape: bool = False,
+        maximum_start_escape_distance: float = 0.60,
+        live_start_clear: bool = True,
+    ) -> PlannerResult:
+        """Plan with explicit start/goal/search/dynamic failure semantics."""
+        started = time.monotonic()
+        deadline = (
+            None
+            if planning_time_budget is None
+            else started + max(0.0, float(planning_time_budget))
+        )
+        start_cell = self.saved_map.world_to_cell(
+            float(start["x"]), float(start["y"])
+        )
+        if start_cell is None:
+            return PlannerResult(
+                "START_OUTSIDE_MAP",
+                reason="START_OUTSIDE_MAP",
+                message="Current robot center is outside the Saved Map",
+            )
+        goal_cell = self.saved_map.world_to_cell(float(goal["x"]), float(goal["y"]))
+        if goal_cell is None:
+            return PlannerResult(
+                "GOAL_OUTSIDE_MAP",
+                reason="GOAL_OUTSIDE_MAP",
+                message="Goal is outside the Saved Map",
+            )
+        initial_same_component = self.geometry.same_component(start_cell, goal_cell)
+        if not self.geometry.robot_navigable_mask[
+            self.geometry.index(*goal_cell)
+        ]:
+            return PlannerResult(
+                "GOAL_INVALID",
+                reason="GOAL_INVALID",
+                message="Goal has no translation-safe robot footprint",
+            )
+        start_validation = self.saved_map.validate_footprint(
+            float(start["x"]),
+            float(start["y"]),
+            float(start.get("yaw", 0.0)),
+            half_length=self.half_length,
+            half_width=self.half_width,
+            padding=self.padding,
+            allow_unknown=False,
+            code_prefix="START",
+        )
+        escape: StartEscape | None = None
+        planning_start = dict(start)
+        if not start_validation.valid:
+            if start_validation.code == "START_FOOTPRINT_OUTSIDE_MAP":
+                return PlannerResult(
+                    "START_OUTSIDE_MAP",
+                    reason="START_OUTSIDE_MAP",
+                    message=start_validation.message,
+                )
+            escape = find_start_escape(
+                self.saved_map,
+                start,
+                half_length=self.half_length,
+                half_width=self.half_width,
+                padding=self.padding,
+                maximum_distance=maximum_start_escape_distance,
+            )
+            escape_cell = (
+                None
+                if escape is None
+                else self.saved_map.world_to_cell(
+                    float(escape.end["x"]), float(escape.end["y"])
+                )
+            )
+            if (
+                not initial_same_component
+                and (
+                    escape_cell is None
+                    or not self.geometry.same_component(escape_cell, goal_cell)
+                )
+            ):
+                return PlannerResult(
+                    "GOAL_DISCONNECTED",
+                    reason="GOAL_DISCONNECTED",
+                    message="Goal is outside the translation-reachable component",
+                    start_escape=escape,
+                )
+            if not allow_start_escape:
+                return PlannerResult(
+                    "START_STATIC_OVERLAP",
+                    reason="START_STATIC_OVERLAP",
+                    message="Saved Map raster overlaps the initial footprint",
+                    start_escape=escape,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            if not live_start_clear or escape is None:
+                return PlannerResult(
+                    "START_ESCAPE_UNAVAILABLE",
+                    reason=(
+                        "DYNAMICALLY_BLOCKED"
+                        if not live_start_clear
+                        else "START_ESCAPE_UNAVAILABLE"
+                    ),
+                    message="No bounded forward-only start escape is executable",
+                    start_escape=escape,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            planning_start = {
+                "x": escape.end["x"],
+                "y": escape.end["y"],
+                "yaw": escape.yaw,
+            }
+        elif not initial_same_component:
+            return PlannerResult(
+                "GOAL_DISCONNECTED",
+                reason="GOAL_DISCONNECTED",
+                message="Goal is outside the translation-reachable component",
+            )
+        forbidden = tuple(
+            (float(x), float(y), max(0.0, float(radius)))
+            for x, y, radius in exclusions
+        )
+        planning_start_cell = self.saved_map.world_to_cell(
+            float(planning_start["x"]), float(planning_start["y"])
+        )
+        if forbidden and planning_start_cell is not None:
+            static_seed = self._grid_seed(
+                planning_start_cell, goal_cell, (), deadline
+            )
+            dynamic_seed = self._grid_seed(
+                planning_start_cell, goal_cell, forbidden, deadline
+            )
+            if (
+                static_seed
+                and not dynamic_seed
+                and (deadline is None or time.monotonic() < deadline)
+            ):
+                return PlannerResult(
+                    "DYNAMICALLY_BLOCKED",
+                    reason="DYNAMICALLY_BLOCKED",
+                    message="Temporary obstacles disconnect every current route",
+                    start_escape=escape,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+        route = self.plan(
+            planning_start,
+            goal,
+            exclusions=forbidden,
+            deadline_monotonic=deadline,
+        )
+        elapsed = time.monotonic() - started
+        expansions = int(getattr(self, "_last_plan_expansions", 0))
+        if route is not None:
+            return PlannerResult(
+                "SUCCESS",
+                route=route,
+                start_escape=escape,
+                expansions=expansions,
+                elapsed_seconds=elapsed,
+            )
+        limit = str(getattr(self, "_last_plan_limit", ""))
+        if limit:
+            return PlannerResult(
+                limit,
+                reason=limit,
+                message="Stop-turn search reached its configured bound",
+                start_escape=escape,
+                expansions=expansions,
+                elapsed_seconds=elapsed,
+            )
+        if forbidden:
+            static_route = self.plan(
+                planning_start,
+                goal,
+                exclusions=(),
+                deadline_monotonic=deadline,
+            )
+            if static_route is not None:
+                return PlannerResult(
+                    "DYNAMICALLY_BLOCKED",
+                    reason="DYNAMICALLY_BLOCKED",
+                    message="Temporary obstacles block every current route",
+                    start_escape=escape,
+                    expansions=expansions,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+        start_yaw = float(planning_start.get("yaw", 0.0))
+        forward_probe = {
+            "x": float(planning_start["x"]) + self.primitive_length * math.cos(start_yaw),
+            "y": float(planning_start["y"]) + self.primitive_length * math.sin(start_yaw),
+        }
+        forward_valid = self._translation_valid(planning_start, forward_probe)
+        left_valid = self._turn_valid(
+            float(planning_start["x"]),
+            float(planning_start["y"]),
+            start_yaw,
+            start_yaw + self.heading_step,
+            robust=False,
+        )
+        right_valid = self._turn_valid(
+            float(planning_start["x"]),
+            float(planning_start["y"]),
+            start_yaw,
+            start_yaw - self.heading_step,
+            robust=False,
+        )
+        if not forward_valid and not left_valid and not right_valid:
+            return PlannerResult(
+                "START_TURN_BLOCKED_STATIC",
+                reason="START_TURN_BLOCKED_STATIC",
+                message="Start cannot translate forward or begin either static turn",
+                start_escape=escape,
+                expansions=expansions,
+                elapsed_seconds=elapsed,
+            )
+        return PlannerResult(
+            "NO_EXACT_STOP_TURN_ROUTE",
+            reason="NO_EXACT_STOP_TURN_ROUTE",
+            message="No exact-valid straight/stop/turn route was found",
+            start_escape=escape,
+            expansions=expansions,
+            elapsed_seconds=elapsed,
+        )
 
     def ranking_key(
         self, route: StopTurnRoute
@@ -1731,13 +2241,21 @@ class StopTurnStateLatticePlanner:
         maximum_candidates: int = 3,
         overlap_threshold: float = 0.80,
         planning_time_budget: float | None = None,
+        exclusions: Iterable[tuple[float, float, float]] = (),
+        primary_route: StopTurnRoute | None = None,
     ) -> list[StopTurnRoute]:
         deadline = (
             None
             if planning_time_budget is None
             else time.monotonic() + max(0.0, float(planning_time_budget))
         )
-        primary = self.plan(start, goal, deadline_monotonic=deadline)
+        dynamic_exclusions = tuple(exclusions)
+        primary = primary_route or self.plan(
+            start,
+            goal,
+            exclusions=dynamic_exclusions,
+            deadline_monotonic=deadline,
+        )
         if primary is None:
             return []
         candidates = [primary]
@@ -1761,7 +2279,7 @@ class StopTurnStateLatticePlanner:
             candidate = self.plan(
                 start,
                 goal,
-                exclusions=(exclusion,),
+                exclusions=(*dynamic_exclusions, exclusion),
                 deadline_monotonic=deadline,
             )
             if candidate is None:
@@ -2077,6 +2595,7 @@ def evaluate_corridor(
     lookahead: float = 0.80,
     rotation_margin: float | None = None,
     hard_side_margin: float = 0.02,
+    translation_lateral_margin: float = 0.01,
     localization_uncertainty: float = 0.0,
 ) -> CorridorAssessment:
     """Evaluate straight and in-place-rotation envelopes independently.
@@ -2151,7 +2670,8 @@ def evaluate_corridor(
         (
             x - length
             for x, y in values
-            if x >= length and abs(y) <= width + margin
+            if x >= length
+            and abs(y) <= width + max(0.0, float(translation_lateral_margin))
         ),
         default=math.inf,
     )
@@ -2262,6 +2782,52 @@ def path_overlap_ratio(
         return matches / len(source)
 
     return round(min(covered(left_points, right_points), covered(right_points, left_points)), 4)
+
+
+def dynamic_exclusions_intersect_route(
+    points: Iterable[dict[str, float]],
+    exclusions: Iterable[tuple[float, float, float]],
+    *,
+    horizon: float = 2.0,
+) -> bool:
+    """Check only the bounded upcoming route, never unrelated/behind objects."""
+    route = list(points)
+    remaining_horizon = max(0.0, float(horizon))
+    dynamic = tuple(exclusions)
+    for left, right in zip(route, route[1:]):
+        left_x, left_y = float(left["x"]), float(left["y"])
+        delta_x = float(right["x"]) - left_x
+        delta_y = float(right["y"]) - left_y
+        length = math.hypot(delta_x, delta_y)
+        if length <= 1e-9:
+            continue
+        used = min(length, remaining_horizon)
+        ratio_end = used / length
+        end_x = left_x + delta_x * ratio_end
+        end_y = left_y + delta_y * ratio_end
+        segment_x = end_x - left_x
+        segment_y = end_y - left_y
+        denominator = segment_x * segment_x + segment_y * segment_y
+        for center_x, center_y, radius in dynamic:
+            ratio = 0.0 if denominator <= 1e-12 else max(
+                0.0,
+                min(
+                    1.0,
+                    (
+                        (float(center_x) - left_x) * segment_x
+                        + (float(center_y) - left_y) * segment_y
+                    ) / denominator,
+                ),
+            )
+            if math.hypot(
+                left_x + ratio * segment_x - float(center_x),
+                left_y + ratio * segment_y - float(center_y),
+            ) <= float(radius):
+                return True
+        remaining_horizon -= used
+        if remaining_horizon <= 1e-9:
+            break
+    return False
 
 
 def environment_flag(name: str, default: bool = False) -> bool:
@@ -3058,6 +3624,77 @@ class SavedOccupancyMap:
                 )
         return GoalValidation(True)
 
+    def footprint_overlap_cells(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        *,
+        half_length: float,
+        half_width: float,
+        padding: float = 0.0,
+        include_unknown: bool = True,
+    ) -> tuple[tuple[int, int, int], ...]:
+        """Return exact static raster cells intersecting an oriented body.
+
+        This is intentionally diagnostic/escape geometry.  It does not grant
+        a global collision exemption and it does not inspect dynamic inputs.
+        """
+        length = max(0.0, float(half_length) + float(padding))
+        width = max(0.0, float(half_width) + float(padding))
+        if length <= 0.0 or width <= 0.0:
+            raise ValueError("footprint half dimensions must be positive")
+        center = self.world_to_cell(float(x), float(y))
+        if center is None:
+            return ()
+        robot_x_axis = (math.cos(yaw), math.sin(yaw))
+        robot_y_axis = (-math.sin(yaw), math.cos(yaw))
+        map_x_axis = (math.cos(self.origin_yaw), math.sin(self.origin_yaw))
+        map_y_axis = (-math.sin(self.origin_yaw), math.cos(self.origin_yaw))
+        half_cell = self.resolution / 2.0
+
+        def intersects(cell_x: float, cell_y: float) -> bool:
+            delta = (cell_x - float(x), cell_y - float(y))
+            for axis in (robot_x_axis, robot_y_axis, map_x_axis, map_y_axis):
+                separation = abs(delta[0] * axis[0] + delta[1] * axis[1])
+                robot_projection = (
+                    length * abs(
+                        robot_x_axis[0] * axis[0]
+                        + robot_x_axis[1] * axis[1]
+                    )
+                    + width * abs(
+                        robot_y_axis[0] * axis[0]
+                        + robot_y_axis[1] * axis[1]
+                    )
+                )
+                cell_projection = half_cell * (
+                    abs(map_x_axis[0] * axis[0] + map_x_axis[1] * axis[1])
+                    + abs(map_y_axis[0] * axis[0] + map_y_axis[1] * axis[1])
+                )
+                if separation > robot_projection + cell_projection:
+                    return False
+            return True
+
+        center_column, center_row = center
+        radius = math.ceil(
+            (math.hypot(length, width) + math.sqrt(2.0) * half_cell)
+            / self.resolution
+        ) + 1
+        overlaps: list[tuple[int, int, int]] = []
+        for row in range(center_row - radius, center_row + radius + 1):
+            for column in range(center_column - radius, center_column + radius + 1):
+                if not (0 <= column < self.width and 0 <= row < self.height):
+                    continue
+                value = self.value_at(column, row)
+                if value < 0 and not include_unknown:
+                    continue
+                if value < 65 and value >= 0:
+                    continue
+                cell_x, cell_y = self.cell_center(column, row)
+                if intersects(cell_x, cell_y):
+                    overlaps.append((column, row, value))
+        return tuple(overlaps)
+
     def nearest_valid_goal(
         self,
         x: float,
@@ -3140,6 +3777,108 @@ class SavedOccupancyMap:
             return None
         _, _, _, candidate_x, candidate_y = min(candidates)
         return candidate_x, candidate_y
+
+
+def find_start_escape(
+    saved_map: SavedOccupancyMap,
+    start: dict[str, float],
+    *,
+    half_length: float,
+    half_width: float,
+    padding: float = 0.0,
+    maximum_distance: float = 0.60,
+    probe_step: float | None = None,
+    live_blocked_points: Iterable[tuple[float, float]] = (),
+    live_inflation: float = 0.0,
+) -> StartEscape | None:
+    """Find the nearest exact-valid pose straight ahead of an overlapped start.
+
+    Every intermediate footprint may retain only cells already overlapped at
+    the initial pose.  Encountering any new occupied/unknown cell terminates
+    the search, so this cannot become permission to cross a wall.
+    """
+    start_x = float(start["x"])
+    start_y = float(start["y"])
+    yaw = float(start.get("yaw", 0.0))
+    initial_validation = saved_map.validate_footprint(
+        start_x,
+        start_y,
+        yaw,
+        half_length=half_length,
+        half_width=half_width,
+        padding=padding,
+        allow_unknown=False,
+        code_prefix="START",
+    )
+    if initial_validation.valid:
+        return None
+    if initial_validation.code == "START_FOOTPRINT_OUTSIDE_MAP":
+        return None
+    initial_cells = saved_map.footprint_overlap_cells(
+        start_x,
+        start_y,
+        yaw,
+        half_length=half_length,
+        half_width=half_width,
+        padding=padding,
+    )
+    initial_set = {(column, row) for column, row, _ in initial_cells}
+    if not initial_set:
+        return None
+    step = (
+        max(saved_map.resolution * 0.5, 0.005)
+        if probe_step is None
+        else max(0.005, min(float(probe_step), saved_map.resolution))
+    )
+    limit = max(0.0, float(maximum_distance))
+    dynamic = tuple((float(x), float(y)) for x, y in live_blocked_points)
+    previous_count = len(initial_set)
+    samples = max(0, math.floor(limit / step))
+    for index in range(1, samples + 1):
+        distance = min(limit, index * step)
+        x = start_x + distance * math.cos(yaw)
+        y = start_y + distance * math.sin(yaw)
+        overlap = saved_map.footprint_overlap_cells(
+            x,
+            y,
+            yaw,
+            half_length=half_length,
+            half_width=half_width,
+            padding=padding,
+        )
+        overlap_set = {(column, row) for column, row, _ in overlap}
+        if not overlap_set.issubset(initial_set) or len(overlap_set) > previous_count:
+            return None
+        previous_count = len(overlap_set)
+        lateral = half_width + padding + max(0.0, float(live_inflation))
+        longitudinal = half_length + padding
+        for obstacle_x, obstacle_y in dynamic:
+            delta_x = obstacle_x - x
+            delta_y = obstacle_y - y
+            local_x = math.cos(yaw) * delta_x + math.sin(yaw) * delta_y
+            local_y = -math.sin(yaw) * delta_x + math.cos(yaw) * delta_y
+            if abs(local_x) <= longitudinal and abs(local_y) <= lateral:
+                return None
+        validation = saved_map.validate_footprint(
+            x,
+            y,
+            yaw,
+            half_length=half_length,
+            half_width=half_width,
+            padding=padding,
+            allow_unknown=False,
+            code_prefix="START",
+        )
+        if validation.valid:
+            return StartEscape(
+                start={"x": start_x, "y": start_y},
+                end={"x": x, "y": y},
+                yaw=yaw,
+                distance=distance,
+                initial_overlap_cells=tuple(sorted(initial_set)),
+                samples_checked=index,
+            )
+    return None
 
 
 def localization_confidence(
