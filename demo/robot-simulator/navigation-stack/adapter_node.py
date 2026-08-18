@@ -69,6 +69,7 @@ from navigation_core import (
     heading_diversity,
     localization_confidence,
     path_overlap_ratio,
+    post_turn_reanchor_requires_turn,
     pose_stability,
     rotation_swept_clearance,
     route_geometry_metadata,
@@ -210,12 +211,16 @@ class NavigationAdapter(Node):
         self.localization_seed_approximate = False
         self.global_search_requires_rotation = False
         self.global_search_rotation_pending = False
+        self.global_search_untrusted = False
         self.stationary_global_candidate_ambiguous = False
         self.last_initial_pose_publish_monotonic = 0.0
         self.rotation_active = False
         self.rotation_angle = 0.0
         self.rotation_last_monotonic = 0.0
         self.rotation_yaw_progress = UnwrappedYawProgress()
+        self.localization_rotation_cycle_start_angle = 0.0
+        self.localization_next_observation_angle = 0.0
+        self.localization_actual_yaw: float | None = None
         self.localization_settling_evidence_started = False
         # Passive by default: physical rotation always requires an explicit
         # command and is never implied by map load, reconnect or recovery.
@@ -361,6 +366,13 @@ class NavigationAdapter(Node):
         self.localization_rotation_blocked_timeout = configured(
             "localization_rotation_blocked_timeout_seconds", 5.0
         )
+        self.localization_tf_chain_timeout = configured(
+            "localization_tf_chain_timeout_seconds", 8.0
+        )
+        self.localization_tf_unavailable_since: float | None = None
+        self.last_localization_tf_log_monotonic = 0.0
+        self.last_localization_tf_signature = ""
+        self.last_navigation_scan_published_monotonic = 0.0
         self.localization_rotation_blocked_since: float | None = None
         self.global_heading_bin_count = max(4, int(self.declare_parameter(
             "localization_global_heading_bin_count", 8
@@ -369,7 +381,15 @@ class NavigationAdapter(Node):
             "localization_global_min_heading_bins", 4
         ).value))
         self.global_minimum_heading_span = math.radians(configured(
-            "localization_global_min_heading_span_degrees", 180.0
+            "localization_global_min_heading_span_degrees", 150.0
+        ))
+        self.global_strong_minimum_heading_bins = max(2, int(
+            self.declare_parameter(
+                "localization_global_strong_min_heading_bins", 2
+            ).value
+        ))
+        self.global_strong_minimum_heading_span = math.radians(configured(
+            "localization_global_strong_min_heading_span_degrees", 75.0
         ))
         # Kept as an observable physical-sweep diagnostic and max-sweep guard;
         # READY uses actual scan heading bins/span below, not commanded angle.
@@ -659,6 +679,7 @@ class NavigationAdapter(Node):
         }
         self.last_scan_filter_log_monotonic = 0.0
         self.last_localization_candidate_log_monotonic = 0.0
+        self.last_localization_rotate_log_monotonic = 0.0
         self.last_tf_debug_monotonic: dict[str, float] = {}
         self.scan_transform_cache: dict[
             tuple[str, str, int], tuple[float, float, float] | None
@@ -1329,6 +1350,9 @@ class NavigationAdapter(Node):
             )
             covariance_yaw = max(0.0, float(self.last_amcl_covariance[35]))
         metrics = self.pose_stability_metrics
+        required_heading_bins, required_heading_span = (
+            self._global_heading_requirement()
+        )
         return {
             "localization_state": self.localization_state,
             "localization_confidence": self.localization_confidence,
@@ -1367,6 +1391,12 @@ class NavigationAdapter(Node):
             ),
             "global_observation": {
                 "requires_rotation": self.global_search_requires_rotation,
+                "untrusted_global": self.global_search_untrusted,
+                "candidate_class": (
+                    "AMBIGUOUS"
+                    if self.stationary_global_candidate_ambiguous
+                    else "STRONG"
+                ),
                 "accumulated_rotation_degrees": round(
                     math.degrees(self.rotation_angle), 1
                 ),
@@ -1375,21 +1405,16 @@ class NavigationAdapter(Node):
                 ),
                 "heading_bins_observed": list(self.localization_heading_bins),
                 "heading_bin_count": self.global_heading_bin_count,
-                "minimum_heading_bins": self.global_minimum_heading_bins,
+                "minimum_heading_bins": required_heading_bins,
                 "heading_span_degrees": round(
                     math.degrees(self.localization_heading_span), 1
                 ),
                 "minimum_heading_span_degrees": round(
-                    math.degrees(self.global_minimum_heading_span), 1
+                    math.degrees(required_heading_span), 1
                 ),
                 "sufficient": (
-                    not self.global_search_requires_rotation
-                    or (
-                        len(self.localization_heading_bins)
-                        >= self.global_minimum_heading_bins
-                        and self.localization_heading_span
-                        >= self.global_minimum_heading_span
-                    )
+                    not self.global_search_untrusted
+                    or self._global_heading_diversity_ready()
                 ),
             },
             "scan_age_ms": self._age_milliseconds(self.last_scan_monotonic),
@@ -1606,6 +1631,22 @@ class NavigationAdapter(Node):
 
     def _dispatch(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
         expected_state = str(payload.get("expected_state", "")).upper()
+        if command != "system.status":
+            self._nav_debug(
+                "COMMAND",
+                command=command,
+                expected_state=expected_state or None,
+                current_state=self.current_state,
+                map_id=str(payload.get("map_id") or self.map_id),
+                map_version=(
+                    payload.get("version") or payload.get("map_version")
+                    or self.map_version
+                ),
+                request_id=(
+                    payload.get("request_id") or payload.get("command_id")
+                    or payload.get("message_id")
+                ),
+            )
         restartable_mapping_start = (
             command == "mapping.start"
             and expected_state == "IDLE"
@@ -1630,6 +1671,22 @@ class NavigationAdapter(Node):
             and not restartable_navigation_plan
             and not unconditional_safety_command
         ):
+            self._nav_debug(
+                "COMMAND_REJECTED",
+                command=command,
+                expected_state=expected_state,
+                current_state=self.current_state,
+                map_id=str(payload.get("map_id") or self.map_id),
+                map_version=(
+                    payload.get("version") or payload.get("map_version")
+                    or self.map_version
+                ),
+                request_id=(
+                    payload.get("request_id") or payload.get("command_id")
+                    or payload.get("message_id")
+                ),
+                reason="STATE_CONFLICT",
+            )
             raise AdapterError(
                 "STATE_CONFLICT",
                 f"Expected {expected_state}, robot is {self.current_state}",
@@ -1688,6 +1745,11 @@ class NavigationAdapter(Node):
                 self.localization_rotation_authorized = True
                 self.localization_started_monotonic = time.monotonic()
                 self._start_global_localization()
+                return {
+                    "status": "accepted",
+                    "current_state": self.current_state,
+                    "state": self._state(),
+                }
             elif self.localized and self.localization_state == "READY":
                 # Initial convergence already passed the strict stationary
                 # gates. READY is continuously maintained with lower-threshold
@@ -1702,18 +1764,36 @@ class NavigationAdapter(Node):
                 "LOCALIZATION_INITIALIZING", "LOCALIZING_LAST_POSE",
                 "LOCALIZING_APPROXIMATE_POSE", "VERIFYING",
             }:
+                self._nav_debug(
+                    "LOCALIZATION",
+                    state=self.localization_state,
+                    action="AUTO_READY_REUSE_UNAVAILABLE",
+                    reason=self._localization_rejection_reason(time.monotonic()),
+                )
                 # Preserve a recent-pose/no-motion verification already in
                 # progress. Auto Go only authorizes its later global fallback.
                 self.localization_rotation_authorized = (
                     self.localization_rotation_authorized or allow_rotation
                 )
             elif self.last_amcl_pose is not None:
+                self._nav_debug(
+                    "LOCALIZATION",
+                    state=self.localization_state,
+                    action="AUTO_READY_REUSE_UNAVAILABLE",
+                    reason=self._localization_rejection_reason(time.monotonic()),
+                )
                 # Even when Auto Go authorizes a later rotation, first verify
                 # the existing AMCL cloud without moving the chassis.
                 self._begin_localization_verification(
                     allow_rotation=allow_rotation
                 )
             else:
+                self._nav_debug(
+                    "LOCALIZATION",
+                    state=self.localization_state,
+                    action="AUTO_READY_REUSE_UNAVAILABLE",
+                    reason=self._localization_rejection_reason(time.monotonic()),
+                )
                 self.localization_rotation_authorized = allow_rotation
                 self.localization_started_monotonic = time.monotonic()
                 self._start_global_localization()
@@ -1838,10 +1918,26 @@ class NavigationAdapter(Node):
                 self.scan_map_median_residual = math.inf
                 self.scan_map_p90_residual = math.inf
                 self.scan_map_mean_residual = math.inf
-                if self.global_search_requires_rotation:
+                # Physical verification deliberately changes chassis yaw.
+                # Invalidate cross-heading corroboration only when AMCL moves
+                # the spatial hypothesis to another location; ordinary yaw
+                # progress is measured independently from odometry.
+                if (
+                    self.global_search_untrusted
+                    and jump > self.pose_maximum_xy_spread * 2
+                ):
                     self.localization_evidence_headings.clear()
                     self.localization_heading_bins = ()
                     self.localization_heading_span = 0.0
+                    self.ready_evidence_since = None
+                    self._nav_debug(
+                        "LOCALIZATION",
+                        state=self.localization_state,
+                        action="HEADING_CORROBORATION_RESET",
+                        reason="SPATIAL_HYPOTHESIS_JUMP",
+                        position_jump_m=jump,
+                        yaw_jump_deg=math.degrees(yaw_jump),
+                    )
         self.last_amcl_pose = sample
         self.last_amcl_monotonic = time.monotonic()
         self.pose_window.append((self.last_amcl_monotonic, *sample))
@@ -2477,6 +2573,9 @@ class NavigationAdapter(Node):
                 padding=self.planning_footprint_padding,
                 linear_speed=self.speed_profiles.get(self.auto_speed_mode).linear_max,
                 angular_speed=self.execution_turn_max_speed,
+                start_yaw=(
+                    None if self.pose is None else float(self.pose.get("yaw", 0.0))
+                ),
             )
             valid = valid and geometry_metadata.turn_safe
         length = self._path_length(canonical)
@@ -2491,6 +2590,10 @@ class NavigationAdapter(Node):
             "minimum_turn_clearance": None,
             "turn_count": 0,
             "total_turn_angle": 0.0,
+            "initial_turn_angle": 0.0,
+            "internal_turn_angle": 0.0,
+            "final_turn_angle": 0.0,
+            "execution_total_turn_angle": 0.0,
             "narrow_segments": [],
             "turn_safe": False,
             "overlap_with_original": overlap,
@@ -2523,6 +2626,13 @@ class NavigationAdapter(Node):
             metadata = self._route_metadata(points, original=points)
             if not metadata["valid"]:
                 continue
+            # Preserve live costmap validation above, but use the planner's
+            # start-yaw-aware execution cost for ranking/diagnostics.
+            valid = metadata["valid"]
+            overlap = metadata["overlap_with_original"]
+            metadata.update(planned_route.metadata.as_dict())
+            metadata["valid"] = valid
+            metadata["overlap_with_original"] = overlap
             digest = hashlib.sha1(
                 json.dumps(points, sort_keys=True).encode()
             ).hexdigest()[:10]
@@ -2990,19 +3100,154 @@ class NavigationAdapter(Node):
     def _tf_debug(self, event: str, **fields: Any) -> None:
         if not self.navigation_debug_enabled:
             return
+        if (
+            event in {"TF_AT_SCAN_MISS", "SCAN_REJECTED_TF"}
+            and self.mode == "NAVIGATION"
+            and bool(self.map_id)
+            and self.localization_state != "READY"
+        ):
+            # Missing map links are an expected pre-READY condition. The
+            # link-by-link LOCALIZATION_TF transition diagnostic below is the
+            # single authority until a tracked pose exists.
+            return
         now = time.monotonic()
-        if now - self.last_tf_debug_monotonic.get(event, 0.0) < 1.0:
+        signature = json.dumps(fields, sort_keys=True, default=str)
+        signature_key = f"{event}:{signature}"
+        throttle = (
+            10.0
+            if event in {"TF_AT_SCAN_MISS", "SCAN_REJECTED_TF"}
+            else 1.0
+        )
+        if now - self.last_tf_debug_monotonic.get(signature_key, 0.0) < throttle:
             return
         self._nav_debug(event, **fields)
-        self.last_tf_debug_monotonic[event] = now
+        self.last_tf_debug_monotonic[signature_key] = now
+
+    def _tf_link_diagnostic(
+        self,
+        target_frame: str,
+        source_frame: str,
+    ) -> dict[str, Any]:
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame, source_frame, Time()
+            )
+        except TransformException:
+            return {"available": False, "age_ms": None}
+        stamp = Time.from_msg(transform.header.stamp)
+        age_ms = None
+        if stamp.nanoseconds > 0:
+            age_ms = round(max(
+                0.0,
+                (self.get_clock().now().nanoseconds - stamp.nanoseconds) / 1e6,
+            ), 1)
+        return {"available": True, "age_ms": age_ms}
+
+    def _monitor_localization_tf(self, now: float) -> bool:
+        links = {
+            "map_to_odom": self._tf_link_diagnostic("map", "odom"),
+            "odom_to_base": self._tf_link_diagnostic(
+                "odom", "base_footprint"
+            ),
+            "base_to_laser": self._tf_link_diagnostic(
+                "base_footprint", "laser_frame"
+            ),
+            "map_to_laser": self._tf_link_diagnostic("map", "laser_frame"),
+        }
+        navigation_scan_age = self._age_milliseconds(
+            self.last_navigation_scan_published_monotonic
+        )
+        diagnostics = {
+            **links,
+            "amcl_pose_age_ms": self._age_milliseconds(
+                self.last_amcl_monotonic
+            ),
+            "scan_navigation_age_ms": navigation_scan_age,
+            "scan_navigation_published": bool(
+                navigation_scan_age is not None
+                and navigation_scan_age <= 500.0
+            ),
+            "global_localization_service_ready": (
+                self.global_localization_client.service_is_ready()
+            ),
+            "nomotion_update_service_ready": (
+                self.nomotion_update_client.service_is_ready()
+            ),
+            "localization_state": self.localization_state,
+        }
+        signature = json.dumps({
+            key: value["available"] for key, value in links.items()
+        }, sort_keys=True) + f":{self.localization_state}"
+        if (
+            signature != self.last_localization_tf_signature
+            or now - self.last_localization_tf_log_monotonic >= 30.0
+        ):
+            self._nav_debug("LOCALIZATION_TF", **diagnostics)
+            self.last_localization_tf_signature = signature
+            self.last_localization_tf_log_monotonic = now
+        missing_link = next(
+            (name for name, status in links.items() if not status["available"]),
+            "",
+        )
+        global_active = self.localization_state in {
+            "LOCALIZING_GLOBAL", "LOCALIZING_ROTATING", "LOCALIZING_SETTLING"
+        }
+        if not global_active or not missing_link:
+            self.localization_tf_unavailable_since = None
+            return True
+        if self.localization_tf_unavailable_since is None:
+            self.localization_tf_unavailable_since = now
+            return True
+        if (
+            now - self.localization_tf_unavailable_since
+            < self.localization_tf_chain_timeout
+        ):
+            return True
+        self._stop_localization_rotation()
+        self.localized = False
+        self.localization_state = "LOCALIZATION_FAILED"
+        self._set_state(
+            "LOCALIZATION_FAILED", "localization_tf_chain_unavailable"
+        )
+        self._nav_debug(
+            "LOCALIZATION_TF",
+            **diagnostics,
+            failed=True,
+            reason="LOCALIZATION_TF_CHAIN_UNAVAILABLE",
+            missing_link=missing_link,
+        )
+        return False
 
     def _scan_heading_in_odom(self, message: LaserScan) -> float | None:
         scan_pose = self._scan_transform("odom", message)
         return None if scan_pose is None else scan_pose[2]
 
-    def _record_heading_observation(self, message: LaserScan) -> None:
-        """Record physical scan headings independently from AMCL quality."""
-        if not self.global_search_requires_rotation:
+    def _record_heading_observation(
+        self,
+        message: LaserScan,
+        *,
+        scan_quality_passed: bool,
+    ) -> None:
+        """Record corroborated physical headings for one stable hypothesis."""
+        stationary_observation = bool(
+            self.global_search_untrusted
+            and self.localization_state in {
+                "LOCALIZING_GLOBAL", "LOCALIZING_SETTLING"
+            }
+            and not self.rotation_active
+            and self.motion_owner != "LOCALIZATION"
+            and (
+                self.localization_state != "LOCALIZING_SETTLING"
+                or self.localization_settling_evidence_started
+            )
+        )
+        if (
+            not stationary_observation
+            or not scan_quality_passed
+            or not self._pose_is_stable()
+            or self.localization_confidence
+            < self.localization_confidence_threshold
+        ):
             return
         valid_beams = sum(
             1
@@ -3023,12 +3268,12 @@ class NavigationAdapter(Node):
         self.localization_heading_bins = diversity.observed_bins
         self.localization_heading_span = diversity.span_radians
 
-    def _update_scan_map_match(self, message: LaserScan) -> None:
+    def _update_scan_map_match(self, message: LaserScan) -> bool:
         if self.saved_map is None:
-            return
+            return False
         scan_pose = self._scan_transform("map", message)
         if scan_pose is None:
-            return
+            return False
         match = scan_to_map_match(
             self.saved_map,
             message.ranges,
@@ -3048,7 +3293,7 @@ class NavigationAdapter(Node):
         self.scan_map_valid_beams = match.valid_beams
         self.scan_map_residual_beams = match.residual_beams
         if match.valid_beams < self.scan_map_minimum_beams:
-            return
+            return False
         self.scan_map_scores.append(match.score)
         self.scan_map_median_residuals.append(match.median_residual)
         self.scan_map_p90_residuals.append(match.p90_residual)
@@ -3067,6 +3312,15 @@ class NavigationAdapter(Node):
         if self.verification_started_monotonic:
             self.verification_scan_count += 1
         self._refresh_localization_confidence()
+        return bool(
+            match.score >= self.scan_map_threshold
+            and match.residual_beams
+            >= self.localization_final_minimum_residual_beams
+            and match.median_residual
+            <= self.localization_final_max_median_residual
+            and match.p90_residual
+            <= self.localization_final_max_p90_residual
+        )
 
     def _planning_scan_message(self, message: LaserScan) -> LaserScan:
         scan_pose = self._scan_transform("map", message)
@@ -3256,14 +3510,15 @@ class NavigationAdapter(Node):
             # the segment; uncertainty alone must not hand off to Manual.
             if evidence_reason == "PHYSICALLY_BLOCKED":
                 self._enter_narrow_path_decision(evidence_reason, confirmed)
-        # Observation coverage must keep progressing even while the current
-        # AMCL candidate has no usable map transform or fails strict residuals.
-        self._record_heading_observation(message)
-        self._update_scan_map_match(message)
+        scan_quality_passed = self._update_scan_map_match(message)
+        self._record_heading_observation(
+            message, scan_quality_passed=scan_quality_passed
+        )
         if self.mode == "MAPPING" and self.current_state in {"MAPPING", "MAPPING_RUNNING"}:
             self.mapping_scan.publish(message)
         elif self.mode == "NAVIGATION":
             self.navigation_scan.publish(message)
+            self.last_navigation_scan_published_monotonic = callback_started
             self.planning_scan.publish(self._planning_scan_message(message))
         self.scan_callback_latency_ms = round(
             (time.monotonic() - callback_started) * 1000.0, 3
@@ -3582,6 +3837,7 @@ class NavigationAdapter(Node):
         self.last_nomotion_request_monotonic = 0.0
         self.localization_rotation_blocked_since = None
         self.global_search_rotation_pending = False
+        self.global_search_untrusted = False
         self.stationary_global_candidate_ambiguous = False
 
     def _begin_localization_verification(self, *, allow_rotation: bool) -> None:
@@ -3603,6 +3859,7 @@ class NavigationAdapter(Node):
         self.localization_rotation_authorized = allow_rotation
         self.global_search_requires_rotation = False
         self.global_search_rotation_pending = False
+        self.global_search_untrusted = False
         self.last_nomotion_request_monotonic = 0.0
         self.low_confidence_since = None
         self.ready_evidence_since = None
@@ -3622,6 +3879,7 @@ class NavigationAdapter(Node):
         self.localization_seed_pose = None
         self.localization_seed_approximate = False
         self.global_search_requires_rotation = False
+        self.global_search_untrusted = False
         if isinstance(last_pose, dict) and all(
             math.isfinite(float(last_pose.get(axis, 0.0))) for axis in ("x", "y", "yaw")
         ):
@@ -3673,7 +3931,11 @@ class NavigationAdapter(Node):
         # to resolve genuine ambiguity.
         self.global_search_requires_rotation = False
         self.global_search_rotation_pending = True
+        self.global_search_untrusted = True
         self.stationary_global_candidate_ambiguous = False
+        self.localization_rotation_cycle_start_angle = 0.0
+        self.localization_next_observation_angle = 0.0
+        self.localization_tf_unavailable_since = None
         if not self.global_localization_client.wait_for_service(timeout_sec=3.0):
             self.localization_state = "LOCALIZATION_FAILED"
             self._set_state("LOCALIZATION_FAILED", "global_localization_service_unavailable")
@@ -3979,16 +4241,29 @@ class NavigationAdapter(Node):
         except AdapterError as exc:
             self.get_logger().error(str(exc))
 
-    def _localization_evidence_ready(self, now: float) -> bool:
-        required_scan_score = (
-            self.global_scan_map_threshold
-            if (
-                self.localization_state == "LOCALIZING_GLOBAL"
-                and self.global_search_rotation_pending
-            )
-            else self.scan_map_threshold
-        )
+    def _global_heading_requirement(self) -> tuple[int, float]:
+        if self.stationary_global_candidate_ambiguous:
+            return self.global_minimum_heading_bins, self.global_minimum_heading_span
         return (
+            self.global_strong_minimum_heading_bins,
+            self.global_strong_minimum_heading_span,
+        )
+
+    def _global_heading_diversity_ready(self) -> bool:
+        required_bins, required_span = self._global_heading_requirement()
+        return bool(
+            len(self.localization_heading_bins) >= required_bins
+            and self.localization_heading_span >= required_span
+        )
+
+    def _localization_quality_ready(
+        self,
+        now: float,
+        *,
+        required_scan_score: float,
+    ) -> bool:
+        """Quality/stability gate independent from global uniqueness."""
+        return bool(
             self.localization_confidence >= self.localization_confidence_threshold
             and self._pose_is_stable()
             and now - self.last_amcl_monotonic <= self.amcl_pose_freshness
@@ -4004,14 +4279,60 @@ class NavigationAdapter(Node):
             and now - self.last_scan_monotonic <= 0.30
             and now - self.last_map_tf_monotonic <= 0.60
             and self._critical_sensor_time_healthy()
+        )
+
+    def _actual_odom_yaw(self) -> float | None:
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "odom", "base_footprint", Time()
+            )
+        except TransformException:
+            return None
+        return self._yaw_from_quaternion(transform.transform.rotation)
+
+    def _start_next_localization_rotation(self, now: float) -> None:
+        required_bins, required_span = self._global_heading_requirement()
+        remaining_bins = max(
+            1, required_bins - len(self.localization_heading_bins)
+        )
+        remaining_span = max(
+            0.0, required_span - self.localization_heading_span
+        )
+        increment = max(
+            math.radians(30.0),
+            remaining_span / remaining_bins,
+        )
+        if not self.stationary_global_candidate_ambiguous:
+            increment = max(increment, required_span)
+        self.localization_rotation_cycle_start_angle = self.rotation_angle
+        self.localization_next_observation_angle = min(
+            self.rotation_max_angle,
+            self.rotation_angle + increment,
+        )
+        actual_yaw = self._actual_odom_yaw()
+        self.localization_actual_yaw = actual_yaw
+        self.rotation_yaw_progress.reset(actual_yaw)
+        self.localization_state = "LOCALIZING_ROTATING"
+        self.localization_phase_started_monotonic = now
+        self.localization_settling_evidence_started = False
+        self._set_state("LOCALIZING_ROTATING", "global_search_needs_new_heading")
+
+    def _localization_evidence_ready(self, now: float) -> bool:
+        required_scan_score = (
+            self.global_scan_map_threshold
+            if (
+                self.localization_state == "LOCALIZING_GLOBAL"
+                and self.global_search_rotation_pending
+            )
+            else self.scan_map_threshold
+        )
+        return bool(
+            self._localization_quality_ready(
+                now, required_scan_score=required_scan_score
+            )
             and (
-                not self.global_search_requires_rotation
-                or (
-                    len(self.localization_heading_bins)
-                    >= self.global_minimum_heading_bins
-                    and self.localization_heading_span
-                    >= self.global_minimum_heading_span
-                )
+                not self.global_search_untrusted
+                or self._global_heading_diversity_ready()
             )
         )
 
@@ -4037,9 +4358,9 @@ class NavigationAdapter(Node):
             return "MEDIAN_RESIDUAL_TOO_HIGH"
         if self.scan_map_p90_residual > self.localization_final_max_p90_residual:
             return "P90_RESIDUAL_TOO_HIGH"
-        if self.global_search_requires_rotation and (
-            len(self.localization_heading_bins) < self.global_minimum_heading_bins
-            or self.localization_heading_span < self.global_minimum_heading_span
+        if (
+            self.global_search_untrusted
+            and not self._global_heading_diversity_ready()
         ):
             return "INSUFFICIENT_HEADING_DIVERSITY"
         if not self._pose_is_stable():
@@ -4070,11 +4391,16 @@ class NavigationAdapter(Node):
             and self._critical_sensor_time_healthy()
         )
 
-    def _begin_localization_settling(self, now: float) -> None:
+    def _begin_localization_settling(
+        self,
+        now: float,
+        *,
+        reason: str = "heading_observation_reached",
+    ) -> None:
         """Stop after the global sweep and wait for stationary AMCL samples."""
         self._stop_localization_rotation()
         self.localization_state = "LOCALIZING_SETTLING"
-        self._set_state("LOCALIZING_SETTLING", "rotation_sweep_complete")
+        self._set_state("LOCALIZING_SETTLING", reason)
         self.localization_phase_started_monotonic = now
         self.localization_settling_evidence_started = False
 
@@ -4134,6 +4460,8 @@ class NavigationAdapter(Node):
         if self.mode != "NAVIGATION":
             return
         now = time.monotonic()
+        if self.map_id and not self._monitor_localization_tf(now):
+            return
         (
             sensor_time_healthy,
             sensor_time_reason,
@@ -4367,6 +4695,7 @@ class NavigationAdapter(Node):
             self.localization_rotation_authorized = False
             self.global_search_requires_rotation = False
             self.global_search_rotation_pending = False
+            self.global_search_untrusted = False
             self.verification_started_monotonic = 0.0
             self.verification_scan_count = 0
             self.ready_evidence_invalid_since = None
@@ -4374,6 +4703,27 @@ class NavigationAdapter(Node):
             # Replan from this newly verified pose in a worker, never from the
             # localization timer callback that owns AMCL service responses.
             self._resume_sensor_time_navigation_if_ready()
+            return
+        if (
+            self.localization_state == "LOCALIZING_SETTLING"
+            and self.localization_settling_evidence_started
+            and self.global_search_untrusted
+            and self._localization_quality_ready(
+                now, required_scan_score=self.scan_map_threshold
+            )
+            and not self._global_heading_diversity_ready()
+        ):
+            if self.rotation_angle >= self.rotation_max_angle:
+                self._stop_localization_rotation()
+                self.localized = False
+                self.localization_state = "LOCALIZATION_FAILED"
+                self._set_state(
+                    "LOCALIZATION_FAILED",
+                    "global_heading_corroboration_exhausted",
+                )
+                return
+            if self._safe_to_rotate():
+                self._start_next_localization_rotation(now)
             return
         if (
             self.localization_state == "VERIFYING"
@@ -4427,29 +4777,28 @@ class NavigationAdapter(Node):
                 return
             if self.global_search_rotation_pending:
                 # The stationary candidate has now had a bounded opportunity.
-                # Only the ambiguous fallback requires heading diversity.
                 stationary_reject_reason = self._localization_rejection_reason(now)
-                self.stationary_global_candidate_ambiguous = (
-                    stationary_reject_reason == "SCAN_MATCH_SCORE_TOO_LOW"
-                    and self.scan_map_score >= self.scan_map_threshold
-                    and self.scan_map_residual_beams
-                    >= self.localization_final_minimum_residual_beams
-                    and self.scan_map_median_residual
-                    <= self.localization_final_max_median_residual
-                    and self.scan_map_p90_residual
-                    <= self.localization_final_max_p90_residual
-                    and self._pose_is_stable()
-                    and self.localization_confidence
-                    >= self.localization_confidence_threshold
+                strong_candidate = self._localization_quality_ready(
+                    now, required_scan_score=self.global_scan_map_threshold
                 )
+                self.stationary_global_candidate_ambiguous = not strong_candidate
                 self.global_search_rotation_pending = False
                 self.global_search_requires_rotation = True
                 self.ready_evidence_since = None
+                required_bins, required_span = self._global_heading_requirement()
                 self._nav_debug(
                     "LOCALIZATION",
-                    state="AMBIGUOUS_STATIONARY_CANDIDATE",
+                    state=(
+                        "AMBIGUOUS_STATIONARY_CANDIDATE"
+                        if self.stationary_global_candidate_ambiguous
+                        else "STRONG_STATIONARY_CANDIDATE"
+                    ),
                     action="ROTATION_REQUIRED",
                     reject_reason=stationary_reject_reason,
+                    required_heading_bins=required_bins,
+                    required_heading_span_deg=round(
+                        math.degrees(required_span), 1
+                    ),
                 )
             if not self._safe_to_rotate():
                 # Do not claim progress while a live safety gate withholds
@@ -4496,20 +4845,16 @@ class NavigationAdapter(Node):
                     )
                 return
             self.localization_rotation_blocked_since = None
-            self.localization_state = "LOCALIZING_ROTATING"
-            self._set_state("LOCALIZING_ROTATING", "global_search_needs_new_heading")
-            self.rotation_yaw_progress.reset(
-                None if self.pose is None else float(self.pose.get("yaw", 0.0))
-            )
+            self._start_next_localization_rotation(now)
         if self.localization_state == "LOCALIZING_ROTATING":
-            if self.pose is not None:
-                self.rotation_angle = self.rotation_yaw_progress.update(
-                    float(self.pose.get("yaw", 0.0))
+            actual_yaw = self._actual_odom_yaw()
+            if actual_yaw is not None:
+                self.localization_actual_yaw = actual_yaw
+                self.rotation_angle = (
+                    self.localization_rotation_cycle_start_angle
+                    + self.rotation_yaw_progress.update(actual_yaw)
                 )
-            if self.rotation_angle >= self.rotation_max_angle:
-                # Completing the sweep is success of the observation phase,
-                # not a localization failure. Verify fresh stationary samples
-                # without destroying AMCL's converged particle cloud.
+            if self.rotation_angle >= self.localization_next_observation_angle:
                 self._begin_localization_settling(now)
                 return
             if not self._safe_to_rotate():
@@ -4525,11 +4870,89 @@ class NavigationAdapter(Node):
             self.localization_velocity.publish(command)
             self.rotation_active = True
             self.rotation_last_monotonic = now
+            if now - self.last_localization_rotate_log_monotonic >= 0.5:
+                final_output = self.pipeline_samples.get("motion_safety")
+                required_bins, required_span = self._global_heading_requirement()
+                self._nav_debug(
+                    "LOCALIZATION_ROTATE",
+                    state=self.localization_state,
+                    phase="ROTATE_TO_NEXT_OBSERVATION",
+                    current_actual_yaw=self.localization_actual_yaw,
+                    accumulated_yaw_span=self.rotation_angle,
+                    target_accumulated_yaw=self.localization_next_observation_angle,
+                    heading_bins=list(self.localization_heading_bins),
+                    required_heading_bins=required_bins,
+                    required_heading_span=required_span,
+                    scan_score=self.scan_map_score,
+                    requested_angular=command.angular.z,
+                    final_safety_output=(
+                        None if final_output is None else final_output[1]
+                    ),
+                )
+                self.last_localization_rotate_log_monotonic = now
+
+    def _resolve_runtime_map_yaml(self, payload: dict[str, Any]) -> Path:
+        try:
+            runtime_root = self.map_root.resolve(strict=True)
+            bundle_directory = Path(str(payload["map_path"])).resolve(strict=True)
+            bundle_directory.relative_to(runtime_root)
+        except (KeyError, OSError, ValueError) as exc:
+            raise AdapterError(
+                "MAP_PATH_INVALID",
+                "Active map path must be inside the runtime map root",
+            ) from exc
+        map_yaml = bundle_directory / "map.yaml"
+        if not map_yaml.is_file():
+            raise AdapterError(
+                "MAP_MISSING", "map.yaml is missing from verified cache"
+            )
+        return map_yaml.resolve(strict=True)
+
+    def _log_active_map(
+        self,
+        payload: dict[str, Any],
+        map_yaml: Path,
+        saved_map: SavedOccupancyMap,
+    ) -> None:
+        yaml_metadata = yaml.safe_load(map_yaml.read_text()) or {}
+        image_path = Path(str(yaml_metadata.get("image") or ""))
+        if not image_path.is_absolute():
+            image_path = map_yaml.parent / image_path
+        metadata_path = map_yaml.parent / "metadata.json"
+        bundle_metadata: dict[str, Any] = {}
+        try:
+            loaded = json.loads(metadata_path.read_text())
+            if isinstance(loaded, dict):
+                bundle_metadata = loaded
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        bundle_path = map_yaml.parent / "map-bundle.tar.gz"
+        checksum = (
+            payload.get("checksum")
+            or bundle_metadata.get("checksum")
+            or bundle_metadata.get("bundle_checksum")
+            or bundle_metadata.get("sha256")
+        )
+        self._nav_debug(
+            "MAP_ACTIVE",
+            map_id=self.map_id,
+            map_version=self.map_version,
+            canonical_map_yaml_path=str(map_yaml),
+            image_path=str(image_path.resolve()),
+            bundle_path=(str(bundle_path.resolve()) if bundle_path.is_file() else None),
+            checksum=checksum,
+            resolution=saved_map.resolution,
+            width=saved_map.width,
+            height=saved_map.height,
+            origin=[
+                saved_map.origin_x,
+                saved_map.origin_y,
+                saved_map.origin_yaw,
+            ],
+        )
 
     def _load_map(self, payload: dict[str, Any]) -> dict[str, Any]:
-        map_yaml = Path(str(payload["map_path"])) / "map.yaml"
-        if not map_yaml.is_file():
-            raise AdapterError("MAP_MISSING", "map.yaml is missing from verified cache")
+        map_yaml = self._resolve_runtime_map_yaml(payload)
         try:
             candidate_grid = SavedOccupancyMap.load(map_yaml)
         except (OSError, KeyError, TypeError, ValueError) as exc:
@@ -4637,6 +5060,7 @@ class NavigationAdapter(Node):
             except AdapterError:
                 self._set_state("FAILED", "map_topic_and_rollback_failed")
             raise AdapterError("MAP_TOPIC_UNAVAILABLE", "Map Server did not publish /map")
+        self._log_active_map(payload, map_yaml, candidate_grid)
         self._begin_auto_localization(payload.get("last_known_pose"))
         return {
             "status": "completed",
@@ -5461,15 +5885,47 @@ class NavigationAdapter(Node):
                 stable_dwell=self.execution_turn_stable_dwell,
             )
             if transition == "TURN":
-                self.execution_phase = "TURN"
+                # The chassis can coast through the target while settling.
+                # Reusing the TURN_BEGIN direction after that sign change
+                # drives away from the target and can produce endless full
+                # rotations. Re-evaluate both direction and safety from the
+                # current pose before applying another angular command.
+                previous_direction = self.execution_turn_direction
+                left_static = self._turn_static_safe(pose, target, 1)
+                right_static = self._turn_static_safe(pose, target, -1)
+                snapshot_fresh = self._atomic_safety_fresh(now)
+                left_live = snapshot_fresh and not self._safety_blocks_turn(1)
+                right_live = snapshot_fresh and not self._safety_blocks_turn(-1)
+                direction = choose_turn_direction(
+                    error,
+                    left_static_safe=left_static,
+                    right_static_safe=right_static,
+                    left_live_safe=left_live,
+                    right_live_safe=right_live,
+                )
+                self.execution_turn_direction = (
+                    direction if direction else (1 if error > 0.0 else -1)
+                )
+                self.execution_phase = (
+                    "TURN" if direction else "WAIT_FOR_TURN_CLEAR"
+                )
                 self.execution_phase_started = now
-                self.execution_turn_blocked_since = None
-                self.latest_feedback["execution_phase"] = "TURN"
+                self.execution_turn_blocked_since = None if direction else now
+                self.turn_block_tracker = TurnBlockTracker(
+                    clear_dwell_seconds=0.30
+                )
+                self.latest_feedback["execution_phase"] = self.execution_phase
                 self._nav_debug(
                     "EXECUTION_PHASE",
-                    phase="TURN_REENTER",
+                    phase=(
+                        "TURN_REENTER"
+                        if direction
+                        else "WAIT_FOR_TURN_CLEAR"
+                    ),
                     segment_index=self.execution_segment_index,
                     heading_error=error,
+                    previous_direction=previous_direction,
+                    direction=self.execution_turn_direction,
                 )
                 return
             if transition != "STRAIGHT_PREPARE":
@@ -5833,6 +6289,16 @@ class NavigationAdapter(Node):
             narrow=self.execution_segment_index in self.execution_narrow_segments,
         )
         current_yaw = float(pose.get("yaw", active.fixed_heading))
+        heading_delta = self._yaw_delta(active.fixed_heading, current_yaw)
+        straight_entry_after_reanchor = bool(
+            self.execution_segment_reanchors > 0
+            and not post_turn_reanchor_requires_turn(
+                heading_delta,
+                planned_progress.signed_cross_track,
+                straight_entry_heading_limit=self.execution_turn_reentry_tolerance,
+                straight_entry_cross_track_limit=self.straight_hard_cross_track,
+            )
+        )
         if start_escape:
             if abs(self._yaw_delta(active.fixed_heading, current_yaw)) > self.execution_turn_tolerance:
                 self.navigation_velocity.publish(Twist())
@@ -5851,21 +6317,22 @@ class NavigationAdapter(Node):
             )
             self._dispatch_prepared_segment(goal_generation)
             return
-        start_turn = validate_rotation_sweep(
-            self.saved_map,
-            float(pose["x"]),
-            float(pose["y"]),
-            current_yaw,
-            active.fixed_heading,
-            half_length=self.footprint_half_length,
-            half_width=self.footprint_half_width,
-            padding=self.planning_footprint_padding,
-        )
-        if not start_turn.valid:
-            self._schedule_execution_replan(
-                "REANCHOR_START_TURN_INVALID", goal_generation
+        if not straight_entry_after_reanchor:
+            start_turn = validate_rotation_sweep(
+                self.saved_map,
+                float(pose["x"]),
+                float(pose["y"]),
+                current_yaw,
+                active.fixed_heading,
+                half_length=self.footprint_half_length,
+                half_width=self.footprint_half_width,
+                padding=self.planning_footprint_padding,
             )
-            return
+            if not start_turn.valid:
+                self._schedule_execution_replan(
+                    "REANCHOR_START_TURN_INVALID", goal_generation
+                )
+                return
         if self.execution_segment_index + 2 < len(self.execution_points):
             following = self.execution_points[self.execution_segment_index + 2]
             next_heading = math.atan2(
@@ -5901,6 +6368,18 @@ class NavigationAdapter(Node):
             segment_token=active.segment_token,
             narrow=active.narrow,
         )
+        if straight_entry_after_reanchor:
+            self.execution_reanchor_after_turn = False
+            self._nav_debug(
+                "EXECUTION_PHASE",
+                phase="STRAIGHT_ENTRY_CORRECTION",
+                segment_index=self.execution_segment_index,
+                heading_error=heading_delta,
+                cross_track=planned_progress.signed_cross_track,
+                reason="POST_TURN_REANCHOR_WITHIN_CONTROLLER_BAND",
+            )
+            self._dispatch_prepared_segment(goal_generation)
+            return
         self._begin_turn_or_settling(
             pose, active.fixed_heading, goal_generation
         )

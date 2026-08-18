@@ -25,6 +25,7 @@ from navigation_core import (  # noqa: E402
     TurnBlockTracker,
     UnwrappedYawProgress,
     canonicalize_stop_turn_path,
+    choose_turn_direction,
     classify_planning_failure,
     compact_lethal_cells,
     densify_straight_segment,
@@ -39,8 +40,10 @@ from navigation_core import (  # noqa: E402
     localization_confidence,
     mask_scan_self_returns,
     path_overlap_ratio,
+    post_turn_reanchor_requires_turn,
     pose_stability,
     rotation_swept_clearance,
+    route_geometry_metadata,
     scan_to_map_match,
     segment_travel_watchdog,
     straight_heading_lock,
@@ -1079,6 +1082,18 @@ def test_turn_hysteresis_does_not_chatter_inside_reentry_band() -> None:
     ) == "TURN"
 
 
+def test_turn_direction_tracks_overshoot_error_sign_on_reentry() -> None:
+    safety = {
+        "left_static_safe": True,
+        "right_static_safe": True,
+        "left_live_safe": True,
+        "right_live_safe": True,
+    }
+
+    assert choose_turn_direction(math.radians(-6.2), **safety) == -1
+    assert choose_turn_direction(math.radians(6.2), **safety) == 1
+
+
 def test_rotation_sweep_rejects_collision_missed_at_both_endpoint_headings() -> None:
     resolution = 0.01
     width = height = 80
@@ -1196,6 +1211,111 @@ def test_global_rotation_progress_uses_unwrapped_measured_yaw() -> None:
     assert progress.update(math.radians(-170)) == pytest.approx(math.radians(20))
 
 
+def test_route_execution_cost_includes_large_initial_turn() -> None:
+    saved = _manual_map(100, 100, _free_rectangle(1, 98, 1, 98))
+    start = {"x": 2.5, "y": 2.5}
+    heading = math.radians(109.0)
+    goal = {
+        "x": start["x"] + 2.5 * math.cos(heading),
+        "y": start["y"] + 2.5 * math.sin(heading),
+    }
+
+    metadata = route_geometry_metadata(
+        saved,
+        saved.navigation_geometry,
+        (start, goal),
+        half_length=0.15,
+        half_width=0.10,
+        linear_speed=0.20,
+        angular_speed=0.60,
+        start_yaw=math.radians(-50.0),
+    )
+
+    assert metadata.initial_turn_angle == pytest.approx(math.radians(159.0))
+    assert metadata.internal_turn_angle == 0.0
+    assert metadata.execution_total_turn_angle == pytest.approx(
+        metadata.initial_turn_angle
+    )
+    assert metadata.turn_count == 1
+    assert metadata.estimated_time > metadata.total_length / 0.20
+
+
+def test_direct_candidate_is_ranked_instead_of_returned_unconditionally(
+    monkeypatch,
+) -> None:
+    saved = _manual_map(80, 80, _free_rectangle(1, 78, 1, 78))
+    planner = StopTurnStateLatticePlanner(
+        saved, saved.navigation_geometry, max_expansions=1
+    )
+    start = {"x": 1.0, "y": 1.0, "yaw": math.radians(-50.0)}
+    goal = {"x": 2.0, "y": 3.0}
+
+    def candidate(route, *, start_yaw=None, goal_yaw=None):
+        del start_yaw, goal_yaw
+        direct = len(route) == 2
+        angle = math.radians(159.0 if direct else 55.0)
+        return StopTurnRoute(
+            points=tuple(route),
+            metadata=RouteMetadata(
+                total_length=2.5 if direct else 2.8,
+                minimum_passage_width=1.0,
+                minimum_static_clearance=0.5,
+                minimum_turn_clearance=0.5,
+                turn_count=1 if direct else 2,
+                total_turn_angle=angle,
+                initial_turn_angle=(angle if direct else math.radians(15.0)),
+                internal_turn_angle=(0.0 if direct else math.radians(40.0)),
+                final_turn_angle=0.0,
+                execution_total_turn_angle=angle,
+                narrow_segments=(),
+                estimated_time=18.0 if direct else 16.0,
+                turn_safe=True,
+            ),
+            heading_bins=(0,) if direct else (0, 1),
+        )
+
+    monkeypatch.setattr(planner, "_route_result", candidate)
+    monkeypatch.setattr(planner, "_grid_seed", lambda *args, **kwargs: [])
+
+    route = planner.plan(start, goal)
+
+    assert route is not None
+    assert len(route.points) == 3
+    assert route.metadata.estimated_time == 16.0
+
+
+def test_small_initial_turn_keeps_short_direct_candidate() -> None:
+    saved = _manual_map(80, 80, _free_rectangle(1, 78, 1, 78))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    start = {"x": 1.0, "y": 1.0, "yaw": math.radians(5.0)}
+    goal = {"x": 3.0, "y": 1.2}
+
+    route = planner.plan(start, goal)
+
+    assert route is not None
+    assert len(route.points) == 2
+    assert route.metadata.initial_turn_angle < math.radians(2.0)
+
+
+def test_post_turn_reanchor_uses_straight_band_for_small_drift() -> None:
+    assert not post_turn_reanchor_requires_turn(
+        math.radians(5.0),
+        0.04,
+        straight_entry_heading_limit=math.radians(6.0),
+        straight_entry_cross_track_limit=0.08,
+    )
+    assert post_turn_reanchor_requires_turn(
+        math.radians(8.0),
+        0.04,
+        straight_entry_heading_limit=math.radians(6.0),
+        straight_entry_cross_track_limit=0.08,
+    )
+    assert post_turn_reanchor_requires_turn(
+        math.radians(2.0),
+        0.10,
+        straight_entry_heading_limit=math.radians(6.0),
+        straight_entry_cross_track_limit=0.08,
+    )
 def test_actual_project_map_rejects_direct_line_and_finds_exact_detour() -> None:
     project = Path(__file__).parents[3]
     saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
@@ -1478,6 +1598,10 @@ def test_adequate_clearance_ranking_does_not_reward_many_extra_turns() -> None:
                 minimum_turn_clearance=0.05,
                 turn_count=turns,
                 total_turn_angle=turns * math.pi / 4,
+                initial_turn_angle=0.0,
+                internal_turn_angle=turns * math.pi / 4,
+                final_turn_angle=0.0,
+                execution_total_turn_angle=turns * math.pi / 4,
                 narrow_segments=(),
                 estimated_time=estimated_time,
                 turn_safe=True,
@@ -1566,6 +1690,10 @@ def test_route_candidate_search_uses_one_shared_wall_clock_budget(monkeypatch) -
             minimum_turn_clearance=0.5,
             turn_count=0,
             total_turn_angle=0.0,
+            initial_turn_angle=0.0,
+            internal_turn_angle=0.0,
+            final_turn_angle=0.0,
+            execution_total_turn_angle=0.0,
             narrow_segments=(),
             estimated_time=12.5,
             turn_safe=True,
@@ -1606,6 +1734,10 @@ def test_primary_only_candidate_request_never_searches_exclusions(monkeypatch) -
             minimum_turn_clearance=0.5,
             turn_count=0,
             total_turn_angle=0.0,
+            initial_turn_angle=0.0,
+            internal_turn_angle=0.0,
+            final_turn_angle=0.0,
+            execution_total_turn_angle=0.0,
             narrow_segments=(),
             estimated_time=12.5,
             turn_safe=True,
@@ -1818,7 +1950,11 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert 135 <= localization["localization_global_min_heading_span_degrees"] < 180
     assert 0 < localization["scan_tf_wait_seconds"] <= 0.05
     assert 0 < localization["scan_tf_fallback_max_age_seconds"] <= 0.15
-    assert localization["auto_localization_max_angle_degrees"] >= 360.0
+    assert 180.0 <= localization["auto_localization_max_angle_degrees"] < 360.0
+    assert localization["localization_global_strong_min_heading_bins"] >= 2
+    assert 60.0 <= localization[
+        "localization_global_strong_min_heading_span_degrees"
+    ] <= 90.0
     assert navigation["amcl"]["ros__parameters"]["max_particles"] >= 3000
     assert navigation["amcl"]["ros__parameters"]["max_beams"] >= 90
     assert localization["localization_verify_timeout_seconds"] <= 3.0

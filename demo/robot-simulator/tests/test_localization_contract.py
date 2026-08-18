@@ -112,10 +112,9 @@ def test_global_search_is_stationary_first_then_requires_authorized_rotation() -
     assert "if not self.localization_rotation_authorized" in tick
     assert "if self.global_search_rotation_pending" in tick
     assert "self.global_search_requires_rotation = True" in tick
-    assert "len(self.localization_heading_bins)" in evidence
-    assert "self.global_minimum_heading_bins" in evidence
-    assert "self.localization_heading_span" in evidence
-    assert "self.global_minimum_heading_span" in evidence
+    assert "self.global_search_untrusted" in evidence
+    assert "self._global_heading_diversity_ready()" in evidence
+    assert "self._start_next_localization_rotation(now)" in tick
     assert 'self.localization_state = "LOCALIZATION_REQUIRED"' in global_search
 
 
@@ -171,11 +170,11 @@ def test_completed_rotation_settles_then_uses_fresh_stationary_evidence() -> Non
     assert "self.last_amcl_covariance = []" not in evidence
     assert "self.pose_window.clear()" in evidence
     assert "self.scan_map_scores.clear()" in evidence
-    max_rotation = tick.split(
-        "if self.rotation_angle >= self.rotation_max_angle:", 1
+    observation_rotation = tick.split(
+        "if self.rotation_angle >= self.localization_next_observation_angle:", 1
     )[1].split("if not self._safe_to_rotate():", 1)[0]
-    assert "self._begin_localization_settling(now)" in max_rotation
-    assert '"LOCALIZATION_FAILED"' not in max_rotation
+    assert "self._begin_localization_settling(now)" in observation_rotation
+    assert '"LOCALIZATION_FAILED"' not in observation_rotation
     assert "self.localization_rotation_settle" in tick
 
 
@@ -239,16 +238,17 @@ def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
     tick = _method_source("_localization_tick", "_load_map")
 
     evidence = _method_source("_localization_evidence_ready", "_localization_tick")
+    quality = _method_source("_localization_quality_ready", "_actual_odom_yaw")
 
-    assert "self._pose_is_stable()" in evidence
-    assert "self.amcl_pose_freshness" in evidence
+    assert "self._pose_is_stable()" in quality
+    assert "self.amcl_pose_freshness" in quality
     assert "self.global_scan_map_threshold" in evidence
-    assert "self.scan_map_score >= required_scan_score" in evidence
-    assert "self._critical_sensor_time_healthy()" in evidence
-    assert "self.localization_final_max_median_residual" in evidence
-    assert "self.localization_final_max_p90_residual" in evidence
-    assert "self.localization_final_minimum_residual_beams" in evidence
-    assert "self.global_minimum_heading_bins" in evidence
+    assert "self.scan_map_score >= required_scan_score" in quality
+    assert "self._critical_sensor_time_healthy()" in quality
+    assert "self.localization_final_max_median_residual" in quality
+    assert "self.localization_final_max_p90_residual" in quality
+    assert "self.localization_final_minimum_residual_beams" in quality
+    assert "self._global_heading_diversity_ready()" in evidence
     assert 'self.localization_state == "VERIFYING"' in tick
     assert "self.localization_ready_hold" in tick
     assert 'self.localized and self.localization_state == "READY"' in tick
@@ -289,17 +289,18 @@ def test_map_initialization_cannot_timeout_before_session_clock_is_started() -> 
     assert initializing_guard < timeout
 
 
-def test_heading_observation_is_independent_from_candidate_quality() -> None:
+def test_heading_observation_requires_stationary_quality_for_same_hypothesis() -> None:
     observation = _method_source(
         "_record_heading_observation", "_update_scan_map_match"
     )
     callback = _method_source("_scan_callback", "_sensor_time_callback")
     assert "valid_beams < self.scan_map_minimum_beams" in observation
     assert "self._scan_heading_in_odom(message)" in observation
-    assert "match.score" not in observation
-    assert "residual" not in observation
-    assert callback.index("self._record_heading_observation(message)") < callback.index(
-        "self._update_scan_map_match(message)"
+    assert "scan_quality_passed" in observation
+    assert "self._pose_is_stable()" in observation
+    assert "not self.rotation_active" in observation
+    assert callback.index("self._update_scan_map_match(message)") < callback.index(
+        "self._record_heading_observation("
     )
 
 
@@ -311,6 +312,120 @@ def test_scan_tf_uses_bounded_wait_and_age_checked_fallback() -> None:
     assert '"TF_AT_SCAN_MISS"' in transform
     assert '"TF_FALLBACK"' in transform
     assert '"SCAN_REJECTED_TF"' in transform
+
+
+def test_untrusted_global_cannot_ready_from_one_heading() -> None:
+    evidence = _method_source(
+        "_localization_evidence_ready", "_localization_rejection_reason"
+    )
+    global_search = _method_source(
+        "_start_global_localization", "_safe_to_rotate"
+    )
+
+    assert "self.global_search_untrusted = True" in global_search
+    assert "not self.global_search_untrusted" in evidence
+    assert "self._global_heading_diversity_ready()" in evidence
+
+
+def test_adaptive_global_heading_requirements_allow_strong_early_exit() -> None:
+    requirement = _method_source(
+        "_global_heading_requirement", "_global_heading_diversity_ready"
+    )
+    rotation = _method_source(
+        "_start_next_localization_rotation", "_localization_evidence_ready"
+    )
+    tick = _method_source("_localization_tick", "_resolve_runtime_map_yaml")
+
+    assert "self.global_strong_minimum_heading_bins" in requirement
+    assert "self.global_strong_minimum_heading_span" in requirement
+    assert "self.global_minimum_heading_bins" in requirement
+    assert "self.global_minimum_heading_span" in requirement
+    assert "if not self.stationary_global_candidate_ambiguous" in rotation
+    assert "self.localization_next_observation_angle" in rotation
+    assert "self._global_heading_diversity_ready()" in tick
+
+
+def test_hypothesis_jump_invalidates_old_heading_corroboration() -> None:
+    callback = _method_source("_amcl_pose_callback", "_pose_is_stable")
+
+    assert "self.global_search_untrusted" in callback
+    assert "self.localization_evidence_headings.clear()" in callback
+    assert "self.localization_heading_bins = ()" in callback
+    assert 'reason="SPATIAL_HYPOTHESIS_JUMP"' in callback
+
+
+def test_tf_chain_diagnostic_names_each_link_and_bounded_failure() -> None:
+    diagnostic = _method_source(
+        "_tf_link_diagnostic", "_scan_heading_in_odom"
+    )
+
+    for link in (
+        '"map_to_odom"',
+        '"odom_to_base"',
+        '"base_to_laser"',
+        '"map_to_laser"',
+    ):
+        assert link in diagnostic
+    assert '"amcl_pose_age_ms"' in diagnostic
+    assert '"scan_navigation_age_ms"' in diagnostic
+    assert '"global_localization_service_ready"' in diagnostic
+    assert '"nomotion_update_service_ready"' in diagnostic
+    assert "self.localization_tf_chain_timeout" in diagnostic
+    assert 'reason="LOCALIZATION_TF_CHAIN_UNAVAILABLE"' in diagnostic
+
+
+def test_command_rejection_is_logged_before_expected_state_guard() -> None:
+    dispatch = _method_source("_dispatch", "_foreign_mapping_authorities")
+
+    command_log = dispatch.index('"COMMAND"')
+    expected_state_guard = dispatch.index("expected_state != self.current_state")
+    rejected_log = dispatch.index('"COMMAND_REJECTED"', expected_state_guard)
+    state_conflict = dispatch.index('"STATE_CONFLICT"', rejected_log)
+    assert command_log < expected_state_guard < rejected_log < state_conflict
+
+
+def test_runtime_map_loader_and_active_log_use_canonical_runtime_bundle() -> None:
+    resolve = _method_source("_resolve_runtime_map_yaml", "_log_active_map")
+    active_log = _method_source("_log_active_map", "_load_map")
+    load = _method_source("_load_map", "_set_initial_pose")
+
+    assert "self.map_root.resolve(strict=True)" in resolve
+    assert 'payload["map_path"]' in resolve
+    assert "relative_to(runtime_root)" in resolve
+    assert "sample-data" not in resolve + load
+    assert '"MAP_ACTIVE"' in active_log
+    for field in (
+        "canonical_map_yaml_path",
+        "image_path",
+        "resolution",
+        "width",
+        "height",
+        "origin",
+    ):
+        assert field in active_log
+
+
+def test_localization_rotation_has_a_dedicated_diagnostic_event() -> None:
+    tick = _method_source("_localization_tick", "_resolve_runtime_map_yaml")
+
+    assert '"LOCALIZATION_ROTATE"' in tick
+    assert "current_actual_yaw" in tick
+    assert "accumulated_yaw_span" in tick
+    assert "requested_angular" in tick
+    assert "final_safety_output" in tick
+
+
+def test_post_turn_reanchor_enters_straight_inside_bounded_band() -> None:
+    prepare = _method_source(
+        "_prepare_active_segment", "_begin_turn_or_settling"
+    )
+
+    assert "post_turn_reanchor_requires_turn" in prepare
+    assert "self.execution_turn_reentry_tolerance" in prepare
+    assert "self.straight_hard_cross_track" in prepare
+    assert 'phase="STRAIGHT_ENTRY_CORRECTION"' in prepare
+    correction = prepare.split('phase="STRAIGHT_ENTRY_CORRECTION"', 1)[1]
+    assert "self._dispatch_prepared_segment(goal_generation)" in correction
 
 
 def test_ready_tracking_uses_low_threshold_without_stationary_reacquisition() -> None:
@@ -654,6 +769,23 @@ def test_turn_hysteresis_and_persistent_safety_block_are_bounded() -> None:
     assert '"PERSISTENT_SAFETY_BLOCK"' in tick
     assert "self._schedule_execution_replan" in tick
     assert '"TURN_CMD"' in tick
+
+
+def test_turn_reentry_reselects_direction_after_target_overshoot() -> None:
+    tick = _method_source("_segment_execution_tick", "_fresh_execution_pose")
+    settling = tick.split(
+        'if self.execution_phase == "TURN_SETTLING":', 1
+    )[1].split(
+        "\n        direction = self.execution_turn_direction", 1
+    )[0]
+    reentry = settling.split('if transition == "TURN":', 1)[1]
+
+    assert "previous_direction = self.execution_turn_direction" in reentry
+    assert "direction = choose_turn_direction(" in reentry
+    assert "self.execution_turn_direction =" in reentry
+    assert '"TURN" if direction else "WAIT_FOR_TURN_CLEAR"' in reentry
+    assert "previous_direction=previous_direction" in reentry
+    assert "direction=self.execution_turn_direction" in reentry
 
 
 def test_navigation_debug_events_cover_new_geometry_and_recovery_sources() -> None:

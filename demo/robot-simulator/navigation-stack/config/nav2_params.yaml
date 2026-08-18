@@ -67,9 +67,8 @@ rovera_navigation_adapter:
     localization_tracking_scan_map_sanity_score: 0.12
     # A stationary global search has no heading diversity, so only accept a
     # distinctly strong map match. Weaker aliases still qualify for the
-    # rotation-assisted path below, where the normal 0.35 score is combined
-    # with residual quality and multi-heading evidence. Live tests separated
-    # the correct 0.79-0.81 candidate from repeated 0.60-0.70 aliases.
+    # This score measures stationary evidence quality only. It never proves
+    # global uniqueness; physical multi-heading corroboration does that.
     localization_global_scan_map_minimum_score: 0.75
     # If geometry blocks rotation, resample AMCL inside the same bounded Force
     # Rescan request instead of making the operator press the button 4-5 times.
@@ -100,20 +99,21 @@ rovera_navigation_adapter:
     # accept the nearest transform only inside this explicit age budget.
     scan_tf_wait_seconds: 0.02
     scan_tf_fallback_max_age_seconds: 0.12
+    localization_tf_chain_timeout_seconds: 8.0
     scan_map_freshness_seconds: 0.60
     sensor_time_invalid_grace_seconds: 1.0
     auto_localization_rotation_degrees_per_second: 45.0
-    # Complete one full observation sweep when an accurate hypothesis has not
-    # appeared earlier. The extra quarter-turn costs about two seconds at the
-    # configured speed and avoids requiring another operator rescan merely
-    # because the distinctive map view lay in the skipped 90-degree sector.
-    auto_localization_max_angle_degrees: 360.0
+    # Hard cap only. Strong candidates normally stop around 75 degrees and
+    # ambiguous candidates collect stationary checkpoints across 150 degrees.
+    auto_localization_max_angle_degrees: 270.0
     # Wait for the chassis/smoother to stop before collecting the stationary
     # AMCL window used by the strict READY acquisition gate.
     localization_rotation_settle_seconds: 1.0
     # Force Rescan records actual odom headings only for scans whose score and
     # residual pass. Commanded rotation alone is never localization evidence.
     localization_global_heading_bin_count: 8
+    localization_global_strong_min_heading_bins: 2
+    localization_global_strong_min_heading_span_degrees: 75.0
     localization_global_min_heading_bins: 4
     localization_global_min_heading_span_degrees: 150.0
     # Pure localization rotation uses the same rectangular corner sweep and

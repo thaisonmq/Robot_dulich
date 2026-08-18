@@ -55,6 +55,10 @@ class RouteMetadata:
     minimum_turn_clearance: float
     turn_count: int
     total_turn_angle: float
+    initial_turn_angle: float
+    internal_turn_angle: float
+    final_turn_angle: float
+    execution_total_turn_angle: float
     narrow_segments: tuple[dict[str, float], ...]
     estimated_time: float
     turn_safe: bool
@@ -73,6 +77,12 @@ class RouteMetadata:
             ),
             "turn_count": self.turn_count,
             "total_turn_angle": round(self.total_turn_angle, 4),
+            "initial_turn_angle": round(self.initial_turn_angle, 4),
+            "internal_turn_angle": round(self.internal_turn_angle, 4),
+            "final_turn_angle": round(self.final_turn_angle, 4),
+            "execution_total_turn_angle": round(
+                self.execution_total_turn_angle, 4
+            ),
             "narrow_segments": [dict(item) for item in self.narrow_segments],
             "estimated_time": round(self.estimated_time, 3),
             "turn_safe": self.turn_safe,
@@ -570,6 +580,26 @@ def turn_hysteresis_transition(
     if float(stable_elapsed) >= max(0.0, float(stable_dwell)):
         return "STRAIGHT_PREPARE"
     return "TURN_SETTLING"
+
+
+def post_turn_reanchor_requires_turn(
+    heading_delta: float,
+    cross_track: float,
+    *,
+    straight_entry_heading_limit: float,
+    straight_entry_cross_track_limit: float,
+) -> bool:
+    """Decide whether a validated post-turn re-anchor needs another turn.
+
+    The fixed-heading straight controller is authoritative inside these
+    bounded entry limits.  This keeps a small localization/chassis shift from
+    producing TURN -> re-anchor -> TURN for the same physical segment.
+    """
+    return bool(
+        abs(float(heading_delta)) > abs(float(straight_entry_heading_limit))
+        or abs(float(cross_track))
+        > abs(float(straight_entry_cross_track_limit))
+    )
 
 
 def _finite_or_none(value: float) -> float | None:
@@ -1269,6 +1299,8 @@ def route_geometry_metadata(
     padding: float = 0.0,
     linear_speed: float = 0.20,
     angular_speed: float = 0.60,
+    start_yaw: float | None = None,
+    goal_yaw: float | None = None,
 ) -> RouteMetadata:
     route = canonicalize_stop_turn_path(points)
     total_length = 0.0
@@ -1276,8 +1308,8 @@ def route_geometry_metadata(
     minimum_passage_width = math.inf
     minimum_turn_clearance = math.inf
     narrow_segments: list[dict[str, float]] = []
-    turn_count = 0
-    total_turn_angle = 0.0
+    internal_turn_count = 0
+    internal_turn_angle = 0.0
     turn_safe = True
     rotation_diameter = 2.0 * math.hypot(
         half_length + padding, half_width + padding
@@ -1341,8 +1373,8 @@ def route_geometry_metadata(
         angle = abs(_angle_delta(outgoing, incoming))
         if angle <= 1e-6:
             continue
-        turn_count += 1
-        total_turn_angle += angle
+        internal_turn_count += 1
+        internal_turn_angle += angle
         cell = saved_map.world_to_cell(route[index]["x"], route[index]["y"])
         clearance = 0.0 if cell is None else geometry.clearance_at_cell(*cell)
         turn_clearance = clearance - math.hypot(
@@ -1359,22 +1391,51 @@ def route_geometry_metadata(
             half_width=half_width,
             padding=padding,
         ).valid
+    initial_turn_angle = 0.0
+    final_turn_angle = 0.0
+    if len(route) >= 2:
+        first_heading = math.atan2(
+            route[1]["y"] - route[0]["y"],
+            route[1]["x"] - route[0]["x"],
+        )
+        if start_yaw is not None:
+            initial_turn_angle = abs(_angle_delta(first_heading, start_yaw))
+        last_heading = math.atan2(
+            route[-1]["y"] - route[-2]["y"],
+            route[-1]["x"] - route[-2]["x"],
+        )
+        if goal_yaw is not None:
+            final_turn_angle = abs(_angle_delta(goal_yaw, last_heading))
+    executed_turn_angles = (
+        (initial_turn_angle if initial_turn_angle > 1e-6 else 0.0),
+        internal_turn_angle,
+        (final_turn_angle if final_turn_angle > 1e-6 else 0.0),
+    )
+    execution_total_turn_angle = sum(executed_turn_angles)
+    turn_count = (
+        internal_turn_count
+        + int(initial_turn_angle > 1e-6)
+        + int(final_turn_angle > 1e-6)
+    )
     return RouteMetadata(
         total_length=total_length,
         minimum_passage_width=minimum_passage_width,
         minimum_static_clearance=minimum_clearance,
         minimum_turn_clearance=minimum_turn_clearance,
         turn_count=turn_count,
-        total_turn_angle=total_turn_angle,
+        total_turn_angle=execution_total_turn_angle,
+        initial_turn_angle=initial_turn_angle,
+        internal_turn_angle=internal_turn_angle,
+        final_turn_angle=final_turn_angle,
+        execution_total_turn_angle=execution_total_turn_angle,
         narrow_segments=tuple(narrow_segments),
         estimated_time=(
             total_length / max(0.01, linear_speed)
-            + total_turn_angle / max(0.01, angular_speed)
-            # Every additional stop-turn corner also forces one complete
-            # translation decel/settle/accel cycle.  One footprint length at
-            # nominal speed is a geometry-scaled lower-bound for that cycle;
-            # accounting for it prevents tiny distance savings from adding
-            # chattering corners while still rewarding material oblique cuts.
+            + execution_total_turn_angle / max(0.01, angular_speed)
+            # Every executed rotation has a stop/settle boundary. One
+            # footprint length at nominal speed is a geometry-scaled lower
+            # bound for that overhead and applies to initial/final rotations
+            # as well as internal corners.
             + turn_count
             * (2.0 * (half_length + padding))
             / max(0.01, linear_speed)
@@ -1715,6 +1776,8 @@ class StopTurnStateLatticePlanner:
             padding=self.padding,
             linear_speed=self.linear_speed,
             angular_speed=self.angular_speed,
+            start_yaw=start_yaw,
+            goal_yaw=goal_yaw,
         )
         headings = tuple(
             self.heading_bin(math.atan2(
@@ -1757,16 +1820,14 @@ class StopTurnStateLatticePlanner:
             {"x": start_x, "y": start_y},
             {"x": goal_x, "y": goal_y},
         ]
+        candidate_pool: list[StopTurnRoute] = []
         if not self._segment_excluded(direct_points[0], direct_points[1], forbidden):
             direct = self._route_result(
                 direct_points, start_yaw=start_yaw, goal_yaw=goal_yaw
             )
-            # Once every exact translation/start-turn/final-yaw constraint is
-            # satisfied, an extra stop-turn corner has no safety benefit.
             if direct is not None:
-                return direct
+                candidate_pool.append(direct)
 
-        candidate_pool: list[StopTurnRoute] = []
         for simple in (
             [
                 {"x": start_x, "y": start_y},
