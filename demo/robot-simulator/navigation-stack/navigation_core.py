@@ -3022,6 +3022,22 @@ class ScanMapMatch:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalizationRaycastConsistency:
+    comparable_beams: int
+    matched_beams: int
+    match_ratio: float
+    median_error: float
+    p90_error: float
+    mean_error: float
+
+
+@dataclass(frozen=True, slots=True)
+class LocalizationVerification:
+    accepted: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class PlanningScanFilter:
     ranges: list[float]
     total_beams: int
@@ -3684,6 +3700,76 @@ def scan_to_map_match(
         median_residual=(statistics.median(ordered) if ordered else math.inf),
         p90_residual=(ordered[p90_index] if ordered else math.inf),
         mean_residual=(statistics.fmean(ordered) if ordered else math.inf),
+    )
+
+
+def scan_raycast_consistency(
+    saved_map: "SavedOccupancyMap",
+    ranges: Iterable[float],
+    *,
+    angle_min: float,
+    angle_increment: float,
+    range_min: float,
+    range_max: float,
+    laser_x: float,
+    laser_y: float,
+    laser_yaw: float,
+    maximum_beams: int = 90,
+    minimum_usable_range: float = 0.20,
+    maximum_usable_range: float = 6.0,
+    match_tolerance: float = 0.15,
+) -> LocalizationRaycastConsistency:
+    """Compare measured ranges with first-hit ranges from the saved map.
+
+    Unlike endpoint proximity, this detects an occupied endpoint hidden behind
+    a nearer mapped wall. Rays without a conclusive static-map hit are omitted
+    from the denominator and therefore cannot create positive evidence.
+    """
+    measurements = list(ranges)
+    if not measurements:
+        return LocalizationRaycastConsistency(
+            0, 0, 0.0, math.inf, math.inf, math.inf
+        )
+    step = max(1, math.ceil(len(measurements) / max(1, int(maximum_beams))))
+    lower = max(float(range_min), float(minimum_usable_range))
+    upper = min(float(range_max), float(maximum_usable_range))
+    errors: list[float] = []
+    matched = 0
+    for index, distance, _, _ in _scan_endpoints(
+        measurements,
+        angle_min=float(angle_min),
+        angle_increment=float(angle_increment),
+        lower_range=lower,
+        upper_range=upper,
+        laser_x=float(laser_x),
+        laser_y=float(laser_y),
+        laser_yaw=float(laser_yaw),
+        step=step,
+    ):
+        angle = float(laser_yaw) + float(angle_min) + index * float(angle_increment)
+        expected = saved_map.raycast_static_range(
+            float(laser_x),
+            float(laser_y),
+            angle,
+            minimum_range=lower,
+            maximum_range=upper,
+        )
+        if expected is None:
+            continue
+        error = abs(distance - expected)
+        errors.append(error)
+        if error <= float(match_tolerance):
+            matched += 1
+    ordered = sorted(errors)
+    p90_index = max(0, math.ceil(0.9 * len(ordered)) - 1)
+    comparable = len(ordered)
+    return LocalizationRaycastConsistency(
+        comparable_beams=comparable,
+        matched_beams=matched,
+        match_ratio=(0.0 if comparable == 0 else round(matched / comparable, 4)),
+        median_error=(statistics.median(ordered) if ordered else math.inf),
+        p90_error=(ordered[p90_index] if ordered else math.inf),
+        mean_error=(statistics.fmean(ordered) if ordered else math.inf),
     )
 
 
@@ -4391,12 +4477,93 @@ def find_start_escape(
     return None
 
 
+def localization_verification(
+    *,
+    confidence: float,
+    confidence_threshold: float,
+    pose_stable: bool,
+    covariance_xy: float | None,
+    covariance_yaw: float | None,
+    maximum_covariance_xy: float,
+    maximum_covariance_yaw: float,
+    scan_valid_beams: int,
+    minimum_scan_beams: int,
+    scan_score: float,
+    required_scan_score: float,
+    residual_beams: int,
+    minimum_residual_beams: int,
+    median_residual: float,
+    maximum_median_residual: float,
+    p90_residual: float,
+    maximum_p90_residual: float,
+    raycast_comparable_beams: int,
+    minimum_raycast_beams: int,
+    raycast_match_ratio: float,
+    minimum_raycast_match_ratio: float,
+    raycast_median_error: float,
+    maximum_raycast_median_error: float,
+    raycast_p90_error: float,
+    maximum_raycast_p90_error: float,
+    heading_required: bool,
+    heading_ready: bool,
+    amcl_fresh: bool,
+    scan_map_fresh: bool,
+    scan_fresh: bool,
+    tf_valid: bool,
+    sensor_time_valid: bool,
+) -> LocalizationVerification:
+    """Evaluate every mandatory acquisition gate without score compensation."""
+    if not sensor_time_valid:
+        return LocalizationVerification(False, "SENSOR_TIME_INVALID")
+    if not tf_valid:
+        return LocalizationVerification(False, "TF_UNAVAILABLE")
+    if not amcl_fresh:
+        return LocalizationVerification(False, "AMCL_STALE")
+    if not scan_fresh:
+        return LocalizationVerification(False, "SCAN_STALE")
+    if not scan_map_fresh:
+        return LocalizationVerification(False, "SCAN_MAP_EVIDENCE_STALE")
+    if not pose_stable:
+        return LocalizationVerification(False, "POSE_UNSTABLE")
+    if covariance_xy is None or covariance_yaw is None:
+        return LocalizationVerification(False, "COVARIANCE_UNAVAILABLE")
+    if (
+        covariance_xy > maximum_covariance_xy
+        or covariance_yaw > maximum_covariance_yaw
+    ):
+        return LocalizationVerification(False, "COVARIANCE_TOO_HIGH")
+    if scan_valid_beams < minimum_scan_beams:
+        return LocalizationVerification(False, "SCAN_INSUFFICIENT_BEAMS")
+    if scan_score < required_scan_score:
+        return LocalizationVerification(False, "SCAN_SCORE_TOO_LOW")
+    if residual_beams < minimum_residual_beams:
+        return LocalizationVerification(False, "SCAN_RESIDUALS_INSUFFICIENT")
+    if median_residual > maximum_median_residual:
+        return LocalizationVerification(False, "SCAN_MEDIAN_RESIDUAL_TOO_HIGH")
+    if p90_residual > maximum_p90_residual:
+        return LocalizationVerification(False, "SCAN_P90_RESIDUAL_TOO_HIGH")
+    if raycast_comparable_beams < minimum_raycast_beams:
+        return LocalizationVerification(False, "RAYCAST_INSUFFICIENT_BEAMS")
+    if raycast_match_ratio < minimum_raycast_match_ratio:
+        return LocalizationVerification(False, "RAYCAST_MATCH_TOO_LOW")
+    if raycast_median_error > maximum_raycast_median_error:
+        return LocalizationVerification(False, "RAYCAST_MEDIAN_ERROR_TOO_HIGH")
+    if raycast_p90_error > maximum_raycast_p90_error:
+        return LocalizationVerification(False, "RAYCAST_P90_ERROR_TOO_HIGH")
+    if heading_required and not heading_ready:
+        return LocalizationVerification(False, "HEADING_EVIDENCE_INSUFFICIENT")
+    if confidence < confidence_threshold:
+        return LocalizationVerification(False, "LOW_CONFIDENCE")
+    return LocalizationVerification(True, "ACCEPTED")
+
+
 def localization_confidence(
     covariance: list[float] | tuple[float, ...],
     *,
     stability_score: float,
     scan_map_score: float,
     scan_map_threshold: float,
+    raycast_match_ratio: float | None = None,
     scan_fresh: bool,
     tf_stable: bool,
     odometry_healthy: bool,
@@ -4416,9 +4583,21 @@ def localization_confidence(
     variance += max(0.0, float(covariance[35])) * 0.5
     covariance_score = math.exp(-variance * 2.0)
     stability = max(0.0, min(1.0, float(stability_score)))
-    map_score = max(0.0, min(1.0, float(scan_map_score) / scan_map_threshold))
+    # The acceptance threshold is a gate, not the top of the quality scale.
+    # A sublinear curve preserves useful separation across the full 0..1
+    # scan range instead of making every score above 0.35 indistinguishable.
+    endpoint_quality = max(
+        0.0, min(1.0, float(scan_map_score))
+    ) ** 0.7
+    raycast_source = (
+        float(scan_map_score)
+        if raycast_match_ratio is None
+        else float(raycast_match_ratio)
+    )
+    raycast_quality = max(0.0, min(1.0, raycast_source)) ** 0.7
+    geometry_score = 0.65 * endpoint_quality + 0.35 * raycast_quality
     return round(
-        max(0.0, min(1.0, covariance_score * stability * map_score)), 4
+        max(0.0, min(1.0, covariance_score * stability * geometry_score)), 4
     )
 
 

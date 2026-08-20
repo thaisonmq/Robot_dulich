@@ -55,9 +55,11 @@ def test_each_localization_phase_discards_old_evidence_and_uses_full_threshold()
     global_localization = _method_source("_start_global_localization", "_safe_to_rotate")
     tick = _method_source("_localization_tick", "_load_map")
     evidence = _method_source("_localization_evidence_ready", "_localization_tick")
+    verdict = _method_source("_localization_verdict", "_localization_quality_ready")
 
     assert "self._reset_localization_evidence()" in global_localization
-    assert "self.localization_confidence_threshold" in evidence
+    assert "self.localization_confidence_threshold" in verdict
+    assert "self._required_localization_scan_score()" in evidence
     assert "required_confidence" not in tick
     assert '"LOCALIZING_APPROXIMATE_POSE"' in tick
     assert "self.approximate_pose_timeout" in tick
@@ -104,6 +106,7 @@ def test_localization_rotation_keeps_every_live_safety_gate() -> None:
 def test_global_search_is_stationary_first_then_requires_authorized_rotation() -> None:
     global_search = _method_source("_start_global_localization", "_safe_to_rotate")
     evidence = _method_source("_localization_evidence_ready", "_localization_tick")
+    verdict = _method_source("_localization_verdict", "_localization_quality_ready")
     tick = _method_source("_localization_tick", "_load_map")
 
     guard = global_search.index("if not self.localization_rotation_authorized")
@@ -115,7 +118,8 @@ def test_global_search_is_stationary_first_then_requires_authorized_rotation() -
     assert "if self.global_search_rotation_pending" in tick
     assert "self.global_search_requires_rotation = True" in tick
     assert "self.global_search_untrusted" in evidence
-    assert "self._global_heading_diversity_ready()" in evidence
+    assert "require_heading=self.global_search_untrusted" in evidence
+    assert "self._global_heading_diversity_ready()" in verdict
     assert "self._start_next_localization_rotation(now)" in tick
     assert 'self.localization_state = "LOCALIZATION_REQUIRED"' in global_search
 
@@ -241,16 +245,19 @@ def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
 
     evidence = _method_source("_localization_evidence_ready", "_localization_tick")
     quality = _method_source("_localization_quality_ready", "_actual_odom_yaw")
+    verdict = _method_source("_localization_verdict", "_localization_quality_ready")
 
-    assert "self._pose_is_stable()" in quality
-    assert "self.amcl_pose_freshness" in quality
-    assert "self.global_scan_map_threshold" in evidence
-    assert "self.scan_map_score >= required_scan_score" in quality
-    assert "self._critical_sensor_time_healthy()" in quality
-    assert "self.localization_final_max_median_residual" in quality
-    assert "self.localization_final_max_p90_residual" in quality
-    assert "self.localization_final_minimum_residual_beams" in quality
-    assert "self._global_heading_diversity_ready()" in evidence
+    assert "self._pose_is_stable()" in verdict
+    assert "self.amcl_pose_freshness" in verdict
+    assert "self._required_localization_scan_score()" in evidence
+    assert "required_scan_score=required_scan_score" in quality
+    assert "self._critical_sensor_time_healthy()" in verdict
+    assert "self.localization_final_max_median_residual" in verdict
+    assert "self.localization_final_max_p90_residual" in verdict
+    assert "self.localization_final_minimum_residual_beams" in verdict
+    assert "self.localization_raycast_minimum_beams" in verdict
+    assert "self.localization_raycast_minimum_match_ratio" in verdict
+    assert "self._global_heading_diversity_ready()" in verdict
     assert 'self.localization_state == "VERIFYING"' in tick
     assert "self.localization_ready_hold" in tick
     assert 'self.localized and self.localization_state == "READY"' in tick
@@ -269,12 +276,15 @@ def test_verify_timeout_does_not_restart_an_accepted_candidate_during_ready_hold
 
 
 def test_stationary_global_search_rejects_weak_alias_and_resamples_when_turn_blocked() -> None:
-    evidence = _method_source("_localization_evidence_ready", "_localization_tick")
+    threshold = _method_source(
+        "_required_localization_scan_score", "_localization_verdict"
+    )
     tick = _method_source("_localization_tick", "_load_map")
 
-    assert 'self.localization_state == "LOCALIZING_GLOBAL"' in evidence
-    assert "self.global_search_rotation_pending" in evidence
-    assert "self.global_scan_map_threshold" in evidence
+    assert 'self.localization_state == "LOCALIZING_GLOBAL"' in threshold
+    assert "self.global_search_rotation_pending" in threshold
+    assert "self.global_scan_map_threshold" in threshold
+    assert "self.global_final_scan_map_threshold" in threshold
     assert "self.stationary_global_candidate_ambiguous" in tick
     assert "self.stationary_global_retry_delay" in tick
     assert 'action="GLOBAL_RESAMPLE"' in tick
@@ -296,14 +306,78 @@ def test_heading_observation_requires_stationary_quality_for_same_hypothesis() -
         "_record_heading_observation", "_update_scan_map_match"
     )
     callback = _method_source("_scan_callback", "_sensor_time_callback")
+    update = _method_source("_update_scan_map_match", "_planning_scan_message")
     assert "valid_beams < self.scan_map_minimum_beams" in observation
     assert "self._scan_heading_in_odom(message)" in observation
     assert "scan_quality_passed" in observation
     assert "self._pose_is_stable()" in observation
     assert "not self.rotation_active" in observation
+    assert "self._required_localization_scan_score()" in update
+    assert "self.localization_raycast_minimum_match_ratio" in update
     assert callback.index("self._update_scan_map_match(message)") < callback.index(
         "self._record_heading_observation("
     )
+
+
+def test_localization_verify_log_contains_every_mandatory_gate_metric() -> None:
+    tick = _method_source("_localization_tick", "_load_map")
+    for field in (
+        "state=self.localization_state",
+        "candidate_pose=self.last_amcl_pose",
+        "scan_score=self.scan_map_score",
+        "scan_score_required=self._required_localization_scan_score()",
+        "covariance_xy=",
+        "covariance_yaw=",
+        "median_residual_m=",
+        "p90_residual_m=",
+        "raycast_comparable_beams=",
+        "raycast_matches=",
+        "raycast_match_ratio=",
+        "raycast_median_error_m=",
+        "raycast_p90_error_m=",
+        "heading_bins=",
+        "heading_span_deg=",
+        "rotation_degrees=",
+        "global_search_untrusted=",
+        "accepted=",
+        "reason=",
+    ):
+        assert field in tick
+
+
+def test_new_navigation_start_rechecks_fresh_raycast_without_canceling_route() -> None:
+    start_gate = _method_source(
+        "_localization_start_evidence_ready", "_begin_localization_settling"
+    )
+    navigate = _method_source("_navigate", "_segment_execution_tick")
+
+    assert "self._localization_tracking_evidence_ready(now)" in start_gate
+    assert "self.localization_raycast_minimum_beams" in start_gate
+    assert "self.localization_raycast_minimum_match_ratio" in start_gate
+    assert "not recovery_attempt" in navigate
+    assert "self._localization_start_evidence_ready(time.monotonic())" in navigate
+    assert "cancel_goal_async" not in start_gate
+
+
+def test_failed_global_checkpoint_continues_rotation_without_counting_heading() -> None:
+    checkpoint = _method_source(
+        "_localization_checkpoint_observed", "_localization_tick"
+    )
+    tick = _method_source("_localization_tick", "_load_map")
+    settling = tick.split(
+        "and self._localization_checkpoint_observed(now)", 1
+    )[1].split(
+        'self.localization_state == "VERIFYING"', 1
+    )[0]
+
+    assert "self._pose_is_stable()" in checkpoint
+    assert "self.last_scan_map_monotonic" in checkpoint
+    assert "self.scan_map_valid_beams >= self.scan_map_minimum_beams" in checkpoint
+    assert "self._localization_checkpoint_observed(now)" in tick
+    assert "and not localization_ready" in settling
+    assert "self._start_next_localization_rotation(now)" in settling
+    assert "self._localization_quality_ready(" not in settling
+    assert "self._record_heading_observation" not in settling
 
 
 def test_scan_tf_uses_bounded_wait_and_age_checked_fallback() -> None:
@@ -325,8 +399,9 @@ def test_untrusted_global_cannot_ready_from_one_heading() -> None:
     )
 
     assert "self.global_search_untrusted = True" in global_search
-    assert "not self.global_search_untrusted" in evidence
-    assert "self._global_heading_diversity_ready()" in evidence
+    assert "require_heading=self.global_search_untrusted" in evidence
+    verdict = _method_source("_localization_verdict", "_localization_quality_ready")
+    assert "self._global_heading_diversity_ready()" in verdict
 
 
 def test_adaptive_global_heading_requirements_allow_strong_early_exit() -> None:
@@ -344,7 +419,7 @@ def test_adaptive_global_heading_requirements_allow_strong_early_exit() -> None:
     assert "self.global_minimum_heading_span" in requirement
     assert "if not self.stationary_global_candidate_ambiguous" in rotation
     assert "self.localization_next_observation_angle" in rotation
-    assert "self._global_heading_diversity_ready()" in tick
+    assert "localization_ready = self._localization_evidence_ready(now)" in tick
 
 
 def test_hypothesis_jump_invalidates_old_heading_corroboration() -> None:

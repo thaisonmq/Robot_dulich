@@ -48,6 +48,7 @@ from navigation_core import (
     ActiveSegment,
     DynamicObstacleOverlay,
     ExecutablePathValidation,
+    LocalizationVerification,
     MapNavigationGeometry,
     NavigationDebugLog,
     PoseStability,
@@ -70,6 +71,7 @@ from navigation_core import (
     find_start_escape,
     heading_diversity,
     localization_confidence,
+    localization_verification,
     path_overlap_ratio,
     position_within_tolerance,
     preferred_turn_bay_directions,
@@ -77,6 +79,7 @@ from navigation_core import (
     pose_stability,
     rotation_swept_clearance,
     route_geometry_metadata,
+    scan_raycast_consistency,
     scan_to_map_match,
     segment_travel_watchdog,
     straight_heading_lock,
@@ -203,6 +206,15 @@ class NavigationAdapter(Node):
         self.scan_map_mean_residuals: deque[float] = deque(
             maxlen=self.scan_map_scores.maxlen
         )
+        self.raycast_match_ratios: deque[float] = deque(
+            maxlen=self.scan_map_scores.maxlen
+        )
+        self.raycast_median_errors: deque[float] = deque(
+            maxlen=self.scan_map_scores.maxlen
+        )
+        self.raycast_p90_errors: deque[float] = deque(
+            maxlen=self.scan_map_scores.maxlen
+        )
         self.scan_map_score = 0.0
         self.scan_map_matched_beams = 0
         self.scan_map_valid_beams = 0
@@ -210,6 +222,11 @@ class NavigationAdapter(Node):
         self.scan_map_median_residual = math.inf
         self.scan_map_p90_residual = math.inf
         self.scan_map_mean_residual = math.inf
+        self.raycast_comparable_beams = 0
+        self.raycast_matched_beams = 0
+        self.raycast_match_ratio = 0.0
+        self.raycast_median_error = math.inf
+        self.raycast_p90_error = math.inf
         self.last_scan_map_monotonic = 0.0
         self.verification_scan_count = 0
         self.verification_started_monotonic = 0.0
@@ -311,6 +328,18 @@ class NavigationAdapter(Node):
             self.scan_map_threshold,
             configured("localization_global_scan_map_minimum_score", 0.80),
         )
+        self.global_final_scan_map_threshold = max(
+            self.scan_map_threshold,
+            configured(
+                "localization_global_final_scan_map_minimum_score", 0.70
+            ),
+        )
+        self.localization_maximum_covariance_xy = configured(
+            "localization_maximum_covariance_xy", 0.50
+        )
+        self.localization_maximum_covariance_yaw = configured(
+            "localization_maximum_covariance_yaw", 0.50
+        )
         self.scan_map_minimum_beams = int(self.declare_parameter(
             "scan_map_minimum_valid_beams", 25
         ).value)
@@ -322,6 +351,28 @@ class NavigationAdapter(Node):
         self.scan_map_maximum_beams = int(self.declare_parameter(
             "scan_map_maximum_beams", 90
         ).value)
+        self.localization_raycast_maximum_beams = max(1, int(
+            self.declare_parameter(
+                "localization_raycast_maximum_beams", 90
+            ).value
+        ))
+        self.localization_raycast_minimum_beams = max(1, int(
+            self.declare_parameter(
+                "localization_raycast_minimum_comparable_beams", 25
+            ).value
+        ))
+        self.localization_raycast_match_tolerance = configured(
+            "localization_raycast_match_tolerance", 0.15
+        )
+        self.localization_raycast_minimum_match_ratio = configured(
+            "localization_raycast_minimum_match_ratio", 0.55
+        )
+        self.localization_raycast_maximum_median_error = configured(
+            "localization_raycast_maximum_median_error", 0.15
+        )
+        self.localization_raycast_maximum_p90_error = configured(
+            "localization_raycast_maximum_p90_error", 1.0
+        )
         self.scan_map_minimum_range = configured("scan_map_minimum_range", 0.20)
         self.scan_map_maximum_range = configured("scan_map_maximum_range", 6.0)
         self.localization_coarse_match_tolerance = configured(
@@ -1434,6 +1485,7 @@ class NavigationAdapter(Node):
             },
             "scan_map_score": self.scan_map_score,
             "scan_map_threshold": self.scan_map_threshold,
+            "scan_map_score_required": self._required_localization_scan_score(),
             "scan_map_matched_beams": self.scan_map_matched_beams,
             "scan_map_valid_beams": self.scan_map_valid_beams,
             "scan_map_residual_beams": self.scan_map_residual_beams,
@@ -1445,6 +1497,15 @@ class NavigationAdapter(Node):
             ),
             "mean_endpoint_residual_m": self._finite_metric(
                 self.scan_map_mean_residual
+            ),
+            "raycast_comparable_beams": self.raycast_comparable_beams,
+            "raycast_matches": self.raycast_matched_beams,
+            "raycast_match_ratio": self.raycast_match_ratio,
+            "raycast_median_error_m": self._finite_metric(
+                self.raycast_median_error
+            ),
+            "raycast_p90_error_m": self._finite_metric(
+                self.raycast_p90_error
             ),
             "ready_evidence_hold_ms": (
                 None if self.ready_evidence_since is None else round(
@@ -1982,10 +2043,18 @@ class NavigationAdapter(Node):
                 self.scan_map_median_residuals.clear()
                 self.scan_map_p90_residuals.clear()
                 self.scan_map_mean_residuals.clear()
+                self.raycast_match_ratios.clear()
+                self.raycast_median_errors.clear()
+                self.raycast_p90_errors.clear()
                 self.scan_map_score = 0.0
                 self.scan_map_median_residual = math.inf
                 self.scan_map_p90_residual = math.inf
                 self.scan_map_mean_residual = math.inf
+                self.raycast_comparable_beams = 0
+                self.raycast_matched_beams = 0
+                self.raycast_match_ratio = 0.0
+                self.raycast_median_error = math.inf
+                self.raycast_p90_error = math.inf
                 # Physical verification deliberately changes chassis yaw.
                 # Invalidate cross-heading corroboration only when AMCL moves
                 # the spatial hypothesis to another location; ordinary yaw
@@ -2179,6 +2248,7 @@ class NavigationAdapter(Node):
             stability_score=stability_score,
             scan_map_score=confidence_scan_map_score,
             scan_map_threshold=self.scan_map_threshold,
+            raycast_match_ratio=self.raycast_match_ratio,
             scan_fresh=time.monotonic() - self.last_scan_monotonic <= 0.30,
             tf_stable=time.monotonic() - self.last_map_tf_monotonic <= 0.60,
             odometry_healthy=self.tf_buffer.can_transform(
@@ -3390,15 +3460,39 @@ class NavigationAdapter(Node):
             maximum_usable_range=self.scan_map_maximum_range,
             endpoint_tolerance=self.localization_coarse_match_tolerance,
         )
+        raycast = scan_raycast_consistency(
+            self.saved_map,
+            message.ranges,
+            angle_min=float(message.angle_min),
+            angle_increment=float(message.angle_increment),
+            range_min=float(message.range_min),
+            range_max=float(message.range_max),
+            laser_x=scan_pose[0],
+            laser_y=scan_pose[1],
+            laser_yaw=scan_pose[2],
+            maximum_beams=self.localization_raycast_maximum_beams,
+            minimum_usable_range=self.scan_map_minimum_range,
+            maximum_usable_range=self.scan_map_maximum_range,
+            match_tolerance=self.localization_raycast_match_tolerance,
+        )
         self.scan_map_matched_beams = match.matched_beams
         self.scan_map_valid_beams = match.valid_beams
         self.scan_map_residual_beams = match.residual_beams
+        self.raycast_comparable_beams = raycast.comparable_beams
+        self.raycast_matched_beams = raycast.matched_beams
+        self.raycast_match_ratio = raycast.match_ratio
+        self.raycast_median_error = raycast.median_error
+        self.raycast_p90_error = raycast.p90_error
         if match.valid_beams < self.scan_map_minimum_beams:
             return False
         self.scan_map_scores.append(match.score)
         self.scan_map_median_residuals.append(match.median_residual)
         self.scan_map_p90_residuals.append(match.p90_residual)
         self.scan_map_mean_residuals.append(match.mean_residual)
+        if raycast.comparable_beams >= self.localization_raycast_minimum_beams:
+            self.raycast_match_ratios.append(raycast.match_ratio)
+            self.raycast_median_errors.append(raycast.median_error)
+            self.raycast_p90_errors.append(raycast.p90_error)
         self.scan_map_score = round(statistics.median(self.scan_map_scores), 4)
         self.scan_map_median_residual = statistics.median(
             self.scan_map_median_residuals
@@ -3409,18 +3503,36 @@ class NavigationAdapter(Node):
         self.scan_map_mean_residual = statistics.median(
             self.scan_map_mean_residuals
         )
+        if self.raycast_match_ratios:
+            self.raycast_match_ratio = round(
+                statistics.median(self.raycast_match_ratios), 4
+            )
+            self.raycast_median_error = statistics.median(
+                self.raycast_median_errors
+            )
+            self.raycast_p90_error = statistics.median(
+                self.raycast_p90_errors
+            )
         self.last_scan_map_monotonic = time.monotonic()
         if self.verification_started_monotonic:
             self.verification_scan_count += 1
         self._refresh_localization_confidence()
         return bool(
-            match.score >= self.scan_map_threshold
+            match.score >= self._required_localization_scan_score()
             and match.residual_beams
             >= self.localization_final_minimum_residual_beams
             and match.median_residual
             <= self.localization_final_max_median_residual
             and match.p90_residual
             <= self.localization_final_max_p90_residual
+            and raycast.comparable_beams
+            >= self.localization_raycast_minimum_beams
+            and raycast.match_ratio
+            >= self.localization_raycast_minimum_match_ratio
+            and raycast.median_error
+            <= self.localization_raycast_maximum_median_error
+            and raycast.p90_error
+            <= self.localization_raycast_maximum_p90_error
         )
 
     def _planning_scan_message(self, message: LaserScan) -> LaserScan:
@@ -3922,6 +4034,9 @@ class NavigationAdapter(Node):
         self.scan_map_median_residuals.clear()
         self.scan_map_p90_residuals.clear()
         self.scan_map_mean_residuals.clear()
+        self.raycast_match_ratios.clear()
+        self.raycast_median_errors.clear()
+        self.raycast_p90_errors.clear()
         self.scan_map_score = 0.0
         self.scan_map_matched_beams = 0
         self.scan_map_valid_beams = 0
@@ -3929,6 +4044,11 @@ class NavigationAdapter(Node):
         self.scan_map_median_residual = math.inf
         self.scan_map_p90_residual = math.inf
         self.scan_map_mean_residual = math.inf
+        self.raycast_comparable_beams = 0
+        self.raycast_matched_beams = 0
+        self.raycast_match_ratio = 0.0
+        self.raycast_median_error = math.inf
+        self.raycast_p90_error = math.inf
         self.localization_evidence_headings.clear()
         self.localization_heading_bins = ()
         self.localization_heading_span = 0.0
@@ -4360,6 +4480,81 @@ class NavigationAdapter(Node):
             and self.localization_heading_span >= required_span
         )
 
+    def _required_localization_scan_score(self) -> float:
+        """Keep global-origin candidates on global criteria through READY."""
+        if not self.global_search_untrusted:
+            return self.scan_map_threshold
+        if (
+            self.localization_state == "LOCALIZING_GLOBAL"
+            and self.global_search_rotation_pending
+        ):
+            return self.global_scan_map_threshold
+        return self.global_final_scan_map_threshold
+
+    def _localization_verdict(
+        self,
+        now: float,
+        *,
+        required_scan_score: float,
+        require_heading: bool,
+    ) -> LocalizationVerification:
+        covariance_xy: float | None = None
+        covariance_yaw: float | None = None
+        if len(self.last_amcl_covariance) >= 36:
+            covariance_xy = max(
+                0.0, float(self.last_amcl_covariance[0])
+            ) + max(0.0, float(self.last_amcl_covariance[7]))
+            covariance_yaw = max(
+                0.0, float(self.last_amcl_covariance[35])
+            )
+        return localization_verification(
+            confidence=self.localization_confidence,
+            confidence_threshold=self.localization_confidence_threshold,
+            pose_stable=self._pose_is_stable(),
+            covariance_xy=covariance_xy,
+            covariance_yaw=covariance_yaw,
+            maximum_covariance_xy=self.localization_maximum_covariance_xy,
+            maximum_covariance_yaw=self.localization_maximum_covariance_yaw,
+            scan_valid_beams=self.scan_map_valid_beams,
+            minimum_scan_beams=self.scan_map_minimum_beams,
+            scan_score=self.scan_map_score,
+            required_scan_score=required_scan_score,
+            residual_beams=self.scan_map_residual_beams,
+            minimum_residual_beams=self.localization_final_minimum_residual_beams,
+            median_residual=self.scan_map_median_residual,
+            maximum_median_residual=self.localization_final_max_median_residual,
+            p90_residual=self.scan_map_p90_residual,
+            maximum_p90_residual=self.localization_final_max_p90_residual,
+            raycast_comparable_beams=self.raycast_comparable_beams,
+            minimum_raycast_beams=self.localization_raycast_minimum_beams,
+            raycast_match_ratio=self.raycast_match_ratio,
+            minimum_raycast_match_ratio=(
+                self.localization_raycast_minimum_match_ratio
+            ),
+            raycast_median_error=self.raycast_median_error,
+            maximum_raycast_median_error=(
+                self.localization_raycast_maximum_median_error
+            ),
+            raycast_p90_error=self.raycast_p90_error,
+            maximum_raycast_p90_error=(
+                self.localization_raycast_maximum_p90_error
+            ),
+            heading_required=require_heading,
+            heading_ready=self._global_heading_diversity_ready(),
+            amcl_fresh=now - self.last_amcl_monotonic <= self.amcl_pose_freshness,
+            scan_map_fresh=(
+                now - self.last_scan_map_monotonic <= self.scan_map_freshness
+            ),
+            scan_fresh=now - self.last_scan_monotonic <= 0.30,
+            tf_valid=(
+                now - self.last_map_tf_monotonic <= 0.60
+                and self.tf_buffer.can_transform(
+                    "odom", "base_footprint", Time()
+                )
+            ),
+            sensor_time_valid=self._critical_sensor_time_healthy(),
+        )
+
     def _localization_quality_ready(
         self,
         now: float,
@@ -4367,23 +4562,11 @@ class NavigationAdapter(Node):
         required_scan_score: float,
     ) -> bool:
         """Quality/stability gate independent from global uniqueness."""
-        return bool(
-            self.localization_confidence >= self.localization_confidence_threshold
-            and self._pose_is_stable()
-            and now - self.last_amcl_monotonic <= self.amcl_pose_freshness
-            and self.scan_map_valid_beams >= self.scan_map_minimum_beams
-            and self.scan_map_score >= required_scan_score
-            and self.scan_map_residual_beams
-            >= self.localization_final_minimum_residual_beams
-            and self.scan_map_median_residual
-            <= self.localization_final_max_median_residual
-            and self.scan_map_p90_residual
-            <= self.localization_final_max_p90_residual
-            and now - self.last_scan_map_monotonic <= self.scan_map_freshness
-            and now - self.last_scan_monotonic <= 0.30
-            and now - self.last_map_tf_monotonic <= 0.60
-            and self._critical_sensor_time_healthy()
-        )
+        return self._localization_verdict(
+            now,
+            required_scan_score=required_scan_score,
+            require_heading=False,
+        ).accepted
 
     def _actual_odom_yaw(self) -> float | None:
         try:
@@ -4422,62 +4605,18 @@ class NavigationAdapter(Node):
         self._set_state("LOCALIZING_ROTATING", "global_search_needs_new_heading")
 
     def _localization_evidence_ready(self, now: float) -> bool:
-        required_scan_score = (
-            self.global_scan_map_threshold
-            if (
-                self.localization_state == "LOCALIZING_GLOBAL"
-                and self.global_search_rotation_pending
-            )
-            else self.scan_map_threshold
-        )
-        return bool(
-            self._localization_quality_ready(
-                now, required_scan_score=required_scan_score
-            )
-            and (
-                not self.global_search_untrusted
-                or self._global_heading_diversity_ready()
-            )
-        )
+        return self._localization_verdict(
+            now,
+            required_scan_score=self._required_localization_scan_score(),
+            require_heading=self.global_search_untrusted,
+        ).accepted
 
     def _localization_rejection_reason(self, now: float) -> str:
-        required_scan_score = (
-            self.global_scan_map_threshold
-            if (
-                self.localization_state == "LOCALIZING_GLOBAL"
-                and self.global_search_rotation_pending
-            )
-            else self.scan_map_threshold
-        )
-        if self.scan_map_valid_beams < self.scan_map_minimum_beams:
-            return "INSUFFICIENT_VALID_BEAMS"
-        if self.scan_map_score < required_scan_score:
-            return "SCAN_MATCH_SCORE_TOO_LOW"
-        if (
-            self.scan_map_residual_beams
-            < self.localization_final_minimum_residual_beams
-        ):
-            return "INSUFFICIENT_ENDPOINT_RESIDUALS"
-        if self.scan_map_median_residual > self.localization_final_max_median_residual:
-            return "MEDIAN_RESIDUAL_TOO_HIGH"
-        if self.scan_map_p90_residual > self.localization_final_max_p90_residual:
-            return "P90_RESIDUAL_TOO_HIGH"
-        if (
-            self.global_search_untrusted
-            and not self._global_heading_diversity_ready()
-        ):
-            return "INSUFFICIENT_HEADING_DIVERSITY"
-        if not self._pose_is_stable():
-            return "POSE_UNSTABLE"
-        if self.localization_confidence < self.localization_confidence_threshold:
-            return "LOW_CONFIDENCE"
-        if now - self.last_amcl_monotonic > self.amcl_pose_freshness:
-            return "AMCL_STALE"
-        if now - self.last_scan_map_monotonic > self.scan_map_freshness:
-            return "SCAN_MAP_EVIDENCE_STALE"
-        if not self._critical_sensor_time_healthy():
-            return "SENSOR_TIME_INVALID"
-        return "EVIDENCE_HOLD_PENDING"
+        return self._localization_verdict(
+            now,
+            required_scan_score=self._required_localization_scan_score(),
+            require_heading=self.global_search_untrusted,
+        ).reason
 
     def _localization_tracking_evidence_ready(self, now: float) -> bool:
         """Maintain an acquired pose with hysteresis, not acquisition gates.
@@ -4493,6 +4632,23 @@ class NavigationAdapter(Node):
             and now - self.last_scan_monotonic <= 0.30
             and now - self.last_map_tf_monotonic <= 0.60
             and self._critical_sensor_time_healthy()
+        )
+
+    def _localization_start_evidence_ready(self, now: float) -> bool:
+        """Reject a new navigation start after severe geometry degradation."""
+        return bool(
+            self.localized
+            and self.localization_state == "READY"
+            and self._localization_tracking_evidence_ready(now)
+            and now - self.last_scan_map_monotonic <= self.scan_map_freshness
+            and self.raycast_comparable_beams
+            >= self.localization_raycast_minimum_beams
+            and self.raycast_match_ratio
+            >= self.localization_raycast_minimum_match_ratio
+            and self.raycast_median_error
+            <= self.localization_raycast_maximum_median_error
+            and self.raycast_p90_error
+            <= self.localization_raycast_maximum_p90_error
         )
 
     def _begin_localization_settling(
@@ -4523,6 +4679,9 @@ class NavigationAdapter(Node):
         self.scan_map_median_residuals.clear()
         self.scan_map_p90_residuals.clear()
         self.scan_map_mean_residuals.clear()
+        self.raycast_match_ratios.clear()
+        self.raycast_median_errors.clear()
+        self.raycast_p90_errors.clear()
         self.scan_map_score = 0.0
         self.scan_map_matched_beams = 0
         self.scan_map_valid_beams = 0
@@ -4530,6 +4689,11 @@ class NavigationAdapter(Node):
         self.scan_map_median_residual = math.inf
         self.scan_map_p90_residual = math.inf
         self.scan_map_mean_residual = math.inf
+        self.raycast_comparable_beams = 0
+        self.raycast_matched_beams = 0
+        self.raycast_match_ratio = 0.0
+        self.raycast_median_error = math.inf
+        self.raycast_p90_error = math.inf
         self.last_scan_map_monotonic = 0.0
         self.ready_evidence_since = None
         self.ready_evidence_invalid_since = None
@@ -4559,6 +4723,24 @@ class NavigationAdapter(Node):
             return True
         refresh_age = max(0.25, self.amcl_pose_freshness * 0.5)
         return now - self.last_amcl_monotonic >= refresh_age
+
+    def _localization_checkpoint_observed(self, now: float) -> bool:
+        """Confirm a fresh stationary checkpoint before rotating again.
+
+        A failed score/raycast gate must not count as heading evidence, but it
+        must be allowed to trigger the next authorized observation angle so
+        AMCL can correct a nearby wrong hypothesis instead of stalling in
+        LOCALIZING_SETTLING until the global timeout.
+        """
+        return bool(
+            self._pose_is_stable()
+            and now - self.last_amcl_monotonic <= self.amcl_pose_freshness
+            and now - self.last_scan_map_monotonic <= self.scan_map_freshness
+            and now - self.last_scan_monotonic <= 0.30
+            and now - self.last_map_tf_monotonic <= 0.60
+            and self.scan_map_valid_beams >= self.scan_map_minimum_beams
+            and self._critical_sensor_time_healthy()
+        )
 
     def _localization_tick(self) -> None:
         if self.mode != "NAVIGATION":
@@ -4712,14 +4894,7 @@ class NavigationAdapter(Node):
                 ),
                 confidence=self.localization_confidence,
                 scan_score=self.scan_map_score,
-                scan_score_required=(
-                    self.global_scan_map_threshold
-                    if (
-                        self.localization_state == "LOCALIZING_GLOBAL"
-                        and self.global_search_rotation_pending
-                    )
-                    else self.scan_map_threshold
-                ),
+                scan_score_required=self._required_localization_scan_score(),
                 median_residual_m=self._finite_metric(
                     self.scan_map_median_residual
                 ),
@@ -4729,12 +4904,22 @@ class NavigationAdapter(Node):
                 mean_residual_m=self._finite_metric(
                     self.scan_map_mean_residual
                 ),
+                raycast_comparable_beams=self.raycast_comparable_beams,
+                raycast_matches=self.raycast_matched_beams,
+                raycast_match_ratio=self.raycast_match_ratio,
+                raycast_median_error_m=self._finite_metric(
+                    self.raycast_median_error
+                ),
+                raycast_p90_error_m=self._finite_metric(
+                    self.raycast_p90_error
+                ),
                 heading_bins=len(self.localization_heading_bins),
                 heading_bin_ids=list(self.localization_heading_bins),
                 heading_span_deg=round(
                     math.degrees(self.localization_heading_span), 1
                 ),
                 rotation_degrees=round(math.degrees(self.rotation_angle), 1),
+                global_search_untrusted=self.global_search_untrusted,
                 accepted=localization_ready,
                 reason=(
                     "ACCEPTED"
@@ -4756,14 +4941,7 @@ class NavigationAdapter(Node):
             self.localization_state != "VERIFYING"
             or self.verification_scan_count >= self.localization_verify_min_scans
         ):
-            accepted_scan_score_required = (
-                self.global_scan_map_threshold
-                if (
-                    self.localization_state == "LOCALIZING_GLOBAL"
-                    and self.global_search_rotation_pending
-                )
-                else self.scan_map_threshold
-            )
+            accepted_scan_score_required = self._required_localization_scan_score()
             self._stop_localization_rotation()
             self.localized = True
             self.localization_state = "READY"
@@ -4775,18 +4953,40 @@ class NavigationAdapter(Node):
             self._set_state("READY", "localization_verified")
             self._nav_debug(
                 "LOCALIZATION_VERIFY",
+                state=self.localization_state,
                 candidate_pose=self.last_amcl_pose,
+                covariance_xy=(
+                    None if len(self.last_amcl_covariance) < 36 else
+                    float(self.last_amcl_covariance[0])
+                    + float(self.last_amcl_covariance[7])
+                ),
+                covariance_yaw=(
+                    None if len(self.last_amcl_covariance) < 36 else
+                    float(self.last_amcl_covariance[35])
+                ),
                 scan_score=self.scan_map_score,
+                scan_score_required=accepted_scan_score_required,
                 median_residual_m=self._finite_metric(
                     self.scan_map_median_residual
                 ),
                 p90_residual_m=self._finite_metric(
                     self.scan_map_p90_residual
                 ),
+                raycast_comparable_beams=self.raycast_comparable_beams,
+                raycast_matches=self.raycast_matched_beams,
+                raycast_match_ratio=self.raycast_match_ratio,
+                raycast_median_error_m=self._finite_metric(
+                    self.raycast_median_error
+                ),
+                raycast_p90_error_m=self._finite_metric(
+                    self.raycast_p90_error
+                ),
                 heading_bins=len(self.localization_heading_bins),
                 heading_span_deg=round(
                     math.degrees(self.localization_heading_span), 1
                 ),
+                rotation_degrees=round(math.degrees(self.rotation_angle), 1),
+                global_search_untrusted=self.global_search_untrusted,
                 accepted=True,
                 reason="ACCEPTED",
             )
@@ -4817,10 +5017,8 @@ class NavigationAdapter(Node):
             self.localization_state == "LOCALIZING_SETTLING"
             and self.localization_settling_evidence_started
             and self.global_search_untrusted
-            and self._localization_quality_ready(
-                now, required_scan_score=self.scan_map_threshold
-            )
-            and not self._global_heading_diversity_ready()
+            and self._localization_checkpoint_observed(now)
+            and not localization_ready
         ):
             if self.rotation_angle >= self.rotation_max_angle:
                 self._stop_localization_rotation()
@@ -4828,7 +5026,7 @@ class NavigationAdapter(Node):
                 self.localization_state = "LOCALIZATION_FAILED"
                 self._set_state(
                     "LOCALIZATION_FAILED",
-                    "global_heading_corroboration_exhausted",
+                    "global_verification_exhausted",
                 )
                 return
             if self._safe_to_rotate():
@@ -5692,6 +5890,14 @@ class NavigationAdapter(Node):
         self._validate_command_map(command_payload)
         goal_payload = self._execution_destination(goal_payload)
         self._validate_goal(goal_payload)
+        if (
+            not recovery_attempt
+            and not self._localization_start_evidence_ready(time.monotonic())
+        ):
+            raise AdapterError(
+                "LOCALIZATION_UNRELIABLE",
+                "Localization quality must be freshly verified before navigation",
+            )
         if not self.follow_path_client.wait_for_server(timeout_sec=5.0):
             raise AdapterError("NAV2_UNAVAILABLE", "FollowPath action unavailable")
         route_id = str(

@@ -40,6 +40,7 @@ from navigation_core import (  # noqa: E402
     heading_diversity,
     deskew_scan_points,
     localization_confidence,
+    localization_verification,
     mask_scan_self_returns,
     path_overlap_ratio,
     position_within_tolerance,
@@ -48,6 +49,7 @@ from navigation_core import (  # noqa: E402
     pose_stability,
     rotation_swept_clearance,
     route_geometry_metadata,
+    scan_raycast_consistency,
     scan_to_map_match,
     segment_travel_watchdog,
     straight_heading_lock,
@@ -76,6 +78,75 @@ def _saved_map(tmp_path: Path) -> SavedOccupancyMap:
         "negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\nmode: trinary\n"
     )
     return SavedOccupancyMap.load(tmp_path / "map.yaml")
+
+
+def _verification_result(**overrides: object):
+    values = {
+        "confidence": 0.90,
+        "confidence_threshold": 0.72,
+        "pose_stable": True,
+        "covariance_xy": 0.02,
+        "covariance_yaw": 0.01,
+        "maximum_covariance_xy": 0.50,
+        "maximum_covariance_yaw": 0.50,
+        "scan_valid_beams": 40,
+        "minimum_scan_beams": 25,
+        "scan_score": 0.85,
+        "required_scan_score": 0.70,
+        "residual_beams": 35,
+        "minimum_residual_beams": 20,
+        "median_residual": 0.03,
+        "maximum_median_residual": 0.075,
+        "p90_residual": 0.07,
+        "maximum_p90_residual": 0.115,
+        "raycast_comparable_beams": 40,
+        "minimum_raycast_beams": 25,
+        "raycast_match_ratio": 0.80,
+        "minimum_raycast_match_ratio": 0.55,
+        "raycast_median_error": 0.04,
+        "maximum_raycast_median_error": 0.15,
+        "raycast_p90_error": 0.40,
+        "maximum_raycast_p90_error": 1.0,
+        "heading_required": True,
+        "heading_ready": True,
+        "amcl_fresh": True,
+        "scan_map_fresh": True,
+        "scan_fresh": True,
+        "tf_valid": True,
+        "sensor_time_valid": True,
+    }
+    values.update(overrides)
+    return localization_verification(**values)
+
+
+def _boxed_raycast_fixture(
+    beam_count: int = 40,
+) -> tuple[SavedOccupancyMap, float, float, float, list[float]]:
+    size = 120
+    occupancy = [0] * (size * size)
+    for cell in range(10, 111):
+        occupancy[10 * size + cell] = 100
+        occupancy[110 * size + cell] = 100
+        occupancy[cell * size + 10] = 100
+        occupancy[cell * size + 110] = 100
+    saved = SavedOccupancyMap(size, size, 0.1, 0.0, 0.0, 0.0, occupancy)
+    laser_x = laser_y = 6.05
+    angle_min = -math.pi
+    increment = 2.0 * math.pi / beam_count
+    ranges = [
+        saved.raycast_static_range(
+            laser_x,
+            laser_y,
+            angle_min + index * increment,
+            minimum_range=0.1,
+            maximum_range=8.0,
+        )
+        for index in range(beam_count)
+    ]
+    assert all(distance is not None for distance in ranges)
+    return saved, laser_x, laser_y, increment, [
+        float(distance) for distance in ranges if distance is not None
+    ]
 
 
 def _cell_center(saved: SavedOccupancyMap, column: int, row: int) -> tuple[float, float]:
@@ -489,7 +560,7 @@ def test_localization_requires_fresh_scan_tf_low_covariance_and_stability() -> N
     covariance = [0.0] * 36
     covariance[0] = covariance[7] = 0.01
     covariance[35] = 0.02
-    assert localization_confidence(
+    confidence = localization_confidence(
         covariance,
         stability_score=1.0,
         scan_map_score=0.6,
@@ -498,7 +569,8 @@ def test_localization_requires_fresh_scan_tf_low_covariance_and_stability() -> N
         tf_stable=True,
         odometry_healthy=True,
         sensor_time_valid=True,
-    ) > 0.9
+    )
+    assert 0.60 < confidence < 0.75
     assert localization_confidence(
         covariance,
         stability_score=0.2,
@@ -519,6 +591,44 @@ def test_localization_requires_fresh_scan_tf_low_covariance_and_stability() -> N
         odometry_healthy=True,
         sensor_time_valid=True,
     ) == 0
+
+
+def test_untrusted_global_candidate_keeps_final_global_scan_threshold() -> None:
+    verdict = _verification_result(
+        scan_score=0.55,
+        required_scan_score=0.70,
+        confidence=0.99,
+        covariance_xy=0.001,
+        covariance_yaw=0.001,
+        heading_required=True,
+        heading_ready=True,
+    )
+    assert not verdict.accepted
+    assert verdict.reason == "SCAN_SCORE_TOO_LOW"
+
+
+def test_localization_confidence_preserves_scan_quality_separation() -> None:
+    covariance = [0.0] * 36
+    scores = [0.40, 0.55, 0.75, 0.90]
+    confidences = [
+        localization_confidence(
+            covariance,
+            stability_score=1.0,
+            scan_map_score=score,
+            scan_map_threshold=0.35,
+            raycast_match_ratio=0.80,
+            scan_fresh=True,
+            tf_stable=True,
+            odometry_healthy=True,
+            sensor_time_valid=True,
+        )
+        for score in scores
+    ]
+
+    assert confidences == sorted(confidences)
+    assert len(set(confidences)) == len(scores)
+    assert confidences[-1] < 0.99
+    assert confidences[1] < confidences[2] - 0.05
 
 
 def test_localization_confidence_rejects_stable_wrong_pose_and_bad_clock() -> None:
@@ -761,6 +871,134 @@ def test_scan_map_residual_rejects_offset_hidden_by_coarse_score() -> None:
     assert good.p90_residual < 0.07
     assert offset.median_residual > 0.07
     assert offset.p90_residual > 0.07
+
+
+def test_endpoint_match_cannot_hide_wrong_first_hit_raycast() -> None:
+    size = 120
+    saved = SavedOccupancyMap(
+        size, size, 0.1, 0.0, 0.0, 0.0, [0] * (size * size)
+    )
+    laser_x = laser_y = 5.05
+    for x, y in (
+        (6.05, 5.05), (7.05, 5.05),
+        (5.05, 6.05), (5.05, 7.05),
+        (4.05, 5.05), (3.05, 5.05),
+        (5.05, 4.05), (5.05, 3.05),
+    ):
+        column, row = saved.world_to_cell(x, y) or (-1, -1)
+        saved.occupancy[row * size + column] = 100
+    common = {
+        "angle_min": 0.0,
+        "angle_increment": math.pi / 2,
+        "range_min": 0.1,
+        "range_max": 8.0,
+        "laser_x": laser_x,
+        "laser_y": laser_y,
+        "laser_yaw": 0.0,
+        "maximum_beams": 4,
+    }
+    endpoint = scan_to_map_match(
+        saved, [2.0] * 4, endpoint_tolerance=0.12, **common
+    )
+    raycast = scan_raycast_consistency(
+        saved, [2.0] * 4, match_tolerance=0.15, **common
+    )
+
+    assert endpoint.score == 1.0
+    assert raycast.comparable_beams == 4
+    assert raycast.match_ratio == 0.0
+    verdict = _verification_result(
+        scan_valid_beams=endpoint.valid_beams,
+        minimum_scan_beams=4,
+        scan_score=endpoint.score,
+        residual_beams=endpoint.residual_beams,
+        minimum_residual_beams=4,
+        median_residual=endpoint.median_residual,
+        p90_residual=endpoint.p90_residual,
+        raycast_comparable_beams=raycast.comparable_beams,
+        minimum_raycast_beams=4,
+        raycast_match_ratio=raycast.match_ratio,
+        raycast_median_error=raycast.median_error,
+        raycast_p90_error=raycast.p90_error,
+    )
+    assert not verdict.accepted
+    assert verdict.reason == "RAYCAST_MATCH_TOO_LOW"
+
+
+def test_correct_pose_passes_endpoint_and_raycast_verification() -> None:
+    saved, laser_x, laser_y, increment, ranges = _boxed_raycast_fixture()
+    common = {
+        "angle_min": -math.pi,
+        "angle_increment": increment,
+        "range_min": 0.1,
+        "range_max": 8.0,
+        "laser_x": laser_x,
+        "laser_y": laser_y,
+        "laser_yaw": 0.0,
+        "maximum_beams": 40,
+    }
+    endpoint = scan_to_map_match(
+        saved, ranges, endpoint_tolerance=0.12, **common
+    )
+    raycast = scan_raycast_consistency(
+        saved, ranges, match_tolerance=0.15, **common
+    )
+    verdict = _verification_result(
+        scan_valid_beams=endpoint.valid_beams,
+        scan_score=endpoint.score,
+        residual_beams=endpoint.residual_beams,
+        median_residual=endpoint.median_residual,
+        p90_residual=endpoint.p90_residual,
+        raycast_comparable_beams=raycast.comparable_beams,
+        raycast_match_ratio=raycast.match_ratio,
+        raycast_median_error=raycast.median_error,
+        raycast_p90_error=raycast.p90_error,
+    )
+
+    assert endpoint.score >= 0.9
+    assert raycast.match_ratio == 1.0
+    assert verdict.accepted
+    assert verdict.reason == "ACCEPTED"
+
+
+def test_raycast_verification_tolerates_partial_dynamic_occlusion() -> None:
+    saved, laser_x, laser_y, increment, ranges = _boxed_raycast_fixture()
+    occluded = list(ranges)
+    for index in range(0, 40, 5):
+        occluded[index] = max(0.2, occluded[index] - 0.75)
+    raycast = scan_raycast_consistency(
+        saved,
+        occluded,
+        angle_min=-math.pi,
+        angle_increment=increment,
+        range_min=0.1,
+        range_max=8.0,
+        laser_x=laser_x,
+        laser_y=laser_y,
+        laser_yaw=0.0,
+        maximum_beams=40,
+        match_tolerance=0.15,
+    )
+    verdict = _verification_result(
+        raycast_comparable_beams=raycast.comparable_beams,
+        raycast_match_ratio=raycast.match_ratio,
+        raycast_median_error=raycast.median_error,
+        raycast_p90_error=raycast.p90_error,
+    )
+
+    assert 0.75 <= raycast.match_ratio < 1.0
+    assert verdict.accepted
+
+
+def test_insufficient_raycast_evidence_never_defaults_to_pass() -> None:
+    verdict = _verification_result(
+        raycast_comparable_beams=8,
+        raycast_match_ratio=1.0,
+        raycast_median_error=0.0,
+        raycast_p90_error=0.0,
+    )
+    assert not verdict.accepted
+    assert verdict.reason == "RAYCAST_INSUFFICIENT_BEAMS"
 
 
 def test_force_rescan_heading_diversity_rejects_a_thirty_degree_cluster() -> None:
@@ -2300,6 +2538,12 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert localization["localization_global_scan_map_minimum_score"] >= localization[
         "scan_map_minimum_score"
     ]
+    assert localization["localization_global_final_scan_map_minimum_score"] > localization[
+        "scan_map_minimum_score"
+    ]
+    assert localization["localization_global_scan_map_minimum_score"] >= localization[
+        "localization_global_final_scan_map_minimum_score"
+    ]
     assert localization["localization_final_minimum_residual_beams"] >= 20
     assert localization["localization_final_max_median_residual"] < 0.08
     assert localization["localization_final_max_p90_residual"] < localization[
@@ -2314,6 +2558,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert localization["planning_static_match_tolerance"] != localization[
         "localization_coarse_match_tolerance"
     ]
+    assert localization["localization_raycast_minimum_comparable_beams"] >= 20
+    assert 0.5 <= localization["localization_raycast_minimum_match_ratio"] < 1.0
+    assert localization["localization_raycast_match_tolerance"] <= 0.15
     assert localization["localization_global_min_heading_bins"] >= 4
     assert 135 <= localization["localization_global_min_heading_span_degrees"] < 180
     assert 0 < localization["scan_tf_wait_seconds"] <= 0.05

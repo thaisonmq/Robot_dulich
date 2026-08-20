@@ -58,6 +58,8 @@ rovera_navigation_adapter:
     localization_pose_maximum_median_deviation: 0.06
     localization_pose_maximum_yaw_variance: 0.025
     localization_pose_maximum_yaw_spread: 0.20
+    localization_maximum_covariance_xy: 0.50
+    localization_maximum_covariance_yaw: 0.50
     # Coarse endpoint agreement finds a viable AMCL hypothesis. Final READY
     # verification below separately constrains the actual endpoint residuals.
     scan_map_score_window_size: 5
@@ -65,11 +67,12 @@ rovera_navigation_adapter:
     scan_map_minimum_valid_beams: 25
     scan_map_minimum_score: 0.35
     localization_tracking_scan_map_sanity_score: 0.12
-    # A stationary global search has no heading diversity, so only accept a
-    # distinctly strong map match. Weaker aliases still qualify for the
-    # This score measures stationary evidence quality only. It never proves
-    # global uniqueness; physical multi-heading corroboration does that.
+    # A stationary global search has no heading diversity, so require a
+    # distinctly strong initial match. During later heading checkpoints the
+    # candidate remains on the separate global-final threshold until READY;
+    # it must never fall back to the 0.35 local acquisition threshold.
     localization_global_scan_map_minimum_score: 0.75
+    localization_global_final_scan_map_minimum_score: 0.70
     # If geometry blocks rotation, resample AMCL inside the same bounded Force
     # Rescan request instead of making the operator press the button 4-5 times.
     localization_stationary_global_retry_seconds: 1.0
@@ -84,6 +87,16 @@ rovera_navigation_adapter:
     localization_final_minimum_residual_beams: 20
     localization_final_max_median_residual: 0.075
     localization_final_max_p90_residual: 0.115
+    # Independent first-hit range verification rejects corridor/room aliases
+    # whose endpoints happen to land near occupied cells. A 55% robust ratio
+    # tolerates a substantial minority of beams occluded by people or objects;
+    # insufficient comparable static rays never default to PASS.
+    localization_raycast_maximum_beams: 90
+    localization_raycast_minimum_comparable_beams: 25
+    localization_raycast_match_tolerance: 0.15
+    localization_raycast_minimum_match_ratio: 0.55
+    localization_raycast_maximum_median_error: 0.15
+    localization_raycast_maximum_p90_error: 1.0
     # Planning scan filtering has different semantics: compare measured range
     # with a map raycast, and never reuse the localization coarse tolerance.
     planning_static_match_tolerance: 0.08
