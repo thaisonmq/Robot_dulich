@@ -24,6 +24,7 @@ import type {
   AutoNavigationSpeedMode, Destination, MediaState, NavigationFeedback,
   NavigationVisualization, RouteCandidate, VideoProfile,
 } from "../types";
+import { mergeNavigationVisualization } from "../utils/navigationVisualization";
 import { createUuid } from "../utils/uuid";
 
 const ROBOT_LANGUAGE_CODE = "vi";
@@ -260,16 +261,9 @@ export function DashboardPage() {
       if (next) setNavigationState(next);
       setMapState(normalized);
     },
-    onVisualization: (next) => setVisualization((previous) => {
-      const sameMap = previous?.map_id === next.map_id && previous.map_version === next.map_version;
-      const sameRoute = sameMap && Boolean(next.route_id)
-        && next.route_id === previous?.route_id;
-      return {
-        ...next,
-        global_path: next.global_path ?? (sameRoute ? previous?.global_path : []) ?? [],
-        dynamic_obstacles: next.dynamic_obstacles ?? (sameMap ? previous?.dynamic_obstacles : []) ?? [],
-      };
-    }),
+    onVisualization: (next) => setVisualization((previous) => (
+      mergeNavigationVisualization(previous, next)
+    )),
     onDisconnect: () => {
       if (sessionEndedRef.current) return;
       manager.clear("telemetry_disconnected", false);

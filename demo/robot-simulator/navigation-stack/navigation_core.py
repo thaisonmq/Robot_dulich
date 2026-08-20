@@ -94,11 +94,12 @@ class StopTurnRoute:
     points: tuple[dict[str, float], ...]
     metadata: RouteMetadata
     heading_bins: tuple[int, ...]
+    segment_directions: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class StartEscape:
-    """One bounded, forward-only motion that leaves initial map overlap."""
+    """One bounded straight motion that leaves initial map overlap."""
 
     start: dict[str, float]
     end: dict[str, float]
@@ -106,6 +107,20 @@ class StartEscape:
     distance: float
     initial_overlap_cells: tuple[tuple[int, int], ...]
     samples_checked: int
+    motion_direction: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class PoseContinuity:
+    """Map-pose motion compared with the same physical motion in odom."""
+
+    consistent: bool
+    translation_residual: float
+    yaw_residual: float
+    map_translation: float
+    odom_translation: float
+    map_yaw_delta: float
+    odom_yaw_delta: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +360,7 @@ class ActiveSegment:
     route_id: str
     segment_token: int
     narrow: bool
+    motion_direction: int
 
     @classmethod
     def create(
@@ -357,6 +373,7 @@ class ActiveSegment:
         route_id: str,
         segment_token: int,
         narrow: bool = False,
+        motion_direction: int = 1,
     ) -> "ActiveSegment":
         planned = {
             "x": float(planned_start["x"]),
@@ -372,16 +389,23 @@ class ActiveSegment:
         length = math.hypot(delta_x, delta_y)
         if length <= 1e-9:
             raise ValueError("Active segment must have non-zero length")
+        direction = -1 if int(motion_direction) < 0 else 1
+        travel_heading = math.atan2(delta_y, delta_x)
         return cls(
             planned_start=planned,
             effective_start=effective,
             endpoint=end,
-            fixed_heading=math.atan2(delta_y, delta_x),
+            fixed_heading=(
+                travel_heading
+                if direction > 0
+                else _angle_delta(travel_heading + math.pi, 0.0)
+            ),
             segment_length=length,
             segment_index=int(segment_index),
             route_id=str(route_id),
             segment_token=int(segment_token),
             narrow=bool(narrow),
+            motion_direction=direction,
         )
 
 
@@ -410,6 +434,79 @@ class SegmentWatchdogDecision:
     elapsed_limit: float
     travel_limit: float
     reason: str = ""
+
+
+def position_within_tolerance(
+    pose: dict[str, float],
+    destination: dict[str, float],
+    tolerance: float,
+) -> bool:
+    """Return position-only arrival without interpreting either pose yaw."""
+    try:
+        pose_x = float(pose["x"])
+        pose_y = float(pose["y"])
+        destination_x = float(destination["x"])
+        destination_y = float(destination["y"])
+        limit = max(0.0, float(tolerance))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(
+        all(math.isfinite(value) for value in (
+            pose_x, pose_y, destination_x, destination_y, limit
+        ))
+        and math.hypot(pose_x - destination_x, pose_y - destination_y) <= limit
+    )
+
+
+def controller_abort_is_live_blockage(
+    *,
+    error_code: Any,
+    error_msg: str,
+    atomic_motion_safety_block: bool,
+    dynamic_route_intersection: bool,
+    controller_zero_linear: bool,
+    repeated_zero_linear_abort: bool,
+    corridor_sample_fresh: bool,
+    corridor_front_clearance: float,
+    corridor_blockage_limit: float,
+) -> bool:
+    """Classify explicit/fresh blockage evidence without inferring from status.
+
+    Older Humble FollowPath results contain no diagnostics. In that case a
+    fresh near-front corridor sample or repeated zero-linear abort supplies
+    the missing controller-side evidence. None of these inputs proves a
+    static disconnection; they only select runtime wait/replan behavior.
+    """
+    normalized_message = str(error_msg or "").strip().upper()
+    normalized_code = str(error_code or "").strip().upper()
+    diagnostic_block = bool(
+        normalized_code in {
+            "106", "NO_VALID_CONTROL", "COLLISION", "BLOCKED",
+        }
+        or any(term in normalized_message for term in (
+            "COLLISION",
+            "OBSTACLE",
+            "BLOCKED",
+            "NO VALID CONTROL",
+            "NO VALID TRAJECTORY",
+            "COSTMAP COLLISION",
+        ))
+    )
+    front_clearance = float(corridor_front_clearance)
+    blockage_limit = max(0.0, float(corridor_blockage_limit))
+    fresh_near_front = bool(
+        controller_zero_linear
+        and corridor_sample_fresh
+        and math.isfinite(front_clearance)
+        and front_clearance <= blockage_limit
+    )
+    return bool(
+        atomic_motion_safety_block
+        or dynamic_route_intersection
+        or diagnostic_block
+        or (controller_zero_linear and repeated_zero_linear_abort)
+        or fresh_near_front
+    )
 
 
 def straight_segment_progress(
@@ -610,6 +707,62 @@ def _angle_delta(target: float, current: float) -> float:
     return math.atan2(math.sin(target - current), math.cos(target - current))
 
 
+def execution_pose_continuity(
+    previous_map: dict[str, float],
+    current_map: dict[str, float],
+    previous_odom: dict[str, float],
+    current_odom: dict[str, float],
+    *,
+    maximum_translation_residual: float,
+    maximum_yaw_residual: float,
+) -> PoseContinuity:
+    """Reject map-frame corrections that cannot be explained by odometry.
+
+    Relative translation is expressed in the previous chassis frame before
+    comparing the two coordinate systems. A fixed map->odom transform then
+    cancels out, while an AMCL hypothesis jump remains visible as residual
+    motion that the wheels did not report.
+    """
+
+    def local_translation(
+        previous: dict[str, float], current: dict[str, float]
+    ) -> tuple[float, float]:
+        delta_x = float(current["x"]) - float(previous["x"])
+        delta_y = float(current["y"]) - float(previous["y"])
+        yaw = float(previous.get("yaw", 0.0))
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        return (
+            cosine * delta_x + sine * delta_y,
+            -sine * delta_x + cosine * delta_y,
+        )
+
+    map_x, map_y = local_translation(previous_map, current_map)
+    odom_x, odom_y = local_translation(previous_odom, current_odom)
+    translation_residual = math.hypot(map_x - odom_x, map_y - odom_y)
+    map_yaw_delta = _angle_delta(
+        float(current_map.get("yaw", 0.0)),
+        float(previous_map.get("yaw", 0.0)),
+    )
+    odom_yaw_delta = _angle_delta(
+        float(current_odom.get("yaw", 0.0)),
+        float(previous_odom.get("yaw", 0.0)),
+    )
+    yaw_residual = abs(_angle_delta(map_yaw_delta, odom_yaw_delta))
+    return PoseContinuity(
+        consistent=(
+            translation_residual <= max(0.0, maximum_translation_residual)
+            and yaw_residual <= max(0.0, maximum_yaw_residual)
+        ),
+        translation_residual=translation_residual,
+        yaw_residual=yaw_residual,
+        map_translation=math.hypot(map_x, map_y),
+        odom_translation=math.hypot(odom_x, odom_y),
+        map_yaw_delta=map_yaw_delta,
+        odom_yaw_delta=odom_yaw_delta,
+    )
+
+
 def canonicalize_stop_turn_path(
     points: Iterable[dict[str, float]],
     *,
@@ -688,6 +841,7 @@ def validate_executable_grid_path(
     allow_unknown: bool = False,
     lethal_threshold: int = 99,
     inscribed_threshold: int | None = None,
+    allow_monotonic_initial_overlap: bool = False,
 ) -> ExecutablePathValidation:
     """Validate the oriented physical footprint over every path segment.
 
@@ -724,6 +878,12 @@ def validate_executable_grid_path(
     samples_checked = 0
     first_collision: tuple[str, int, float, float, float, int, float, float] | None = None
     collision_cells: dict[tuple[int, int], tuple[float, float, int]] = {}
+    permitted_initial_overlap: set[tuple[int, int]] | None = None
+    previous_overlap_count = 0
+    last_overlap: tuple[
+        tuple[str, int, float, float, float, int, float, float],
+        dict[tuple[int, int], tuple[float, float, int]],
+    ] | None = None
 
     def grid_coordinates(world_x: float, world_y: float) -> tuple[float, float]:
         delta_x = world_x - float(origin_x)
@@ -806,6 +966,12 @@ def validate_executable_grid_path(
                     None,
                     samples_checked,
                 )
+            sample_first_collision: tuple[
+                str, int, float, float, float, int, float, float
+            ] | None = None
+            sample_collision_cells: dict[
+                tuple[int, int], tuple[float, float, int]
+            ] = {}
             center_column = math.floor(local_x / resolution)
             center_row = math.floor(local_y / resolution)
             center_cost = costs[center_row * width + center_column]
@@ -831,13 +997,13 @@ def validate_executable_grid_path(
                     if center_cost < 0
                     else "PATH_FOOTPRINT_COLLISION"
                 )
-                collision_cells[(center_column, center_row)] = (
+                sample_collision_cells[(center_column, center_row)] = (
                     collision_x,
                     collision_y,
                     center_cost,
                 )
-                if first_collision is None:
-                    first_collision = (
+                if sample_first_collision is None:
+                    sample_first_collision = (
                         code,
                         segment_index,
                         sample_x,
@@ -874,13 +1040,13 @@ def validate_executable_grid_path(
                         if cost < 0
                         else "PATH_FOOTPRINT_COLLISION"
                     )
-                    collision_cells[(column, row)] = (
+                    sample_collision_cells[(column, row)] = (
                         collision_x,
                         collision_y,
                         cost,
                     )
-                    if first_collision is None:
-                        first_collision = (
+                    if sample_first_collision is None:
+                        sample_first_collision = (
                             code,
                             segment_index,
                             sample_x,
@@ -890,6 +1056,42 @@ def validate_executable_grid_path(
                             collision_x,
                             collision_y,
                         )
+            if allow_monotonic_initial_overlap:
+                sample_cells = set(sample_collision_cells)
+                if permitted_initial_overlap is None:
+                    permitted_initial_overlap = sample_cells
+                    previous_overlap_count = len(sample_cells)
+                elif (
+                    not sample_cells.issubset(permitted_initial_overlap)
+                    or len(sample_cells) > previous_overlap_count
+                ):
+                    assert sample_first_collision is not None
+                    first_collision = sample_first_collision
+                    collision_cells = sample_collision_cells
+                    break
+                else:
+                    previous_overlap_count = len(sample_cells)
+                if sample_first_collision is not None:
+                    last_overlap = (
+                        sample_first_collision,
+                        sample_collision_cells,
+                    )
+                else:
+                    last_overlap = None
+            elif sample_first_collision is not None:
+                collision_cells.update(sample_collision_cells)
+                if first_collision is None:
+                    first_collision = sample_first_collision
+        if first_collision is not None and allow_monotonic_initial_overlap:
+            break
+    if (
+        allow_monotonic_initial_overlap
+        and first_collision is None
+        and last_overlap is not None
+    ):
+        # An escape must end at a collision-free footprint. Merely retaining
+        # the same overlap all the way to the endpoint is not executable.
+        first_collision, collision_cells = last_overlap
     if first_collision is not None:
         (
             code,
@@ -1167,6 +1369,25 @@ def choose_turn_direction(
     return 0
 
 
+def preferred_turn_bay_directions(
+    start: dict[str, float], goal: dict[str, float]
+) -> tuple[int, ...]:
+    """Prefer the straight relocation that progresses toward the destination.
+
+    A positive direction is forward along the current chassis heading and a
+    negative direction is reverse with the chassis heading held fixed. Reverse
+    is eligible only when it lies in the destination half-plane; it is never a
+    fallback for a destination ahead of the chassis.
+    """
+    yaw = float(start.get("yaw", 0.0))
+    goal_delta_x = float(goal["x"]) - float(start["x"])
+    goal_delta_y = float(goal["y"]) - float(start["y"])
+    forward_progress = (
+        goal_delta_x * math.cos(yaw) + goal_delta_y * math.sin(yaw)
+    )
+    return (1,) if forward_progress >= 0.0 else (-1, 1)
+
+
 def validate_rotation_sweep_neighborhood(
     saved_map: "SavedOccupancyMap",
     x: float,
@@ -1234,10 +1455,18 @@ def validate_stop_turn_route(
     half_width: float,
     padding: float = 0.0,
     turn_robustness_radius: float = 0.0,
+    segment_directions: Iterable[int] | None = None,
 ) -> ExecutablePathValidation:
     route = canonicalize_stop_turn_path(points)
     if len(route) < 2:
         return ExecutablePathValidation(False, "PATH_HAS_NO_LENGTH")
+    directions = (
+        tuple(1 for _ in range(len(route) - 1))
+        if segment_directions is None
+        else tuple(-1 if int(value) < 0 else 1 for value in segment_directions)
+    )
+    if len(directions) != len(route) - 1:
+        return ExecutablePathValidation(False, "SEGMENT_DIRECTIONS_INVALID")
     translation = validate_executable_grid_path(
         route,
         width=saved_map.width,
@@ -1264,6 +1493,10 @@ def validate_stop_turn_route(
             route[corner_index + 1]["y"] - route[corner_index]["y"],
             route[corner_index + 1]["x"] - route[corner_index]["x"],
         )
+        if directions[corner_index - 1] < 0:
+            incoming = _angle_delta(incoming + math.pi, 0.0)
+        if directions[corner_index] < 0:
+            outgoing = _angle_delta(outgoing + math.pi, 0.0)
         rotation = validate_rotation_sweep_neighborhood(
             saved_map,
             route[corner_index]["x"],
@@ -1301,8 +1534,16 @@ def route_geometry_metadata(
     angular_speed: float = 0.60,
     start_yaw: float | None = None,
     goal_yaw: float | None = None,
+    segment_directions: Iterable[int] | None = None,
 ) -> RouteMetadata:
     route = canonicalize_stop_turn_path(points)
+    directions = (
+        tuple(1 for _ in range(max(0, len(route) - 1)))
+        if segment_directions is None
+        else tuple(-1 if int(value) < 0 else 1 for value in segment_directions)
+    )
+    if len(directions) != max(0, len(route) - 1):
+        raise ValueError("segment_directions must match the canonical route")
     total_length = 0.0
     minimum_clearance = math.inf
     minimum_passage_width = math.inf
@@ -1370,6 +1611,10 @@ def route_geometry_metadata(
             route[index + 1]["y"] - route[index]["y"],
             route[index + 1]["x"] - route[index]["x"],
         )
+        if directions[index - 1] < 0:
+            incoming = _angle_delta(incoming + math.pi, 0.0)
+        if directions[index] < 0:
+            outgoing = _angle_delta(outgoing + math.pi, 0.0)
         angle = abs(_angle_delta(outgoing, incoming))
         if angle <= 1e-6:
             continue
@@ -1398,12 +1643,16 @@ def route_geometry_metadata(
             route[1]["y"] - route[0]["y"],
             route[1]["x"] - route[0]["x"],
         )
+        if directions[0] < 0:
+            first_heading = _angle_delta(first_heading + math.pi, 0.0)
         if start_yaw is not None:
             initial_turn_angle = abs(_angle_delta(first_heading, start_yaw))
         last_heading = math.atan2(
             route[-1]["y"] - route[-2]["y"],
             route[-1]["x"] - route[-2]["x"],
         )
+        if directions[-1] < 0:
+            last_heading = _angle_delta(last_heading + math.pi, 0.0)
         if goal_yaw is not None:
             final_turn_angle = abs(_angle_delta(goal_yaw, last_heading))
     executed_turn_angles = (
@@ -1462,6 +1711,7 @@ class StopTurnStateLatticePlanner:
         angular_speed: float = 0.60,
         max_expansions: int = 250_000,
         turn_robustness_radius: float = 0.01,
+        turn_bay_max_distance: float = 0.80,
     ) -> None:
         self.saved_map = saved_map
         self.geometry = geometry
@@ -1477,6 +1727,7 @@ class StopTurnStateLatticePlanner:
         self.angular_speed = max(0.01, float(angular_speed))
         self.max_expansions = max(1, int(max_expansions))
         self.turn_robustness_radius = max(0.0, float(turn_robustness_radius))
+        self.turn_bay_max_distance = max(0.0, float(turn_bay_max_distance))
         self.heading_step = 2.0 * math.pi / self.HEADING_BINS
 
     def _turn_valid(
@@ -1564,6 +1815,150 @@ class StopTurnStateLatticePlanner:
             allow_unknown=False,
             lethal_threshold=65,
         ).valid
+
+    def _turn_bay_candidate(
+        self,
+        start: dict[str, float],
+        goal: dict[str, float],
+        exclusions: tuple[tuple[float, float, float], ...],
+        deadline_monotonic: float | None,
+    ) -> StopTurnRoute | None:
+        """Try a bounded goal-aligned relocation before turning at a bay."""
+        if self.turn_bay_max_distance <= 0.0:
+            return None
+        start_yaw = float(start.get("yaw", 0.0))
+        goal_yaw = (
+            float(goal["yaw"])
+            if "yaw" in goal and goal["yaw"] is not None
+            else None
+        )
+        step = max(self.saved_map.resolution, self.primitive_length)
+        attempts = math.floor(self.turn_bay_max_distance / step)
+        goal_cell = self.saved_map.world_to_cell(
+            float(goal["x"]), float(goal["y"])
+        )
+        if goal_cell is None:
+            return None
+
+        def reverse_is_needed_for_turn(
+            route: list[dict[str, float]],
+        ) -> bool:
+            """A reverse bay is legal only when the next turn cannot occur here."""
+            if len(route) < 3:
+                return False
+            bay = route[1]
+            following = route[2]
+            target_heading = math.atan2(
+                float(following["y"]) - float(bay["y"]),
+                float(following["x"]) - float(bay["x"]),
+            )
+            return not any(
+                validate_rotation_sweep(
+                    self.saved_map,
+                    float(start["x"]),
+                    float(start["y"]),
+                    start_yaw,
+                    target_heading,
+                    half_length=self.half_length,
+                    half_width=self.half_width,
+                    padding=self.padding,
+                    direction=turn_direction,
+                ).valid
+                for turn_direction in (1, -1)
+            )
+
+        for direction in preferred_turn_bay_directions(start, goal):
+            for index in range(1, attempts + 1):
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    return None
+                distance = direction * index * step
+                bay = {
+                    "x": float(start["x"]) + distance * math.cos(start_yaw),
+                    "y": float(start["y"]) + distance * math.sin(start_yaw),
+                    "yaw": start_yaw,
+                }
+                if self._segment_excluded(start, bay, exclusions):
+                    continue
+
+                simple_continuations = (
+                    [bay, dict(goal)],
+                    [
+                        bay,
+                        {"x": float(goal["x"]), "y": float(bay["y"])},
+                        dict(goal),
+                    ],
+                    [
+                        bay,
+                        {"x": float(bay["x"]), "y": float(goal["y"])},
+                        dict(goal),
+                    ],
+                )
+                for continuation in simple_continuations:
+                    combined = canonicalize_stop_turn_path(
+                        [dict(start), *continuation]
+                    )
+                    if len(combined) != len(continuation) + 1:
+                        continue
+                    if any(
+                        self._segment_excluded(left, right, exclusions)
+                        for left, right in zip(combined, combined[1:])
+                    ):
+                        continue
+                    if direction < 0 and not reverse_is_needed_for_turn(combined):
+                        continue
+                    result = self._route_result(
+                        combined,
+                        start_yaw=start_yaw,
+                        goal_yaw=goal_yaw,
+                        segment_directions=(
+                            direction,
+                            *(1 for _ in range(len(combined) - 2)),
+                        ),
+                    )
+                    if result is not None:
+                        return result
+
+                bay_cell = self.saved_map.world_to_cell(bay["x"], bay["y"])
+                if bay_cell is None:
+                    continue
+                seed = self._grid_seed(
+                    bay_cell,
+                    goal_cell,
+                    exclusions,
+                    deadline_monotonic,
+                )
+                continuation = self._canonical_route_from_seed(
+                    seed,
+                    bay,
+                    goal,
+                    exclusions,
+                    deadline_monotonic,
+                )
+                if not continuation:
+                    continue
+                combined = canonicalize_stop_turn_path([
+                    dict(start),
+                    *continuation,
+                ])
+                if len(combined) != len(continuation) + 1:
+                    continue
+                if direction < 0 and not reverse_is_needed_for_turn(combined):
+                    continue
+                result = self._route_result(
+                    combined,
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                    segment_directions=(
+                        direction,
+                        *(1 for _ in range(len(combined) - 2)),
+                    ),
+                )
+                if result is not None:
+                    return result
+        return None
 
     def _grid_seed(
         self,
@@ -1725,13 +2120,26 @@ class StopTurnStateLatticePlanner:
         *,
         start_yaw: float | None = None,
         goal_yaw: float | None = None,
+        segment_directions: Iterable[int] | None = None,
     ) -> StopTurnRoute | None:
         if len(route) < 2:
+            return None
+        directions = (
+            tuple(1 for _ in range(len(route) - 1))
+            if segment_directions is None
+            else tuple(
+                -1 if int(value) < 0 else 1
+                for value in segment_directions
+            )
+        )
+        if len(directions) != len(route) - 1:
             return None
         first_heading = math.atan2(
             route[1]["y"] - route[0]["y"],
             route[1]["x"] - route[0]["x"],
         )
+        if directions[0] < 0:
+            first_heading = _angle_delta(first_heading + math.pi, 0.0)
         if start_yaw is not None and not validate_rotation_sweep(
             self.saved_map,
             route[0]["x"],
@@ -1747,6 +2155,8 @@ class StopTurnStateLatticePlanner:
             route[-1]["y"] - route[-2]["y"],
             route[-1]["x"] - route[-2]["x"],
         )
+        if directions[-1] < 0:
+            last_heading = _angle_delta(last_heading + math.pi, 0.0)
         if goal_yaw is not None and not validate_rotation_sweep(
             self.saved_map,
             route[-1]["x"],
@@ -1764,6 +2174,7 @@ class StopTurnStateLatticePlanner:
             half_length=self.half_length,
             half_width=self.half_width,
             padding=self.padding,
+            segment_directions=directions,
         )
         if not validation.valid:
             return None
@@ -1778,14 +2189,19 @@ class StopTurnStateLatticePlanner:
             angular_speed=self.angular_speed,
             start_yaw=start_yaw,
             goal_yaw=goal_yaw,
+            segment_directions=directions,
         )
         headings = tuple(
-            self.heading_bin(math.atan2(
-                right["y"] - left["y"], right["x"] - left["x"]
-            ))
-            for left, right in zip(route, route[1:])
+            self.heading_bin(
+                math.atan2(
+                    right["y"] - left["y"], right["x"] - left["x"]
+                ) + (math.pi if direction < 0 else 0.0)
+            )
+            for direction, (left, right) in zip(
+                directions, zip(route, route[1:])
+            )
         )
-        return StopTurnRoute(tuple(route), metadata, headings)
+        return StopTurnRoute(tuple(route), metadata, headings, directions)
 
     def plan(
         self,
@@ -1876,6 +2292,15 @@ class StopTurnStateLatticePlanner:
         # exact candidate cannot be built.
         if seeded_result is not None:
             return min(candidate_pool, key=self.ranking_key)
+        turn_bay_result = self._turn_bay_candidate(
+            start,
+            goal,
+            forbidden,
+            deadline_monotonic,
+        )
+        if turn_bay_result is not None:
+            candidate_pool.append(turn_bay_result)
+            return min(candidate_pool, key=self.ranking_key)
         if (
             deadline_monotonic is not None
             and time.monotonic() >= deadline_monotonic
@@ -1903,7 +2328,6 @@ class StopTurnStateLatticePlanner:
         )
         edge_cache: dict[tuple[tuple[int, int, int], tuple[int, int, int]], bool] = {}
         rotation_cache: dict[tuple[tuple[int, int, int], int], bool] = {}
-        finish_key: tuple[int, int, int] | None = None
         expansions = 0
         while (
             queue
@@ -1928,7 +2352,7 @@ class StopTurnStateLatticePlanner:
                     y,
                     yaw,
                     goal_heading,
-                    robust=False,
+                    robust=True,
                 )
                 direct = {"x": goal_x, "y": goal_y}
                 if (
@@ -1939,11 +2363,27 @@ class StopTurnStateLatticePlanner:
                     )
                     and self._translation_valid({"x": x, "y": y}, direct)
                 ):
-                    goal_bin = self.heading_bin(goal_heading)
-                    finish_key = self._pose_key(goal_x, goal_y, goal_bin)
-                    positions[finish_key] = (goal_x, goal_y)
-                    parents[finish_key] = state
-                    break
+                    states: list[tuple[int, int, int]] = []
+                    cursor: tuple[int, int, int] | None = state
+                    while cursor is not None:
+                        states.append(cursor)
+                        cursor = parents[cursor]
+                    states.reverse()
+                    candidate = canonicalize_stop_turn_path([
+                        *(
+                            {"x": positions[item][0], "y": positions[item][1]}
+                            for item in states
+                        ),
+                        direct,
+                    ])
+                    lattice_result = self._route_result(
+                        candidate,
+                        start_yaw=start_yaw,
+                        goal_yaw=goal_yaw,
+                    )
+                    if lattice_result is not None:
+                        candidate_pool.append(lattice_result)
+                        return min(candidate_pool, key=self.ranking_key)
 
             next_x = x + self.primitive_length * math.cos(yaw)
             next_y = y + self.primitive_length * math.sin(yaw)
@@ -2004,30 +2444,13 @@ class StopTurnStateLatticePlanner:
                 sequence += 1
                 heuristic = math.hypot(goal_x - x, goal_y - y) / self.linear_speed
                 heapq.heappush(queue, (next_cost + heuristic, sequence, next_key))
-        if finish_key is None:
-            if expansions >= self.max_expansions:
-                self._last_plan_limit = "SEARCH_EXPANSION_LIMIT"
-            elif (
-                deadline_monotonic is not None
-                and time.monotonic() >= deadline_monotonic
-            ):
-                self._last_plan_limit = "SEARCH_TIME_BUDGET_EXCEEDED"
-            return min(candidate_pool, key=self.ranking_key) if candidate_pool else None
-        states: list[tuple[int, int, int]] = []
-        cursor: tuple[int, int, int] | None = finish_key
-        while cursor is not None:
-            states.append(cursor)
-            cursor = parents[cursor]
-        states.reverse()
-        route = canonicalize_stop_turn_path(
-            {"x": positions[state][0], "y": positions[state][1]}
-            for state in states
-        )
-        lattice_result = self._route_result(
-            route, start_yaw=start_yaw, goal_yaw=goal_yaw
-        )
-        if lattice_result is not None:
-            candidate_pool.append(lattice_result)
+        if expansions >= self.max_expansions:
+            self._last_plan_limit = "SEARCH_EXPANSION_LIMIT"
+        elif (
+            deadline_monotonic is not None
+            and time.monotonic() >= deadline_monotonic
+        ):
+            self._last_plan_limit = "SEARCH_TIME_BUDGET_EXCEEDED"
         return min(candidate_pool, key=self.ranking_key) if candidate_pool else None
 
     def plan_result(
@@ -2099,6 +2522,10 @@ class StopTurnStateLatticePlanner:
                 half_width=self.half_width,
                 padding=self.padding,
                 maximum_distance=maximum_start_escape_distance,
+                # Start-overlap recovery is forward-only. Reverse motion is
+                # reserved for turn-bay recovery after a turn is proven
+                # blocked and the destination lies behind the chassis.
+                directions=(1,),
             )
             escape_cell = (
                 None
@@ -2107,19 +2534,6 @@ class StopTurnStateLatticePlanner:
                     float(escape.end["x"]), float(escape.end["y"])
                 )
             )
-            if (
-                not initial_same_component
-                and (
-                    escape_cell is None
-                    or not self.geometry.same_component(escape_cell, goal_cell)
-                )
-            ):
-                return PlannerResult(
-                    "GOAL_DISCONNECTED",
-                    reason="GOAL_DISCONNECTED",
-                    message="Goal is outside the translation-reachable component",
-                    start_escape=escape,
-                )
             if not allow_start_escape:
                 return PlannerResult(
                     "START_STATIC_OVERLAP",
@@ -2136,9 +2550,22 @@ class StopTurnStateLatticePlanner:
                         if not live_start_clear
                         else "START_ESCAPE_UNAVAILABLE"
                     ),
-                    message="No bounded forward-only start escape is executable",
+                    message="No bounded straight start escape is executable",
                     start_escape=escape,
                     elapsed_seconds=time.monotonic() - started,
+                )
+            if (
+                not initial_same_component
+                and (
+                    escape_cell is None
+                    or not self.geometry.same_component(escape_cell, goal_cell)
+                )
+            ):
+                return PlannerResult(
+                    "GOAL_DISCONNECTED",
+                    reason="GOAL_DISCONNECTED",
+                    message="Goal is outside the translation-reachable component",
+                    start_escape=escape,
                 )
             planning_start = {
                 "x": escape.end["x"],
@@ -2352,6 +2779,9 @@ class StopTurnStateLatticePlanner:
                 half_width=self.half_width,
                 padding=self.padding,
                 turn_robustness_radius=self.turn_robustness_radius,
+                segment_directions=(
+                    candidate.segment_directions or None
+                ),
             ).valid:
                 # Optional routes must retain a small position-error reserve at
                 # every corner. The primary remains available for genuinely
@@ -3851,8 +4281,9 @@ def find_start_escape(
     probe_step: float | None = None,
     live_blocked_points: Iterable[tuple[float, float]] = (),
     live_inflation: float = 0.0,
+    directions: Iterable[int] = (1,),
 ) -> StartEscape | None:
-    """Find the nearest exact-valid pose straight ahead of an overlapped start.
+    """Find the nearest exact-valid pose in the requested straight directions.
 
     Every intermediate footprint may retain only cells already overlapped at
     the initial pose.  Encountering any new occupied/unknown cell terminates
@@ -3893,52 +4324,70 @@ def find_start_escape(
     )
     limit = max(0.0, float(maximum_distance))
     dynamic = tuple((float(x), float(y)) for x, y in live_blocked_points)
-    previous_count = len(initial_set)
     samples = max(0, math.floor(limit / step))
-    for index in range(1, samples + 1):
-        distance = min(limit, index * step)
-        x = start_x + distance * math.cos(yaw)
-        y = start_y + distance * math.sin(yaw)
-        overlap = saved_map.footprint_overlap_cells(
-            x,
-            y,
-            yaw,
-            half_length=half_length,
-            half_width=half_width,
-            padding=padding,
-        )
-        overlap_set = {(column, row) for column, row, _ in overlap}
-        if not overlap_set.issubset(initial_set) or len(overlap_set) > previous_count:
-            return None
-        previous_count = len(overlap_set)
-        lateral = half_width + padding + max(0.0, float(live_inflation))
-        longitudinal = half_length + padding
-        for obstacle_x, obstacle_y in dynamic:
-            delta_x = obstacle_x - x
-            delta_y = obstacle_y - y
-            local_x = math.cos(yaw) * delta_x + math.sin(yaw) * delta_y
-            local_y = -math.sin(yaw) * delta_x + math.cos(yaw) * delta_y
-            if abs(local_x) <= longitudinal and abs(local_y) <= lateral:
-                return None
-        validation = saved_map.validate_footprint(
-            x,
-            y,
-            yaw,
-            half_length=half_length,
-            half_width=half_width,
-            padding=padding,
-            allow_unknown=False,
-            code_prefix="START",
-        )
-        if validation.valid:
-            return StartEscape(
-                start={"x": start_x, "y": start_y},
-                end={"x": x, "y": y},
-                yaw=yaw,
-                distance=distance,
-                initial_overlap_cells=tuple(sorted(initial_set)),
-                samples_checked=index,
+    normalized_directions = tuple(dict.fromkeys(
+        -1 if int(direction) < 0 else 1 for direction in directions
+    ))
+    for direction in normalized_directions:
+        previous_count = len(initial_set)
+        for index in range(1, samples + 1):
+            distance = min(limit, index * step)
+            x = start_x + direction * distance * math.cos(yaw)
+            y = start_y + direction * distance * math.sin(yaw)
+            overlap = saved_map.footprint_overlap_cells(
+                x,
+                y,
+                yaw,
+                half_length=half_length,
+                half_width=half_width,
+                padding=padding,
             )
+            overlap_set = {(column, row) for column, row, _ in overlap}
+            if (
+                not overlap_set.issubset(initial_set)
+                or len(overlap_set) > previous_count
+            ):
+                break
+            previous_count = len(overlap_set)
+            lateral = half_width + padding + max(
+                0.0, float(live_inflation)
+            )
+            longitudinal = half_length + padding
+            live_collision = False
+            for obstacle_x, obstacle_y in dynamic:
+                delta_x = obstacle_x - x
+                delta_y = obstacle_y - y
+                local_x = (
+                    math.cos(yaw) * delta_x + math.sin(yaw) * delta_y
+                )
+                local_y = (
+                    -math.sin(yaw) * delta_x + math.cos(yaw) * delta_y
+                )
+                if abs(local_x) <= longitudinal and abs(local_y) <= lateral:
+                    live_collision = True
+                    break
+            if live_collision:
+                break
+            validation = saved_map.validate_footprint(
+                x,
+                y,
+                yaw,
+                half_length=half_length,
+                half_width=half_width,
+                padding=padding,
+                allow_unknown=False,
+                code_prefix="START",
+            )
+            if validation.valid:
+                return StartEscape(
+                    start={"x": start_x, "y": start_y},
+                    end={"x": x, "y": y},
+                    yaw=yaw,
+                    distance=distance,
+                    initial_overlap_cells=tuple(sorted(initial_set)),
+                    samples_checked=index,
+                    motion_direction=direction,
+                )
     return None
 
 

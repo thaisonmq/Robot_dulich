@@ -154,6 +154,9 @@ rovera_navigation_adapter:
     # Arrival is position-based. The approach segment already determines a
     # safe chassis heading, so no final in-place orientation adjustment runs.
     stop_turn_require_final_yaw: false
+    # Keep final public-goal arrival aligned with Nav2's public goal checker.
+    # Internal stop-turn corners retain straight_endpoint_tolerance below.
+    stop_turn_final_position_tolerance: 0.12
     stop_turn_max_reanchors_per_segment: 1
     stop_turn_settle_seconds: 0.20
     stop_turn_heading_tolerance_degrees: 3.0
@@ -167,6 +170,9 @@ rovera_navigation_adapter:
     straight_max_angular_correction: 0.18
     straight_path_pose_spacing: 0.05
     execution_pose_freshness_seconds: 0.30
+    execution_pose_max_translation_residual_m: 0.12
+    execution_pose_max_yaw_residual_degrees: 20.0
+    execution_pose_discontinuity_confirmation_seconds: 0.15
     straight_heading_kp: 1.2
     straight_cross_track_kp: 1.0
     straight_heading_deadband_degrees: 1.0
@@ -308,10 +314,11 @@ controller_server:
       cost_scaling_dist: 0.18
       cost_scaling_gain: 0.80
       inflation_cost_scaling_factor: 3.0
-      # Rotation is exclusively the adapter's TURN phase. RPP may only follow
-      # the current line with the adapter's small angular correction clamp.
+      # Rotation is exclusively the adapter's TURN phase. RPP may follow the
+      # current isolated line forward or reverse; the adapter owns the signed
+      # direction and keeps the chassis on one fixed heading.
       use_rotate_to_heading: false
-      allow_reversing: false
+      allow_reversing: true
       # RPP sees no internal corner. While straight, the adapter additionally
       # clamps angular correction so wheel/odometry drift cannot become an arc.
       rotate_to_heading_min_angle: 0.10

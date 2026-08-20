@@ -28,11 +28,13 @@ from navigation_core import (  # noqa: E402
     choose_turn_direction,
     classify_planning_failure,
     compact_lethal_cells,
+    controller_abort_is_live_blockage,
     densify_straight_segment,
     dynamic_exclusions_intersect_route,
     endpoint_braking_speed_limit,
     evaluate_corridor,
     exact_euclidean_distance_transform,
+    execution_pose_continuity,
     filter_static_map_scan,
     find_start_escape,
     heading_diversity,
@@ -40,6 +42,8 @@ from navigation_core import (  # noqa: E402
     localization_confidence,
     mask_scan_self_returns,
     path_overlap_ratio,
+    position_within_tolerance,
+    preferred_turn_bay_directions,
     post_turn_reanchor_requires_turn,
     pose_stability,
     rotation_swept_clearance,
@@ -210,6 +214,62 @@ def test_executable_path_does_not_expand_footprint_twice_over_inscribed_costs() 
     )
     assert through_inscribed.valid is False
     assert through_inscribed.cell_cost == 99
+
+
+def test_start_escape_live_validation_allows_only_shrinking_initial_overlap() -> None:
+    width, height, resolution = 50, 30, 0.05
+    costs = [0] * (width * height)
+    for column in range(20, 23):
+        costs[10 * width + column] = 100
+    escape = [{"x": 1.025, "y": 0.43}, {"x": 1.50, "y": 0.43}]
+
+    ordinary = validate_executable_grid_path(
+        escape,
+        width=width,
+        height=height,
+        resolution=resolution,
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+        data=costs,
+        half_length=0.15,
+        half_width=0.10,
+    )
+    bounded_escape = validate_executable_grid_path(
+        escape,
+        width=width,
+        height=height,
+        resolution=resolution,
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+        data=costs,
+        half_length=0.15,
+        half_width=0.10,
+        allow_monotonic_initial_overlap=True,
+    )
+
+    assert not ordinary.valid
+    assert bounded_escape.valid
+
+    # A different cell encountered ahead is not part of the initial overlap
+    # and must remain a hard collision.
+    costs[10 * width + 27] = 100
+    new_collision = validate_executable_grid_path(
+        escape,
+        width=width,
+        height=height,
+        resolution=resolution,
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+        data=costs,
+        half_length=0.15,
+        half_width=0.10,
+        allow_monotonic_initial_overlap=True,
+    )
+    assert not new_collision.valid
+    assert new_collision.code == "PATH_FOOTPRINT_COLLISION"
 
 
 def test_exact_saved_grid_negative_rotated_origin_and_y_axis(tmp_path: Path) -> None:
@@ -480,6 +540,48 @@ def test_localization_confidence_rejects_stable_wrong_pose_and_bad_clock() -> No
         scan_map_score=0.8,
         **{**common, "sensor_time_valid": False},
     ) == 0
+
+
+def test_execution_pose_continuity_accepts_the_same_motion_in_map_and_odom() -> None:
+    local_x, local_y = 0.10, 0.02
+
+    def moved(pose: dict[str, float]) -> dict[str, float]:
+        yaw = pose["yaw"]
+        return {
+            "x": pose["x"] + math.cos(yaw) * local_x - math.sin(yaw) * local_y,
+            "y": pose["y"] + math.sin(yaw) * local_x + math.cos(yaw) * local_y,
+            "yaw": yaw + 0.05,
+        }
+
+    previous_map = {"x": 1.8, "y": 1.2, "yaw": 1.0}
+    previous_odom = {"x": 0.3, "y": -0.2, "yaw": 0.2}
+    result = execution_pose_continuity(
+        previous_map,
+        moved(previous_map),
+        previous_odom,
+        moved(previous_odom),
+        maximum_translation_residual=0.12,
+        maximum_yaw_residual=math.radians(20.0),
+    )
+
+    assert result.consistent
+    assert result.translation_residual == pytest.approx(0.0, abs=1e-9)
+    assert result.yaw_residual == pytest.approx(0.0, abs=1e-9)
+
+
+def test_execution_pose_continuity_rejects_latest_amcl_jump_without_odom_motion() -> None:
+    result = execution_pose_continuity(
+        {"x": 1.8127, "y": 1.2561, "yaw": 2.7711},
+        {"x": 0.2887, "y": 0.7899, "yaw": 0.0034},
+        {"x": 0.0, "y": 0.0, "yaw": 0.0},
+        {"x": 0.03, "y": 0.0, "yaw": 0.01},
+        maximum_translation_residual=0.12,
+        maximum_yaw_residual=math.radians(20.0),
+    )
+
+    assert not result.consistent
+    assert result.translation_residual > 1.4
+    assert result.yaw_residual > math.radians(150.0)
 
 
 def test_shared_sensor_clock_preserves_capture_intervals_with_large_offset() -> None:
@@ -929,6 +1031,34 @@ def test_reanchored_segment_uses_actual_pose_and_new_fixed_heading() -> None:
     assert segment.segment_length == pytest.approx(math.hypot(0.95, 0.02))
 
 
+def test_reverse_segment_keeps_chassis_heading_opposite_travel() -> None:
+    segment = ActiveSegment.create(
+        planned_start={"x": 1.0, "y": 0.0},
+        effective_start={"x": 1.0, "y": 0.0},
+        endpoint={"x": 0.5, "y": 0.0},
+        segment_index=0,
+        route_id="reverse-turn-bay",
+        segment_token=9,
+        motion_direction=-1,
+    )
+
+    assert segment.motion_direction == -1
+    assert segment.fixed_heading == pytest.approx(0.0)
+    decision = straight_heading_lock(
+        segment,
+        {"x": 0.9, "y": 0.0, "yaw": 0.0},
+        heading_kp=1.2,
+        cross_track_kp=1.0,
+        maximum_angular=0.18,
+        heading_deadband=math.radians(1.0),
+        cross_track_deadband=0.01,
+        hard_heading_error=math.radians(12.0),
+        hard_cross_track=0.08,
+    )
+    assert decision.forward_allowed is True
+    assert decision.heading_error == pytest.approx(0.0)
+
+
 def test_straight_large_heading_or_cross_track_error_blocks_forward() -> None:
     segment = ActiveSegment.create(
         planned_start={"x": 0.0, "y": 0.0},
@@ -1250,8 +1380,14 @@ def test_direct_candidate_is_ranked_instead_of_returned_unconditionally(
     start = {"x": 1.0, "y": 1.0, "yaw": math.radians(-50.0)}
     goal = {"x": 2.0, "y": 3.0}
 
-    def candidate(route, *, start_yaw=None, goal_yaw=None):
-        del start_yaw, goal_yaw
+    def candidate(
+        route,
+        *,
+        start_yaw=None,
+        goal_yaw=None,
+        segment_directions=None,
+    ):
+        del start_yaw, goal_yaw, segment_directions
         direct = len(route) == 2
         angle = math.radians(159.0 if direct else 55.0)
         return StopTurnRoute(
@@ -1410,6 +1546,80 @@ def test_actual_runtime_start_overlap_is_classified_and_escapes_forward() -> Non
     assert recovered.route.points[-1] == goal
 
 
+def test_actual_runtime_pose_prefers_goal_aligned_turn_bay_direction() -> None:
+    project = Path(__file__).parents[3]
+    saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        linear_speed=0.27,
+        angular_speed=0.60,
+        turn_bay_max_distance=0.80,
+    )
+    start = {
+        "x": 1.94006334733655,
+        "y": 1.1641913867574625,
+        "yaw": -1.4428476156244743,
+    }
+
+    for goal, expected_direction in (
+        ({"x": 0.585, "y": 1.565}, -1),
+        ({"x": -0.003265306122449, "y": 0.330816326530613}, 1),
+    ):
+        result = planner.plan_result(
+            start,
+            goal,
+            planning_time_budget=6.0,
+            allow_start_escape=True,
+        )
+        assert result.success
+        assert result.status != "SEARCH_TIME_BUDGET_EXCEEDED"
+        assert result.route is not None
+        assert result.route.points[0] == {"x": start["x"], "y": start["y"]}
+        assert result.route.points[-1] == goal
+        # Relocate without changing chassis yaw, preferring whichever of
+        # forward/reverse lies in the destination half-plane, then turn.
+        assert result.route.segment_directions[0] == expected_direction
+        if expected_direction < 0:
+            assert result.route.points[1]["y"] > start["y"] + 0.05
+        else:
+            assert result.route.points[1]["y"] < start["y"] - 0.20
+        assert validate_stop_turn_route(
+            saved,
+            result.route.points,
+            half_length=0.15,
+            half_width=0.10,
+            segment_directions=result.route.segment_directions,
+        ).valid
+
+
+def test_turn_bay_direction_order_tracks_goal_projection() -> None:
+    start = {"x": 1.0, "y": 1.0, "yaw": 0.0}
+
+    assert preferred_turn_bay_directions(
+        start, {"x": 2.0, "y": 1.2}
+    ) == (1,)
+    assert preferred_turn_bay_directions(
+        start, {"x": 0.0, "y": 0.8}
+    ) == (-1, 1)
+
+
+def test_turn_bay_does_not_reverse_when_the_required_turn_is_already_clear() -> None:
+    saved = _manual_map(80, 80, _free_rectangle(1, 78, 1, 78))
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        turn_bay_max_distance=0.60,
+    )
+    start = {"x": 2.0, "y": 2.0, "yaw": 0.0}
+    goal = {"x": 1.0, "y": 2.0}
+
+    candidate = planner._turn_bay_candidate(start, goal, (), None)
+
+    assert candidate is not None
+    assert candidate.segment_directions[0] == 1
+
+
 def test_start_escape_rejects_a_new_static_overlap_cell() -> None:
     free = _free_rectangle(1, 38, 1, 18)
     free.remove((10, 8))   # Initial side overlap that persists while moving.
@@ -1427,6 +1637,63 @@ def test_start_escape_rejects_a_new_static_overlap_cell() -> None:
         half_width=0.10,
         maximum_distance=0.50,
     ) is None
+
+    reverse_escape = find_start_escape(
+        saved,
+        start,
+        half_length=0.15,
+        half_width=0.10,
+        maximum_distance=0.50,
+        directions=(1, -1),
+    )
+    assert reverse_escape is not None
+    assert reverse_escape.motion_direction == -1
+    assert reverse_escape.end["x"] < start["x"]
+
+    result = StopTurnStateLatticePlanner(
+        saved, saved.navigation_geometry
+    ).plan_result(
+        start,
+        {"x": 1.50, "y": 0.525},
+        allow_start_escape=True,
+        maximum_start_escape_distance=0.50,
+    )
+    assert result.status == "START_ESCAPE_UNAVAILABLE"
+    assert result.start_escape is None
+
+
+def test_latest_runtime_overlap_does_not_reverse_as_start_escape() -> None:
+    project = Path(__file__).parents[3]
+    saved = SavedOccupancyMap.load(
+        project / "sample-data/maps/map-bundle/map.yaml"
+    )
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        linear_speed=0.27,
+        angular_speed=0.60,
+        turn_bay_max_distance=0.80,
+    )
+    start = {
+        "x": 0.38273931698398644,
+        "y": 1.3962081589759003,
+        "yaw": 0.14514972477459964,
+    }
+    goal = {
+        "x": 1.8579591836734695,
+        "y": 1.242040816326531,
+    }
+
+    result = planner.plan_result(
+        start,
+        goal,
+        planning_time_budget=6.0,
+        allow_start_escape=True,
+    )
+
+    assert not result.success
+    assert result.status == "START_ESCAPE_UNAVAILABLE"
+    assert result.start_escape is None
 
 
 def test_dynamic_overlay_clusters_points_filters_static_wall_and_expires() -> None:
@@ -1520,6 +1787,106 @@ def test_dynamic_obstacles_only_affect_the_upcoming_route_horizon() -> None:
     assert not dynamic_exclusions_intersect_route(
         route, ((3.0, 0.0, 0.20),), horizon=2.0
     )
+
+
+def test_controller_zero_abort_with_fresh_near_front_evidence_is_live_blockage() -> None:
+    # 08:53:23: Humble FollowPath has no result diagnostics, Motion Safety did
+    # not hard-stop, but RPP requested zero with the obstacle only 16.8 cm in
+    # front of the footprint. This is a live wait/replan condition, not proof
+    # that the destination is unreachable.
+    assert controller_abort_is_live_blockage(
+        error_code=None,
+        error_msg="",
+        atomic_motion_safety_block=False,
+        dynamic_route_intersection=False,
+        controller_zero_linear=True,
+        repeated_zero_linear_abort=False,
+        corridor_sample_fresh=True,
+        corridor_front_clearance=0.168,
+        corridor_blockage_limit=0.17,
+    )
+    assert not controller_abort_is_live_blockage(
+        error_code=None,
+        error_msg="",
+        atomic_motion_safety_block=False,
+        dynamic_route_intersection=False,
+        controller_zero_linear=True,
+        repeated_zero_linear_abort=False,
+        corridor_sample_fresh=True,
+        corridor_front_clearance=0.346,
+        corridor_blockage_limit=0.17,
+    )
+
+
+def test_controller_diagnostics_and_repeated_zero_abort_are_live_blockage() -> None:
+    assert controller_abort_is_live_blockage(
+        error_code=106,
+        error_msg="No valid control: predicted collision ahead",
+        atomic_motion_safety_block=False,
+        dynamic_route_intersection=False,
+        controller_zero_linear=False,
+        repeated_zero_linear_abort=False,
+        corridor_sample_fresh=False,
+        corridor_front_clearance=math.inf,
+        corridor_blockage_limit=0.17,
+    )
+    assert controller_abort_is_live_blockage(
+        error_code=None,
+        error_msg="",
+        atomic_motion_safety_block=False,
+        dynamic_route_intersection=False,
+        controller_zero_linear=True,
+        repeated_zero_linear_abort=True,
+        corridor_sample_fresh=False,
+        corridor_front_clearance=math.inf,
+        corridor_blockage_limit=0.17,
+    )
+
+
+def test_replanned_copy_of_blocked_remaining_route_is_not_distinct() -> None:
+    blocked_remaining = [
+        {"x": 0.05, "y": 1.71},
+        {"x": 0.435, "y": 1.565},
+        {"x": 1.20, "y": 1.40},
+    ]
+    same_route_from_new_pose = [
+        {"x": 0.06, "y": 1.713},
+        {"x": 0.435, "y": 1.565},
+        {"x": 1.20, "y": 1.40},
+    ]
+    detour = [
+        {"x": 0.06, "y": 1.713},
+        {"x": 0.10, "y": 0.90},
+        {"x": 1.20, "y": 1.40},
+    ]
+    assert path_overlap_ratio(blocked_remaining, same_route_from_new_pose) >= 0.85
+    assert path_overlap_ratio(blocked_remaining, detour) < 0.85
+
+
+def test_near_final_goal_is_position_complete_but_internal_corner_is_not() -> None:
+    current = {
+        "x": -1.6786696503710226,
+        "y": 1.7188354687906582,
+        "yaw": -1.1047,
+    }
+    destination = {
+        "x": -1.7093877551020404,
+        "y": 1.6879591836734704,
+    }
+    assert position_within_tolerance(current, destination, 0.12)
+    assert not position_within_tolerance(current, destination, 0.03)
+    assert math.hypot(
+        current["x"] - destination["x"], current["y"] - destination["y"]
+    ) == pytest.approx(0.043554, abs=1e-6)
+    target_heading = math.atan2(
+        destination["y"] - current["y"], destination["x"] - current["x"]
+    )
+    heading_error = math.atan2(
+        math.sin(target_heading - current["yaw"]),
+        math.cos(target_heading - current["yaw"]),
+    )
+    assert target_heading == pytest.approx(-2.3536, abs=1e-4)
+    assert abs(math.degrees(heading_error)) == pytest.approx(71.55, abs=0.1)
 
 
 def test_real_expansion_bound_has_a_search_limit_reason(monkeypatch) -> None:
@@ -1849,6 +2216,7 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
         "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
     )
     assert follow["use_rotate_to_heading"] is False
+    assert follow["allow_reversing"] is True
     assert planner["plugin"] == "nav2_smac_planner/SmacPlannerLattice"
     assert planner["allow_unknown"] is False
     assert planner["smooth_path"] is False

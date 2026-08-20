@@ -68,6 +68,46 @@ def localization_pose_safe_to_persist(state: dict[str, Any]) -> bool:
     )
 
 
+def navigation_visualization_delta(
+    visualization: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a route-aware visualization delta with explicit clear semantics."""
+    identity = (
+        str(visualization.get("map_id", "")),
+        int(visualization.get("map_version", 0) or 0),
+    )
+    route_id = str(visualization.get("route_id", ""))
+    path = list(visualization.get("global_path") or [])
+    obstacles = list(visualization.get("dynamic_obstacles") or [])
+    changed: dict[str, Any] = {
+        "revision": int(visualization.get("revision", -1)),
+        "map_id": identity[0],
+        "map_version": identity[1],
+        "route_id": route_id,
+    }
+    route_changed = bool(
+        previous is None
+        or identity != previous["identity"]
+        or route_id != previous["route_id"]
+    )
+    if route_changed or path != previous["global_path"]:
+        # [] is intentionally retained: omission means unchanged, not clear.
+        changed["global_path"] = path
+    if (
+        previous is None
+        or identity != previous["identity"]
+        or obstacles != previous["dynamic_obstacles"]
+    ):
+        changed["dynamic_obstacles"] = obstacles
+    return changed, {
+        "identity": identity,
+        "route_id": route_id,
+        "global_path": path,
+        "dynamic_obstacles": obstacles,
+    }
+
+
 class RobotConnectionClient:
     def __init__(self, config: SimulatorConfig) -> None:
         self.config = config
@@ -1696,6 +1736,7 @@ class RobotConnectionClient:
             return
         last_visualization_revision = -1
         last_visualization_identity: tuple[str, int] | None = None
+        last_route_id: str | None = None
         last_global_path: list[dict[str, Any]] | None = None
         last_dynamic_obstacles: list[dict[str, Any]] | None = None
         last_pose_save = 0.0
@@ -1736,24 +1777,23 @@ class RobotConnectionClient:
                     revision = int(visualization.get("revision", -1))
                     if revision != last_visualization_revision:
                         last_visualization_revision = revision
-                        identity = (
-                            str(visualization.get("map_id", "")),
-                            int(visualization.get("map_version", 0) or 0),
+                        previous = (
+                            None
+                            if last_visualization_identity is None
+                            else {
+                                "identity": last_visualization_identity,
+                                "route_id": last_route_id,
+                                "global_path": last_global_path,
+                                "dynamic_obstacles": last_dynamic_obstacles,
+                            }
                         )
-                        path = list(visualization.get("global_path") or [])
-                        obstacles = list(visualization.get("dynamic_obstacles") or [])
-                        changed: dict[str, Any] = {
-                            "revision": revision,
-                            "map_id": identity[0],
-                            "map_version": identity[1],
-                        }
-                        if identity != last_visualization_identity or path != last_global_path:
-                            changed["global_path"] = path
-                            last_global_path = path
-                        if identity != last_visualization_identity or obstacles != last_dynamic_obstacles:
-                            changed["dynamic_obstacles"] = obstacles
-                            last_dynamic_obstacles = obstacles
-                        last_visualization_identity = identity
+                        changed, delta_state = navigation_visualization_delta(
+                            visualization, previous
+                        )
+                        last_visualization_identity = delta_state["identity"]
+                        last_route_id = delta_state["route_id"]
+                        last_global_path = delta_state["global_path"]
+                        last_dynamic_obstacles = delta_state["dynamic_obstacles"]
                         await socket.send(
                             json.dumps(
                                 make_message(

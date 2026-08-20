@@ -483,7 +483,7 @@ export interface NavigationVisualization {
   revision: number;
   map_id: string;
   map_version: number;
-  route_id?: string;
+  route_id: string;
   global_path?: Point[];
   dynamic_obstacles?: Point[];
 }

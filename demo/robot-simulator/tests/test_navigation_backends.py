@@ -538,3 +538,70 @@ def test_motion_safety_uses_only_normalized_scan_and_publishes_atomic_status() -
     # Compatibility topics remain available for non-navigation consumers.
     assert '"/safety/health"' in safety_node
     assert '"/safety/directional_mask"' in safety_node
+
+
+def test_visualization_delta_is_route_aware_and_explicit_about_clear() -> None:
+    from simulator.client import navigation_visualization_delta
+
+    first, state = navigation_visualization_delta(
+        {
+            "revision": 1,
+            "map_id": "MAP-A",
+            "map_version": 1,
+            "route_id": "R1",
+            "global_path": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}],
+            "dynamic_obstacles": [],
+        },
+        None,
+    )
+    assert first["route_id"] == "R1"
+    assert "global_path" in first
+
+    obstacle_only, state = navigation_visualization_delta(
+        {
+            "revision": 2,
+            "map_id": "MAP-A",
+            "map_version": 1,
+            "route_id": "R1",
+            "global_path": first["global_path"],
+            "dynamic_obstacles": [{"x": 0.5, "y": 0.0}],
+        },
+        state,
+    )
+    assert obstacle_only == {
+        "revision": 2,
+        "map_id": "MAP-A",
+        "map_version": 1,
+        "route_id": "R1",
+        "dynamic_obstacles": [{"x": 0.5, "y": 0.0}],
+    }
+
+    route_change, state = navigation_visualization_delta(
+        {
+            "revision": 3,
+            "map_id": "MAP-A",
+            "map_version": 1,
+            "route_id": "R2",
+            # Route identity still forces a full path even when rounded
+            # geometry happens to match the previous route.
+            "global_path": first["global_path"],
+            "dynamic_obstacles": obstacle_only["dynamic_obstacles"],
+        },
+        state,
+    )
+    assert route_change["route_id"] == "R2"
+    assert route_change["global_path"] == first["global_path"]
+
+    explicit_clear, _ = navigation_visualization_delta(
+        {
+            "revision": 4,
+            "map_id": "MAP-A",
+            "map_version": 1,
+            "route_id": "R2",
+            "global_path": [],
+            "dynamic_obstacles": obstacle_only["dynamic_obstacles"],
+        },
+        state,
+    )
+    assert explicit_clear["route_id"] == "R2"
+    assert explicit_clear["global_path"] == []

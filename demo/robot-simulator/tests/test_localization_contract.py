@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import yaml
+
 
 ADAPTER_SOURCE = (
     Path(__file__).parents[1] / "navigation-stack" / "adapter_node.py"
@@ -592,7 +594,8 @@ def test_compute_path_uses_cached_stop_turn_geometry_and_live_validation() -> No
     assert "resolved_goal, goal_adjusted = self._resolve_planning_goal" in compute_path
     assert "self.stop_turn_planner.plan_candidates" in compute_path
     assert "self._serialize_stop_turn_candidates(planned)" in compute_path
-    assert "self._route_metadata(points, original=points)" in serialize
+    assert "self._route_metadata(" in serialize
+    assert "segment_directions=directions" in serialize
     assert 'planner="StopTurnStateLattice24"' in compute_path
     assert "_request_path_once" not in compute_path
 
@@ -718,6 +721,7 @@ def test_active_segment_is_the_execution_geometry_authority() -> None:
     assert "self.active_segment.fixed_heading" in heading
     assert 'self.execution_phase in {"TURN", "TURN_SETTLING"}' in heading
     assert "ActiveSegment.create" in prepare
+    assert "motion_direction=motion_direction" in prepare
     assert 'context="STRAIGHT_REANCHOR"' in prepare
     assert "validate_stop_turn_route" in prepare
     assert '"REANCHOR_TRANSLATION_INVALID"' in prepare
@@ -733,6 +737,9 @@ def test_straight_controller_and_endpoint_guards_are_independent_of_rpp_curvatur
 
     assert "straight_heading_lock" in velocity
     assert "endpoint_braking_speed_limit" in velocity
+    assert "active.motion_direction < 0" in velocity
+    assert "profile.backup_speed" in velocity
+    assert '"DIRECTIONAL_SAFETY_BLOCK"' in velocity
     assert "0.0 if straight_phase else message.angular.z" in velocity
     assert 'linear = 0.0' in velocity
     assert '"GEOMETRIC_ENDPOINT_STOP"' in velocity
@@ -831,3 +838,165 @@ def test_live_narrow_uncertainty_does_not_cancel_prevalidated_auto_route() -> No
     decision = callback.split("self._corridor_failure_evidence()", 1)[1]
     assert 'if evidence_reason == "PHYSICALLY_BLOCKED"' in decision
     assert 'evidence_reason in {"NARROW_OR_UNCERTAIN"' not in decision
+
+
+def test_follow_path_abort_diagnostics_precede_retry_budget_and_preserve_goal() -> None:
+    result = _method_source("_navigation_result", "_set_recovery_terminal")
+    policy = _method_source(
+        "_controller_abort_live_blockage", "_runtime_live_blockage_reason"
+    )
+
+    assert 'getattr(result, "error_code"' in result
+    assert 'getattr(result, "error_msg"' in result
+    assert '"FOLLOW_PATH_RESULT"' in result
+    assert "controller_abort_is_live_blockage" in policy
+    assert "_controller_abort_live_blockage" in result
+    assert 'self._enter_dynamic_wait("CONTROLLER_ABORT_LIVE_BLOCKAGE")' in result
+    assert result.index("_controller_abort_live_blockage") < result.index(
+        "self.navigation_recovery_attempts < self.failed_segment_max_replans"
+    )
+
+
+def test_rotation_sweep_stop_and_start_escape_remain_runtime_recoverable() -> None:
+    safety = _method_source("_safety_status_callback", "_safety_source_callback")
+    atomic = _method_source("_atomic_dynamic_blockage", "_remaining_execution_route")
+    prepare = _method_source("_prepare_active_segment", "_begin_turn_or_settling")
+    escape = _method_source(
+        "_start_escape_execution", "_final_position_distance"
+    )
+
+    assert '"ROTATION_SWEEP_COLLISION"' in safety
+    assert '"ROTATION_SWEEP_COLLISION"' in atomic
+    assert "allow_monotonic_initial_overlap=start_escape" in prepare
+    assert 'status="ALREADY_CLEAR"' in prepare
+    assert "START_ESCAPE_ALREADY_CLEAR" in prepare
+    assert "preferred_turn_bay_directions" not in escape
+    assert "directions=(1,)" in escape
+    assert "escape.motion_direction" in escape
+
+
+def test_navigation_pose_jump_stops_before_replan_and_preserves_destination() -> None:
+    update = _method_source("_update_pose", "_publish_initial_pose")
+    guard = _method_source(
+        "_execution_pose_candidate_accepted",
+        "_pause_for_execution_pose_discontinuity",
+    )
+    pause = _method_source(
+        "_pause_for_execution_pose_discontinuity",
+        "_release_execution_pose_hold",
+    )
+    release = _method_source(
+        "_release_execution_pose_hold", "_fresh_execution_pose"
+    )
+    fresh = _method_source("_fresh_execution_pose", "_prepare_active_segment")
+
+    assert "_execution_pose_candidate_accepted(pose)" in update
+    assert "_execution_pose_candidate_accepted(pose)" in fresh
+    assert "execution_pose_continuity(" in guard
+    assert "self.navigation_velocity.publish(Twist())" in guard
+    assert guard.index("self.navigation_velocity.publish(Twist())") < guard.index(
+        "_pause_for_execution_pose_discontinuity"
+    )
+    assert '"goal": goal' in pause
+    assert '"path": list(self.latest_global_path)' in pause
+    assert "self.latest_global_path = []" not in pause
+    assert "self._begin_localization_verification(allow_rotation=True)" in pause
+    assert "self.execution_pose_hold = False" in release
+    assert "self.pose =" in release
+
+
+def test_live_blockage_replan_exhaustion_waits_without_terminal_cleanup() -> None:
+    schedule = _method_source(
+        "_schedule_execution_replan", "_enter_dynamic_wait"
+    )
+    live_branch = schedule.split("if live_blockage_reason:", 1)[1].split(
+        "if self.execution_replan_attempts", 1
+    )[0]
+
+    assert "self._enter_dynamic_wait" in live_branch
+    assert "_set_recovery_terminal" not in live_branch
+    assert schedule.index("if live_blockage_reason:") < schedule.index(
+        "if self.execution_replan_attempts"
+    )
+    assert 'self._enter_dynamic_wait("REPLAN_BUDGET_COOLDOWN")' in schedule
+    assert "_set_recovery_terminal" not in schedule
+
+
+def test_dynamic_wait_periodically_replans_and_success_resumes_same_goal() -> None:
+    tick = _method_source("_dynamic_recovery_tick", "_attempt_dynamic_replan")
+    attempt = _method_source("_attempt_dynamic_replan", "_replan_execution_from_current")
+
+    assert "self.dynamic_obstacle_wait" in tick
+    assert "self.dynamic_replan_retry" in tick
+    assert 'self._set_state("DYNAMIC_REPLAN"' in tick
+    assert "target=self._attempt_dynamic_replan" in tick
+    assert "goal = dict(self.execution_goal or self.paused_goal or {})" in attempt
+    assert "self._navigate(" in attempt
+    assert 'self._set_state("WAITING_FOR_DYNAMIC_CLEAR"' in attempt
+    assert "destination_preserved=True" in attempt
+
+
+def test_dynamic_recovery_rejects_same_blocked_geometry_without_retry_burn() -> None:
+    attempt = _method_source("_attempt_dynamic_replan", "_replan_execution_from_current")
+
+    assert "path_overlap_ratio" in attempt
+    assert "self.dynamic_blocked_route" in attempt
+    assert 'self._set_state("WAITING_FOR_DYNAMIC_CLEAR"' in attempt
+    assert 'reason="SAME_BLOCKED_ROUTE"' in attempt
+    assert "self.execution_replan_attempts += 1" not in attempt
+
+
+def test_true_static_disconnect_remains_terminal_during_runtime_recovery() -> None:
+    dynamic = _method_source("_attempt_dynamic_replan", "_replan_execution_from_current")
+    ordinary = _method_source("_replan_execution_from_current", "_send_current_straight_segment")
+
+    assert 'exc.code == "GOAL_PHYSICALLY_UNREACHABLE"' in dynamic
+    assert "self._set_recovery_terminal" in dynamic
+    assert 'exc.code == "GOAL_PHYSICALLY_UNREACHABLE"' in ordinary
+    assert "self._set_recovery_terminal" in ordinary
+
+
+def test_final_position_short_circuit_is_before_turn_and_endpoint_replan() -> None:
+    tick = _method_source("_segment_execution_tick", "_start_turn_bay_recovery")
+    prepare = _method_source("_prepare_active_segment", "_begin_turn_or_settling")
+    finish = _method_source("_finish_execution_success", "_restart_segment_from_current")
+
+    first_final_check = tick.index("_complete_final_position_if_reached")
+    assert first_final_check < tick.index("_prepare_active_segment")
+    straight = tick.split('if self.execution_phase in {"STRAIGHT", "NARROW_STRAIGHT"}:', 1)[1]
+    assert straight.index("_complete_final_position_if_reached") < straight.index(
+        "straight_segment_progress"
+    )
+    assert prepare.index("_complete_final_position_if_reached") < prepare.index(
+        "planned_progress.passed_endpoint"
+    )
+    assert prepare.index("_complete_final_position_if_reached") < prepare.index(
+        "_begin_turn_or_settling"
+    )
+    assert '"GOAL_REACHED"' in finish
+    assert 'mode="POSITION_ONLY"' in finish
+    assert 'phase="FINAL_TURN_END"' in finish
+    assert "physical_final_turn" in finish
+
+
+def test_final_tolerance_is_separate_from_internal_segment_tolerance() -> None:
+    project = Path(__file__).parents[1]
+    navigation = yaml.safe_load(
+        (project / "navigation-stack/config/nav2_params.yaml").read_text()
+    )
+    parameters = navigation["rovera_navigation_adapter"]["ros__parameters"]
+    controller = navigation["controller_server"]["ros__parameters"]
+
+    assert parameters["straight_endpoint_tolerance"] == 0.03
+    assert parameters["stop_turn_final_position_tolerance"] == 0.12
+    assert parameters["stop_turn_final_position_tolerance"] == controller[
+        "goal_checker"
+    ]["xy_goal_tolerance"]
+
+
+def test_adapter_visualization_contract_always_identifies_route_authority() -> None:
+    dispatch = _method_source("_dispatch", "_foreign_mapping_authorities")
+
+    assert '"route_id": (' in dispatch
+    assert "self.execution_route_id" in dispatch
+    assert "self.selected_route_id" in dispatch
