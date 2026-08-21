@@ -307,4 +307,20 @@ describe("MapPanel navigation controls", () => {
     }} /></I18nProvider>);
     expect(screen.getByText(/Robot đã dừng an toàn/)).toBeInTheDocument();
   });
+
+  it("keeps the destination active while replanning around an obstacle", () => {
+    panel({
+      localized: true,
+      localizationState: "READY",
+      mapState: "DYNAMIC_REPLAN",
+      navigationStatus: "recovery",
+      onPause: vi.fn(),
+    });
+
+    expect(screen.getByText("NAV2 · Đang tìm đường tránh vật cản")).toBeInTheDocument();
+    expect(screen.getByText(/Điểm đến vẫn được giữ/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Tạm dừng" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Dừng điều hướng" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Chọn điểm đến" })).not.toBeInTheDocument();
+  });
 });

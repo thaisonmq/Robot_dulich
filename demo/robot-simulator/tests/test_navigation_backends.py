@@ -465,8 +465,45 @@ def test_mode_supervisor_idle_stops_both_ros_authorities(tmp_path, monkeypatch) 
     }
     assert calls == [
         (("stop", "navigation-stack"), "navigation"),
-        (("stop", "mapping-stack"), "legacy-coexistence"),
+        (("stop", "rviz-bridge", "mapping-stack"), "legacy-coexistence"),
     ]
+
+
+def test_mode_supervisor_starts_prebuilt_mapping_and_rviz_bridge(
+    tmp_path, monkeypatch
+) -> None:
+    project_dir = Path(__file__).parents[1]
+    monkeypatch.setenv("ROVERA_PROJECT_DIR", str(project_dir))
+    monkeypatch.setenv("ROVERA_STATE_DIR", str(tmp_path))
+    script = project_dir / "scripts" / "mode_supervisor.py"
+    spec = importlib.util.spec_from_file_location("mapping_mode_supervisor", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls: list[tuple[tuple[str, ...], str]] = []
+
+    monkeypatch.setattr(module, "validate_base_runtime", lambda: "managed-motion")
+    monkeypatch.setattr(module, "adapter_status", lambda: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(
+        module,
+        "compose",
+        lambda files, profile, *args, **kwargs: calls.append((tuple(args), profile)),
+    )
+    monkeypatch.setattr(module, "remove_stale_socket", lambda: None)
+    monkeypatch.setattr(module, "wait_for_mode", lambda mode: {"mode": mode})
+
+    assert module.switch_mode({"mode": "MAPPING"}) == {"mode": "MAPPING"}
+    assert calls == [
+        (("stop", "navigation-stack"), "navigation"),
+        (
+            (
+                "up", "-d", "--no-deps", "--force-recreate",
+                "mapping-stack", "rviz-bridge",
+            ),
+            "legacy-coexistence",
+        ),
+    ]
+    assert "--build" not in calls[1][0]
 
 
 def test_mode_supervisor_accepts_guarded_managed_motion_without_vendor(

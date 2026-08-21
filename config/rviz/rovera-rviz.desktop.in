@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rovera RViz Viewer
+Comment=Open the observation-only Rovera RViz mapping view
+Exec=/usr/bin/python3 "@HANDLER_PATH@" %u
+Icon=utilities-system-monitor
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/rovera-rviz;
+Categories=Development;Engineering;

@@ -62,7 +62,7 @@ Visualization Manager:
       Name: Vị trí xe hiện tại
       Enabled: true
       Topic:
-        Value: /odom
+        Value: /odometry/filtered
         Reliability Policy: Best Effort
         Durability Policy: Volatile
       Position Tolerance: 0.001

@@ -15,5 +15,4 @@ compose=(
 
 # Stop only Rovera's read-only services. Never use `down` here because the
 # vendor and guarded legacy hardware runtimes are outside this ownership set.
-"${compose[@]}" stop mapping-stack robot-simulator
-
+"${compose[@]}" stop rviz-bridge mapping-stack robot-simulator

@@ -10,6 +10,22 @@ describe("Control saved-map architecture", () => {
     }
   });
 
+  it("keeps dynamic wait and replan states attached to the active mission", () => {
+    const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
+    const panel = readFileSync(resolve("src/components/MapPanel.tsx"), "utf8");
+
+    for (const state of [
+      "WAIT_FOR_DYNAMIC_CLEAR", "WAITING_FOR_DYNAMIC_CLEAR", "DYNAMIC_REPLAN",
+    ]) {
+      expect(dashboard).toContain(`${state}: "recovery"`);
+      expect(panel).toContain(`"${state}"`);
+    }
+    expect(dashboard).toContain(
+      'setNavigationState(ACTIVE_RUNTIME_NAVIGATION_STATES[runtimeState] ?? "ready")',
+    );
+    expect(panel).toContain("const activeMission = moving || recovering");
+  });
+
   it("keeps camera, mapping, mini-map and modal in the same Dashboard tree", () => {
     const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
     expect(dashboard.match(/<video\b/g)).toHaveLength(1);

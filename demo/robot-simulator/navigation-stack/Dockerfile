@@ -16,6 +16,7 @@ RUN apt-get update \
         ros-humble-nav2-regulated-pure-pursuit-controller \
         ros-humble-nav2-smac-planner \
         ros-humble-nav2-waypoint-follower \
+        ros-humble-domain-bridge \
         ros-humble-robot-localization \
         ros-humble-robot-state-publisher \
         ros-humble-slam-toolbox \

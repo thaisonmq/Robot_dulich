@@ -232,10 +232,16 @@ def switch_mode(request: dict[str, Any]) -> dict[str, Any]:
         # authority behind. The vendor base and motion-safety runtime remain
         # alive, so manual control and E-stop are still available.
         compose(navigation_files, "navigation", "stop", "navigation-stack")
-        compose(mapping_files, "legacy-coexistence", "stop", "mapping-stack")
+        compose(
+            mapping_files, "legacy-coexistence", "stop",
+            "rviz-bridge", "mapping-stack",
+        )
         remove_stale_socket()
     elif mode == "NAVIGATION":
-        compose(mapping_files, "legacy-coexistence", "stop", "mapping-stack")
+        compose(
+            mapping_files, "legacy-coexistence", "stop",
+            "rviz-bridge", "mapping-stack",
+        )
         remove_stale_socket()
         compose(
             navigation_files,
@@ -248,7 +254,8 @@ def switch_mode(request: dict[str, Any]) -> dict[str, Any]:
         compose(
             mapping_files,
             "legacy-coexistence",
-            "up", "-d", "--no-deps", "--force-recreate", "mapping-stack",
+            "up", "-d", "--no-deps", "--force-recreate",
+            "mapping-stack", "rviz-bridge",
         )
     return wait_for_mode(mode)
 

@@ -92,7 +92,7 @@ echo "Preflight passed: preserving the existing serial Agent and vendor joystick
 echo "$graph_check"
 echo "Starting only read-only edge + mapping services; Web chassis motion is disabled."
 ROVERA_USE_VENDOR_BASE_RUNTIME="$vendor_base_runtime" \
-  "${compose[@]}" up -d --build robot-simulator mapping-stack
+  "${compose[@]}" up -d --build robot-simulator mapping-stack rviz-bridge
 
-"${compose[@]}" ps robot-simulator mapping-stack
+"${compose[@]}" ps robot-simulator mapping-stack rviz-bridge
 echo "Coexistence mode is active. No service in this mode opens /dev/ttyUSB0 or publishes /cmd_vel."

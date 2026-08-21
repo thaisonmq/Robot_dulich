@@ -6,8 +6,13 @@ from fractions import Fraction
 
 import pytest
 
-from simulator.client import RobotConnectionClient, localization_pose_safe_to_persist
+from simulator.client import (
+    RobotConnectionClient,
+    localization_pose_safe_to_persist,
+    mapping_autosave_posegraph,
+)
 from simulator.config import SimulatorConfig
+from simulator.map_cache import MapCacheError
 from simulator.media import MediaPublisher, SourceVideoProbe
 from simulator.messages import make_message
 
@@ -31,6 +36,67 @@ def test_pose_persistence_requires_sustained_independent_localization_evidence()
     state["localization_diagnostics"]["ready_evidence_hold_ms"] = 30_001
     state["localization_diagnostics"]["scan_map_score"] = 0.34
     assert not localization_pose_safe_to_persist(state)
+
+
+def test_mapping_autosave_recovery_requires_a_complete_safe_pair(tmp_path) -> None:
+    cache = tmp_path / "maps" / "cache"
+    autosave = tmp_path / "maps" / ".autosave"
+    autosave.mkdir(parents=True)
+    basename = autosave / "MAP-RECOVERY-latest"
+    basename.with_suffix(".posegraph").write_bytes(b"posegraph")
+
+    with pytest.raises(MapCacheError, match="complete mapping autosave"):
+        mapping_autosave_posegraph(str(cache), "MAP-RECOVERY", 1)
+
+    basename.with_suffix(".data").write_bytes(b"scan-data")
+    assert mapping_autosave_posegraph(str(cache), "MAP-RECOVERY", 1) == basename
+
+    with pytest.raises(MapCacheError, match="invalid map identity"):
+        mapping_autosave_posegraph(str(cache), "../escape", 1)
+
+
+@pytest.mark.asyncio
+async def test_mapping_recovery_dispatches_local_autosave_as_mapping_start(tmp_path) -> None:
+    cache = tmp_path / "maps" / "cache"
+    autosave = tmp_path / "maps" / ".autosave"
+    autosave.mkdir(parents=True)
+    basename = autosave / "MAP-RECOVERY-latest"
+    basename.with_suffix(".posegraph").write_bytes(b"posegraph")
+    basename.with_suffix(".data").write_bytes(b"scan-data")
+    client = RobotConnectionClient(SimulatorConfig(
+        navigation_backend="ros2",
+        map_cache_dir=str(cache),
+        media_enabled=False,
+    ))
+    dispatched: list[dict] = []
+
+    class FakeNavigationBackend:
+        def state(self) -> dict:
+            return {"state": "IDLE", "mode": "MAPPING"}
+
+        async def execute(self, command: str, payload: dict) -> dict:
+            dispatched.append({"command": command, "payload": payload})
+            return {
+                "status": "completed",
+                "current_state": "PAUSED" if command == "mapping.pause" else "MAPPING_RUNNING",
+            }
+
+    client.navigation_backend = FakeNavigationBackend()  # type: ignore[assignment]
+
+    result = await client._execute_navigation_command(
+        "mapping.recover",
+        {
+            "map_id": "MAP-RECOVERY",
+            "version": 1,
+            "expected_state": "IDLE",
+        },
+    )
+
+    assert result["current_state"] == "PAUSED"
+    assert result["recovered_from_autosave"] is True
+    assert [item["command"] for item in dispatched] == ["mapping.start", "mapping.pause"]
+    assert dispatched[0]["payload"]["posegraph_path"] == str(basename)
+    assert dispatched[0]["payload"]["initial_pose"] is None
 
 
 @pytest.mark.asyncio

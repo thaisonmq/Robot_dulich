@@ -8,7 +8,8 @@ class InvalidTransition(ValueError):
 MAPPING_TRANSITIONS: dict[str, frozenset[str]] = {
     "MAPPING_STARTING": frozenset({"MAPPING_RUNNING", "MAPPING_ERROR", "CANCELED"}),
     "MAPPING_RUNNING": frozenset({
-        "MAPPING_STOPPED_UNSAVED", "MAPPING_SAVING", "CANCELED", "MAPPING_ERROR",
+        "MAPPING_STOPPED_UNSAVED", "MAPPING_SAVING", "PAUSED", "CANCELED",
+        "MAPPING_ERROR",
     }),
     "MAPPING_STOPPED_UNSAVED": frozenset({
         "MAPPING_RUNNING", "MAPPING_SAVING", "CANCELED", "MAPPING_ERROR",
@@ -18,7 +19,9 @@ MAPPING_TRANSITIONS: dict[str, frozenset[str]] = {
     # Legacy states are retained for sessions created before migration 0007.
     "STARTING": frozenset({"MAPPING", "FAULT", "CANCELED"}),
     "MAPPING": frozenset({"PAUSED", "SAVING", "FINISHING", "CANCELED", "FAULT"}),
-    "PAUSED": frozenset({"MAPPING", "SAVING", "FINISHING", "CANCELED", "FAULT"}),
+    "PAUSED": frozenset({
+        "MAPPING", "MAPPING_RUNNING", "SAVING", "FINISHING", "CANCELED", "FAULT",
+    }),
     "SAVING": frozenset({"MAPPING", "PAUSED", "SAVED_DRAFT", "FAULT"}),
     "SAVED_DRAFT": frozenset({"MAPPING", "PAUSED", "FINISHING", "CANCELED", "FAULT"}),
     "FINISHING": frozenset({"FINISHED", "FAULT"}),

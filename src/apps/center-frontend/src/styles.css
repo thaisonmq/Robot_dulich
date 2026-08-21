@@ -3103,6 +3103,21 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .mapping-timer small { color: var(--muted); font-size: 7px; }
 .mapping-timer strong { font-size: 22px; font-variant-numeric: tabular-nums; }
 .mapping-rviz-note { margin: 0; color: var(--muted); font-size: 8px; line-height: 1.45; }
+.mapping-rviz-launch {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: #fff;
+  background: var(--blue);
+  border: 1px solid var(--blue);
+  border-radius: 7px;
+  font-size: 9px;
+  font-weight: 750;
+  text-decoration: none;
+}
+.mapping-rviz-launch:hover { background: #164daf; }
 .mapping-control-panel__actions { display: flex; gap: 6px; }
 .mapping-control-panel__actions button { flex: 1; min-height: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid var(--line-dark); border-radius: 7px; cursor: pointer; }
 .mapping-control-panel__actions button.button--primary { color: #fff; background: var(--blue); border-color: var(--blue); }

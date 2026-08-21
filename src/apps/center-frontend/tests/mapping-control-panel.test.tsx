@@ -47,12 +47,12 @@ const mapping: MappingSession = {
   sync_status: "SYNCED",
 };
 
-function renderPanel(nextHealth: Health = health) {
+function renderPanel(nextHealth: Health = health, canOpenRviz = false) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
       <I18nProvider>
-        <MappingControlPanel robotId="ROBOT-1" health={nextHealth} />
+        <MappingControlPanel robotId="ROBOT-1" health={nextHealth} canOpenRviz={canOpenRviz} />
       </I18nProvider>
     </QueryClientProvider>,
   );
@@ -110,5 +110,38 @@ describe("MappingControlPanel i18n display labels", () => {
     expect(screen.getByText(/SLAM.*Đang chạy/)).toBeInTheDocument();
     expect(screen.getByText(/Dữ liệu cục bộ.*Có sẵn trên robot.*Đồng bộ.*Đã đồng bộ/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Dừng mapping" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Lưu bản nháp" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Kết thúc & lưu" })).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Xem map" })).not.toBeInTheDocument();
+  });
+
+  it("offers the observation-only RViz launcher to an admin", async () => {
+    vi.spyOn(api, "mappingSession").mockResolvedValue(mapping);
+    sessionStorage.setItem("rovera:mapping-intent", JSON.stringify({
+      session_id: mapping.session_id,
+      robot_id: mapping.robot_id,
+    }));
+
+    renderPanel(health, true);
+
+    const link = await screen.findByRole("link", { name: "Xem map" });
+    expect(link).toHaveAttribute(
+      "href",
+      "rovera-rviz://mapping?domain=21&robot_id=ROBOT-1&session_id=MAPPING-SESSION-1",
+    );
+  });
+
+  it("offers continue and save choices after autosave recovery pauses mapping", async () => {
+    vi.spyOn(api, "mappingSession").mockResolvedValue({ ...mapping, status: "PAUSED" });
+    sessionStorage.setItem("rovera:mapping-intent", JSON.stringify({
+      session_id: mapping.session_id,
+      robot_id: mapping.robot_id,
+    }));
+
+    renderPanel();
+
+    expect(await screen.findByRole("button", { name: "Tiếp tục mapping" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Lưu bản nháp" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Kết thúc & lưu" })).toBeInTheDocument();
   });
 });

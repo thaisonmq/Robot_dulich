@@ -256,7 +256,8 @@ def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
     assert "self.localization_final_max_p90_residual" in verdict
     assert "self.localization_final_minimum_residual_beams" in verdict
     assert "self.localization_raycast_minimum_beams" in verdict
-    assert "self.localization_raycast_minimum_match_ratio" in verdict
+    assert "self.localization_raycast_minimum_static_matches" in verdict
+    assert "self.localization_raycast_maximum_contradiction_ratio" in verdict
     assert "self._global_heading_diversity_ready()" in verdict
     assert 'self.localization_state == "VERIFYING"' in tick
     assert "self.localization_ready_hold" in tick
@@ -301,7 +302,7 @@ def test_map_initialization_cannot_timeout_before_session_clock_is_started() -> 
     assert initializing_guard < timeout
 
 
-def test_heading_observation_requires_stationary_quality_for_same_hypothesis() -> None:
+def test_heading_observation_uses_basic_quality_not_final_raycast_gate() -> None:
     observation = _method_source(
         "_record_heading_observation", "_update_scan_map_match"
     )
@@ -309,11 +310,17 @@ def test_heading_observation_requires_stationary_quality_for_same_hypothesis() -
     update = _method_source("_update_scan_map_match", "_planning_scan_message")
     assert "valid_beams < self.scan_map_minimum_beams" in observation
     assert "self._scan_heading_in_odom(message)" in observation
-    assert "scan_quality_passed" in observation
+    assert "heading_observation_valid" in observation
     assert "self._pose_is_stable()" in observation
     assert "not self.rotation_active" in observation
+    assert "self.localization_confidence_threshold" not in observation
     assert "self._required_localization_scan_score()" in update
-    assert "self.localization_raycast_minimum_match_ratio" in update
+    assert "self.localization_raycast_minimum_reliable_structure_span" in update
+    heading_gate = update.split("return bool(", 1)[1]
+    assert "match.score" in heading_gate
+    assert "match.median_residual" in heading_gate
+    assert "match.p90_residual" in heading_gate
+    assert "raycast." not in heading_gate
     assert callback.index("self._update_scan_map_match(message)") < callback.index(
         "self._record_heading_observation("
     )
@@ -324,6 +331,8 @@ def test_localization_verify_log_contains_every_mandatory_gate_metric() -> None:
     for field in (
         "state=self.localization_state",
         "candidate_pose=self.last_amcl_pose",
+        "pose_stability={",
+        "confidence=self.localization_confidence",
         "scan_score=self.scan_map_score",
         "scan_score_required=self._required_localization_scan_score()",
         "covariance_xy=",
@@ -331,11 +340,19 @@ def test_localization_verify_log_contains_every_mandatory_gate_metric() -> None:
         "median_residual_m=",
         "p90_residual_m=",
         "raycast_comparable_beams=",
+        "raycast_static_matches=",
+        "raycast_dynamic_occlusions=",
+        "raycast_map_contradictions=",
+        "raycast_inconclusive_map_hits=",
+        "raycast_static_match_ratio=",
+        "raycast_dynamic_occlusion_ratio=",
+        "raycast_contradiction_ratio=",
         "raycast_matches=",
         "raycast_match_ratio=",
         "raycast_median_error_m=",
         "raycast_p90_error_m=",
         "heading_bins=",
+        "heading_bin_ids=",
         "heading_span_deg=",
         "rotation_degrees=",
         "global_search_untrusted=",
@@ -353,7 +370,8 @@ def test_new_navigation_start_rechecks_fresh_raycast_without_canceling_route() -
 
     assert "self._localization_tracking_evidence_ready(now)" in start_gate
     assert "self.localization_raycast_minimum_beams" in start_gate
-    assert "self.localization_raycast_minimum_match_ratio" in start_gate
+    assert "self.localization_raycast_minimum_static_matches" in start_gate
+    assert "self.localization_raycast_maximum_contradiction_ratio" in start_gate
     assert "not recovery_attempt" in navigate
     assert "self._localization_start_evidence_ready(time.monotonic())" in navigate
     assert "cancel_goal_async" not in start_gate
@@ -427,8 +445,20 @@ def test_hypothesis_jump_invalidates_old_heading_corroboration() -> None:
 
     assert "self.global_search_untrusted" in callback
     assert "self.localization_evidence_headings.clear()" in callback
+    assert "self.localization_heading_positions.clear()" in callback
     assert "self.localization_heading_bins = ()" in callback
     assert 'reason="SPATIAL_HYPOTHESIS_JUMP"' in callback
+
+
+def test_cross_heading_position_inconsistency_resets_corroboration() -> None:
+    observation = _method_source(
+        "_record_heading_observation", "_update_scan_map_match"
+    )
+
+    assert "heading_position_spread" in observation
+    assert "self.pose_maximum_xy_spread * 2.0" in observation
+    assert "self.localization_heading_positions.clear()" in observation
+    assert 'reason="SPATIAL_HYPOTHESIS_INCONSISTENT_ACROSS_HEADINGS"' in observation
 
 
 def test_tf_chain_diagnostic_names_each_link_and_bounded_failure() -> None:
@@ -1000,6 +1030,9 @@ def test_live_blockage_replan_exhaustion_waits_without_terminal_cleanup() -> Non
 def test_dynamic_wait_periodically_replans_and_success_resumes_same_goal() -> None:
     tick = _method_source("_dynamic_recovery_tick", "_attempt_dynamic_replan")
     attempt = _method_source("_attempt_dynamic_replan", "_replan_execution_from_current")
+    blocker = _method_source(
+        "_observe_controller_blocker", "_schedule_execution_replan"
+    )
 
     assert "self.dynamic_obstacle_wait" in tick
     assert "self.dynamic_replan_retry" in tick
@@ -1009,6 +1042,32 @@ def test_dynamic_wait_periodically_replans_and_success_resumes_same_goal() -> No
     assert "self._navigate(" in attempt
     assert 'self._set_state("WAITING_FOR_DYNAMIC_CLEAR"' in attempt
     assert "destination_preserved=True" in attempt
+    assert "self.dynamic_overlay.observe_confirmed_blocker" in blocker
+    assert "saved_map=self.saved_map" not in blocker
+    assert "corridor_blocked" in tick
+    assert 'self.dynamic_block_reason.startswith("CONTROLLER_ABORT")' not in tick
+
+
+def test_dynamic_replan_pause_invalidates_inflight_route_restart() -> None:
+    attempt = _method_source("_attempt_dynamic_replan", "_replan_execution_from_current")
+    pause = _method_source("_pause_navigation", "_manual_handoff")
+
+    generation_checks = [
+        index
+        for index in range(len(attempt))
+        if attempt.startswith(
+            "if expected_generation != self.navigation_goal_generation:",
+            index,
+        )
+    ]
+    assert len(generation_checks) >= 2
+    assert generation_checks[1] < attempt.index("same_blocked_route = bool(")
+    for state in (
+        '"WAIT_FOR_DYNAMIC_CLEAR"',
+        '"WAITING_FOR_DYNAMIC_CLEAR"',
+        '"DYNAMIC_REPLAN"',
+    ):
+        assert state in pause
 
 
 def test_dynamic_recovery_rejects_same_blocked_geometry_without_retry_burn() -> None:

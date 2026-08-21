@@ -62,6 +62,11 @@ class RouteMetadata:
     narrow_segments: tuple[dict[str, float], ...]
     estimated_time: float
     turn_safe: bool
+    # Smallest lateral gap from either side of the physical chassis to Saved
+    # Map structure while translating.  Total passage width alone is not
+    # sufficient: a 35 cm corridor is still unusable when a 20 cm robot is
+    # planned only a few millimetres from one wall.
+    minimum_side_clearance: float = math.inf
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -74,6 +79,9 @@ class RouteMetadata:
             ),
             "minimum_turn_clearance": _finite_or_none(
                 self.minimum_turn_clearance
+            ),
+            "minimum_side_clearance": _finite_or_none(
+                self.minimum_side_clearance
             ),
             "turn_count": self.turn_count,
             "total_turn_angle": round(self.total_turn_angle, 4),
@@ -289,6 +297,22 @@ class DynamicObstacleOverlay:
                 min(1.0, count / 3.0),
             )
         return self.snapshot(timestamp)
+
+    def observe_confirmed_blocker(
+        self,
+        points: Iterable[tuple[float, float]],
+        *,
+        now: float,
+    ) -> tuple[DynamicObstacle, ...]:
+        """Retain a live blocker confirmed by the motion controller.
+
+        Ordinary scan points close to Saved Map occupancy are filtered so
+        static walls never become dynamic obstacles. A fresh controller stop
+        plus corridor evidence is stronger: even when the blocker overlaps a
+        stale map pixel it must become a temporary planning exclusion, or the
+        recovery planner will repeatedly return the route that just failed.
+        """
+        return self.observe(points, now=now, saved_map=None)
 
     def snapshot(self, now: float) -> tuple[DynamicObstacle, ...]:
         self.expire(now)
@@ -1547,6 +1571,7 @@ def route_geometry_metadata(
     total_length = 0.0
     minimum_clearance = math.inf
     minimum_passage_width = math.inf
+    minimum_side_clearance = math.inf
     minimum_turn_clearance = math.inf
     narrow_segments: list[dict[str, float]] = []
     internal_turn_count = 0
@@ -1593,6 +1618,14 @@ def route_geometry_metadata(
                 0.0
                 if left_width is None or right_width is None
                 else left_width + right_width
+            )
+            side_clearance = (
+                -float(half_width)
+                if left_width is None or right_width is None
+                else min(left_width, right_width) - float(half_width)
+            )
+            minimum_side_clearance = min(
+                minimum_side_clearance, side_clearance
             )
             segment_width = min(segment_width, passage_width)
         minimum_passage_width = min(minimum_passage_width, segment_width)
@@ -1690,6 +1723,7 @@ def route_geometry_metadata(
             / max(0.01, linear_speed)
         ),
         turn_safe=turn_safe,
+        minimum_side_clearance=minimum_side_clearance,
     )
 
 
@@ -1712,6 +1746,8 @@ class StopTurnStateLatticePlanner:
         max_expansions: int = 250_000,
         turn_robustness_radius: float = 0.01,
         turn_bay_max_distance: float = 0.80,
+        hard_side_margin: float = 0.0,
+        preferred_side_margin: float = 0.05,
     ) -> None:
         self.saved_map = saved_map
         self.geometry = geometry
@@ -1728,6 +1764,10 @@ class StopTurnStateLatticePlanner:
         self.max_expansions = max(1, int(max_expansions))
         self.turn_robustness_radius = max(0.0, float(turn_robustness_radius))
         self.turn_bay_max_distance = max(0.0, float(turn_bay_max_distance))
+        self.hard_side_margin = max(0.0, float(hard_side_margin))
+        self.preferred_side_margin = max(
+            self.hard_side_margin, float(preferred_side_margin)
+        )
         self.heading_step = 2.0 * math.pi / self.HEADING_BINS
 
     def _turn_valid(
@@ -1746,7 +1786,7 @@ class StopTurnStateLatticePlanner:
             start_yaw,
             end_yaw,
             half_length=self.half_length,
-            half_width=self.half_width,
+            half_width=self.half_width + self.hard_side_margin,
             padding=self.padding,
             robustness_radius=(self.turn_robustness_radius if robust else 0.0),
         ).valid
@@ -1811,10 +1851,47 @@ class StopTurnStateLatticePlanner:
             origin_yaw=self.saved_map.origin_yaw,
             data=self.saved_map.occupancy,
             half_length=self.half_length + self.padding,
-            half_width=self.half_width + self.padding,
+            half_width=(
+                self.half_width + self.padding + self.hard_side_margin
+            ),
             allow_unknown=False,
             lethal_threshold=65,
         ).valid
+
+    def _segment_has_center_clearance(
+        self,
+        left: dict[str, float],
+        right: dict[str, float],
+        minimum_center_clearance: float | None,
+    ) -> bool:
+        """Keep seed simplification inside the clearance band it searched.
+
+        Without this check, A* can find a centered series of cells and the
+        line-of-sight simplifier can immediately cut back across the cells
+        beside a wall, recreating the short but unexecutable route.
+        """
+        if minimum_center_clearance is None:
+            return True
+        delta_x = float(right["x"]) - float(left["x"])
+        delta_y = float(right["y"]) - float(left["y"])
+        distance = math.hypot(delta_x, delta_y)
+        count = max(
+            1,
+            math.ceil(distance / max(0.001, self.saved_map.resolution / 2.0)),
+        )
+        for sample in range(1, count):
+            ratio = sample / count
+            cell = self.saved_map.world_to_cell(
+                float(left["x"]) + delta_x * ratio,
+                float(left["y"]) + delta_y * ratio,
+            )
+            if (
+                cell is None
+                or self.geometry.clearance_at_cell(*cell) + 1e-9
+                < float(minimum_center_clearance)
+            ):
+                return False
+        return True
 
     def _turn_bay_candidate(
         self,
@@ -1924,40 +2001,43 @@ class StopTurnStateLatticePlanner:
                 bay_cell = self.saved_map.world_to_cell(bay["x"], bay["y"])
                 if bay_cell is None:
                     continue
-                seed = self._grid_seed(
-                    bay_cell,
-                    goal_cell,
-                    exclusions,
-                    deadline_monotonic,
-                )
-                continuation = self._canonical_route_from_seed(
-                    seed,
-                    bay,
-                    goal,
-                    exclusions,
-                    deadline_monotonic,
-                )
-                if not continuation:
-                    continue
-                combined = canonicalize_stop_turn_path([
-                    dict(start),
-                    *continuation,
-                ])
-                if len(combined) != len(continuation) + 1:
-                    continue
-                if direction < 0 and not reverse_is_needed_for_turn(combined):
-                    continue
-                result = self._route_result(
-                    combined,
-                    start_yaw=start_yaw,
-                    goal_yaw=goal_yaw,
-                    segment_directions=(
-                        direction,
-                        *(1 for _ in range(len(combined) - 2)),
-                    ),
-                )
-                if result is not None:
-                    return result
+                for seed_clearance in self._clearance_levels():
+                    seed = self._grid_seed(
+                        bay_cell,
+                        goal_cell,
+                        exclusions,
+                        deadline_monotonic,
+                        minimum_center_clearance=seed_clearance,
+                    )
+                    continuation = self._canonical_route_from_seed(
+                        seed,
+                        bay,
+                        goal,
+                        exclusions,
+                        deadline_monotonic,
+                        minimum_center_clearance=seed_clearance,
+                    )
+                    if not continuation:
+                        continue
+                    combined = canonicalize_stop_turn_path([
+                        dict(start),
+                        *continuation,
+                    ])
+                    if len(combined) != len(continuation) + 1:
+                        continue
+                    if direction < 0 and not reverse_is_needed_for_turn(combined):
+                        continue
+                    result = self._route_result(
+                        combined,
+                        start_yaw=start_yaw,
+                        goal_yaw=goal_yaw,
+                        segment_directions=(
+                            direction,
+                            *(1 for _ in range(len(combined) - 2)),
+                        ),
+                    )
+                    if result is not None:
+                        return result
         return None
 
     def _grid_seed(
@@ -1966,6 +2046,7 @@ class StopTurnStateLatticePlanner:
         goal_cell: tuple[int, int],
         exclusions: tuple[tuple[float, float, float], ...],
         deadline_monotonic: float | None = None,
+        minimum_center_clearance: float | None = None,
     ) -> list[tuple[int, int]]:
         """Fast topology search; exact SE(2) checks remain authoritative."""
         start_index = self.geometry.index(*start_cell)
@@ -1997,7 +2078,14 @@ class StopTurnStateLatticePlanner:
                 next_index = self.geometry.index(next_column, next_row)
                 if (
                     next_index not in {start_index, goal_index}
-                    and not self.geometry.robot_navigable_mask[next_index]
+                    and (
+                        not self.geometry.robot_navigable_mask[next_index]
+                        or (
+                            minimum_center_clearance is not None
+                            and self.geometry.static_clearance[next_index] + 1e-9
+                            < float(minimum_center_clearance)
+                        )
+                    )
                 ):
                     continue
                 if delta_x and delta_y:
@@ -2006,6 +2094,15 @@ class StopTurnStateLatticePlanner:
                     if not (
                         self.geometry.robot_navigable_mask[side_a]
                         and self.geometry.robot_navigable_mask[side_b]
+                        and (
+                            minimum_center_clearance is None
+                            or (
+                                self.geometry.static_clearance[side_a] + 1e-9
+                                >= float(minimum_center_clearance)
+                                and self.geometry.static_clearance[side_b] + 1e-9
+                                >= float(minimum_center_clearance)
+                            )
+                        )
                     ):
                         continue
                 world_x, world_y = self.saved_map.cell_center(next_column, next_row)
@@ -2032,6 +2129,256 @@ class StopTurnStateLatticePlanner:
         output.reverse()
         return output
 
+    def _minimum_turn_grid_seed(
+        self,
+        start_cell: tuple[int, int],
+        goal_cell: tuple[int, int],
+        exclusions: tuple[tuple[float, float, float], ...],
+        deadline_monotonic: float | None = None,
+        minimum_center_clearance: float | None = None,
+    ) -> list[tuple[int, int]]:
+        """Find a width-valid topology seed with few direction changes.
+
+        The ordinary grid seed minimizes distance. That can select a short
+        staircase around an obstacle even when a slightly longer route has
+        one fewer stop-turn boundary. Direction is therefore part of this
+        search state and the lexicographic cost minimizes grid turns before
+        distance. Exact footprint, rotation-sweep, and route ranking checks
+        remain authoritative after the seed is canonicalized.
+        """
+        directions = (
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        )
+        start_index = self.geometry.index(*start_cell)
+        goal_index = self.geometry.index(*goal_cell)
+        start_state = (start_index, -1)
+        costs: dict[tuple[int, int], tuple[int, float]] = {
+            start_state: (0, 0.0)
+        }
+        parents: dict[
+            tuple[int, int], tuple[int, int] | None
+        ] = {start_state: None}
+        queue: list[
+            tuple[float, float, float, int, tuple[int, int]]
+        ] = []
+        sequence = 0
+        initial_heuristic = math.hypot(
+            goal_cell[0] - start_cell[0], goal_cell[1] - start_cell[1]
+        )
+        heapq.heappush(
+            queue,
+            (0.0, initial_heuristic, 0.0, sequence, start_state),
+        )
+        goal_state: tuple[int, int] | None = None
+        while queue:
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                return []
+            turns, _, distance, _, state = heapq.heappop(queue)
+            best_cost = costs.get(state)
+            if best_cost is None or (int(turns), distance) != best_cost:
+                continue
+            index, previous_direction = state
+            if index == goal_index:
+                goal_state = state
+                break
+            row, column = divmod(index, self.saved_map.width)
+            for direction_index, (delta_x, delta_y) in enumerate(directions):
+                next_column = column + delta_x
+                next_row = row + delta_y
+                if not (
+                    0 <= next_column < self.saved_map.width
+                    and 0 <= next_row < self.saved_map.height
+                ):
+                    continue
+                next_index = self.geometry.index(next_column, next_row)
+                if (
+                    next_index not in {start_index, goal_index}
+                    and (
+                        not self.geometry.robot_navigable_mask[next_index]
+                        or (
+                            minimum_center_clearance is not None
+                            and self.geometry.static_clearance[next_index] + 1e-9
+                            < float(minimum_center_clearance)
+                        )
+                    )
+                ):
+                    continue
+                if delta_x and delta_y:
+                    side_a = self.geometry.index(column + delta_x, row)
+                    side_b = self.geometry.index(column, row + delta_y)
+                    if not (
+                        self.geometry.robot_navigable_mask[side_a]
+                        and self.geometry.robot_navigable_mask[side_b]
+                        and (
+                            minimum_center_clearance is None
+                            or (
+                                self.geometry.static_clearance[side_a] + 1e-9
+                                >= float(minimum_center_clearance)
+                                and self.geometry.static_clearance[side_b] + 1e-9
+                                >= float(minimum_center_clearance)
+                            )
+                        )
+                    ):
+                        continue
+                world_x, world_y = self.saved_map.cell_center(
+                    next_column, next_row
+                )
+                if self._excluded(world_x, world_y, exclusions):
+                    continue
+                next_turns = int(turns) + int(
+                    previous_direction >= 0
+                    and previous_direction != direction_index
+                )
+                next_distance = distance + math.hypot(delta_x, delta_y)
+                next_state = (next_index, direction_index)
+                next_cost = (next_turns, next_distance)
+                if next_cost >= costs.get(next_state, (math.inf, math.inf)):
+                    continue
+                costs[next_state] = next_cost
+                parents[next_state] = state
+                heuristic = math.hypot(
+                    goal_cell[0] - next_column,
+                    goal_cell[1] - next_row,
+                )
+                sequence += 1
+                heapq.heappush(
+                    queue,
+                    (
+                        float(next_turns),
+                        next_distance + heuristic,
+                        next_distance,
+                        sequence,
+                        next_state,
+                    ),
+                )
+        if goal_state is None:
+            return []
+        output: list[tuple[int, int]] = []
+        cursor: tuple[int, int] | None = goal_state
+        while cursor is not None:
+            row, column = divmod(cursor[0], self.saved_map.width)
+            output.append((column, row))
+            cursor = parents[cursor]
+        output.reverse()
+        return output
+
+    def _clearance_levels(self) -> tuple[float, ...]:
+        """Center-clearance bands, widest first, down to the hard reserve."""
+        preferred = self.half_width + self.padding + self.preferred_side_margin
+        hard = self.half_width + self.padding + self.hard_side_margin
+        if preferred <= hard + 1e-9:
+            return (hard,)
+        # One-centimetre bands are finer than the 5 cm Saved Map cells while
+        # keeping recovery planning bounded. The first exact-valid band wins;
+        # distance and minimum-turn seeds compete only within that width class.
+        step = 0.01
+        count = max(1, math.ceil((preferred - hard) / step))
+        levels = [max(hard, preferred - index * step) for index in range(count + 1)]
+        levels[-1] = hard
+        return tuple(dict.fromkeys(round(value, 6) for value in levels))
+
+    def _single_turn_visibility_candidate(
+        self,
+        start: dict[str, float],
+        goal: dict[str, float],
+        exclusions: tuple[tuple[float, float, float], ...],
+        *,
+        maximum_total_length: float,
+        maximum_turn_count: int,
+        minimum_center_clearance: float,
+        start_yaw: float,
+        goal_yaw: float | None,
+        deadline_monotonic: float | None = None,
+    ) -> StopTurnRoute | None:
+        """Move one turn waypoint off the grid seed when both legs are visible.
+
+        Eight-connected seeds can represent an oblique leg only as alternating
+        grid headings. A useful one-turn waypoint may therefore lie beside,
+        rather than on, both the shortest-distance and minimum-grid-turn
+        seeds. Search turn-safe cell centers inside a bounded path-length
+        ellipse, then retain only exact-valid routes in the same clearance
+        band. The length bound is supplied by the caller so removing one stop
+        cannot justify an arbitrarily large detour.
+        """
+        start_x = float(start["x"])
+        start_y = float(start["y"])
+        goal_x = float(goal["x"])
+        goal_y = float(goal["y"])
+        required_side_clearance = max(
+            0.0,
+            float(minimum_center_clearance)
+            - self.half_width
+            - self.padding,
+        )
+        best: StopTurnRoute | None = None
+        for row in range(self.saved_map.height):
+            for column in range(self.saved_map.width):
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    return best
+                index = self.geometry.index(column, row)
+                if (
+                    not self.geometry.turn_safe_mask[index]
+                    or self.geometry.static_clearance[index] + 1e-9
+                    < float(minimum_center_clearance)
+                ):
+                    continue
+                waypoint_x, waypoint_y = self.saved_map.cell_center(column, row)
+                if (
+                    math.hypot(waypoint_x - start_x, waypoint_y - start_y)
+                    + math.hypot(goal_x - waypoint_x, goal_y - waypoint_y)
+                    > float(maximum_total_length) + 1e-9
+                ):
+                    continue
+                waypoint = {"x": waypoint_x, "y": waypoint_y}
+                if (
+                    self._excluded(waypoint_x, waypoint_y, exclusions)
+                    or self._segment_excluded(start, waypoint, exclusions)
+                    or self._segment_excluded(waypoint, goal, exclusions)
+                    or not self._segment_has_center_clearance(
+                        start,
+                        waypoint,
+                        minimum_center_clearance,
+                    )
+                    or not self._segment_has_center_clearance(
+                        waypoint,
+                        goal,
+                        minimum_center_clearance,
+                    )
+                ):
+                    continue
+                result = self._route_result(
+                    [
+                        {"x": start_x, "y": start_y},
+                        waypoint,
+                        {"x": goal_x, "y": goal_y},
+                    ],
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                )
+                if (
+                    result is None
+                    or result.metadata.turn_count > int(maximum_turn_count)
+                    or result.metadata.minimum_side_clearance + 1e-9
+                    < required_side_clearance
+                ):
+                    continue
+                if best is None or self.ranking_key(result) < self.ranking_key(best):
+                    best = result
+        return best
+
     def _canonical_route_from_seed(
         self,
         seed: list[tuple[int, int]],
@@ -2039,6 +2386,7 @@ class StopTurnStateLatticePlanner:
         goal: dict[str, float],
         exclusions: tuple[tuple[float, float, float], ...] = (),
         deadline_monotonic: float | None = None,
+        minimum_center_clearance: float | None = None,
     ) -> list[dict[str, float]]:
         if len(seed) < 2:
             return []
@@ -2076,6 +2424,12 @@ class StopTurnStateLatticePlanner:
                     raw[following]["x"] - raw[index]["x"],
                 )
                 if self._segment_excluded(raw[index], raw[following], exclusions):
+                    continue
+                if not self._segment_has_center_clearance(
+                    raw[index],
+                    raw[following],
+                    minimum_center_clearance,
+                ):
                     continue
                 if index > 0 and abs(_angle_delta(outgoing_yaw, incoming_yaw)) > math.radians(1.0):
                     if self._excluded(raw[index]["x"], raw[index]["y"], exclusions):
@@ -2147,7 +2501,7 @@ class StopTurnStateLatticePlanner:
             float(start_yaw),
             first_heading,
             half_length=self.half_length,
-            half_width=self.half_width,
+            half_width=self.half_width + self.hard_side_margin,
             padding=self.padding,
         ).valid:
             return None
@@ -2164,7 +2518,7 @@ class StopTurnStateLatticePlanner:
             last_heading,
             float(goal_yaw),
             half_length=self.half_length,
-            half_width=self.half_width,
+            half_width=self.half_width + self.hard_side_margin,
             padding=self.padding,
         ).valid:
             return None
@@ -2172,7 +2526,7 @@ class StopTurnStateLatticePlanner:
             self.saved_map,
             route,
             half_length=self.half_length,
-            half_width=self.half_width,
+            half_width=self.half_width + self.hard_side_margin,
             padding=self.padding,
             segment_directions=directions,
         )
@@ -2267,26 +2621,73 @@ class StopTurnStateLatticePlanner:
             )
             if result is not None:
                 candidate_pool.append(result)
-        seed = self._grid_seed(
-            start_cell,
-            goal_cell,
-            forbidden,
-            deadline_monotonic,
-        )
-        seeded_route = self._canonical_route_from_seed(
-            seed,
-            start,
-            goal,
-            forbidden,
-            deadline_monotonic,
-        )
         seeded_result: StopTurnRoute | None = None
-        if seeded_route:
-            seeded_result = self._route_result(
-                seeded_route, start_yaw=start_yaw, goal_yaw=goal_yaw
-            )
-            if seeded_result is not None:
-                candidate_pool.append(seeded_result)
+        for seed_clearance in self._clearance_levels():
+            level_results: list[StopTurnRoute] = []
+            seen_routes: set[tuple[tuple[float, float], ...]] = set()
+            for seed_search in (
+                self._minimum_turn_grid_seed,
+                self._grid_seed,
+            ):
+                seed = seed_search(
+                    start_cell,
+                    goal_cell,
+                    forbidden,
+                    deadline_monotonic,
+                    minimum_center_clearance=seed_clearance,
+                )
+                seeded_route = self._canonical_route_from_seed(
+                    seed,
+                    start,
+                    goal,
+                    forbidden,
+                    deadline_monotonic,
+                    minimum_center_clearance=seed_clearance,
+                )
+                if not seeded_route:
+                    continue
+                route_key = tuple(
+                    (round(point["x"], 6), round(point["y"], 6))
+                    for point in seeded_route
+                )
+                if route_key in seen_routes:
+                    continue
+                seen_routes.add(route_key)
+                result = self._route_result(
+                    seeded_route,
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                )
+                if result is not None:
+                    level_results.append(result)
+            if level_results:
+                baseline = min(level_results, key=self.ranking_key)
+                if len(baseline.points) > 3:
+                    # One removed stop has a geometry-scaled execution
+                    # overhead equivalent to one chassis length of travel.
+                    # Use that as the maximum extra distance worth searching.
+                    single_turn = self._single_turn_visibility_candidate(
+                        start,
+                        goal,
+                        forbidden,
+                        maximum_total_length=(
+                            min(
+                                result.metadata.total_length
+                                for result in level_results
+                            )
+                            + 2.0 * (self.half_length + self.padding)
+                        ),
+                        maximum_turn_count=baseline.metadata.turn_count - 1,
+                        minimum_center_clearance=seed_clearance,
+                        start_yaw=start_yaw,
+                        goal_yaw=goal_yaw,
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                    if single_turn is not None:
+                        level_results.append(single_turn)
+                candidate_pool.extend(level_results)
+                seeded_result = min(level_results, key=self.ranking_key)
+                break
         # The 8-connected topology seed exposes oblique alternatives to both
         # Manhattan routes.  The full heading lattice is only needed if that
         # exact candidate cannot be built.
@@ -2587,10 +2988,22 @@ class StopTurnStateLatticePlanner:
         )
         if forbidden and planning_start_cell is not None:
             static_seed = self._grid_seed(
-                planning_start_cell, goal_cell, (), deadline
+                planning_start_cell,
+                goal_cell,
+                (),
+                deadline,
+                minimum_center_clearance=(
+                    self.half_width + self.padding + self.hard_side_margin
+                ),
             )
             dynamic_seed = self._grid_seed(
-                planning_start_cell, goal_cell, forbidden, deadline
+                planning_start_cell,
+                goal_cell,
+                forbidden,
+                deadline,
+                minimum_center_clearance=(
+                    self.half_width + self.padding + self.hard_side_margin
+                ),
             )
             if (
                 static_seed
@@ -2689,26 +3102,30 @@ class StopTurnStateLatticePlanner:
     ) -> tuple[float, float, float, int, float, float, float, float]:
         metadata = route.metadata
         # Exact footprint and turn-sweep validation are hard filters before
-        # ranking.  Within the geometry-derived adequate band, execution time
-        # and turn complexity dominate; clearance is only a bounded tie-break.
+        # ranking. Prefer a centered comfort-clear route before considering
+        # execution time: total passage width cannot reveal that the centerline
+        # is only a few millimetres from one wall.
         rotation_radius = math.hypot(
             self.half_length + self.padding,
-            self.half_width + self.padding,
+            self.half_width + self.padding + self.hard_side_margin,
         )
-        required_passage = 2.0 * rotation_radius
+        required_side_clearance = self.preferred_side_margin
+        required_passage = 2.0 * (
+            self.half_width + self.padding + required_side_clearance
+        )
         passage_shortfall = max(
             0.0,
             required_passage - metadata.minimum_passage_width,
         ) / max(1e-9, required_passage)
-        # Directional rectangle validation already proves translation safety;
-        # raw radial clearance can be below the corner radius beside a wall
-        # without making a straight passage unsafe. Passage width is the
-        # geometry-aware comfort band used here.
+        side_shortfall = max(
+            0.0,
+            required_side_clearance - metadata.minimum_side_clearance,
+        ) / max(1e-9, required_side_clearance)
         turn_shortfall = max(
             0.0,
             -metadata.minimum_turn_clearance,
         ) / max(1e-9, rotation_radius)
-        safety_shortfall = passage_shortfall + turn_shortfall
+        safety_shortfall = passage_shortfall + side_shortfall + turn_shortfall
         safety_band = 0.0 if safety_shortfall <= 1e-9 else 1.0
         return (
             safety_band,
@@ -2717,8 +3134,11 @@ class StopTurnStateLatticePlanner:
             metadata.turn_count,
             metadata.total_turn_angle,
             metadata.total_length,
+            -min(
+                metadata.minimum_side_clearance,
+                required_side_clearance,
+            ),
             -min(metadata.minimum_passage_width, required_passage),
-            -min(metadata.minimum_static_clearance, rotation_radius),
         )
 
     def plan_candidates(
@@ -2776,7 +3196,7 @@ class StopTurnStateLatticePlanner:
                 self.saved_map,
                 candidate.points,
                 half_length=self.half_length,
-                half_width=self.half_width,
+                half_width=self.half_width + self.hard_side_margin,
                 padding=self.padding,
                 turn_robustness_radius=self.turn_robustness_radius,
                 segment_directions=(
@@ -3024,11 +3444,26 @@ class ScanMapMatch:
 @dataclass(frozen=True, slots=True)
 class LocalizationRaycastConsistency:
     comparable_beams: int
-    matched_beams: int
-    match_ratio: float
+    static_matches: int
+    dynamic_occlusions: int
+    map_contradictions: int
+    inconclusive_map_hits: int
+    static_match_ratio: float
+    dynamic_occlusion_ratio: float
+    contradiction_ratio: float
     median_error: float
     p90_error: float
     mean_error: float
+
+    @property
+    def matched_beams(self) -> int:
+        """Backward-compatible name for exact saved-map matches."""
+        return self.static_matches
+
+    @property
+    def match_ratio(self) -> float:
+        """Backward-compatible name for the static-match ratio."""
+        return self.static_match_ratio
 
 
 @dataclass(frozen=True, slots=True)
@@ -3090,6 +3525,21 @@ def heading_diversity(
                 abs(math.atan2(math.sin(left - right), math.cos(left - right))),
             )
     return HeadingDiversity(bins, span)
+
+
+def heading_position_spread(
+    positions: Iterable[tuple[float, float]],
+) -> float:
+    """Maximum candidate-position separation across independent headings."""
+    values = [(float(x), float(y)) for x, y in positions]
+    return max(
+        (
+            math.hypot(left_x - right_x, left_y - right_y)
+            for left_x, left_y in values
+            for right_x, right_y in values
+        ),
+        default=0.0,
+    )
 
 
 def evaluate_corridor(
@@ -3718,23 +4168,38 @@ def scan_raycast_consistency(
     minimum_usable_range: float = 0.20,
     maximum_usable_range: float = 6.0,
     match_tolerance: float = 0.15,
+    minimum_reliable_structure_span: float = 0.75,
 ) -> LocalizationRaycastConsistency:
-    """Compare measured ranges with first-hit ranges from the saved map.
+    """Classify measured ranges against first-hit ranges from the saved map.
 
-    Unlike endpoint proximity, this detects an occupied endpoint hidden behind
-    a nearer mapped wall. Rays without a conclusive static-map hit are omitted
-    from the denominator and therefore cannot create positive evidence.
+    A nearer measurement is a dynamic occlusion, not direct evidence that the
+    pose is wrong. A measurement beyond a conclusive saved-map hit is a map
+    contradiction and is the strong negative evidence used by localization.
+    Rays without a conclusive static-map hit are omitted from the denominator.
     """
     measurements = list(ranges)
     if not measurements:
         return LocalizationRaycastConsistency(
-            0, 0, 0.0, math.inf, math.inf, math.inf
+            comparable_beams=0,
+            static_matches=0,
+            dynamic_occlusions=0,
+            map_contradictions=0,
+            inconclusive_map_hits=0,
+            static_match_ratio=0.0,
+            dynamic_occlusion_ratio=0.0,
+            contradiction_ratio=0.0,
+            median_error=math.inf,
+            p90_error=math.inf,
+            mean_error=math.inf,
         )
     step = max(1, math.ceil(len(measurements) / max(1, int(maximum_beams))))
     lower = max(float(range_min), float(minimum_usable_range))
     upper = min(float(range_max), float(maximum_usable_range))
     errors: list[float] = []
-    matched = 0
+    static_matches = 0
+    dynamic_occlusions = 0
+    map_contradictions = 0
+    inconclusive_map_hits = 0
     for index, distance, _, _ in _scan_endpoints(
         measurements,
         angle_min=float(angle_min),
@@ -3747,26 +4212,61 @@ def scan_raycast_consistency(
         step=step,
     ):
         angle = float(laser_yaw) + float(angle_min) + index * float(angle_increment)
-        expected = saved_map.raycast_static_range(
+        hit = saved_map.raycast_static_hit(
             float(laser_x),
             float(laser_y),
             angle,
             minimum_range=lower,
             maximum_range=upper,
         )
-        if expected is None:
+        if hit is None:
             continue
-        error = abs(distance - expected)
-        errors.append(error)
+        expected, hit_column, hit_row = hit
+        delta = distance - expected
+        error = abs(delta)
         if error <= float(match_tolerance):
-            matched += 1
+            static_matches += 1
+            errors.append(error)
+        elif delta < 0.0:
+            dynamic_occlusions += 1
+            errors.append(error)
+        elif (
+            hit_column is not None
+            and hit_row is not None
+            and saved_map.is_reliable_static_structure(
+                hit_column,
+                hit_row,
+                minimum_span=float(minimum_reliable_structure_span),
+            )
+        ):
+            map_contradictions += 1
+            errors.append(error)
+        else:
+            # A missing isolated pixel or short mapped object is not strong
+            # enough evidence that the pose is wrong. It remains visible in
+            # diagnostics but cannot dilute or inflate the conclusive ratios.
+            inconclusive_map_hits += 1
     ordered = sorted(errors)
     p90_index = max(0, math.ceil(0.9 * len(ordered)) - 1)
     comparable = len(ordered)
     return LocalizationRaycastConsistency(
         comparable_beams=comparable,
-        matched_beams=matched,
-        match_ratio=(0.0 if comparable == 0 else round(matched / comparable, 4)),
+        static_matches=static_matches,
+        dynamic_occlusions=dynamic_occlusions,
+        map_contradictions=map_contradictions,
+        inconclusive_map_hits=inconclusive_map_hits,
+        static_match_ratio=(
+            0.0 if comparable == 0
+            else round(static_matches / comparable, 4)
+        ),
+        dynamic_occlusion_ratio=(
+            0.0 if comparable == 0
+            else round(dynamic_occlusions / comparable, 4)
+        ),
+        contradiction_ratio=(
+            0.0 if comparable == 0
+            else round(map_contradictions / comparable, 4)
+        ),
         median_error=(statistics.median(ordered) if ordered else math.inf),
         p90_error=(ordered[p90_index] if ordered else math.inf),
         mean_error=(statistics.fmean(ordered) if ordered else math.inf),
@@ -3830,6 +4330,9 @@ class SavedOccupancyMap:
     occupancy: list[int]
     navigation_geometry: MapNavigationGeometry | None = field(
         default=None, repr=False
+    )
+    reliable_structure_cache: dict[tuple[int, int, int], bool] = field(
+        default_factory=dict, init=False, repr=False
     )
 
     @classmethod
@@ -3969,6 +4472,32 @@ class SavedOccupancyMap:
         Reaching unknown space or leaving the map before an occupied cell is
         deliberately inconclusive so callers retain the live obstacle point.
         """
+        hit = self.raycast_static_hit(
+            x,
+            y,
+            angle,
+            minimum_range=minimum_range,
+            maximum_range=maximum_range,
+            unknown_is_blocked=unknown_is_blocked,
+        )
+        return None if hit is None else hit[0]
+
+    def raycast_static_hit(
+        self,
+        x: float,
+        y: float,
+        angle: float,
+        *,
+        minimum_range: float,
+        maximum_range: float,
+        unknown_is_blocked: bool = False,
+    ) -> tuple[float, int | None, int | None] | None:
+        """Return first-hit range and its occupied cell when conclusive.
+
+        The cell coordinates let localization distinguish a trustworthy wall
+        from an isolated or short-lived mapped object. ``None`` cell values
+        are reserved for callers that explicitly treat unknown as blocked.
+        """
         lower = max(0.0, float(minimum_range))
         upper = max(lower, float(maximum_range))
         # Amanatides-Woo traversal visits every crossed cell exactly once.
@@ -4018,12 +4547,16 @@ class SavedOccupancyMap:
         entered_at = lower
         while entered_at <= upper:
             if not (0 <= column < self.width and 0 <= row < self.height):
-                return entered_at if unknown_is_blocked else None
+                return (
+                    (entered_at, None, None) if unknown_is_blocked else None
+                )
             value = self.value_at(column, row)
             if value < 0:
-                return entered_at if unknown_is_blocked else None
+                return (
+                    (entered_at, None, None) if unknown_is_blocked else None
+                )
             if value >= 65:
-                return max(lower, entered_at)
+                return max(lower, entered_at), column, row
             if max_t_x < max_t_y:
                 entered_at = max_t_x
                 max_t_x += delta_t_x
@@ -4039,6 +4572,75 @@ class SavedOccupancyMap:
                 column += step_x
                 row += step_y
         return None
+
+    def is_reliable_static_structure(
+        self,
+        column: int,
+        row: int,
+        *,
+        minimum_span: float,
+    ) -> bool:
+        """Whether an occupied hit belongs to a continuous wall-like line.
+
+        A contradiction is strong negative pose evidence only when the map hit
+        is structural. Sampling multiple line orientations supports angled
+        walls while requiring uninterrupted occupied cells rejects speckles,
+        chair legs, and short furniture edges. Results are cached per map cell
+        because the saved map is immutable while localization is running.
+        """
+        if (
+            not (0 <= column < self.width and 0 <= row < self.height)
+            or self.value_at(column, row) < 65
+        ):
+            return False
+        required_cells = max(
+            1,
+            math.ceil(
+                max(0.0, float(minimum_span)) / self.resolution - 1e-9
+            ),
+        )
+        cache_key = (column, row, required_cells)
+        cached = self.reliable_structure_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if required_cells <= 1:
+            self.reliable_structure_cache[cache_key] = True
+            return True
+
+        # Half a circle is sufficient because each candidate line is sampled
+        # in both directions. Five-degree spacing limits perpendicular drift
+        # to less than one 5 cm cell across the configured 0.75 m span.
+        for angle_index in range(36):
+            line_angle = angle_index * math.pi / 36.0
+            direction_x = math.cos(line_angle)
+            direction_y = math.sin(line_angle)
+            extents: list[int] = []
+            for sign in (-1, 1):
+                extent = 0
+                previous_cell = (column, row)
+                for step in range(1, required_cells + 1):
+                    check_cell = (
+                        round(column + sign * step * direction_x),
+                        round(row + sign * step * direction_y),
+                    )
+                    if check_cell == previous_cell:
+                        continue
+                    previous_cell = check_cell
+                    check_column, check_row = check_cell
+                    if (
+                        not (0 <= check_column < self.width)
+                        or not (0 <= check_row < self.height)
+                        or self.value_at(check_column, check_row) < 65
+                    ):
+                        break
+                    extent = step
+                extents.append(extent)
+            span_cells = extents[0] + 1 + extents[1]
+            if span_cells >= required_cells:
+                self.reliable_structure_cache[cache_key] = True
+                return True
+        self.reliable_structure_cache[cache_key] = False
+        return False
 
     def segment_crosses_unknown(
         self,
@@ -4498,12 +5100,10 @@ def localization_verification(
     maximum_p90_residual: float,
     raycast_comparable_beams: int,
     minimum_raycast_beams: int,
-    raycast_match_ratio: float,
-    minimum_raycast_match_ratio: float,
-    raycast_median_error: float,
-    maximum_raycast_median_error: float,
-    raycast_p90_error: float,
-    maximum_raycast_p90_error: float,
+    raycast_static_matches: int,
+    minimum_raycast_static_matches: int,
+    raycast_contradiction_ratio: float,
+    maximum_raycast_contradiction_ratio: float,
     heading_required: bool,
     heading_ready: bool,
     amcl_fresh: bool,
@@ -4543,15 +5143,15 @@ def localization_verification(
     if p90_residual > maximum_p90_residual:
         return LocalizationVerification(False, "SCAN_P90_RESIDUAL_TOO_HIGH")
     if raycast_comparable_beams < minimum_raycast_beams:
-        return LocalizationVerification(False, "RAYCAST_INSUFFICIENT_BEAMS")
-    if raycast_match_ratio < minimum_raycast_match_ratio:
-        return LocalizationVerification(False, "RAYCAST_MATCH_TOO_LOW")
-    if raycast_median_error > maximum_raycast_median_error:
-        return LocalizationVerification(False, "RAYCAST_MEDIAN_ERROR_TOO_HIGH")
-    if raycast_p90_error > maximum_raycast_p90_error:
-        return LocalizationVerification(False, "RAYCAST_P90_ERROR_TOO_HIGH")
+        return LocalizationVerification(
+            False, "RAYCAST_INSUFFICIENT_COMPARABLE_BEAMS"
+        )
+    if raycast_contradiction_ratio > maximum_raycast_contradiction_ratio:
+        return LocalizationVerification(False, "TOO_MANY_MAP_CONTRADICTIONS")
+    if raycast_static_matches < minimum_raycast_static_matches:
+        return LocalizationVerification(False, "INSUFFICIENT_STATIC_EVIDENCE")
     if heading_required and not heading_ready:
-        return LocalizationVerification(False, "HEADING_EVIDENCE_INSUFFICIENT")
+        return LocalizationVerification(False, "INSUFFICIENT_HEADING_DIVERSITY")
     if confidence < confidence_threshold:
         return LocalizationVerification(False, "LOW_CONFIDENCE")
     return LocalizationVerification(True, "ACCEPTED")

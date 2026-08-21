@@ -38,6 +38,7 @@ from navigation_core import (  # noqa: E402
     filter_static_map_scan,
     find_start_escape,
     heading_diversity,
+    heading_position_spread,
     deskew_scan_points,
     localization_confidence,
     localization_verification,
@@ -101,12 +102,10 @@ def _verification_result(**overrides: object):
         "maximum_p90_residual": 0.115,
         "raycast_comparable_beams": 40,
         "minimum_raycast_beams": 25,
-        "raycast_match_ratio": 0.80,
-        "minimum_raycast_match_ratio": 0.55,
-        "raycast_median_error": 0.04,
-        "maximum_raycast_median_error": 0.15,
-        "raycast_p90_error": 0.40,
-        "maximum_raycast_p90_error": 1.0,
+        "raycast_static_matches": 30,
+        "minimum_raycast_static_matches": 20,
+        "raycast_contradiction_ratio": 0.05,
+        "maximum_raycast_contradiction_ratio": 0.20,
         "heading_required": True,
         "heading_ready": True,
         "amcl_fresh": True,
@@ -147,6 +146,38 @@ def _boxed_raycast_fixture(
     return saved, laser_x, laser_y, increment, [
         float(distance) for distance in ranges if distance is not None
     ]
+
+
+def _classified_raycast_fixture(
+    *,
+    static_matches: int,
+    dynamic_occlusions: int,
+    map_contradictions: int,
+):
+    beam_count = static_matches + dynamic_occlusions + map_contradictions
+    saved, laser_x, laser_y, increment, expected = _boxed_raycast_fixture(
+        beam_count
+    )
+    measured = list(expected)
+    dynamic_end = static_matches + dynamic_occlusions
+    for index in range(static_matches, dynamic_end):
+        measured[index] = max(0.2, measured[index] - 0.50)
+    for index in range(dynamic_end, beam_count):
+        measured[index] += 0.50
+    return scan_raycast_consistency(
+        saved,
+        measured,
+        angle_min=-math.pi,
+        angle_increment=increment,
+        range_min=0.1,
+        range_max=8.0,
+        laser_x=laser_x,
+        laser_y=laser_y,
+        laser_yaw=0.0,
+        maximum_beams=beam_count,
+        maximum_usable_range=8.0,
+        match_tolerance=0.15,
+    )
 
 
 def _cell_center(saved: SavedOccupancyMap, column: int, row: int) -> tuple[float, float]:
@@ -879,13 +910,17 @@ def test_endpoint_match_cannot_hide_wrong_first_hit_raycast() -> None:
         size, size, 0.1, 0.0, 0.0, 0.0, [0] * (size * size)
     )
     laser_x = laser_y = 5.05
-    for x, y in (
-        (6.05, 5.05), (7.05, 5.05),
-        (5.05, 6.05), (5.05, 7.05),
-        (4.05, 5.05), (3.05, 5.05),
-        (5.05, 4.05), (5.05, 3.05),
-    ):
-        column, row = saved.world_to_cell(x, y) or (-1, -1)
+    # Each false first hit belongs to a substantial mapped wall, so seeing
+    # through it remains a conclusive contradiction rather than map speckle.
+    for offset in range(-4, 5):
+        for column, row in (
+            (60, 50 + offset),
+            (50 + offset, 60),
+            (40, 50 + offset),
+            (50 + offset, 40),
+        ):
+            saved.occupancy[row * size + column] = 100
+    for column, row in ((70, 50), (50, 70), (30, 50), (50, 30)):
         saved.occupancy[row * size + column] = 100
     common = {
         "angle_min": 0.0,
@@ -906,7 +941,10 @@ def test_endpoint_match_cannot_hide_wrong_first_hit_raycast() -> None:
 
     assert endpoint.score == 1.0
     assert raycast.comparable_beams == 4
-    assert raycast.match_ratio == 0.0
+    assert raycast.static_matches == 0
+    assert raycast.dynamic_occlusions == 0
+    assert raycast.map_contradictions == 4
+    assert raycast.contradiction_ratio == 1.0
     verdict = _verification_result(
         scan_valid_beams=endpoint.valid_beams,
         minimum_scan_beams=4,
@@ -917,12 +955,60 @@ def test_endpoint_match_cannot_hide_wrong_first_hit_raycast() -> None:
         p90_residual=endpoint.p90_residual,
         raycast_comparable_beams=raycast.comparable_beams,
         minimum_raycast_beams=4,
-        raycast_match_ratio=raycast.match_ratio,
-        raycast_median_error=raycast.median_error,
-        raycast_p90_error=raycast.p90_error,
+        raycast_static_matches=raycast.static_matches,
+        minimum_raycast_static_matches=4,
+        raycast_contradiction_ratio=raycast.contradiction_ratio,
     )
     assert not verdict.accepted
-    assert verdict.reason == "RAYCAST_MATCH_TOO_LOW"
+    assert verdict.reason == "TOO_MANY_MAP_CONTRADICTIONS"
+
+
+def test_missing_short_map_object_is_inconclusive_not_pose_contradiction() -> None:
+    size = 100
+    saved = SavedOccupancyMap(
+        size, size, 0.1, 0.0, 0.0, 0.0, [0] * (size * size)
+    )
+    # The scan sees a mapped endpoint at 2 m, beyond an isolated stale pixel
+    # at 1 m. The short object is not trustworthy enough to disprove the pose.
+    saved.occupancy[50 * size + 60] = 100
+    saved.occupancy[50 * size + 70] = 100
+    raycast = scan_raycast_consistency(
+        saved,
+        [2.0],
+        angle_min=0.0,
+        angle_increment=0.0,
+        range_min=0.1,
+        range_max=8.0,
+        laser_x=5.05,
+        laser_y=5.05,
+        laser_yaw=0.0,
+        maximum_beams=1,
+        match_tolerance=0.15,
+        minimum_reliable_structure_span=0.75,
+    )
+
+    assert raycast.comparable_beams == 0
+    assert raycast.map_contradictions == 0
+    assert raycast.inconclusive_map_hits == 1
+
+
+def test_angled_continuous_wall_is_reliable_static_structure() -> None:
+    size = 100
+    saved = SavedOccupancyMap(
+        size, size, 0.05, 0.0, 0.0, 0.0, [0] * (size * size)
+    )
+    center_column = center_row = 50
+    angle = math.radians(30.0)
+    for step in range(-10, 11):
+        column = round(center_column + step * math.cos(angle))
+        row = round(center_row + step * math.sin(angle))
+        saved.occupancy[row * size + column] = 100
+
+    assert saved.is_reliable_static_structure(
+        center_column,
+        center_row,
+        minimum_span=0.75,
+    )
 
 
 def test_correct_pose_passes_endpoint_and_raycast_verification() -> None:
@@ -950,13 +1036,14 @@ def test_correct_pose_passes_endpoint_and_raycast_verification() -> None:
         median_residual=endpoint.median_residual,
         p90_residual=endpoint.p90_residual,
         raycast_comparable_beams=raycast.comparable_beams,
-        raycast_match_ratio=raycast.match_ratio,
-        raycast_median_error=raycast.median_error,
-        raycast_p90_error=raycast.p90_error,
+        raycast_static_matches=raycast.static_matches,
+        raycast_contradiction_ratio=raycast.contradiction_ratio,
     )
 
     assert endpoint.score >= 0.9
-    assert raycast.match_ratio == 1.0
+    assert raycast.static_match_ratio == 1.0
+    assert raycast.dynamic_occlusions == 0
+    assert raycast.map_contradictions == 0
     assert verdict.accepted
     assert verdict.reason == "ACCEPTED"
 
@@ -977,28 +1064,77 @@ def test_raycast_verification_tolerates_partial_dynamic_occlusion() -> None:
         laser_y=laser_y,
         laser_yaw=0.0,
         maximum_beams=40,
+        maximum_usable_range=8.0,
         match_tolerance=0.15,
     )
     verdict = _verification_result(
         raycast_comparable_beams=raycast.comparable_beams,
-        raycast_match_ratio=raycast.match_ratio,
-        raycast_median_error=raycast.median_error,
-        raycast_p90_error=raycast.p90_error,
+        raycast_static_matches=raycast.static_matches,
+        raycast_contradiction_ratio=raycast.contradiction_ratio,
     )
 
-    assert 0.75 <= raycast.match_ratio < 1.0
+    assert raycast.static_matches == 32
+    assert raycast.dynamic_occlusions == 8
+    assert raycast.map_contradictions == 0
     assert verdict.accepted
 
 
 def test_insufficient_raycast_evidence_never_defaults_to_pass() -> None:
     verdict = _verification_result(
         raycast_comparable_beams=8,
-        raycast_match_ratio=1.0,
-        raycast_median_error=0.0,
-        raycast_p90_error=0.0,
+        raycast_static_matches=8,
+        raycast_contradiction_ratio=0.0,
     )
     assert not verdict.accepted
-    assert verdict.reason == "RAYCAST_INSUFFICIENT_BEAMS"
+    assert verdict.reason == "RAYCAST_INSUFFICIENT_COMPARABLE_BEAMS"
+
+
+def test_dynamic_occlusion_is_not_equivalent_to_map_contradiction() -> None:
+    occluded = _classified_raycast_fixture(
+        static_matches=30,
+        dynamic_occlusions=40,
+        map_contradictions=5,
+    )
+    contradictory = _classified_raycast_fixture(
+        static_matches=30,
+        dynamic_occlusions=5,
+        map_contradictions=40,
+    )
+
+    occluded_verdict = _verification_result(
+        raycast_comparable_beams=occluded.comparable_beams,
+        raycast_static_matches=occluded.static_matches,
+        raycast_contradiction_ratio=occluded.contradiction_ratio,
+    )
+    contradictory_verdict = _verification_result(
+        raycast_comparable_beams=contradictory.comparable_beams,
+        raycast_static_matches=contradictory.static_matches,
+        raycast_contradiction_ratio=contradictory.contradiction_ratio,
+    )
+
+    assert occluded.dynamic_occlusions == 40
+    assert occluded.map_contradictions == 5
+    assert occluded_verdict.accepted
+    assert contradictory.dynamic_occlusions == 5
+    assert contradictory.map_contradictions == 40
+    assert not contradictory_verdict.accepted
+    assert contradictory_verdict.reason == "TOO_MANY_MAP_CONTRADICTIONS"
+
+
+def test_extreme_dynamic_occlusion_fails_without_static_evidence() -> None:
+    raycast = _classified_raycast_fixture(
+        static_matches=8,
+        dynamic_occlusions=67,
+        map_contradictions=5,
+    )
+    verdict = _verification_result(
+        raycast_comparable_beams=raycast.comparable_beams,
+        raycast_static_matches=raycast.static_matches,
+        raycast_contradiction_ratio=raycast.contradiction_ratio,
+    )
+
+    assert not verdict.accepted
+    assert verdict.reason == "INSUFFICIENT_STATIC_EVIDENCE"
 
 
 def test_force_rescan_heading_diversity_rejects_a_thirty_degree_cluster() -> None:
@@ -1020,6 +1156,36 @@ def test_force_rescan_accepts_real_non_cardinal_heading_coverage() -> None:
     )
     assert len(observed.observed_bins) >= 4
     assert math.degrees(observed.span_radians) >= 150
+
+
+def test_force_rescan_heading_bins_progress_during_rotation() -> None:
+    headings = [0, 48, 96, 144, 192, 240]
+    observed_counts = [
+        len(heading_diversity(
+            map(math.radians, headings[:count]), bin_count=8
+        ).observed_bins)
+        for count in range(1, len(headings) + 1)
+    ]
+
+    assert observed_counts[0] == 1
+    assert observed_counts == sorted(observed_counts)
+    assert observed_counts[-1] >= 5
+
+
+def test_repeated_layout_candidate_must_stay_consistent_across_headings() -> None:
+    consistent_candidate = [
+        (1.00, 2.00),
+        (1.03, 1.98),
+        (0.98, 2.02),
+        (1.01, 2.01),
+    ]
+    aliased_candidate = [
+        *consistent_candidate[:2],
+        (2.10, 2.05),
+    ]
+
+    assert heading_position_spread(consistent_candidate) < 0.12
+    assert heading_position_spread(aliased_candidate) > 1.0
 
 
 def test_40cm_corridor_allows_straight_but_not_unsafe_rotation() -> None:
@@ -1608,6 +1774,166 @@ def test_route_execution_cost_includes_large_initial_turn() -> None:
     assert metadata.estimated_time > metadata.total_length / 0.20
 
 
+def test_route_metadata_rejects_total_width_as_proof_of_side_clearance() -> None:
+    saved = _manual_map(80, 40, _free_rectangle(1, 78, 1, 38))
+    near_wall = route_geometry_metadata(
+        saved,
+        saved.navigation_geometry,
+        ({"x": 0.50, "y": 0.16}, {"x": 3.00, "y": 0.16}),
+        half_length=0.15,
+        half_width=0.10,
+    )
+    centered = route_geometry_metadata(
+        saved,
+        saved.navigation_geometry,
+        ({"x": 0.50, "y": 1.00}, {"x": 3.00, "y": 1.00}),
+        half_length=0.15,
+        half_width=0.10,
+    )
+
+    # Both centerlines see the same room width. Only the per-side body gap
+    # exposes that the first route is practically touching one wall.
+    assert near_wall.minimum_passage_width == pytest.approx(
+        centered.minimum_passage_width
+    )
+    assert near_wall.minimum_side_clearance == pytest.approx(0.01)
+    assert centered.minimum_side_clearance > 0.50
+
+
+def test_clearance_bands_prefer_centerline_over_shorter_wall_hugging_path() -> None:
+    free = _free_rectangle(2, 77, 2, 57) - _free_rectangle(30, 40, 10, 38)
+    saved = _manual_map(80, 60, free)
+    start = {"x": 0.50, "y": 1.50, "yaw": 0.0}
+    goal = {"x": 3.50, "y": 1.50}
+    shortest = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        turn_robustness_radius=0.0,
+        hard_side_margin=0.0,
+        preferred_side_margin=0.0,
+    ).plan(start, goal)
+    clearance_aware = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        turn_robustness_radius=0.0,
+        hard_side_margin=0.01,
+        preferred_side_margin=0.05,
+    ).plan(start, goal)
+
+    assert shortest is not None
+    assert clearance_aware is not None
+    assert shortest.metadata.minimum_side_clearance < 0.03
+    assert clearance_aware.metadata.minimum_side_clearance >= 0.05
+    assert clearance_aware.metadata.total_length > shortest.metadata.total_length
+
+
+def test_minimum_turn_seed_removes_extra_stop_without_losing_width() -> None:
+    free = (
+        _free_rectangle(3, 13, 3, 45)
+        | _free_rectangle(3, 70, 30, 40)
+    )
+    saved = _manual_map(75, 55, free)
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.01,
+        preferred_side_margin=0.05,
+        turn_robustness_radius=0.0,
+    )
+    start = {"x": 0.40, "y": 0.35, "yaw": math.pi}
+    goal = {"x": 2.50, "y": 1.65}
+    start_cell = saved.world_to_cell(start["x"], start["y"])
+    goal_cell = saved.world_to_cell(goal["x"], goal["y"])
+    assert start_cell is not None and goal_cell is not None
+
+    shortest_seed = planner._grid_seed(
+        start_cell,
+        goal_cell,
+        (),
+        minimum_center_clearance=0.15,
+    )
+    minimum_turn_seed = planner._minimum_turn_grid_seed(
+        start_cell,
+        goal_cell,
+        (),
+        minimum_center_clearance=0.15,
+    )
+    shortest = planner._route_result(
+        planner._canonical_route_from_seed(
+            shortest_seed,
+            start,
+            goal,
+            minimum_center_clearance=0.15,
+        ),
+        start_yaw=start["yaw"],
+    )
+    minimum_turn = planner._route_result(
+        planner._canonical_route_from_seed(
+            minimum_turn_seed,
+            start,
+            goal,
+            minimum_center_clearance=0.15,
+        ),
+        start_yaw=start["yaw"],
+    )
+
+    assert shortest is not None and minimum_turn is not None
+    assert shortest.metadata.turn_count == 3
+    assert minimum_turn.metadata.turn_count == 2
+    assert shortest.metadata.minimum_side_clearance >= 0.05
+    assert minimum_turn.metadata.minimum_side_clearance >= 0.05
+    assert minimum_turn.metadata.total_length > shortest.metadata.total_length
+
+    selected = planner.plan(start, goal)
+    assert selected is not None
+    assert selected.points == minimum_turn.points
+    assert selected.metadata.turn_count == 2
+
+
+def test_visibility_waypoint_removes_grid_seed_turn_with_small_detour() -> None:
+    free = _free_rectangle(2, 77, 2, 57) - _free_rectangle(32, 42, 6, 32)
+    saved = _manual_map(80, 60, free)
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.01,
+        preferred_side_margin=0.05,
+        turn_robustness_radius=0.0,
+    )
+    start = {"x": 1.20, "y": 0.40, "yaw": -0.70}
+    goal = {"x": 3.00, "y": 1.60}
+    start_cell = saved.world_to_cell(start["x"], start["y"])
+    goal_cell = saved.world_to_cell(goal["x"], goal["y"])
+    assert start_cell is not None and goal_cell is not None
+
+    seed = planner._minimum_turn_grid_seed(
+        start_cell,
+        goal_cell,
+        (),
+        minimum_center_clearance=0.15,
+    )
+    seeded = planner._route_result(
+        planner._canonical_route_from_seed(
+            seed,
+            start,
+            goal,
+            minimum_center_clearance=0.15,
+        ),
+        start_yaw=start["yaw"],
+    )
+    selected = planner.plan(start, goal)
+
+    assert seeded is not None and selected is not None
+    assert len(seeded.points) == 4
+    assert seeded.metadata.turn_count == 3
+    assert len(selected.points) == 3
+    assert selected.metadata.turn_count == 2
+    assert selected.metadata.minimum_side_clearance >= 0.05
+    assert selected.metadata.total_length > seeded.metadata.total_length
+    assert selected.metadata.total_length <= seeded.metadata.total_length + 0.30
+    assert selected.metadata.estimated_time < seeded.metadata.estimated_time
+
+
 def test_direct_candidate_is_ranked_instead_of_returned_unconditionally(
     monkeypatch,
 ) -> None:
@@ -1714,7 +2040,7 @@ def test_actual_project_map_rejects_direct_line_and_finds_exact_detour() -> None
     ).valid
 
 
-def test_actual_project_map_prefers_exact_valid_direct_route() -> None:
+def test_actual_project_map_prefers_small_detour_with_more_side_clearance() -> None:
     project = Path(__file__).parents[3]
     saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
     start = {"x": -3.265, "y": 4.415, "yaw": 0.0}
@@ -1725,6 +2051,14 @@ def test_actual_project_map_prefers_exact_valid_direct_route() -> None:
         half_length=0.15,
         half_width=0.10,
     )
+    direct_metadata = route_geometry_metadata(
+        saved,
+        saved.navigation_geometry,
+        (start, goal),
+        half_length=0.15,
+        half_width=0.10,
+        start_yaw=0.0,
+    )
 
     route = StopTurnStateLatticePlanner(
         saved, saved.navigation_geometry
@@ -1732,9 +2066,15 @@ def test_actual_project_map_prefers_exact_valid_direct_route() -> None:
 
     assert direct.valid
     assert route is not None
-    assert len(route.points) == 2
+    assert len(route.points) > 2
     assert route.points[0] == {"x": start["x"], "y": start["y"]}
     assert route.points[-1] == goal
+    assert direct_metadata.minimum_side_clearance < 0.05
+    assert route.metadata.minimum_side_clearance >= 0.05
+    assert route.metadata.minimum_side_clearance > (
+        direct_metadata.minimum_side_clearance
+    )
+    assert route.metadata.total_length < direct_metadata.total_length + 0.10
 
 
 def test_actual_runtime_start_overlap_is_classified_and_escapes_forward() -> None:
@@ -1965,12 +2305,42 @@ def test_dynamic_overlay_clusters_points_filters_static_wall_and_expires() -> No
     assert overlay.snapshot(11.3) == ()
 
 
+def test_controller_confirmed_blocker_bypasses_only_static_point_filter() -> None:
+    free = _free_rectangle(1, 38, 1, 28)
+    for row in range(1, 29):
+        free.discard((20, row))
+    saved = _manual_map(40, 30, free)
+    overlay = DynamicObstacleOverlay(ttl_seconds=2.0)
+    wall_point = (1.04, 0.50)
+
+    assert overlay.observe(
+        (wall_point,),
+        now=10.0,
+        saved_map=saved,
+        static_tolerance=0.08,
+    ) == ()
+    confirmed = overlay.observe_confirmed_blocker(
+        (wall_point,), now=10.1
+    )
+
+    assert len(confirmed) == 1
+    assert confirmed[0].center_x == pytest.approx(wall_point[0])
+    assert confirmed[0].center_y == pytest.approx(wall_point[1])
+    # This affects only the TTL overlay; Saved Map remains authoritative and
+    # immutable.
+    assert saved.occupied_within(*wall_point, 0.08)
+
+
 def test_dynamic_exclusion_detours_without_mutating_saved_map() -> None:
     free = _free_rectangle(2, 67, 2, 57) - _free_rectangle(28, 35, 15, 45)
     saved = _manual_map(70, 60, free)
     before = tuple(saved.occupancy)
     planner = StopTurnStateLatticePlanner(
-        saved, saved.navigation_geometry, turn_robustness_radius=0.0
+        saved,
+        saved.navigation_geometry,
+        turn_robustness_radius=0.0,
+        hard_side_margin=0.01,
+        preferred_side_margin=0.05,
     )
     start = {"x": 0.50, "y": 1.50, "yaw": 0.0}
     goal = {"x": 3.00, "y": 1.50}
@@ -1986,6 +2356,8 @@ def test_dynamic_exclusion_detours_without_mutating_saved_map() -> None:
     assert result.success
     assert result.route is not None
     assert result.route.points != direct.points
+    assert any(point["y"] > 2.0 for point in result.route.points[1:-1])
+    assert result.route.metadata.minimum_side_clearance >= 0.05
     assert tuple(saved.occupancy) == before
 
 
@@ -2134,6 +2506,9 @@ def test_real_expansion_bound_has_a_search_limit_reason(monkeypatch) -> None:
         saved, saved.navigation_geometry, max_expansions=1
     )
     monkeypatch.setattr(planner, "_grid_seed", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        planner, "_minimum_turn_grid_seed", lambda *args, **kwargs: []
+    )
     result = planner.plan_result(
         {"x": 0.30, "y": 1.00, "yaw": 0.0},
         {"x": 2.20, "y": 1.00},
@@ -2421,12 +2796,44 @@ def test_scan_self_filter_masks_only_points_inside_calibrated_body() -> None:
         laser_x=-0.0046412,
         laser_y=0.0,
         laser_yaw=0.0,
-        half_length=0.15,
-        half_width=0.10,
+        half_length=0.20,
+        half_width=0.18,
     )
     assert masked == 1
     assert math.isnan(filtered[0])
     assert filtered[1:] == ranges[1:]
+
+
+def test_scan_self_filter_removes_live_right_body_returns_but_keeps_obstacle() -> None:
+    laser_x = -0.0046412
+
+    def filter_point(point_x: float, point_y: float) -> tuple[list[float], int]:
+        sensor_x = point_x - laser_x
+        distance = math.hypot(sensor_x, point_y)
+        angle = math.atan2(point_y, sensor_x)
+        return mask_scan_self_returns(
+            [distance],
+            angle_min=angle,
+            angle_increment=0.0,
+            range_min=0.05,
+            range_max=8.0,
+            laser_x=laser_x,
+            laser_y=0.0,
+            laser_yaw=0.0,
+            half_length=0.20,
+            half_width=0.18,
+        )
+
+    # Exact blocker coordinates observed on robot 170 while Mapping was active.
+    for body_point in ((-0.1416, -0.1632), (0.1307, -0.1671)):
+        filtered, masked = filter_point(*body_point)
+        assert masked == 1
+        assert math.isnan(filtered[0])
+
+    outside_distance = math.hypot(0.0 - laser_x, -0.20)
+    filtered, masked = filter_point(0.0, -0.20)
+    assert masked == 0
+    assert filtered == pytest.approx([outside_distance])
 
 
 def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
@@ -2559,8 +2966,17 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
         "localization_coarse_match_tolerance"
     ]
     assert localization["localization_raycast_minimum_comparable_beams"] >= 20
-    assert 0.5 <= localization["localization_raycast_minimum_match_ratio"] < 1.0
+    assert localization["localization_raycast_minimum_static_matches"] >= 20
+    assert localization["localization_raycast_minimum_static_matches"] <= localization[
+        "localization_raycast_minimum_comparable_beams"
+    ]
+    assert 0 < localization[
+        "localization_raycast_maximum_contradiction_ratio"
+    ] <= 0.20
     assert localization["localization_raycast_match_tolerance"] <= 0.15
+    assert localization[
+        "localization_raycast_minimum_reliable_structure_span"
+    ] >= 0.75
     assert localization["localization_global_min_heading_bins"] >= 4
     assert 135 <= localization["localization_global_min_heading_span_degrees"] < 180
     assert 0 < localization["scan_tf_wait_seconds"] <= 0.05
@@ -2726,6 +3142,7 @@ def test_navigation_image_installs_the_configured_planner() -> None:
 
     assert "ros-humble-nav2-smac-planner" in dockerfile
     assert "ros-humble-nav2-rotation-shim-controller" in dockerfile
+    assert "ros-humble-domain-bridge" in dockerfile
 
 
 def test_navigation_debug_logging_defaults_on_and_uses_persistent_state_bind() -> None:
@@ -2756,3 +3173,71 @@ def test_pi_dds_profile_rejects_incompatible_remote_participants() -> None:
         "f:ignoreParticipantFlags",
         namespaces=namespace,
     ) == "FILTER_DIFFERENT_HOST"
+
+
+def test_rviz_bridge_is_one_way_and_uses_a_lan_observation_profile() -> None:
+    project = Path(__file__).parents[1]
+    config = yaml.safe_load(
+        (project / "navigation-stack/config/rviz_domain_bridge.yaml").read_text()
+    )
+    assert config["from_domain"] == 20
+    assert config["to_domain"] == 21
+    assert set(config["topics"]) == {
+        "/map",
+        "/scan_mapping",
+        "/tf",
+        "/tf_static",
+        "/odometry/filtered",
+        "/slam_toolbox/graph_visualization",
+        "/robot_description",
+    }
+    serialized = (project / "navigation-stack/config/rviz_domain_bridge.yaml").read_text()
+    assert "/cmd_vel" not in serialized
+    assert "/odom_raw" not in serialized
+    assert "bidirectional" not in serialized
+
+    profile = ElementTree.parse(
+        project / "rviz_lan_fastdds.xml"
+    ).getroot()
+    namespace = {"f": "http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles"}
+    assert profile.find(
+        ".//f:participant/f:rtps/f:builtin/f:discovery_config/"
+        "f:ignoreParticipantFlags",
+        namespaces=namespace,
+    ) is None
+    assert (project / "rviz_lan_fastdds.xml").read_text() == (
+        project.parents[1] / "config/rviz/rviz_lan_fastdds.xml"
+    ).read_text()
+
+    compose = yaml.safe_load((project / "compose.coexistence.yml").read_text())
+    bridge = compose["services"]["rviz-bridge"]
+    assert bridge["command"][-1] == "/opt/rovera/config/rviz_domain_bridge.yaml"
+    assert bridge["environment"]["FASTRTPS_DEFAULT_PROFILES_FILE"] == (
+        "/etc/rovera/rviz_lan_fastdds.xml"
+    )
+
+
+def test_mapping_profile_rejects_ambiguous_corridor_loop_closures() -> None:
+    project = Path(__file__).parents[1]
+    parameters = yaml.safe_load(
+        (project / "navigation-stack/config/slam_toolbox.yaml").read_text()
+    )["slam_toolbox"]["ros__parameters"]
+
+    assert parameters["ceres_loss_function"] == "HuberLoss"
+    assert parameters["minimum_distance_penalty"] >= 0.5
+    assert parameters["minimum_travel_distance"] >= 0.1
+    assert parameters["minimum_travel_heading"] >= 0.1
+    assert parameters["loop_match_minimum_chain_size"] >= 15
+    assert parameters["loop_match_maximum_variance_coarse"] <= 1.0
+    assert parameters["loop_match_minimum_response_coarse"] >= 0.45
+    assert parameters["loop_match_minimum_response_fine"] >= 0.55
+    assert parameters["loop_search_space_dimension"] <= 4.0
+
+    compose = yaml.safe_load((project / "compose.coexistence.yml").read_text())
+    mounts = compose["services"]["mapping-stack"]["volumes"]
+    assert any(
+        mount.get("source") == "./navigation-stack/config/slam_toolbox.yaml"
+        and mount.get("target") == "/opt/rovera/config/slam_toolbox.yaml"
+        and mount.get("read_only") is True
+        for mount in mounts
+    )

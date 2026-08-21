@@ -36,6 +36,9 @@ const NAVIGATION_STATE_LABELS: Record<string, string> = {
   PAUSED: "Đã tạm dừng",
   BLOCKED: "Lối đi bị chặn",
   RECOVERY: "Đang phục hồi",
+  WAIT_FOR_DYNAMIC_CLEAR: "Đang chờ hoặc tìm đường tránh",
+  WAITING_FOR_DYNAMIC_CLEAR: "Đang chờ hoặc tìm đường tránh",
+  DYNAMIC_REPLAN: "Đang tìm đường tránh vật cản",
   NARROW_PATH_DECISION: "Cần chọn cách qua đường hẹp",
   MANUAL_BYPASS: "Điều khiển thủ công qua đường hẹp",
   COMPUTING_ALTERNATIVES: "Đang tìm tuyến thay thế",
@@ -496,13 +499,18 @@ export function MapPanel({
   const [centerRobot, setCenterRobot] = useState(false);
   useEffect(() => setCandidateMapId(selectedMapId ?? map.map_id), [map.map_id, selectedMapId]);
   const moving = navigationStatus === "moving";
+  const recovering = navigationStatus === "recovery" || [
+    "RECOVERY", "WAIT_FOR_DYNAMIC_CLEAR", "WAITING_FOR_DYNAMIC_CLEAR",
+    "DYNAMIC_REPLAN",
+  ].includes(mapState);
+  const activeMission = moving || recovering;
   const paused = navigationStatus === "paused";
   const narrowDecision = mapState === "NARROW_PATH_DECISION";
   const manualBypass = mapState === "MANUAL_BYPASS";
   const computingAlternatives = mapState === "COMPUTING_ALTERNATIVES";
   const routeSelection = mapState === "ROUTE_SELECTION";
   const showRouteChoices = routeSelection || (
-    !moving && routeCandidates.length > 1
+    !activeMission && routeCandidates.length > 1
   );
   const localizationFailed = localizationState === "LOCALIZATION_FAILED";
   const localizationInProgress = [
@@ -513,7 +521,7 @@ export function MapPanel({
   const localizationNeedsAssistance = localizationFailed || [
     "LOCALIZATION_REQUIRED", "LOCALIZING_GLOBAL", "LOW_CONFIDENCE", "LOCALIZATION_LOST",
   ].includes(localizationState);
-  const rescanBlocked = moving
+  const rescanBlocked = activeMission
     || ["NAVIGATING", "MOVING", "ROTATING", "PLANNING", "RECOVERY"].includes(mapState)
     || localizationInProgress;
   const ready = localized && localizationState === "READY" && pose.map_id === map.map_id
@@ -552,10 +560,10 @@ export function MapPanel({
     <div className="mini-map-toolbar"><button type="button" onClick={() => { setFollowRobot(false); setCenterRobot(false); }}><RotateCcw size={13} /> {t("Vừa màn hình")}</button>
       <button type="button" disabled={!ready} onClick={() => { setFollowRobot(false); setCenterRobot(true); }}><LocateFixed size={13} /> {t("Tới robot")}</button>
       <button type="button" disabled={!ready} className={followRobot ? "is-active" : ""} onClick={() => { setCenterRobot(false); setFollowRobot((value) => !value); }}><Crosshair size={13} /> {t("Theo robot")}</button></div>
-    <div className="map-canvas map-canvas--mini" onDoubleClick={() => ready && setExpanded(true)}>
+    <div className="map-canvas map-canvas--mini" onDoubleClick={() => ready && !activeMission && setExpanded(true)}>
       <MapCanvas map={map} destinations={[]} pose={pose} route={liveRoute}
         routeCandidates={routeCandidates} selectedRouteId={selectedRouteId} selected={selected}
-        dynamicObstacles={obstacles} readOnly={readOnly || loading || moving}
+        dynamicObstacles={obstacles} readOnly={readOnly || loading || activeMission}
         showRobot={showRobot} robotMoving={moving && ready}
         focus={followRobot || centerRobot ? pose : null} zoom={followRobot || centerRobot ? 2 : 1}
         onSelect={onSelect} onSelectRoute={onSelectRoute} />
@@ -580,8 +588,11 @@ export function MapPanel({
     </div>
     {errorMessage && <p className="navigation-inline-error" role="alert">{t(errorMessage)}</p>}
     {noticeMessage && <p className="navigation-inline-notice" role="status">{t(noticeMessage)}</p>}
-    {moving && recoveryCount > 0 && <p className="navigation-inline-recovery" role="status">
+    {activeMission && recoveryCount > 0 && <p className="navigation-inline-recovery" role="status">
       {t("Robot đang cập nhật đường tránh vật cản · {count} lần phục hồi", { count: recoveryCount })}
+    </p>}
+    {recovering && <p className="navigation-inline-recovery" role="status">
+      {t("Điểm đến vẫn được giữ. Robot đang dừng an toàn và tìm đường tránh vật cản.")}
     </p>}
     {mapState === "BLOCKED" && !errorMessage && <p className="navigation-inline-recovery" role="status">
       {t("Đường đi đang bị chặn. Robot đã dừng an toàn; hãy dời vật cản hoặc chọn điểm khác.")}
@@ -625,7 +636,7 @@ export function MapPanel({
         <button type="button" disabled={readOnly || loading || rescanBlocked || !onRetryLocalization}
           title={rescanBlocked ? t("Không thể quét lại khi robot đang di chuyển hoặc định vị.") : undefined}
           onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button></>
-        : moving ? <><button type="button" onClick={onPause}><Pause /> {t("Tạm dừng")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
+        : activeMission ? <><button type="button" onClick={onPause}><Pause /> {t("Tạm dừng")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
         : paused ? <><button type="button" onClick={onResume}><Play /> {t("Tiếp tục")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button>
           <button type="button" disabled={readOnly || loading || rescanBlocked || !onRetryLocalization}
             title={rescanBlocked ? t("Không thể quét lại khi robot đang di chuyển hoặc định vị.") : undefined}
@@ -646,7 +657,7 @@ export function MapPanel({
         <div className="map-modal__canvas"><MapCanvas map={map} destinations={destinations} pose={pose}
           route={liveRoute} routeCandidates={routeCandidates} selectedRouteId={selectedRouteId}
           selected={selected} dynamicObstacles={obstacles}
-          readOnly={readOnly || loading} showRobot={showRobot} robotMoving={moving && ready}
+          readOnly={readOnly || loading || activeMission} showRobot={showRobot} robotMoving={moving && ready}
           onSelect={onSelect} onSelectRoute={onSelectRoute} /></div>
         <footer><button type="button" onClick={() => setExpanded(false)}>{t("Hủy")}</button>
           <button type="button" className="button button--primary" disabled={!selected || !canStart || loading}

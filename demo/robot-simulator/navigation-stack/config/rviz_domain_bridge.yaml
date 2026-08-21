@@ -1,0 +1,56 @@
+name: rovera_rviz_observation_bridge
+from_domain: 20
+to_domain: 21
+
+# Deliberately one-way. Never add command, raw sensor, service or action
+# endpoints here. Domain 21 is only an operator visualization surface.
+topics:
+  /map:
+    type: nav_msgs/msg/OccupancyGrid
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1
+  /scan_mapping:
+    type: sensor_msgs/msg/LaserScan
+    qos:
+      reliability: best_effort
+      durability: volatile
+      history: keep_last
+      depth: 2
+  /tf:
+    type: tf2_msgs/msg/TFMessage
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 50
+  /tf_static:
+    type: tf2_msgs/msg/TFMessage
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 10
+  /odometry/filtered:
+    type: nav_msgs/msg/Odometry
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 5
+  /slam_toolbox/graph_visualization:
+    type: visualization_msgs/msg/MarkerArray
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 5
+  /robot_description:
+    type: std_msgs/msg/String
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1

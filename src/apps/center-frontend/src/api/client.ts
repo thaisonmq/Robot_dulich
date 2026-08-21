@@ -295,7 +295,7 @@ export const api = {
     request<MappingSession>(`/api/maps/mapping-sessions/${sessionId}`),
   mappingAction: (
     sessionId: string,
-    action: "stop" | "save" | "discard" | "pause" | "resume" | "save-draft" | "finish" | "cancel",
+    action: "stop" | "save" | "discard" | "pause" | "resume" | "save-draft" | "finish" | "cancel" | "recover",
     requestId: string,
     expectedState: string,
   ) => request<MappingSession>(`/api/maps/mapping-sessions/${sessionId}/${action}`, {

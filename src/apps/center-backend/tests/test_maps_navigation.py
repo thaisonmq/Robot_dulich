@@ -9,10 +9,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.api.maps import (
+    _map_view,
     _mapping_action_reached,
     _mapping_start_health_failures,
     _posegraph_basename,
 )
+from app.api import maps as maps_api
 from app.api import navigation as navigation_api
 from app.core.config import Settings
 from app.api.navigation import (
@@ -319,6 +321,7 @@ def test_mapping_and_navigation_state_machines_are_idempotent_and_strict() -> No
     assert mapping_transition("MAPPING_STOPPED_UNSAVED", "MAPPING_SAVING") == "MAPPING_SAVING"
     assert mapping_transition("MAPPING_SAVING", "FINISHED") == "FINISHED"
     assert mapping_transition("MAPPING", "PAUSED") == "PAUSED"
+    assert mapping_transition("PAUSED", "MAPPING_RUNNING") == "MAPPING_RUNNING"
     assert mapping_transition("MAPPING", "MAPPING") == "MAPPING"
     assert mapping_transition("MAPPING", "FINISHING") == "FINISHING"
     assert mapping_transition("FINISHING", "FINISHED") == "FINISHED"
@@ -399,6 +402,96 @@ def test_map_version_only_continues_with_complete_posegraph_pair() -> None:
     assert _posegraph_basename(version) == "posegraph"
     version.metadata_json = {"files": {"posegraph.posegraph": "x"}}
     assert _posegraph_basename(version) is None
+
+
+def test_faulted_power_loss_session_is_exposed_as_recoverable() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as database:
+        record = MapRecord(
+            map_id="MAP-AUTOSAVE-RECOVERY",
+            name="M2-T5",
+            image_url="",
+            width_pixels=0,
+            height_pixels=0,
+            resolution_m_per_pixel=0.05,
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            status="DRAFT",
+        )
+        session = MappingSession(
+            session_id="SESSION-AUTOSAVE-RECOVERY",
+            map_id=record.map_id,
+            version=1,
+            robot_id="ROBOT-001",
+            user_id="operator-1",
+            status="FAULT",
+            error_code="MAPPING_RUNTIME_RESET",
+            error_message="runtime reset after power loss",
+            metadata_json={"name": "M2-T5", "site_id": "MQ", "floor_id": "5"},
+        )
+        database.add_all((record, session))
+        database.commit()
+
+        detail = _map_view(database, record, details=True)
+
+    assert detail["mapping_session"] is None
+    assert detail["recoverable_mapping_session"]["session_id"] == "SESSION-AUTOSAVE-RECOVERY"
+    assert detail["recoverable_mapping_session"]["error_code"] == "MAPPING_RUNTIME_RESET"
+
+
+@pytest.mark.asyncio
+async def test_recover_action_dispatches_idle_autosave_recovery(monkeypatch) -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    captured: dict = {}
+
+    async def dispatch(database, **kwargs):
+        del database
+        captured.update(kwargs)
+        return {"status": "completed", "current_state": "PAUSED"}
+
+    monkeypatch.setattr(maps_api, "_dispatch_idempotent", dispatch)
+    with Session(engine) as database:
+        record = MapRecord(
+            map_id="MAP-AUTOSAVE-ACTION",
+            name="M2-T5",
+            image_url="",
+            width_pixels=0,
+            height_pixels=0,
+            resolution_m_per_pixel=0.05,
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            status="DRAFT",
+        )
+        session = MappingSession(
+            session_id="SESSION-AUTOSAVE-ACTION",
+            map_id=record.map_id,
+            version=1,
+            robot_id="ROBOT-001",
+            user_id="operator-1",
+            status="FAULT",
+            error_code="MAPPING_RUNTIME_RESET",
+            metadata_json={"name": "M2-T5", "site_id": "MQ", "floor_id": "5"},
+        )
+        database.add_all((record, session))
+        database.commit()
+
+        result = await maps_api.mapping_action(
+            session.session_id,
+            "recover",
+            maps_api.MappingCommandRequest(
+                request_id="request-autosave-recovery",
+                expected_state="FAULT",
+            ),
+            "operator-1",
+            database,
+            Settings(),
+        )
+
+        assert result["status"] == "PAUSED"
+        assert database.get(MappingSession, session.session_id).status == "PAUSED"
+    assert captured["command_type"] == "mapping.recover"
+    assert captured["expected_state"] == "IDLE"
+    assert captured["payload"]["map_id"] == "MAP-AUTOSAVE-ACTION"
 
 
 def test_navigation_status_reconciles_active_mapping_session() -> None:

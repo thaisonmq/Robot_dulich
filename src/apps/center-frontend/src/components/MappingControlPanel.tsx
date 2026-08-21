@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { CircleStop, RotateCcw, Save, Trash2 } from "lucide-react";
+import { CircleStop, ExternalLink, RotateCcw, Save, Trash2 } from "lucide-react";
 import { api } from "../api/client";
 import { useI18n } from "../i18n/I18nProvider";
 import type { Health, MappingSession } from "../types";
@@ -13,6 +13,7 @@ interface Props {
   health: Health;
   expectedState?: string;
   disabled?: boolean;
+  canOpenRviz?: boolean;
   onMappingChanged?: (mapping: MappingSession | null) => void;
 }
 
@@ -55,7 +56,10 @@ function statusLabel(status: string, labels: Record<string, string>, t: Translat
   return t(labels[status] ?? status);
 }
 
-export function MappingControlPanel({ robotId, health, expectedState = "IDLE", disabled = false, onMappingChanged }: Props) {
+export function MappingControlPanel({
+  robotId, health, expectedState = "IDLE", disabled = false,
+  canOpenRviz = false, onMappingChanged,
+}: Props) {
   const { t } = useI18n();
   const [mapping, setMapping] = useState<MappingSession | null>(null);
   const [name, setName] = useState("");
@@ -111,7 +115,7 @@ export function MappingControlPanel({ robotId, health, expectedState = "IDLE", d
     onError: (reason) => setError(reason instanceof Error ? reason.message : t("SLAM không khởi động được.")),
   });
   const action = useMutation({
-    mutationFn: (actionName: "stop" | "save" | "discard") => api.mappingAction(
+    mutationFn: (actionName: "stop" | "save" | "discard" | "pause" | "resume" | "save-draft" | "finish") => api.mappingAction(
       mapping!.session_id,
       actionName,
       createUuid(),
@@ -126,6 +130,7 @@ export function MappingControlPanel({ robotId, health, expectedState = "IDLE", d
   const state = mapping?.status ?? "IDLE";
   const running = state === "MAPPING_RUNNING";
   const stopped = state === "MAPPING_STOPPED_UNSAVED";
+  const paused = state === "PAUSED";
   const terminal = TERMINAL.has(state);
   const elapsed = Number(mappingHealth?.elapsedSeconds ?? 0);
   const elapsedText = [Math.floor(elapsed / 3600), Math.floor(elapsed / 60) % 60, elapsed % 60]
@@ -141,6 +146,11 @@ export function MappingControlPanel({ robotId, health, expectedState = "IDLE", d
     health.safety !== "HEALTHY" && t("Motion safety chưa sẵn sàng."),
     health.estop && t("E-stop đang bật."),
   ].filter(Boolean) as string[] : [];
+  const rvizUri = mapping ? `rovera-rviz://mapping?${new URLSearchParams({
+    domain: "21",
+    robot_id: robotId,
+    session_id: mapping.session_id,
+  }).toString()}` : "";
 
   return <section className="mapping-control-panel" aria-label={t("Tạo bản đồ")}> 
     <header>
@@ -166,9 +176,17 @@ export function MappingControlPanel({ robotId, health, expectedState = "IDLE", d
         <span>{t("SLAM")} <i className={mappingHealth?.slamHealthy ? "is-ok" : "is-fault"} /> {mappingHealth?.slamHealthy ? t("Đang chạy") : t("Lỗi")}</span>
       </div>
       <div className="mapping-timer"><small>{t("Thời gian")}</small><strong>{elapsedText}</strong></div>
-      <p className="mapping-rviz-note">{t("Mở RViz2 trên máy Ubuntu kỹ thuật để xem /map, /scan, TF và odometry realtime.")}</p>
+      <p className="mapping-rviz-note">{t("RViz2 chỉ nhận các topic quan sát của phiên mapping; điều khiển robot vẫn đi qua Web.")}</p>
+      {canOpenRviz && <a className="mapping-rviz-launch" href={rvizUri}>
+        <ExternalLink size={15} /> {t("Xem map")}
+      </a>}
       <div className="mapping-control-panel__actions">
         {running && <button type="button" onClick={() => action.mutate("stop")} disabled={action.isPending}><CircleStop /> {t("Dừng mapping")}</button>}
+        {running && <button type="button" onClick={() => action.mutate("save-draft")} disabled={action.isPending}><Save /> {t("Lưu bản nháp")}</button>}
+        {running && <button type="button" className="button--primary" onClick={() => action.mutate("finish")} disabled={action.isPending}><Save /> {t("Kết thúc & lưu")}</button>}
+        {paused && <button type="button" className="button--primary" onClick={() => action.mutate("resume")} disabled={action.isPending}><RotateCcw /> {t("Tiếp tục mapping")}</button>}
+        {paused && <button type="button" onClick={() => action.mutate("save-draft")} disabled={action.isPending}><Save /> {t("Lưu bản nháp")}</button>}
+        {paused && <button type="button" onClick={() => action.mutate("finish")} disabled={action.isPending}><Save /> {t("Kết thúc & lưu")}</button>}
         {stopped && <button type="button" className="button--primary" onClick={() => action.mutate("save")} disabled={action.isPending}><Save /> {t("Lưu bản đồ")}</button>}
         {stopped && <button type="button" className="is-danger" onClick={() => action.mutate("discard")} disabled={action.isPending}><Trash2 /> {t("Hủy bản nháp")}</button>}
       </div>

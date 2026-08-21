@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>rovera_rviz_udp_v4</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+
+  <!-- Observation-only DDS profile. The operational robot graph keeps using
+       micro_ros_fastdds.xml, which rejects participants from other hosts. -->
+  <participant profile_name="rovera_rviz_lan" is_default_profile="true">
+    <rtps>
+      <useBuiltinTransports>false</useBuiltinTransports>
+      <userTransports>
+        <transport_id>rovera_rviz_udp_v4</transport_id>
+      </userTransports>
+    </rtps>
+  </participant>
+</profiles>

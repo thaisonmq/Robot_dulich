@@ -44,6 +44,22 @@ from simulator.navigation_backends import (
 )
 from simulator.map_cache import MapCacheError, RobotMapCacheManager
 
+
+def mapping_autosave_posegraph(
+    map_cache_dir: str,
+    map_id: str,
+    version: int,
+) -> Path:
+    """Resolve one complete, local-only SLAM autosave without trusting Center paths."""
+    RobotMapCacheManager._validate_identity(map_id, version)
+    map_root = Path(map_cache_dir).parent
+    posegraph = map_root / ".autosave" / f"{map_id}-latest"
+    artifacts = (posegraph.with_suffix(".posegraph"), posegraph.with_suffix(".data"))
+    if any(not artifact.is_file() or artifact.stat().st_size <= 0 for artifact in artifacts):
+        raise MapCacheError("robot has no complete mapping autosave for this map")
+    return posegraph
+
+
 logger = logging.getLogger("simulator.gateway")
 
 
@@ -1410,6 +1426,7 @@ class RobotConnectionClient:
     async def _execute_navigation_command(
         self, command: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
+        recovering_autosave = False
         if command == "map.resync":
             map_id = str(payload.get("map_id", ""))
             version = int(payload.get("version", 0))
@@ -1436,6 +1453,33 @@ class RobotConnectionClient:
                 "status": "accepted",
                 "current_state": str(self.navigation_backend.state().get("state", "IDLE")),
                 "sync_status": "SYNC_PENDING",
+            }
+        if command == "mapping.recover":
+            if self.config.navigation_backend != "ros2":
+                raise NavigationBackendError(
+                    "AUTOSAVE_RECOVERY_UNAVAILABLE",
+                    "Mapping autosave recovery requires the ROS 2 backend",
+                    current_state=str(
+                        self.navigation_backend.state().get("state", "FAULT")
+                    ),
+                )
+            map_id = str(payload.get("map_id", ""))
+            version = int(payload.get("version", 0))
+            posegraph = mapping_autosave_posegraph(
+                self.config.map_cache_dir,
+                map_id,
+                version,
+            )
+            recovering_autosave = True
+            command = "mapping.start"
+            payload = {
+                **payload,
+                "posegraph_path": str(posegraph),
+                # A powered-off runtime has no authoritative terminal pose.
+                # Resuming from the first graph node permits an immediate save;
+                # collecting more scans requires returning to the original
+                # mapping start pose first.
+                "initial_pose": None,
             }
         if command in {
             "mapping.start", "mapping.stop", "mapping.finish", "mapping.save",
@@ -1493,6 +1537,19 @@ class RobotConnectionClient:
                 raise MapCacheError("downloaded map has no serialized pose-graph")
             command_payload["posegraph_path"] = str(posegraph)
         result = await self.navigation_backend.execute(command, command_payload)
+        if (
+            recovering_autosave
+            and result.get("status") in {"accepted", "completed"}
+        ):
+            # Do not ingest scans at the charging location as though the robot
+            # were still at the graph's first node. The operator must choose
+            # Resume explicitly after returning the chassis to the mapping
+            # start, or save the recovered graph without adding new scans.
+            result = await self.navigation_backend.execute(
+                "mapping.pause",
+                {"expected_state": str(result.get("current_state", "MAPPING_RUNNING"))},
+            )
+            result["recovered_from_autosave"] = True
         if command == "map.load" and result.get("status") in {"accepted", "completed"}:
             self.map_cache.mark_active(
                 str(payload["map_id"]),

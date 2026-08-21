@@ -48,5 +48,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now rovera-mode-supervisor.service
+# `enable --now` starts an inactive unit but deliberately does not restart an
+# already-running one. Always restart here so an upgraded supervisor cannot
+# keep executing stale Python code from memory.
+systemctl enable rovera-mode-supervisor.service
+systemctl restart rovera-mode-supervisor.service
 systemctl --no-pager --full status rovera-mode-supervisor.service

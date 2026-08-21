@@ -21,7 +21,7 @@ import type { LiveKitMediaTransport } from "../transports/MediaTransport";
 import type { PtzCommand, PtzSpeed } from "../transports/ControlTransport";
 import { WebSocketTelemetryTransport } from "../transports/TelemetryTransport";
 import type {
-  AutoNavigationSpeedMode, Destination, MediaState, NavigationFeedback,
+  AutoNavigationSpeedMode, Destination, MediaState, NavigationFeedback, NavigationState,
   NavigationVisualization, RouteCandidate, VideoProfile,
 } from "../types";
 import { mergeNavigationVisualization } from "../utils/navigationVisualization";
@@ -36,6 +36,15 @@ const LOCALIZATION_IN_PROGRESS_STATES = new Set([
   "LOCALIZING_SETTLING",
   "LOW_CONFIDENCE", "LOCALIZATION_LOST", "VERIFYING", "SENSOR_TIME_INVALID",
 ]);
+
+const ACTIVE_RUNTIME_NAVIGATION_STATES: Partial<Record<string, NavigationState>> = {
+  NAVIGATING: "moving",
+  MOVING: "moving",
+  RECOVERY: "recovery",
+  WAIT_FOR_DYNAMIC_CLEAR: "recovery",
+  WAITING_FOR_DYNAMIC_CLEAR: "recovery",
+  DYNAMIC_REPLAN: "recovery",
+};
 
 const PLAN_FAILURE_MESSAGES: Record<string, string> = {
   START_BLOCKED: "Không thể lập đường: vùng xuất phát bị costmap đánh dấu là vật cản.",
@@ -182,6 +191,8 @@ export function DashboardPage() {
       }
       const runtimeMapState = String(nextHealth.map_state ?? "").toUpperCase();
       if (runtimeMapState) setMapState(runtimeMapState);
+      const activeNavigationState = ACTIVE_RUNTIME_NAVIGATION_STATES[runtimeMapState];
+      if (activeNavigationState) setNavigationState(activeNavigationState);
       if (nextHealth.route_candidates) {
         setRouteCandidates(nextHealth.route_candidates);
         setSelectedRouteId((current) => (
@@ -251,6 +262,8 @@ export function DashboardPage() {
         VERIFYING: "localizing", SENSOR_TIME_INVALID: "recovery",
         MAP_LOADING: "loading_map", LOADING_MAP: "loading_map", PLANNING: "planning",
         RECOVERY: "recovery", LOCALIZATION_LOST: "recovery", LOW_CONFIDENCE: "localizing",
+        WAIT_FOR_DYNAMIC_CLEAR: "recovery", WAITING_FOR_DYNAMIC_CLEAR: "recovery",
+        DYNAMIC_REPLAN: "recovery",
         LOCALIZATION_REQUIRED: "idle",
         NARROW_PATH_DECISION: "narrow_decision",
         MANUAL_BYPASS: "manual_bypass",
@@ -627,7 +640,7 @@ export function DashboardPage() {
       poseVerificationSawLocalizingRef.current = true;
       updatePoseVerification("confirmed");
       setMapLocalized(true);
-      setNavigationState("ready");
+      setNavigationState(ACTIVE_RUNTIME_NAVIGATION_STATES[runtimeState] ?? "ready");
       return;
     }
     if (poseVerificationKeyRef.current === verificationKey) return;
@@ -1447,7 +1460,8 @@ export function DashboardPage() {
               </div>}
               {operationMode === "mapping" && !isSpectator ? (
                 <MappingControlPanel robotId={robotId} health={health} expectedState={mapState}
-                  disabled={connectionState !== "connected" || controlState === "disabled"} />
+                  disabled={connectionState !== "connected" || controlState === "disabled"}
+                  canOpenRviz={user?.role === "admin"} />
               ) : map ? (
                 <MapPanel
                 map={map}

@@ -423,6 +423,7 @@
 .mapping-timer small { font-size: 9px; }
 .mapping-timer strong { font-size: 25px; }
 .mapping-rviz-note { font-size: 10px; }
+.mapping-rviz-launch { min-height: 38px; font-size: 10px; }
 .mapping-control-panel__actions { gap: 8px; }
 .mapping-control-panel__actions button { min-height: 38px; font-size: 10px; }
 .mapping-start-blockers { font-size: 9px !important; line-height: 1.45; }

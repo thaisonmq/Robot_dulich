@@ -115,6 +115,48 @@ describe("MapManagementPage detail workspace", () => {
     expect(document.documentElement.lang).toBe("en");
   });
 
+  it("offers autosave recovery for a faulted mapping session without a version", async () => {
+    const recoverable = {
+      ...activeMap,
+      map_id: "MAP-RECOVERABLE",
+      name: "M2-T5",
+      status: "DRAFT" as const,
+      active_status: "INACTIVE",
+      active_version: null,
+      versions: [],
+      posegraph_available: false,
+      recoverable_mapping_session: {
+        session_id: "SESSION-RECOVERABLE",
+        map_id: "MAP-RECOVERABLE",
+        version: 1,
+        robot_id: "ROBOT-001",
+        status: "FAULT" as const,
+        metadata: { name: "M2-T5", site_id: "MQ", floor_id: "5", notes: "" },
+        error_code: "MAPPING_RUNTIME_RESET",
+        error_message: "SLAM runtime reset",
+        created_at: "2026-08-21T02:06:03Z",
+        updated_at: "2026-08-21T02:33:36Z",
+        local_status: "LOCAL_ONLY",
+        sync_status: "LOCAL_ONLY",
+      },
+    };
+    window.history.replaceState(null, "", `/maps/${recoverable.map_id}`);
+    vi.mocked(api.map).mockResolvedValue(recoverable);
+    vi.spyOn(api, "mappingAction").mockResolvedValue({
+      ...recoverable.recoverable_mapping_session,
+      status: "MAPPING_RUNNING",
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(<QueryClientProvider client={queryClient}><I18nProvider><MapManagementPage /></I18nProvider></QueryClientProvider>);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Khôi phục & tiếp tục mapping" }));
+    await waitFor(() => expect(api.mappingAction).toHaveBeenCalledWith(
+      "SESSION-RECOVERABLE", "recover", expect.any(String), "IDLE",
+    ));
+    expect(sessionStorage.getItem("rovera:mapping-intent")).toContain("SESSION-RECOVERABLE");
+  });
+
   it("paginates the map registry and keeps the list controls visible", async () => {
     window.history.replaceState(null, "", "/maps");
     const maps = Array.from({ length: 5 }, (_, index) => ({

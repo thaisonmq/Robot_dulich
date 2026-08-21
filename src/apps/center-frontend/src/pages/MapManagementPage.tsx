@@ -13,6 +13,7 @@ import { useNavigate, usePathname } from "../router";
 import { useAppStore } from "../state/appStore";
 import type { MapData } from "../types";
 import { hasPermission } from "../utils/permissions";
+import { createUuid } from "../utils/uuid";
 
 type MapFilter = "ALL" | "ACTIVE" | "PENDING" | "ARCHIVED";
 type MapDetailTab = "OVERVIEW" | "VERSIONS" | "SETTINGS";
@@ -160,10 +161,29 @@ export function MapManagementPage() {
       navigate("/maps");
     },
   });
+  const recoverMapping = useMutation({
+    mutationFn: (session: NonNullable<MapData["recoverable_mapping_session"]>) =>
+      api.mappingAction(session.session_id, "recover", createUuid(), "IDLE"),
+    onSuccess: async (session) => {
+      sessionStorage.setItem("rovera:mapping-intent", JSON.stringify({
+        map_id: session.map_id,
+        session_id: session.session_id,
+        robot_id: session.robot_id,
+        name: session.metadata.name,
+        site_id: session.metadata.site_id,
+        floor_id: session.metadata.floor_id,
+        notes: session.metadata.notes,
+      }));
+      await refreshRegistry();
+      showToast(t("Đã khôi phục autosave"));
+      navigate("/maps/create");
+    },
+  });
   const canOperate = hasPermission(user, "maps.manage");
   const maps = mapsQuery.data ?? [];
   const detail = detailQuery.data;
   const activeMapping = detail?.mapping_session;
+  const recoverableMapping = detail?.recoverable_mapping_session;
   const continuableVersion = detail?.versions?.find((version) => version.can_continue);
   const activeCount = maps.filter(isActivatedMap).length;
   const pendingCount = maps.filter((item) => ["SYNC_PENDING", "VALIDATING"].includes(item.status ?? "")
@@ -187,7 +207,8 @@ export function MapManagementPage() {
     () => visibleMaps.slice((page - 1) * MAPS_PER_PAGE, page * MAPS_PER_PAGE),
     [page, visibleMaps],
   );
-  const operationError = activate.error ?? update.error ?? remove.error ?? archive.error ?? resync.error;
+  const operationError = activate.error ?? update.error ?? remove.error ?? archive.error
+    ?? resync.error ?? recoverMapping.error;
 
   useEffect(() => {
     setPage((current) => Math.min(current, totalPages));
@@ -342,12 +363,16 @@ export function MapManagementPage() {
             <p className="map-detail-notes">{detail.notes || t("Chưa có ghi chú vận hành cho bản đồ này.")}</p>
             <div className="map-detail-identity"><small>MAP ID</small><code>{detail.map_id}</code></div>
             {canOperate && <div className="map-detail-primary-actions">
-              <button type="button" className="button button--primary" disabled={!activeMapping && !continuableVersion}
-                title={!activeMapping && !continuableVersion ? t("Phiên bản chưa có posegraph hoàn chỉnh") : undefined}
-                onClick={continueMapping}><Pencil size={16} /> {t(activeMapping ? "Mở phiên mapping" : "Tiếp tục mapping")}</button>
+              {recoverableMapping ? <button type="button" className="button button--primary"
+                disabled={recoverMapping.isPending} onClick={() => recoverMapping.mutate(recoverableMapping)}>
+                <RefreshCw size={16} /> {t(recoverMapping.isPending ? "Đang khôi phục…" : "Khôi phục & tiếp tục mapping")}</button>
+                : <button type="button" className="button button--primary" disabled={!activeMapping && !continuableVersion}
+                  title={!activeMapping && !continuableVersion ? t("Phiên bản chưa có posegraph hoàn chỉnh") : undefined}
+                  onClick={continueMapping}><Pencil size={16} /> {t(activeMapping ? "Mở phiên mapping" : "Tiếp tục mapping")}</button>}
               <button type="button" className="button" onClick={() => setDetailTab("SETTINGS")}><FilePenLine size={16} /> {t("Sửa thông tin")}</button>
             </div>}
-            {canOperate && !activeMapping && !continuableVersion && <p className="map-action-hint">{t("Bản đồ này chưa có posegraph để tiếp tục mapping. Bạn vẫn có thể tạo một phiên mapping mới từ thư viện.")}</p>}
+            {canOperate && !activeMapping && !continuableVersion && !recoverableMapping && <p className="map-action-hint">{t("Bản đồ này chưa có posegraph để tiếp tục mapping. Bạn vẫn có thể tạo một phiên mapping mới từ thư viện.")}</p>}
+            {recoverableMapping && <p className="map-action-hint">{t("Pi còn autosave của phiên bị gián đoạn. Khôi phục để tiếp tục quét, lưu bản nháp hoặc kết thúc và lưu map.")}</p>}
           </div>
         </div>
 

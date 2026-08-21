@@ -87,16 +87,20 @@ rovera_navigation_adapter:
     localization_final_minimum_residual_beams: 20
     localization_final_max_median_residual: 0.075
     localization_final_max_p90_residual: 0.115
-    # Independent first-hit range verification rejects corridor/room aliases
-    # whose endpoints happen to land near occupied cells. A 55% robust ratio
-    # tolerates a substantial minority of beams occluded by people or objects;
-    # insufficient comparable static rays never default to PASS.
+    # Independent first-hit verification distinguishes neutral near-side
+    # occlusion from strong far-side map contradiction. Twenty exact static
+    # hits retain a substantial positive-evidence floor. The 20% contradiction
+    # cap is stricter than the old 45% undifferentiated mismatch budget while
+    # allowing people and movable objects to occlude the remaining beams.
     localization_raycast_maximum_beams: 90
     localization_raycast_minimum_comparable_beams: 25
     localization_raycast_match_tolerance: 0.15
-    localization_raycast_minimum_match_ratio: 0.55
-    localization_raycast_maximum_median_error: 0.15
-    localization_raycast_maximum_p90_error: 1.0
+    # Only a continuous wall-like map structure can become strong negative
+    # evidence when the live scan sees beyond it. Short map clutter is logged
+    # as inconclusive; matching it still counts as positive static evidence.
+    localization_raycast_minimum_reliable_structure_span: 0.75
+    localization_raycast_minimum_static_matches: 20
+    localization_raycast_maximum_contradiction_ratio: 0.20
     # Planning scan filtering has different semantics: compare measured range
     # with a map raycast, and never reuse the localization coarse tolerance.
     planning_static_match_tolerance: 0.08
@@ -122,8 +126,8 @@ rovera_navigation_adapter:
     # Wait for the chassis/smoother to stop before collecting the stationary
     # AMCL window used by the strict READY acquisition gate.
     localization_rotation_settle_seconds: 1.0
-    # Force Rescan records actual odom headings only for scans whose score and
-    # residual pass. Commanded rotation alone is never localization evidence.
+    # Force Rescan records actual odom headings from basic endpoint/residual
+    # quality. Final static/contradiction gates remain separate from collection.
     localization_global_heading_bin_count: 8
     localization_global_strong_min_heading_bins: 2
     localization_global_strong_min_heading_span_degrees: 75.0

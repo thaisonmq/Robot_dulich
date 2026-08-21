@@ -6,7 +6,9 @@ slam_toolbox:
     ceres_preconditioner: SCHUR_JACOBI
     ceres_trust_strategy: LEVENBERG_MARQUARDT
     ceres_dogleg_type: TRADITIONAL_DOGLEG
-    ceres_loss_function: None
+    # Down-weight a single bad graph constraint instead of allowing one false
+    # corridor loop closure to pull the whole map sideways.
+    ceres_loss_function: HuberLoss
     odom_frame: odom
     map_frame: map
     base_frame: base_footprint
@@ -20,6 +22,7 @@ slam_toolbox:
     transform_publish_period: 0.05
     map_update_interval: 1.0
     resolution: 0.05
+    min_laser_range: 0.10
     max_laser_range: 8.0
     minimum_time_interval: 0.08
     transform_timeout: 0.2
@@ -28,15 +31,39 @@ slam_toolbox:
     enable_interactive_mode: false
     use_scan_matching: true
     use_scan_barycenter: true
-    minimum_travel_distance: 0.05
-    minimum_travel_heading: 0.05
+    # Five-centimetre nodes produced many nearly identical scans in long,
+    # repetitive corridors. A 10 cm / 0.10 rad spacing keeps enough detail for
+    # this small base while giving loop matching a more distinctive chain.
+    minimum_travel_distance: 0.10
+    minimum_travel_heading: 0.10
     scan_buffer_size: 10
     scan_buffer_maximum_scan_distance: 10.0
-    link_match_minimum_response_fine: 0.1
+    link_match_minimum_response_fine: 0.15
     link_scan_maximum_distance: 1.5
     loop_search_maximum_distance: 3.0
     do_loop_closing: true
-    loop_match_minimum_chain_size: 10
-    loop_match_maximum_variance_coarse: 3.0
-    loop_match_minimum_response_coarse: 0.35
-    loop_match_minimum_response_fine: 0.45
+    # Reject ambiguous matches between parallel corridors. The previous stock
+    # thresholds accepted a false closure roughly 2 m sideways near the end of
+    # a ten-minute mapping run.
+    loop_match_minimum_chain_size: 15
+    loop_match_maximum_variance_coarse: 1.0
+    loop_match_minimum_response_coarse: 0.45
+    loop_match_minimum_response_fine: 0.55
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+    loop_search_space_dimension: 4.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    # Humble's live default on this image was 0.05. Pin the intended value so
+    # scan matching cannot cheaply jump far away from wheel odometry.
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+    min_pass_through: 3
+    occupancy_threshold: 0.1

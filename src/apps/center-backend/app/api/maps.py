@@ -166,6 +166,20 @@ def _map_view(database: Session, map_record: MapRecord, *, details: bool = False
             .order_by(MappingSession.created_at.desc())
         )
         value["mapping_session"] = _session_view(active_mapping) if active_mapping else None
+        recoverable_mapping = None
+        if active_mapping is None and not versions:
+            recoverable_mapping = database.scalar(
+                select(MappingSession)
+                .where(
+                    MappingSession.map_id == map_record.map_id,
+                    MappingSession.status == "FAULT",
+                    MappingSession.error_code == "MAPPING_RUNTIME_RESET",
+                )
+                .order_by(MappingSession.created_at.desc())
+            )
+        value["recoverable_mapping_session"] = (
+            _session_view(recoverable_mapping) if recoverable_mapping else None
+        )
         value["pois"] = [
             {
                 "destination_id": item.poi_id,
@@ -745,6 +759,7 @@ _MAPPING_ACTIONS = {
     "save-draft": ("mapping.save_draft", None),
     "finish": ("mapping.finish", "FINISHED"),
     "cancel": ("mapping.cancel", "CANCELED"),
+    "recover": ("mapping.recover", "PAUSED"),
 }
 
 
@@ -778,7 +793,33 @@ async def mapping_action(
     existing = database.get(CommandReceipt, body.request_id)
     if existing is None:
         try:
-            if action == "save-draft":
+            if action == "recover":
+                if (
+                    session.status != "FAULT"
+                    or session.error_code != "MAPPING_RUNTIME_RESET"
+                ):
+                    raise InvalidTransition(f"invalid recovery from {session.status}")
+                saved_version = database.scalar(
+                    select(MapVersion.id).where(MapVersion.map_id == session.map_id)
+                )
+                if saved_version is not None:
+                    raise InvalidTransition(
+                        "autosave recovery is only for maps without a saved version"
+                    )
+                active_robot_session = database.scalar(
+                    select(MappingSession.session_id).where(
+                        MappingSession.robot_id == session.robot_id,
+                        MappingSession.session_id != session.session_id,
+                        MappingSession.status.not_in(
+                            ("FINISHED", "CANCELED", "FAULT", "MAPPING_ERROR")
+                        ),
+                    )
+                )
+                if active_robot_session is not None:
+                    raise InvalidTransition(
+                        "robot already has another active mapping session"
+                    )
+            elif action == "save-draft":
                 if session.status not in {"MAPPING", "MAPPING_RUNNING", "PAUSED"}:
                     raise InvalidTransition(
                         f"invalid transition {session.status} -> SAVING"
@@ -789,8 +830,13 @@ async def mapping_action(
                         f"invalid transition {session.status} -> MAPPING_SAVING"
                     )
                 if action == "finish":
-                    mapping_transition(session.status, "FINISHING")
-                    mapping_transition("FINISHING", "FINISHED")
+                    if session.status not in {
+                        "MAPPING", "MAPPING_RUNNING", "MAPPING_STOPPED_UNSAVED",
+                        "PAUSED", "SAVED_DRAFT",
+                    }:
+                        raise InvalidTransition(
+                            f"invalid transition {session.status} -> FINISHED"
+                        )
                 else:
                     mapping_transition(session.status, "MAPPING_SAVING")
                     mapping_transition("MAPPING_SAVING", "FINISHED")
@@ -803,15 +849,16 @@ async def mapping_action(
         request_id=body.request_id,
         robot_id=session.robot_id,
         command_type=command_type,
-        expected_state=body.expected_state,
+        expected_state="IDLE" if action == "recover" else body.expected_state,
         payload={
             "mapping_session_id": session.session_id,
             "map_id": session.map_id,
             "version": session.version,
+            "metadata": session.metadata_json,
         },
         timeout_seconds=(
             settings.mapping_command_timeout_seconds
-            if action in {"save", "save-draft", "finish"}
+            if action in {"save", "save-draft", "finish", "recover"}
             else settings.robot_command_timeout_seconds
         ),
     )
@@ -838,6 +885,15 @@ async def mapping_action(
             record = database.get(MapRecord, session.map_id)
             if record:
                 record.status = "SYNC_PENDING"
+        if target == "CANCELED":
+            record = database.get(MapRecord, session.map_id)
+            has_version = database.scalar(
+                select(MapVersion.id).where(MapVersion.map_id == session.map_id)
+            )
+            if record is not None and has_version is None and record.active_version is None:
+                record.status = "DELETED"
+                record.deleted_at = datetime.now(timezone.utc)
+                record.deletion_status = "DELETED"
     else:
         if robot_state in {
             "MAPPING", "MAPPING_RUNNING", "MAPPING_STOPPED_UNSAVED", "MAPPING_ERROR",

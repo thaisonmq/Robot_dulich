@@ -25,16 +25,16 @@ check_rviz_install
 source "${project_root}/scripts/prepare_rviz_media_compat.sh"
 prepare_rviz_media_compat "${project_root}" "/opt/ros/${project_ros_distro}"
 
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-20}"
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-21}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
-export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-${project_root}/demo/robot-simulator/micro_ros_fastdds.xml}"
+export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-${project_root}/config/rviz/rviz_lan_fastdds.xml}"
 echo "ROS 2: ${project_ros_distro}"
 echo "ROS_DOMAIN_ID: ${ROS_DOMAIN_ID}"
 echo "RMW: ${RMW_IMPLEMENTATION}"
 
 if command -v ros2 >/dev/null 2>&1; then
   topics="$(ros2 topic list 2>/dev/null || true)"
-  for topic in /scan /scan_mapping /map /tf /tf_static /odom; do
+  for topic in /scan_mapping /map /tf /tf_static /odometry/filtered; do
     if grep -Fxq "${topic}" <<<"${topics}"; then
       echo "${topic} : OK"
     else

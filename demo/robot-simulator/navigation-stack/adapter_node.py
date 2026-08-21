@@ -70,6 +70,7 @@ from navigation_core import (
     filter_static_map_scan,
     find_start_escape,
     heading_diversity,
+    heading_position_spread,
     localization_confidence,
     localization_verification,
     path_overlap_ratio,
@@ -206,7 +207,13 @@ class NavigationAdapter(Node):
         self.scan_map_mean_residuals: deque[float] = deque(
             maxlen=self.scan_map_scores.maxlen
         )
-        self.raycast_match_ratios: deque[float] = deque(
+        self.raycast_static_match_ratios: deque[float] = deque(
+            maxlen=self.scan_map_scores.maxlen
+        )
+        self.raycast_dynamic_occlusion_ratios: deque[float] = deque(
+            maxlen=self.scan_map_scores.maxlen
+        )
+        self.raycast_contradiction_ratios: deque[float] = deque(
             maxlen=self.scan_map_scores.maxlen
         )
         self.raycast_median_errors: deque[float] = deque(
@@ -223,7 +230,14 @@ class NavigationAdapter(Node):
         self.scan_map_p90_residual = math.inf
         self.scan_map_mean_residual = math.inf
         self.raycast_comparable_beams = 0
+        self.raycast_static_matches = 0
+        self.raycast_dynamic_occlusions = 0
+        self.raycast_map_contradictions = 0
+        self.raycast_inconclusive_map_hits = 0
         self.raycast_matched_beams = 0
+        self.raycast_static_match_ratio = 0.0
+        self.raycast_dynamic_occlusion_ratio = 0.0
+        self.raycast_contradiction_ratio = 0.0
         self.raycast_match_ratio = 0.0
         self.raycast_median_error = math.inf
         self.raycast_p90_error = math.inf
@@ -364,14 +378,16 @@ class NavigationAdapter(Node):
         self.localization_raycast_match_tolerance = configured(
             "localization_raycast_match_tolerance", 0.15
         )
-        self.localization_raycast_minimum_match_ratio = configured(
-            "localization_raycast_minimum_match_ratio", 0.55
+        self.localization_raycast_minimum_reliable_structure_span = configured(
+            "localization_raycast_minimum_reliable_structure_span", 0.75
         )
-        self.localization_raycast_maximum_median_error = configured(
-            "localization_raycast_maximum_median_error", 0.15
-        )
-        self.localization_raycast_maximum_p90_error = configured(
-            "localization_raycast_maximum_p90_error", 1.0
+        self.localization_raycast_minimum_static_matches = max(1, int(
+            self.declare_parameter(
+                "localization_raycast_minimum_static_matches", 20
+            ).value
+        ))
+        self.localization_raycast_maximum_contradiction_ratio = configured(
+            "localization_raycast_maximum_contradiction_ratio", 0.20
         )
         self.scan_map_minimum_range = configured("scan_map_minimum_range", 0.20)
         self.scan_map_maximum_range = configured("scan_map_maximum_range", 6.0)
@@ -457,6 +473,7 @@ class NavigationAdapter(Node):
         # READY uses actual scan heading bins/span below, not commanded angle.
         self.global_observation_minimum_rotation = self.global_minimum_heading_span
         self.localization_evidence_headings: list[float] = []
+        self.localization_heading_positions: dict[int, tuple[float, float]] = {}
         self.localization_heading_bins: tuple[int, ...] = ()
         self.localization_heading_span = 0.0
         self.rotation_speed = math.radians(
@@ -1499,6 +1516,18 @@ class NavigationAdapter(Node):
                 self.scan_map_mean_residual
             ),
             "raycast_comparable_beams": self.raycast_comparable_beams,
+            "raycast_static_matches": self.raycast_static_matches,
+            "raycast_dynamic_occlusions": self.raycast_dynamic_occlusions,
+            "raycast_map_contradictions": self.raycast_map_contradictions,
+            "raycast_inconclusive_map_hits": (
+                self.raycast_inconclusive_map_hits
+            ),
+            "raycast_static_match_ratio": self.raycast_static_match_ratio,
+            "raycast_dynamic_occlusion_ratio": (
+                self.raycast_dynamic_occlusion_ratio
+            ),
+            "raycast_contradiction_ratio": self.raycast_contradiction_ratio,
+            # Compatibility aliases for existing telemetry consumers.
             "raycast_matches": self.raycast_matched_beams,
             "raycast_match_ratio": self.raycast_match_ratio,
             "raycast_median_error_m": self._finite_metric(
@@ -2043,7 +2072,9 @@ class NavigationAdapter(Node):
                 self.scan_map_median_residuals.clear()
                 self.scan_map_p90_residuals.clear()
                 self.scan_map_mean_residuals.clear()
-                self.raycast_match_ratios.clear()
+                self.raycast_static_match_ratios.clear()
+                self.raycast_dynamic_occlusion_ratios.clear()
+                self.raycast_contradiction_ratios.clear()
                 self.raycast_median_errors.clear()
                 self.raycast_p90_errors.clear()
                 self.scan_map_score = 0.0
@@ -2051,7 +2082,14 @@ class NavigationAdapter(Node):
                 self.scan_map_p90_residual = math.inf
                 self.scan_map_mean_residual = math.inf
                 self.raycast_comparable_beams = 0
+                self.raycast_static_matches = 0
+                self.raycast_dynamic_occlusions = 0
+                self.raycast_map_contradictions = 0
+                self.raycast_inconclusive_map_hits = 0
                 self.raycast_matched_beams = 0
+                self.raycast_static_match_ratio = 0.0
+                self.raycast_dynamic_occlusion_ratio = 0.0
+                self.raycast_contradiction_ratio = 0.0
                 self.raycast_match_ratio = 0.0
                 self.raycast_median_error = math.inf
                 self.raycast_p90_error = math.inf
@@ -2064,6 +2102,7 @@ class NavigationAdapter(Node):
                     and jump > self.pose_maximum_xy_spread * 2
                 ):
                     self.localization_evidence_headings.clear()
+                    self.localization_heading_positions.clear()
                     self.localization_heading_bins = ()
                     self.localization_heading_span = 0.0
                     self.ready_evidence_since = None
@@ -2248,7 +2287,12 @@ class NavigationAdapter(Node):
             stability_score=stability_score,
             scan_map_score=confidence_scan_map_score,
             scan_map_threshold=self.scan_map_threshold,
-            raycast_match_ratio=self.raycast_match_ratio,
+            # Dynamic occlusion is neutral here. Contradictions reduce the
+            # summary confidence while explicit static/contradiction gates
+            # remain authoritative for READY.
+            raycast_match_ratio=max(
+                0.0, 1.0 - self.raycast_contradiction_ratio
+            ),
             scan_fresh=time.monotonic() - self.last_scan_monotonic <= 0.30,
             tf_stable=time.monotonic() - self.last_map_tf_monotonic <= 0.60,
             odometry_healthy=self.tf_buffer.can_transform(
@@ -2706,7 +2750,10 @@ class NavigationAdapter(Node):
                 self.saved_map,
                 canonical,
                 half_length=self.footprint_half_length,
-                half_width=self.footprint_half_width,
+                half_width=(
+                    self.footprint_half_width
+                    + self.translation_lateral_margin
+                ),
                 padding=self.planning_footprint_padding,
                 segment_directions=directions,
             )
@@ -3098,7 +3145,9 @@ class NavigationAdapter(Node):
             self.saved_map,
             canonical,
             half_length=self.footprint_half_length,
-            half_width=self.footprint_half_width,
+            half_width=(
+                self.footprint_half_width + self.translation_lateral_margin
+            ),
             padding=self.planning_footprint_padding,
             segment_directions=segment_directions,
         )
@@ -3397,9 +3446,9 @@ class NavigationAdapter(Node):
         self,
         message: LaserScan,
         *,
-        scan_quality_passed: bool,
+        heading_observation_valid: bool,
     ) -> None:
-        """Record corroborated physical headings for one stable hypothesis."""
+        """Record basic-quality headings without pre-accepting localization."""
         stationary_observation = bool(
             self.global_search_untrusted
             and self.localization_state in {
@@ -3414,10 +3463,14 @@ class NavigationAdapter(Node):
         )
         if (
             not stationary_observation
-            or not scan_quality_passed
+            or not heading_observation_valid
             or not self._pose_is_stable()
-            or self.localization_confidence
-            < self.localization_confidence_threshold
+            or self.last_amcl_pose is None
+            or time.monotonic() - self.last_amcl_monotonic
+            > self.amcl_pose_freshness
+            or time.monotonic() - self.last_scan_map_monotonic
+            > self.scan_map_freshness
+            or not self._critical_sensor_time_healthy()
         ):
             return
         valid_beams = sum(
@@ -3431,7 +3484,37 @@ class NavigationAdapter(Node):
         heading = self._scan_heading_in_odom(message)
         if heading is None:
             return
+        heading_bin = min(
+            self.global_heading_bin_count - 1,
+            int(
+                (heading % (2.0 * math.pi))
+                / (2.0 * math.pi)
+                * self.global_heading_bin_count
+            ),
+        )
+        candidate_x, candidate_y, _ = self.last_amcl_pose
+        maximum_position_spread = self.pose_maximum_xy_spread * 2.0
+        position_spread = heading_position_spread([
+            *self.localization_heading_positions.values(),
+            (candidate_x, candidate_y),
+        ])
+        if position_spread > maximum_position_spread:
+            self.localization_evidence_headings.clear()
+            self.localization_heading_positions.clear()
+            self.localization_heading_bins = ()
+            self.localization_heading_span = 0.0
+            self.ready_evidence_since = None
+            self._nav_debug(
+                "LOCALIZATION",
+                state=self.localization_state,
+                action="HEADING_CORROBORATION_RESET",
+                reason="SPATIAL_HYPOTHESIS_INCONSISTENT_ACROSS_HEADINGS",
+                position_spread_m=position_spread,
+            )
         self.localization_evidence_headings.append(heading)
+        self.localization_heading_positions[heading_bin] = (
+            candidate_x, candidate_y
+        )
         diversity = heading_diversity(
             self.localization_evidence_headings,
             bin_count=self.global_heading_bin_count,
@@ -3474,12 +3557,22 @@ class NavigationAdapter(Node):
             minimum_usable_range=self.scan_map_minimum_range,
             maximum_usable_range=self.scan_map_maximum_range,
             match_tolerance=self.localization_raycast_match_tolerance,
+            minimum_reliable_structure_span=(
+                self.localization_raycast_minimum_reliable_structure_span
+            ),
         )
         self.scan_map_matched_beams = match.matched_beams
         self.scan_map_valid_beams = match.valid_beams
         self.scan_map_residual_beams = match.residual_beams
         self.raycast_comparable_beams = raycast.comparable_beams
+        self.raycast_static_matches = raycast.static_matches
+        self.raycast_dynamic_occlusions = raycast.dynamic_occlusions
+        self.raycast_map_contradictions = raycast.map_contradictions
+        self.raycast_inconclusive_map_hits = raycast.inconclusive_map_hits
         self.raycast_matched_beams = raycast.matched_beams
+        self.raycast_static_match_ratio = raycast.static_match_ratio
+        self.raycast_dynamic_occlusion_ratio = raycast.dynamic_occlusion_ratio
+        self.raycast_contradiction_ratio = raycast.contradiction_ratio
         self.raycast_match_ratio = raycast.match_ratio
         self.raycast_median_error = raycast.median_error
         self.raycast_p90_error = raycast.p90_error
@@ -3490,7 +3583,15 @@ class NavigationAdapter(Node):
         self.scan_map_p90_residuals.append(match.p90_residual)
         self.scan_map_mean_residuals.append(match.mean_residual)
         if raycast.comparable_beams >= self.localization_raycast_minimum_beams:
-            self.raycast_match_ratios.append(raycast.match_ratio)
+            self.raycast_static_match_ratios.append(
+                raycast.static_match_ratio
+            )
+            self.raycast_dynamic_occlusion_ratios.append(
+                raycast.dynamic_occlusion_ratio
+            )
+            self.raycast_contradiction_ratios.append(
+                raycast.contradiction_ratio
+            )
             self.raycast_median_errors.append(raycast.median_error)
             self.raycast_p90_errors.append(raycast.p90_error)
         self.scan_map_score = round(statistics.median(self.scan_map_scores), 4)
@@ -3503,10 +3604,19 @@ class NavigationAdapter(Node):
         self.scan_map_mean_residual = statistics.median(
             self.scan_map_mean_residuals
         )
-        if self.raycast_match_ratios:
-            self.raycast_match_ratio = round(
-                statistics.median(self.raycast_match_ratios), 4
+        if self.raycast_static_match_ratios:
+            self.raycast_static_match_ratio = round(
+                statistics.median(self.raycast_static_match_ratios), 4
             )
+            self.raycast_dynamic_occlusion_ratio = round(
+                statistics.median(
+                    self.raycast_dynamic_occlusion_ratios
+                ), 4
+            )
+            self.raycast_contradiction_ratio = round(
+                statistics.median(self.raycast_contradiction_ratios), 4
+            )
+            self.raycast_match_ratio = self.raycast_static_match_ratio
             self.raycast_median_error = statistics.median(
                 self.raycast_median_errors
             )
@@ -3525,14 +3635,6 @@ class NavigationAdapter(Node):
             <= self.localization_final_max_median_residual
             and match.p90_residual
             <= self.localization_final_max_p90_residual
-            and raycast.comparable_beams
-            >= self.localization_raycast_minimum_beams
-            and raycast.match_ratio
-            >= self.localization_raycast_minimum_match_ratio
-            and raycast.median_error
-            <= self.localization_raycast_maximum_median_error
-            and raycast.p90_error
-            <= self.localization_raycast_maximum_p90_error
         )
 
     def _planning_scan_message(self, message: LaserScan) -> LaserScan:
@@ -3723,9 +3825,9 @@ class NavigationAdapter(Node):
             # the segment; uncertainty alone must not hand off to Manual.
             if evidence_reason == "PHYSICALLY_BLOCKED":
                 self._enter_narrow_path_decision(evidence_reason, confirmed)
-        scan_quality_passed = self._update_scan_map_match(message)
+        heading_observation_valid = self._update_scan_map_match(message)
         self._record_heading_observation(
-            message, scan_quality_passed=scan_quality_passed
+            message, heading_observation_valid=heading_observation_valid
         )
         if self.mode == "MAPPING" and self.current_state in {"MAPPING", "MAPPING_RUNNING"}:
             self.mapping_scan.publish(message)
@@ -4034,7 +4136,9 @@ class NavigationAdapter(Node):
         self.scan_map_median_residuals.clear()
         self.scan_map_p90_residuals.clear()
         self.scan_map_mean_residuals.clear()
-        self.raycast_match_ratios.clear()
+        self.raycast_static_match_ratios.clear()
+        self.raycast_dynamic_occlusion_ratios.clear()
+        self.raycast_contradiction_ratios.clear()
         self.raycast_median_errors.clear()
         self.raycast_p90_errors.clear()
         self.scan_map_score = 0.0
@@ -4045,11 +4149,19 @@ class NavigationAdapter(Node):
         self.scan_map_p90_residual = math.inf
         self.scan_map_mean_residual = math.inf
         self.raycast_comparable_beams = 0
+        self.raycast_static_matches = 0
+        self.raycast_dynamic_occlusions = 0
+        self.raycast_map_contradictions = 0
+        self.raycast_inconclusive_map_hits = 0
         self.raycast_matched_beams = 0
+        self.raycast_static_match_ratio = 0.0
+        self.raycast_dynamic_occlusion_ratio = 0.0
+        self.raycast_contradiction_ratio = 0.0
         self.raycast_match_ratio = 0.0
         self.raycast_median_error = math.inf
         self.raycast_p90_error = math.inf
         self.localization_evidence_headings.clear()
+        self.localization_heading_positions.clear()
         self.localization_heading_bins = ()
         self.localization_heading_span = 0.0
         self.last_scan_map_monotonic = 0.0
@@ -4527,17 +4639,13 @@ class NavigationAdapter(Node):
             maximum_p90_residual=self.localization_final_max_p90_residual,
             raycast_comparable_beams=self.raycast_comparable_beams,
             minimum_raycast_beams=self.localization_raycast_minimum_beams,
-            raycast_match_ratio=self.raycast_match_ratio,
-            minimum_raycast_match_ratio=(
-                self.localization_raycast_minimum_match_ratio
+            raycast_static_matches=self.raycast_static_matches,
+            minimum_raycast_static_matches=(
+                self.localization_raycast_minimum_static_matches
             ),
-            raycast_median_error=self.raycast_median_error,
-            maximum_raycast_median_error=(
-                self.localization_raycast_maximum_median_error
-            ),
-            raycast_p90_error=self.raycast_p90_error,
-            maximum_raycast_p90_error=(
-                self.localization_raycast_maximum_p90_error
+            raycast_contradiction_ratio=self.raycast_contradiction_ratio,
+            maximum_raycast_contradiction_ratio=(
+                self.localization_raycast_maximum_contradiction_ratio
             ),
             heading_required=require_heading,
             heading_ready=self._global_heading_diversity_ready(),
@@ -4643,12 +4751,10 @@ class NavigationAdapter(Node):
             and now - self.last_scan_map_monotonic <= self.scan_map_freshness
             and self.raycast_comparable_beams
             >= self.localization_raycast_minimum_beams
-            and self.raycast_match_ratio
-            >= self.localization_raycast_minimum_match_ratio
-            and self.raycast_median_error
-            <= self.localization_raycast_maximum_median_error
-            and self.raycast_p90_error
-            <= self.localization_raycast_maximum_p90_error
+            and self.raycast_static_matches
+            >= self.localization_raycast_minimum_static_matches
+            and self.raycast_contradiction_ratio
+            <= self.localization_raycast_maximum_contradiction_ratio
         )
 
     def _begin_localization_settling(
@@ -4679,7 +4785,9 @@ class NavigationAdapter(Node):
         self.scan_map_median_residuals.clear()
         self.scan_map_p90_residuals.clear()
         self.scan_map_mean_residuals.clear()
-        self.raycast_match_ratios.clear()
+        self.raycast_static_match_ratios.clear()
+        self.raycast_dynamic_occlusion_ratios.clear()
+        self.raycast_contradiction_ratios.clear()
         self.raycast_median_errors.clear()
         self.raycast_p90_errors.clear()
         self.scan_map_score = 0.0
@@ -4690,7 +4798,14 @@ class NavigationAdapter(Node):
         self.scan_map_p90_residual = math.inf
         self.scan_map_mean_residual = math.inf
         self.raycast_comparable_beams = 0
+        self.raycast_static_matches = 0
+        self.raycast_dynamic_occlusions = 0
+        self.raycast_map_contradictions = 0
+        self.raycast_inconclusive_map_hits = 0
         self.raycast_matched_beams = 0
+        self.raycast_static_match_ratio = 0.0
+        self.raycast_dynamic_occlusion_ratio = 0.0
+        self.raycast_contradiction_ratio = 0.0
         self.raycast_match_ratio = 0.0
         self.raycast_median_error = math.inf
         self.raycast_p90_error = math.inf
@@ -4883,6 +4998,19 @@ class NavigationAdapter(Node):
                 "LOCALIZATION_VERIFY",
                 state=self.localization_state,
                 candidate_pose=self.last_amcl_pose,
+                pose_stability={
+                    "passed": self._pose_is_stable(),
+                    "samples": self.pose_stability_metrics.sample_count,
+                    "duration_seconds": round(
+                        self.pose_stability_metrics.duration_seconds, 3
+                    ),
+                    "xy_spread": self._finite_metric(
+                        self.pose_stability_metrics.xy_spread
+                    ),
+                    "median_deviation": self._finite_metric(
+                        self.pose_stability_metrics.median_deviation
+                    ),
+                },
                 covariance_xy=(
                     None if len(self.last_amcl_covariance) < 36 else
                     float(self.last_amcl_covariance[0])
@@ -4905,6 +5033,22 @@ class NavigationAdapter(Node):
                     self.scan_map_mean_residual
                 ),
                 raycast_comparable_beams=self.raycast_comparable_beams,
+                raycast_static_matches=self.raycast_static_matches,
+                raycast_dynamic_occlusions=self.raycast_dynamic_occlusions,
+                raycast_map_contradictions=(
+                    self.raycast_map_contradictions
+                ),
+                raycast_inconclusive_map_hits=(
+                    self.raycast_inconclusive_map_hits
+                ),
+                raycast_static_match_ratio=self.raycast_static_match_ratio,
+                raycast_dynamic_occlusion_ratio=(
+                    self.raycast_dynamic_occlusion_ratio
+                ),
+                raycast_contradiction_ratio=(
+                    self.raycast_contradiction_ratio
+                ),
+                # Compatibility fields retained for existing log parsers.
                 raycast_matches=self.raycast_matched_beams,
                 raycast_match_ratio=self.raycast_match_ratio,
                 raycast_median_error_m=self._finite_metric(
@@ -4955,6 +5099,19 @@ class NavigationAdapter(Node):
                 "LOCALIZATION_VERIFY",
                 state=self.localization_state,
                 candidate_pose=self.last_amcl_pose,
+                pose_stability={
+                    "passed": self._pose_is_stable(),
+                    "samples": self.pose_stability_metrics.sample_count,
+                    "duration_seconds": round(
+                        self.pose_stability_metrics.duration_seconds, 3
+                    ),
+                    "xy_spread": self._finite_metric(
+                        self.pose_stability_metrics.xy_spread
+                    ),
+                    "median_deviation": self._finite_metric(
+                        self.pose_stability_metrics.median_deviation
+                    ),
+                },
                 covariance_xy=(
                     None if len(self.last_amcl_covariance) < 36 else
                     float(self.last_amcl_covariance[0])
@@ -4964,6 +5121,7 @@ class NavigationAdapter(Node):
                     None if len(self.last_amcl_covariance) < 36 else
                     float(self.last_amcl_covariance[35])
                 ),
+                confidence=self.localization_confidence,
                 scan_score=self.scan_map_score,
                 scan_score_required=accepted_scan_score_required,
                 median_residual_m=self._finite_metric(
@@ -4973,6 +5131,21 @@ class NavigationAdapter(Node):
                     self.scan_map_p90_residual
                 ),
                 raycast_comparable_beams=self.raycast_comparable_beams,
+                raycast_static_matches=self.raycast_static_matches,
+                raycast_dynamic_occlusions=self.raycast_dynamic_occlusions,
+                raycast_map_contradictions=(
+                    self.raycast_map_contradictions
+                ),
+                raycast_inconclusive_map_hits=(
+                    self.raycast_inconclusive_map_hits
+                ),
+                raycast_static_match_ratio=self.raycast_static_match_ratio,
+                raycast_dynamic_occlusion_ratio=(
+                    self.raycast_dynamic_occlusion_ratio
+                ),
+                raycast_contradiction_ratio=(
+                    self.raycast_contradiction_ratio
+                ),
                 raycast_matches=self.raycast_matched_beams,
                 raycast_match_ratio=self.raycast_match_ratio,
                 raycast_median_error_m=self._finite_metric(
@@ -4982,6 +5155,7 @@ class NavigationAdapter(Node):
                     self.raycast_p90_error
                 ),
                 heading_bins=len(self.localization_heading_bins),
+                heading_bin_ids=list(self.localization_heading_bins),
                 heading_span_deg=round(
                     math.degrees(self.localization_heading_span), 1
                 ),
@@ -5343,6 +5517,8 @@ class NavigationAdapter(Node):
                 linear_speed=self.speed_profiles.get(self.auto_speed_mode).linear_max,
                 angular_speed=self.execution_turn_max_speed,
                 turn_bay_max_distance=self.turn_bay_max_distance,
+                hard_side_margin=self.translation_lateral_margin,
+                preferred_side_margin=self.corridor_side_margin,
             )
             self.failed_segments = []
             self._publish_failed_segments()
@@ -5863,6 +6039,8 @@ class NavigationAdapter(Node):
             route_id=self.selected_route_id,
             points=len(selected["points"]),
             length=selected["total_length"],
+            minimum_side_clearance=selected.get("minimum_side_clearance"),
+            minimum_passage_width=selected.get("minimum_passage_width"),
             duration_ms=self.planner_latency_ms,
             goal_adjusted=goal_adjusted,
             segment_directions=selected.get("segment_directions", []),
@@ -5953,7 +6131,9 @@ class NavigationAdapter(Node):
             self.saved_map,
             points,
             half_length=self.footprint_half_length,
-            half_width=self.footprint_half_width,
+            half_width=(
+                self.footprint_half_width + self.translation_lateral_margin
+            ),
             padding=self.planning_footprint_padding,
             segment_directions=segment_directions,
         )
@@ -6524,7 +6704,10 @@ class NavigationAdapter(Node):
                     saved_map,
                     (pose, candidate),
                     half_length=self.footprint_half_length,
-                    half_width=self.footprint_half_width,
+                    half_width=(
+                        self.footprint_half_width
+                        + self.translation_lateral_margin
+                    ),
                     padding=self.planning_footprint_padding,
                     segment_directions=(direction,),
                 )
@@ -6923,7 +7106,10 @@ class NavigationAdapter(Node):
                 self.saved_map,
                 candidate,
                 half_length=self.footprint_half_length,
-                half_width=self.footprint_half_width,
+                half_width=(
+                    self.footprint_half_width
+                    + self.translation_lateral_margin
+                ),
                 padding=self.planning_footprint_padding,
                 segment_directions=(motion_direction,),
             )
@@ -7452,16 +7638,23 @@ class NavigationAdapter(Node):
         heading, _ = self._current_path_heading()
         yaw = float(self.pose.get("yaw", 0.0)) if heading is None else float(heading)
         distance = self.footprint_half_length + max(0.0, front_clearance)
-        self.dynamic_overlay.observe(
-            ((
-                float(self.pose["x"]) + distance * math.cos(yaw),
-                float(self.pose["y"]) + distance * math.sin(yaw),
-            ),),
+        blocker = (
+            float(self.pose["x"]) + distance * math.cos(yaw),
+            float(self.pose["y"]) + distance * math.sin(yaw),
+        )
+        snapshot = self.dynamic_overlay.observe_confirmed_blocker(
+            (blocker,),
             now=now,
-            saved_map=self.saved_map,
-            static_tolerance=self.dynamic_overlay_static_tolerance,
         )
         self._refresh_dynamic_obstacle_view()
+        self._nav_debug(
+            "DYNAMIC_BLOCKER",
+            source="CONTROLLER_CORRIDOR",
+            center=(round(blocker[0], 3), round(blocker[1], 3)),
+            front_clearance=round(front_clearance, 3),
+            exclusions=len(snapshot),
+            destination_preserved=bool(self.execution_goal or self.paused_goal),
+        )
 
     def _schedule_execution_replan(
         self,
@@ -7550,9 +7743,13 @@ class NavigationAdapter(Node):
         self.navigation_velocity.publish(Twist())
         fresh = self._atomic_safety_fresh(now)
         corridor_blocked, _ = self._fresh_corridor_blockage(now)
+        # A transient planner error must not erase fresh physical evidence.
+        # Keep the current route blocked while its forward corridor remains
+        # obstructed, regardless of the latest retry's error-code spelling.
         controller_corridor_blocked = bool(
-            self.dynamic_block_reason.startswith("CONTROLLER_ABORT")
-            and corridor_blocked
+            corridor_blocked
+            and (self.execution_goal is not None or self.paused_goal is not None)
+            and len(self.dynamic_blocked_route) >= 2
         )
         dynamic_blocked = bool(
             self._atomic_dynamic_blockage(now)
@@ -7594,6 +7791,8 @@ class NavigationAdapter(Node):
         goal = dict(self.execution_goal or self.paused_goal or {})
         try:
             points = self._plan_stop_turn_from_current(goal)
+            if expected_generation != self.navigation_goal_generation:
+                return
             same_blocked_route = bool(
                 len(self.dynamic_blocked_route) >= 2
                 and len(points) >= 2
@@ -8188,10 +8387,20 @@ class NavigationAdapter(Node):
         return {"status": "completed", "current_state": target, "state": self._state()}
 
     def _pause_navigation(self) -> dict[str, Any]:
-        if self.current_goal_handle is None and self.execution_phase not in {
-            "STRAIGHT_PREPARE", "TURN", "TURN_SETTLING",
-            "DISPATCHING_STRAIGHT", "RECOVERING",
-        }:
+        recovery_active = self.current_state in {
+            "WAIT_FOR_DYNAMIC_CLEAR",
+            "WAITING_FOR_DYNAMIC_CLEAR",
+            "DYNAMIC_REPLAN",
+        }
+        if (
+            self.current_goal_handle is None
+            and not recovery_active
+            and self.execution_phase not in {
+                "STRAIGHT_PREPARE", "TURN", "TURN_SETTLING",
+                "DISPATCHING_STRAIGHT", "RECOVERING",
+                "WAIT_FOR_DYNAMIC_CLEAR", "DYNAMIC_REPLAN",
+            }
+        ):
             raise AdapterError("STATE_CONFLICT", "Navigation is not active")
         return self._cancel_navigation("PAUSED")
 

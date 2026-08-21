@@ -12,6 +12,7 @@ services:
 
   mapping-stack:
     profiles: ["legacy-coexistence"]
+    image: ${ROVERA_MAPPING_IMAGE:-rovera-robot-edge-mapping-stack}
     build:
       context: ./navigation-stack
     network_mode: host
@@ -46,6 +47,16 @@ services:
         source: ./micro_ros_fastdds.xml
         target: /etc/rovera/micro_ros_fastdds.xml
         read_only: true
+      # Mapping calibration is deployed independently of the large ROS image.
+      # The next mapping container picks it up without rebuilding on the Pi.
+      - type: bind
+        source: ./navigation-stack/config/slam_toolbox.yaml
+        target: /opt/rovera/config/slam_toolbox.yaml
+        read_only: true
+      - type: bind
+        source: ./navigation-stack/config/sensor_time.yaml
+        target: /opt/rovera/config/sensor_time.yaml
+        read_only: true
     healthcheck:
       test: ["CMD", "/opt/rovera/scripts/healthcheck.sh"]
       interval: 8s
@@ -59,3 +70,45 @@ services:
       options:
         max-size: "20m"
         max-file: "3"
+
+  rviz-bridge:
+    profiles: ["legacy-coexistence"]
+    image: ${ROVERA_MAPPING_IMAGE:-rovera-robot-edge-mapping-stack}
+    network_mode: host
+    ipc: host
+    restart: unless-stopped
+    stop_grace_period: 3s
+    user: "${ROBOT_UID:-1000}:${ROBOT_GID:-1000}"
+    environment:
+      HOME: /tmp/rovera-rviz-bridge
+      ROS_LOG_DIR: /tmp/rovera-rviz-bridge/ros-log
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      # Unlike the operational graph, this participant may advertise the
+      # whitelisted observation topics to RViz clients on the trusted LAN.
+      FASTRTPS_DEFAULT_PROFILES_FILE: /etc/rovera/rviz_lan_fastdds.xml
+    command:
+      - ros2
+      - run
+      - domain_bridge
+      - domain_bridge
+      - --wait-for-publisher
+      - "true"
+      - --wait-for-subscription
+      - "true"
+      - /opt/rovera/config/rviz_domain_bridge.yaml
+    volumes:
+      - type: bind
+        source: ./rviz_lan_fastdds.xml
+        target: /etc/rovera/rviz_lan_fastdds.xml
+        read_only: true
+      - type: bind
+        source: ./navigation-stack/config/rviz_domain_bridge.yaml
+        target: /opt/rovera/config/rviz_domain_bridge.yaml
+        read_only: true
+    mem_limit: 192m
+    cpus: 0.35
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"

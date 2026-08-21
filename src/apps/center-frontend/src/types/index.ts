@@ -375,6 +375,7 @@ export interface MapData {
   checksum?: string;
   versions?: MapVersion[];
   mapping_session?: MappingSession | null;
+  recoverable_mapping_session?: MappingSession | null;
   pois?: Destination[];
   keepout_zones?: { zone_id: string; name: string; points: Point[] }[];
   speed_zones?: { zone_id: string; name: string; points: Point[]; max_speed_mps: number }[];

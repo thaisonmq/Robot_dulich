@@ -140,7 +140,7 @@ rollback() {
   if [ "$rollback_needed" -eq 1 ]; then
     echo >&2 "Managed-motion verification failed; restoring the vendor joystick."
     "${edge_compose[@]}" stop robot-simulator ros-control-bridge yahboom-joystick >/dev/null 2>&1 || true
-    "${mapping_compose[@]}" stop mapping-stack >/dev/null 2>&1 || true
+    "${mapping_compose[@]}" stop rviz-bridge mapping-stack >/dev/null 2>&1 || true
     ROVERA_CMD_VEL_MODE=exclusive \
       ROVERA_EXCLUSIVE_CMD_VEL_ACK="$required_ack" \
       "${navigation_compose[@]}" stop motion-safety >/dev/null 2>&1 || true
@@ -176,7 +176,7 @@ MOTION_BACKEND=ros2 \
     yahboom-joystick ros-control-bridge robot-simulator
 
 ROVERA_USE_VENDOR_BASE_RUNTIME=1 \
-  "${mapping_compose[@]}" up -d mapping-stack
+  "${mapping_compose[@]}" up -d mapping-stack rviz-bridge
 
 sleep 6
 safety_id="$(docker ps -q --filter label=com.docker.compose.service=motion-safety)"
