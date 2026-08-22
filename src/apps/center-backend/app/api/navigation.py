@@ -44,6 +44,10 @@ PLAN_FAILURE_MESSAGES = {
     "PLANNER_TIMEOUT": "Bộ lập đường không phản hồi đúng thời gian.",
     "TF_ERROR": "Không thể xác định vị trí robot trên bản đồ để lập đường.",
     "COSTMAP_NOT_READY": "Costmap chưa sẵn sàng; vui lòng thử lại sau khi dữ liệu LiDAR được cập nhật.",
+    "ROUTE_CLEARANCE_INSUFFICIENT": (
+        "Không có lộ trình đủ rộng: hệ thống yêu cầu tối thiểu 7 cm "
+        "mỗi bên xe. Hãy chọn điểm khác hoặc cập nhật lại bản đồ."
+    ),
 }
 
 
@@ -698,11 +702,28 @@ async def start_navigation(
     )
     if result.get("status") in {"accepted", "completed"}:
         mission.status = "NAVIGATING"
+        mission.error_code = None
+        mission.error_message = None
     else:
         mission.status = "FAULT"
         mission.error_code = result.get("error_code")
         mission.error_message = result.get("error_message")
     database.commit()
+    if result.get("status") not in {"accepted", "completed"}:
+        # A robot-level rejection is an API failure. Returning HTTP 200 here
+        # made the browser enter its "moving" state even though the adapter
+        # remained READY and never published an autonomous velocity command.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": str(result.get("error_code") or "NAVIGATION_START_REJECTED"),
+                "message": str(
+                    result.get("error_message")
+                    or "Robot từ chối bắt đầu hành trình."
+                ),
+                "status": str(result.get("status") or "rejected"),
+            },
+        )
     return _mission_view(
         mission,
         candidates=candidates,

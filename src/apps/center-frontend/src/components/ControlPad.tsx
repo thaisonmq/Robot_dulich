@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Square } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ShieldCheck, ShieldOff, Square } from "lucide-react";
 import { useI18n } from "../i18n/I18nProvider";
 import type { MotionSpeedLevel } from "../config/control";
 import type { AutoNavigationSpeedMode } from "../types";
@@ -13,6 +13,8 @@ interface Props {
   autoSpeedMode: AutoNavigationSpeedMode;
   autoSpeedDisabled: boolean;
   onAutoSpeedModeChange: (mode: AutoNavigationSpeedMode) => void;
+  obstacleAvoidanceEnabled: boolean;
+  onObstacleAvoidanceEnabledChange: (enabled: boolean) => void;
 }
 
 const controls: { action: InputAction; label: string; icon: typeof ArrowUp; className: string }[] = [
@@ -43,6 +45,8 @@ export function ControlPad({
   autoSpeedMode,
   autoSpeedDisabled,
   onAutoSpeedModeChange,
+  obstacleAvoidanceEnabled,
+  onObstacleAvoidanceEnabledChange,
 }: Props) {
   const { t } = useI18n();
   const pointerDown = (event: React.PointerEvent<HTMLButtonElement>, action: InputAction) => {
@@ -87,6 +91,24 @@ export function ControlPad({
         </div>
       </div>
     </div>
+    <button
+      type="button"
+      className={`manual-obstacle-toggle ${obstacleAvoidanceEnabled ? "is-enabled" : "is-disabled"}`}
+      aria-pressed={obstacleAvoidanceEnabled}
+      aria-label={t(
+        obstacleAvoidanceEnabled
+          ? "Tắt chống vật cản khi điều khiển thủ công"
+          : "Bật chống vật cản khi điều khiển thủ công",
+      )}
+      disabled={disabled}
+      onClick={() => onObstacleAvoidanceEnabledChange(!obstacleAvoidanceEnabled)}
+    >
+      {obstacleAvoidanceEnabled
+        ? <ShieldCheck size={14} strokeWidth={2} />
+        : <ShieldOff size={14} strokeWidth={2} />}
+      <span>{t("Chống vật cản")}</span>
+      <strong>{t(obstacleAvoidanceEnabled ? "BẬT" : "TẮT")}</strong>
+    </button>
     <div className={`control-pad control-pad--${direction}`} aria-label={t("Điều khiển robot")}>
       <div className="control-pad__orbit" aria-hidden="true">
         <i /><i /><i /><i />

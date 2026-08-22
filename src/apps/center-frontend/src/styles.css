@@ -2642,6 +2642,30 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .drive-speed button.is-active { color: #fff; background: var(--blue); box-shadow: 0 3px 8px rgba(23,89,214,.2); }
 .drive-speed--auto button.is-active { background: #0f8a68; box-shadow: 0 3px 8px rgba(15,138,104,.2); }
 .drive-speed button:disabled { opacity: .4; cursor: not-allowed; }
+.manual-obstacle-toggle {
+  min-width: 190px;
+  min-height: 28px;
+  margin-top: 7px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: #167257;
+  background: #eaf7f1;
+  border: 1px solid #a9dbc9;
+  border-radius: 8px;
+  font-size: 8px;
+  font-weight: 750;
+  cursor: pointer;
+}
+.manual-obstacle-toggle strong { font-size: 8px; letter-spacing: .05em; }
+.manual-obstacle-toggle.is-disabled {
+  color: #a3422f;
+  background: #fff0ed;
+  border-color: #efb4a8;
+}
+.manual-obstacle-toggle:disabled { opacity: .4; cursor: not-allowed; }
 .control-pad {
   position: relative;
   width: 168px;

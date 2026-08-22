@@ -36,7 +36,9 @@ rovera_navigation_adapter:
     localization_low_confidence_threshold: 0.30
     localization_low_confidence_grace_seconds: 5.0
     localization_ready_hold_seconds: 1.0
-    localization_verify_timeout_seconds: 3.0
+    # Five 2 Hz AMCL samples plus the READY hold must fit before verification
+    # escalates to an operator-authorized global rotation.
+    localization_verify_timeout_seconds: 5.0
     localization_verify_min_scans: 3
     # Keep a direct AMCL-output freshness gate even while moving, where a
     # stationary pose-spread check is intentionally not applicable.
@@ -107,8 +109,15 @@ rovera_navigation_adapter:
     dynamic_overlay_static_tolerance: 0.08
     dynamic_overlay_ttl_seconds: 2.0
     dynamic_overlay_cluster_distance: 0.12
+    # Track a cluster through several local-costmap frames before acting.
+    # Moving people keep right-of-way; a stable chair becomes replanable.
+    dynamic_obstacle_motion_threshold: 0.12
+    dynamic_obstacle_stationary_confirmation_seconds: 1.0
+    dynamic_overlay_max_cells: 600
     dynamic_obstacle_persistence_seconds: 1.5
-    dynamic_obstacle_clear_dwell_seconds: 0.40
+    # Require sustained route-aligned clearance before resuming. A single
+    # sideways scan while waiting must never restart the blocked segment.
+    dynamic_obstacle_clear_dwell_seconds: 1.00
     dynamic_replan_retry_seconds: 2.0
     start_escape_max_distance: 0.60
     turn_bay_max_relocation_distance: 0.80
@@ -118,6 +127,9 @@ rovera_navigation_adapter:
     scan_tf_fallback_max_age_seconds: 0.12
     localization_tf_chain_timeout_seconds: 8.0
     scan_map_freshness_seconds: 0.60
+    # A go command may land just before the next 1 Hz LiDAR/AMCL evidence
+    # callback. Keep all localization gates strict, but wait for that sample.
+    navigation_start_localization_evidence_wait_seconds: 1.20
     sensor_time_invalid_grace_seconds: 1.0
     auto_localization_rotation_degrees_per_second: 45.0
     # Hard cap only. Strong candidates normally stop around 75 degrees and
@@ -140,14 +152,17 @@ rovera_navigation_adapter:
     localization_rotation_blocked_timeout_seconds: 5.0
     footprint_half_length: 0.15
     footprint_half_width: 0.10
-    # Physical source of truth is 0.30 x 0.20 m. Margins are explicit and do
-    # not shrink or enlarge the collision footprint silently.
+    # Physical body is 0.30 x 0.20 m. LiDAR self-returns are removed by the
+    # scan mask and must not inflate the chassis footprint a second time.
     planning_footprint_padding: 0.0
     corridor_hard_side_margin: 0.02
     # Must match motion-safety's hard straight swept-body envelope. The wider
     # corridor_side_margin below remains comfort/narrow metadata only.
     translation_lateral_margin: 0.01
-    corridor_side_margin: 0.05
+    # Auto routes must keep a real comfort reserve instead of accepting the
+    # former 5 cm threshold, which became only 2-4 cm with map/pose error.
+    corridor_side_margin: 0.07
+    stop_turn_minimum_route_side_clearance: 0.07
     corridor_localization_uncertainty_max: 0.04
     corridor_front_clearance: 0.14
     corridor_lookahead: 1.00
@@ -355,8 +370,7 @@ local_costmap:
       # A 2.5 cm rolling grid avoids a full 5 cm aliasing error when a scan
       # endpoint lands on different cells in the global and local grids.
       resolution: 0.025
-      # Physical 0.30 x 0.20 m body; grid uncertainty is handled by explicit
-      # inflation/corridor margins rather than a false footprint.
+      # Physical body; explicit safety margins are applied separately.
       footprint: "[[0.15, 0.10], [0.15, -0.10], [-0.15, -0.10], [-0.15, 0.10]]"
       footprint_padding: 0.0
       # The robot has a planar LaserScan, not a 3D point cloud. Use the same
@@ -402,7 +416,7 @@ global_costmap:
       robot_base_frame: base_footprint
       resolution: 0.05
       track_unknown_space: true
-      # Same physical 0.30 x 0.20 m body as local costmap and Motion Safety.
+      # Same physical 0.30 x 0.20 m body as local costmap and safety.
       footprint: "[[0.15, 0.10], [0.15, -0.10], [-0.15, -0.10], [-0.15, 0.10]]"
       footprint_padding: 0.0
       plugins: [static_layer, failed_segment_layer, obstacle_layer, inflation_layer]

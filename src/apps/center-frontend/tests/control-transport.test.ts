@@ -156,4 +156,20 @@ describe("WebSocketControlTransport", () => {
     });
     expect(messages[1].payload).toEqual({ operation: "stop" });
   });
+
+  it("sends the selected manual obstacle-avoidance mode with every velocity", async () => {
+    const transport = new WebSocketControlTransport(vi.fn(), vi.fn());
+    const connecting = transport.connect("ROBOT-001", "session-1", "/ws/control");
+    FakeWebSocket.instances[0].open();
+    FakeWebSocket.instances[0].acceptControl();
+    await connecting;
+
+    transport.sendVelocity({ linear_x: 0.1, angular_z: 0 });
+    transport.setObstacleAvoidanceEnabled(false);
+    transport.sendVelocity({ linear_x: 0.2, angular_z: -0.1 });
+
+    const messages = FakeWebSocket.instances[0].sent.map((raw) => JSON.parse(raw));
+    expect(messages[0].payload.obstacle_avoidance_enabled).toBe(true);
+    expect(messages[1].payload.obstacle_avoidance_enabled).toBe(false);
+  });
 });

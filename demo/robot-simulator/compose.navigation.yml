@@ -35,10 +35,10 @@ services:
         target: /etc/rovera/micro_ros_fastdds.xml
         read_only: true
     healthcheck:
-      # CMD-SHELL uses /bin/sh (which has no `source`). Avoid spawning a DDS
-      # probe every five seconds; verify the actual safety node process that
-      # ros2 launch supervises instead.
-      test: ["CMD-SHELL", "grep -a -q '/rovera_motion_safety/safety_node' /proc/[0-9]*/cmdline 2>/dev/null"]
+      # The startup reconciler writes the marker only after the lifecycle node
+      # is active. This catches the otherwise healthy-looking state where the
+      # process exists but /cmd_vel_smoothed never publishes.
+      test: ["CMD-SHELL", "grep -a -q '/rovera_motion_safety/safety_node' /proc/[0-9]*/cmdline 2>/dev/null && grep -a -q '/nav2_velocity_smoother/velocity_smoother' /proc/[0-9]*/cmdline 2>/dev/null && test -f /tmp/rovera-safety/velocity-smoother-active"]
       interval: 5s
       timeout: 3s
       retries: 6

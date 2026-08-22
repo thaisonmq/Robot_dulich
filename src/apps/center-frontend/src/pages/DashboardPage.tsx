@@ -130,7 +130,16 @@ export function DashboardPage() {
   const poseVerificationRef = useRef<PoseVerificationState>("required");
   const poseVerificationSawLocalizingRef = useRef(false);
   const poseVerificationKeyRef = useRef("");
-  const { control, manager, screen, inputState, speedLevel, setSpeedLevel } = useTeleoperation();
+  const {
+    control,
+    manager,
+    screen,
+    inputState,
+    speedLevel,
+    setSpeedLevel,
+    obstacleAvoidanceEnabled,
+    setObstacleAvoidanceEnabled,
+  } = useTeleoperation();
   const [micEnabled, setMicEnabled] = useState(false);
   const [speakerMuted, setSpeakerMuted] = useState(false);
   const translationEnabled = false;
@@ -1440,6 +1449,8 @@ export function DashboardPage() {
                       || controlState === "robot_offline"
                     )}
                     onAutoSpeedModeChange={(mode) => changeAutoSpeed.mutate(mode)}
+                    obstacleAvoidanceEnabled={obstacleAvoidanceEnabled}
+                    onObstacleAvoidanceEnabledChange={setObstacleAvoidanceEnabled}
                   />
                   <div className="command-readout">
                     <span className="command-readout__icon"><Speaker size={20} /></span>

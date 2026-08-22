@@ -11,5 +11,6 @@ fi
 
 source /opt/ros/humble/setup.bash
 source /ws/install/setup.bash
+rm -f /tmp/rovera-safety/velocity-smoother-active
 set -u
 exec "$@"

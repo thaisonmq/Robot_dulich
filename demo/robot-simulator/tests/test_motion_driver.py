@@ -207,6 +207,13 @@ def test_unix_motion_driver_clamps_and_never_blocks() -> None:
     assert command.message_type == "velocity"
     assert command.linear_x == 0.33
     assert command.angular_z == -0.8
+    assert command.obstacle_avoidance_enabled is True
+
+    driver.set_velocity(0.1, 0.1, obstacle_avoidance_enabled=False)
+    command = decode_motion_datagram(
+        transport.sent[-1][0], now_ns=int(now[0] * 1_000_000_000)
+    )
+    assert command.obstacle_avoidance_enabled is False
 
     transport.error = BlockingIOError(errno.EAGAIN, "full")
     driver.set_velocity(0.1, 0.1)
@@ -241,11 +248,19 @@ def test_unix_motion_watchdog_sends_repeated_zero_stop() -> None:
 
 class FakeMotionDriver:
     def __init__(self) -> None:
-        self.velocities: list[tuple[float, float]] = []
+        self.velocities: list[tuple[float, float, bool]] = []
         self.stops: list[str] = []
 
-    def set_velocity(self, linear_x: float, angular_z: float) -> None:
-        self.velocities.append((linear_x, angular_z))
+    def set_velocity(
+        self,
+        linear_x: float,
+        angular_z: float,
+        *,
+        obstacle_avoidance_enabled: bool = True,
+    ) -> None:
+        self.velocities.append(
+            (linear_x, angular_z, obstacle_avoidance_enabled)
+        )
 
     def stop(self, reason: str = "") -> None:
         self.stops.append(reason)
@@ -325,7 +340,11 @@ async def test_ros2_backends_route_velocity_and_stop_without_simulator_fallback(
                 "control.velocity",
                 "ROBOT-001",
                 1,
-                {"linear_x": 0.2, "angular_z": -0.4},
+                {
+                    "linear_x": 0.2,
+                    "angular_z": -0.4,
+                    "obstacle_avoidance_enabled": False,
+                },
                 "session-1",
                 300,
             ),
@@ -342,7 +361,7 @@ async def test_ros2_backends_route_velocity_and_stop_without_simulator_fallback(
 
     await client._receive_loop(socket)
 
-    assert driver.velocities == [(0.2, -0.4)]
+    assert driver.velocities == [(0.2, -0.4, False)]
     assert driver.stops == ["input_released"]
     acknowledgements = [
         message
@@ -426,4 +445,44 @@ async def test_ros2_backend_rejects_non_finite_velocity(
 
     assert driver.velocities == []
     assert driver.stops == ["invalid_velocity"]
+    assert socket.sent[-1]["payload"]["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_ros2_backend_rejects_non_boolean_obstacle_mode(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    driver = FakeMotionDriver()
+    monkeypatch.setattr(
+        "simulator.client.build_motion_driver", lambda _config, _simulator: driver
+    )
+    client = RobotConnectionClient(
+        SimulatorConfig(
+            motion_backend="ros2",
+            navigation_backend="ros2",
+            robot_state_file=str(tmp_path / "missing-device.json"),
+        )
+    )
+    socket = FakeGatewaySocket(
+        [
+            make_message(
+                "control.velocity",
+                "ROBOT-001",
+                1,
+                {
+                    "linear_x": 0.1,
+                    "angular_z": 0.0,
+                    "obstacle_avoidance_enabled": "false",
+                },
+                "session-1",
+                300,
+            )
+        ]
+    )
+
+    await client._receive_loop(socket)
+
+    assert driver.velocities == []
+    assert driver.stops == ["invalid_obstacle_avoidance_mode"]
     assert socket.sent[-1]["payload"]["status"] == "rejected"

@@ -18,6 +18,7 @@ RUN . /opt/ros/humble/setup.sh && colcon build --packages-select rovera_motion_s
 COPY config /opt/rovera/config
 COPY launch /opt/rovera/launch
 COPY scripts/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY scripts/ensure_velocity_smoother_active.py /opt/rovera/scripts/ensure_velocity_smoother_active.py
+RUN chmod +x /entrypoint.sh /opt/rovera/scripts/ensure_velocity_smoother_active.py
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["ros2", "launch", "/opt/rovera/launch/motion_safety.launch.py"]

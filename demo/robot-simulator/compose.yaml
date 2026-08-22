@@ -57,6 +57,18 @@ services:
         target: /app/simulator/client.py
         read_only: true
       - type: bind
+        source: ./simulator/control_protocol.py
+        target: /app/simulator/control_protocol.py
+        read_only: true
+      - type: bind
+        source: ./simulator/motion.py
+        target: /app/simulator/motion.py
+        read_only: true
+      - type: bind
+        source: ./simulator/motion_driver.py
+        target: /app/simulator/motion_driver.py
+        read_only: true
+      - type: bind
         source: ./simulator/map_cache.py
         target: /app/simulator/map_cache.py
         read_only: true

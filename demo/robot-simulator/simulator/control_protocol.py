@@ -115,6 +115,7 @@ class MotionDatagram:
     ttl_ms: int
     linear_x: float = 0.0
     angular_z: float = 0.0
+    obstacle_avoidance_enabled: bool = True
     reason: str = ""
 
     def expired(self, now_ns: int | None = None) -> bool:
@@ -169,6 +170,9 @@ def decode_motion_datagram(
     if not isinstance(value, dict):
         raise ValueError("motion datagram must be an object")
 
+    obstacle_avoidance_enabled = value.get("obstacle_avoidance_enabled", True)
+    if not isinstance(obstacle_avoidance_enabled, bool):
+        raise ValueError("invalid obstacle avoidance mode")
     try:
         command = MotionDatagram(
             protocol_version=int(value["protocol_version"]),
@@ -179,6 +183,7 @@ def decode_motion_datagram(
             ttl_ms=int(value["ttl_ms"]),
             linear_x=float(value.get("linear_x", 0.0)),
             angular_z=float(value.get("angular_z", 0.0)),
+            obstacle_avoidance_enabled=obstacle_avoidance_enabled,
             reason=str(value.get("reason", "")),
         )
     except (KeyError, TypeError, ValueError) as exc:

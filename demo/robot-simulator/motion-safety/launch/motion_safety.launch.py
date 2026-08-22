@@ -1,4 +1,5 @@
 from launch import LaunchDescription
+from launch.actions import ExecuteProcess, TimerAction
 from launch_ros.actions import Node
 
 
@@ -27,6 +28,22 @@ def generate_launch_description() -> LaunchDescription:
                 name="lifecycle_manager_safety",
                 parameters=[{"autostart": True, "node_names": ["velocity_smoother"]}],
                 output="screen",
+            ),
+            # Fast DDS can occasionally time out the lifecycle manager's
+            # configure response while the smoother has already reached the
+            # inactive state. The manager then never sends activate. Run one
+            # delayed, bounded reconciliation so the final command pipeline
+            # cannot remain silently disconnected after container startup.
+            TimerAction(
+                period=2.0,
+                actions=[
+                    ExecuteProcess(
+                        cmd=[
+                            "/opt/rovera/scripts/ensure_velocity_smoother_active.py"
+                        ],
+                        output="screen",
+                    )
+                ],
             ),
             Node(
                 package="rovera_motion_safety",

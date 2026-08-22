@@ -24,7 +24,13 @@ class MotionDisabledError(RuntimeError):
 
 
 class MotionDriver(Protocol):
-    def set_velocity(self, linear_x: float, angular_z: float) -> None: ...
+    def set_velocity(
+        self,
+        linear_x: float,
+        angular_z: float,
+        *,
+        obstacle_avoidance_enabled: bool = True,
+    ) -> None: ...
 
     def stop(self, reason: str = "") -> None: ...
 
@@ -41,7 +47,13 @@ class DisabledMotionDriver:
     because this process does not own the chassis output in this mode.
     """
 
-    def set_velocity(self, _linear_x: float, _angular_z: float) -> None:
+    def set_velocity(
+        self,
+        _linear_x: float,
+        _angular_z: float,
+        *,
+        obstacle_avoidance_enabled: bool = True,
+    ) -> None:
         raise MotionDisabledError(
             "Web motion is disabled while the legacy /cmd_vel owner is active"
         )
@@ -74,11 +86,18 @@ class UnixMotionDriver:
         self.sequence = 0
         self.linear_x = 0.0
         self.angular_z = 0.0
+        self.obstacle_avoidance_enabled = True
         self.last_command_monotonic = 0.0
         self._last_warning_monotonic = 0.0
         self._closed = False
 
-    def set_velocity(self, linear_x: float, angular_z: float) -> None:
+    def set_velocity(
+        self,
+        linear_x: float,
+        angular_z: float,
+        *,
+        obstacle_avoidance_enabled: bool = True,
+    ) -> None:
         self.linear_x = max(
             -self.config.ros_max_reverse_speed,
             min(self.config.ros_max_forward_speed, linear_x),
@@ -87,6 +106,7 @@ class UnixMotionDriver:
             -self.config.ros_max_angular_speed,
             min(self.config.ros_max_angular_speed, angular_z),
         )
+        self.obstacle_avoidance_enabled = bool(obstacle_avoidance_enabled)
         self.last_command_monotonic = self.clock()
         self._send("velocity", now=self.last_command_monotonic)
 
@@ -137,6 +157,7 @@ class UnixMotionDriver:
             ttl_ms=self.config.motion_watchdog_ms,
             linear_x=self.linear_x,
             angular_z=self.angular_z,
+            obstacle_avoidance_enabled=self.obstacle_avoidance_enabled,
             reason=reason,
         )
         try:

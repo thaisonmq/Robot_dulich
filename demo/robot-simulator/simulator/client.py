@@ -671,6 +671,13 @@ class RobotConnectionClient:
                 await self._ack(socket, message, "expired")
                 continue
             if message.message_type == "control.velocity":
+                obstacle_avoidance_enabled = message.payload.get(
+                    "obstacle_avoidance_enabled", True
+                )
+                if not isinstance(obstacle_avoidance_enabled, bool):
+                    self._stop_motion("invalid_obstacle_avoidance_mode")
+                    await self._ack(socket, message, "rejected")
+                    continue
                 try:
                     linear_x = float(message.payload.get("linear_x", 0))
                     angular_z = float(message.payload.get("angular_z", 0))
@@ -700,7 +707,11 @@ class RobotConnectionClient:
                     self._spawn_background(self.navigation_backend.manual_takeover())
                 dispatch_started = time.monotonic()
                 try:
-                    self.motion_driver.set_velocity(linear_x, angular_z)
+                    self.motion_driver.set_velocity(
+                        linear_x,
+                        angular_z,
+                        obstacle_avoidance_enabled=obstacle_avoidance_enabled,
+                    )
                 except MotionDisabledError as exc:
                     await self._ack(
                         socket,

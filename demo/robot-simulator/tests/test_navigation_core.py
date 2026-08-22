@@ -30,6 +30,7 @@ from navigation_core import (  # noqa: E402
     compact_lethal_cells,
     controller_abort_is_live_blockage,
     densify_straight_segment,
+    dynamic_block_requires_alternative,
     dynamic_exclusions_intersect_route,
     endpoint_braking_speed_limit,
     evaluate_corridor,
@@ -1306,6 +1307,10 @@ def test_dynamic_obstacle_payload_is_metric_and_bounded() -> None:
         {"x": -0.85, "y": 2.05},
         {"x": -0.85, "y": 2.15},
     ]
+    assert compact_lethal_cells(message, max_cells=None) == [
+        {"x": -0.85, "y": 2.05},
+        {"x": -0.85, "y": 2.15},
+    ]
 
 
 def test_saved_static_hits_can_be_removed_from_dynamic_overlay(tmp_path: Path) -> None:
@@ -1827,6 +1832,46 @@ def test_clearance_bands_prefer_centerline_over_shorter_wall_hugging_path() -> N
     assert clearance_aware.metadata.total_length > shortest.metadata.total_length
 
 
+def test_shallow_shortcut_is_widened_before_fewer_turns_are_preferred() -> None:
+    # Two rooms joined by a 35 cm passage. A shallow diagonal is executable,
+    # but it leaves less than 7 cm on one side of a 20 cm chassis. Retaining
+    # one nearly-collinear waypoint centers the translation through the choke.
+    free = (
+        _free_rectangle(2, 30, 3, 56)
+        | _free_rectangle(25, 75, 25, 31)
+        | _free_rectangle(70, 97, 3, 56)
+    )
+    saved = _manual_map(100, 60, free)
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.01,
+        preferred_side_margin=0.07,
+        turn_robustness_radius=0.0,
+    )
+    start = {"x": 0.70, "y": 1.60, "yaw": math.pi}
+    goal = {"x": 4.30, "y": 1.40}
+    shortcut = planner._route_result(
+        [start, {"x": 1.30, "y": 1.425}, goal],
+        start_yaw=start["yaw"],
+    )
+
+    assert shortcut is not None
+    assert shortcut.metadata.minimum_side_clearance < 0.07
+    widened = planner._widen_route_with_one_waypoint(
+        shortcut,
+        (),
+        required_side_clearance=0.07,
+        start_yaw=start["yaw"],
+        goal_yaw=None,
+    )
+
+    assert widened is not None
+    assert widened.metadata.minimum_side_clearance >= 0.07
+    assert len(widened.points) == len(shortcut.points) + 1
+    assert widened.metadata.total_length <= shortcut.metadata.total_length + 0.30
+
+
 def test_minimum_turn_seed_removes_extra_stop_without_losing_width() -> None:
     free = (
         _free_rectangle(3, 13, 3, 45)
@@ -1934,7 +1979,35 @@ def test_visibility_waypoint_removes_grid_seed_turn_with_small_detour() -> None:
     assert selected.metadata.estimated_time < seeded.metadata.estimated_time
 
 
-def test_direct_candidate_is_ranked_instead_of_returned_unconditionally(
+def test_adjacent_shallow_corners_can_move_to_one_safe_waypoint() -> None:
+    saved = _manual_map(45, 45, _free_rectangle(2, 42, 2, 42))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    points = [
+        {"x": 0.40, "y": 0.40},
+        {"x": 0.75, "y": 0.65},
+        {"x": 1.05, "y": 0.55},
+        {"x": 1.35, "y": 0.70},
+        {"x": 1.70, "y": 0.45},
+    ]
+    baseline = planner._route_result(points, start_yaw=-1.0)
+
+    assert baseline is not None
+    reduced = planner._reduce_one_route_corner(
+        baseline,
+        (),
+        maximum_total_length=baseline.metadata.total_length + 0.30,
+        minimum_center_clearance=0.15,
+        start_yaw=-1.0,
+        goal_yaw=None,
+    )
+
+    assert reduced is not None
+    assert len(reduced.points) == len(baseline.points) - 1
+    assert reduced.metadata.turn_count < baseline.metadata.turn_count
+    assert reduced.metadata.total_length <= baseline.metadata.total_length + 0.30
+
+
+def test_equally_safe_direct_candidate_wins_by_using_fewer_turns(
     monkeypatch,
 ) -> None:
     saved = _manual_map(80, 80, _free_rectangle(1, 78, 1, 78))
@@ -1980,8 +2053,9 @@ def test_direct_candidate_is_ranked_instead_of_returned_unconditionally(
     route = planner.plan(start, goal)
 
     assert route is not None
-    assert len(route.points) == 3
-    assert route.metadata.estimated_time == 16.0
+    assert len(route.points) == 2
+    assert route.metadata.turn_count == 1
+    assert route.metadata.estimated_time == 18.0
 
 
 def test_small_initial_turn_keeps_short_direct_candidate() -> None:
@@ -2305,6 +2379,57 @@ def test_dynamic_overlay_clusters_points_filters_static_wall_and_expires() -> No
     assert overlay.snapshot(11.3) == ()
 
 
+def test_dynamic_overlay_classifies_fixed_chair_after_confirmation_window() -> None:
+    overlay = DynamicObstacleOverlay(
+        ttl_seconds=2.0,
+        motion_threshold=0.12,
+        stationary_confirmation_seconds=1.0,
+    )
+
+    overlay.observe(((0.80, 0.02),), now=10.0)
+    overlay.observe(((0.81, 0.01),), now=10.5)
+    snapshot = overlay.observe(((0.80, 0.02),), now=11.1)
+
+    assert len(snapshot) == 1
+    assert snapshot[0].observation_count == 3
+    assert snapshot[0].speed < 0.12
+    assert snapshot[0].motion_state == "STATIONARY"
+
+
+def test_dynamic_overlay_tracks_person_without_growing_historical_trail() -> None:
+    overlay = DynamicObstacleOverlay(
+        ttl_seconds=2.0,
+        association_distance=0.35,
+        motion_threshold=0.12,
+    )
+
+    first = overlay.observe(((0.00, 0.00),), now=20.0)[0]
+    overlay.observe(((0.12, 0.00),), now=20.3)
+    moving = overlay.observe(((0.24, 0.00),), now=20.6)[0]
+
+    assert moving.id == first.id
+    assert moving.motion_state == "MOVING"
+    assert moving.speed == pytest.approx(0.40)
+    assert moving.bounds == pytest.approx((0.24, 0.0, 0.24, 0.0))
+    assert moving.radius == pytest.approx(overlay.observation_radius)
+
+
+def test_dynamic_overlay_spatial_clustering_keeps_transitive_components() -> None:
+    overlay = DynamicObstacleOverlay(cluster_distance=0.10)
+
+    clusters = overlay._clusters(
+        (
+            (0.00, 0.00),
+            (0.09, 0.00),
+            (0.18, 0.00),  # Connected transitively through the middle point.
+            (1.00, 1.00),
+        ),
+        0.10,
+    )
+
+    assert sorted(len(cluster) for cluster in clusters) == [1, 3]
+
+
 def test_controller_confirmed_blocker_bypasses_only_static_point_filter() -> None:
     free = _free_rectangle(1, 38, 1, 28)
     for row in range(1, 29):
@@ -2450,6 +2575,21 @@ def test_controller_diagnostics_and_repeated_zero_abort_are_live_blockage() -> N
         corridor_sample_fresh=False,
         corridor_front_clearance=math.inf,
         corridor_blockage_limit=0.17,
+    )
+
+
+def test_hard_controller_block_requires_a_distinct_route() -> None:
+    for reason in (
+        "CONTROLLER_ABORT_LIVE_BLOCKAGE",
+        "CONTROLLER_ABORT:UNCONFIRMED",
+        "MOTION_SAFETY_DYNAMIC_BLOCK",
+        "CONFIRMED_DYNAMIC_ROUTE_BLOCK",
+        "LIVE_ROUTE_CLEARANCE_INSUFFICIENT",
+    ):
+        assert dynamic_block_requires_alternative(reason)
+
+    assert not dynamic_block_requires_alternative(
+        "PREDICTED_DYNAMIC_ROUTE_BLOCK"
     )
 
 
@@ -2836,6 +2976,29 @@ def test_scan_self_filter_removes_live_right_body_returns_but_keeps_obstacle() -
     assert filtered == pytest.approx([outside_distance])
 
 
+def test_motion_safety_startup_recovers_inactive_velocity_smoother() -> None:
+    project = Path(__file__).parents[1]
+    launch = (
+        project / "motion-safety/launch/motion_safety.launch.py"
+    ).read_text()
+    recovery = (
+        project
+        / "motion-safety/scripts/ensure_velocity_smoother_active.py"
+    ).read_text()
+    compose = yaml.safe_load(
+        (project / "compose.navigation.yml").read_text()
+    )
+    healthcheck = compose["services"]["motion-safety"]["healthcheck"]["test"][1]
+
+    assert "TimerAction(" in launch
+    assert "ensure_velocity_smoother_active.py" in launch
+    assert "MAX_ATTEMPTS = 20" in recovery
+    assert "GetState" in recovery
+    assert "Transition.TRANSITION_CONFIGURE" in recovery
+    assert "Transition.TRANSITION_ACTIVATE" in recovery
+    assert "velocity-smoother-active" in healthcheck
+
+
 def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     project = Path(__file__).parents[1]
     navigation = yaml.safe_load(
@@ -2847,6 +3010,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     safety = yaml.safe_load(
         (project / "motion-safety/config/safety.yaml").read_text()
     )["rovera_motion_safety"]["ros__parameters"]
+    sensor_time = yaml.safe_load(
+        (project / "navigation-stack/config/sensor_time.yaml").read_text()
+    )["rovera_sensor_normalizer"]["ros__parameters"]
     controller = navigation["controller_server"]["ros__parameters"]
     follow = controller["FollowPath"]
     planner_server = navigation["planner_server"]["ros__parameters"]
@@ -2930,9 +3096,15 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert safety["lidar_obstacle_avoidance_enabled"] is True
     assert safety["half_length"] == localization["footprint_half_length"]
     assert safety["half_width"] == localization["footprint_half_width"]
+    # The self-return mask may be wider than the physical collision body; it
+    # removes LiDAR hits from wheels/accessories and is not planning padding.
+    assert sensor_time["scan_self_filter_half_length"] >= safety["half_length"]
+    assert sensor_time["scan_self_filter_half_width"] >= safety["half_width"]
+    assert safety["clearance"] == 0.04
+    assert safety["clear_hysteresis"] == 0.20
     assert localization["corridor_hard_side_margin"] <= safety["side_margin"]
     assert safety["side_margin"] <= localization["corridor_side_margin"]
-    # The complete measured footprint is the single source of truth.
+    # Collision planning uses the physical body without reusing scan-mask size.
     expected_collision_footprint = (
         "[[0.15, 0.10], [0.15, -0.10], [-0.15, -0.10], [-0.15, 0.10]]"
     )
@@ -2988,7 +3160,7 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     ] <= 90.0
     assert navigation["amcl"]["ros__parameters"]["max_particles"] >= 3000
     assert navigation["amcl"]["ros__parameters"]["max_beams"] >= 90
-    assert localization["localization_verify_timeout_seconds"] <= 3.0
+    assert 4.0 <= localization["localization_verify_timeout_seconds"] <= 6.0
     # This stale block was never launched; motion-safety owns the one smoother source of truth.
     assert "velocity_smoother" not in navigation
 

@@ -150,6 +150,12 @@ def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict)
                 status_value = {
                     "MOVING": "NAVIGATING",
                     "CANCELLED": "CANCELED",
+                    "WAIT_FOR_DYNAMIC_CLEAR": "RECOVERY",
+                    "WAITING_FOR_DYNAMIC_CLEAR": "RECOVERY",
+                    "DYNAMIC_REPLAN": "RECOVERY",
+                    "SENSOR_TIME_INVALID": "RECOVERY",
+                    "VERIFYING": "RECOVERY",
+                    "LOCALIZATION_REQUIRED": "LOCALIZATION_LOST",
                 }.get(status_value, status_value)
                 if status_value in {
                     "READY", "PLANNING", "NAVIGATING", "PAUSED", "BLOCKED",

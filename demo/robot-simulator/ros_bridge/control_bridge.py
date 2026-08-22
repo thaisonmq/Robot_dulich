@@ -127,6 +127,11 @@ class RosControlBridge(Node):
         self.estop_publisher = self.create_publisher(
             Bool, os.getenv("ROS_ESTOP_TOPIC", "/rovera/emergency_stop"), qos
         )
+        self.manual_obstacle_avoidance_publisher = self.create_publisher(
+            Bool,
+            "/safety/manual_obstacle_avoidance_enabled",
+            qos,
+        )
         self.obstacle_stop_subscription = self.create_subscription(
             Bool,
             os.getenv("ROS_OBSTACLE_STOP_TOPIC", "/rovera/obstacle_stop"),
@@ -185,6 +190,7 @@ class RosControlBridge(Node):
         self._receiver.start()
         self._timer = self.create_timer(0.01, self._tick)
         self._publish_estop_state()
+        self._publish_manual_obstacle_avoidance_mode(True)
         self._sync_obstacle_lock_state(time.monotonic())
         self.get_logger().info(
             "motion bridge ready "
@@ -272,6 +278,7 @@ class RosControlBridge(Node):
         self._last_receive_monotonic = now
         if command.message_type == "stop":
             self._active_command = None
+            self._publish_manual_obstacle_avoidance_mode(True)
             if command.reason == "emergency_stop":
                 self._set_estop(True)
             if self._estop_latched or self._sync_obstacle_lock_state(now):
@@ -283,7 +290,10 @@ class RosControlBridge(Node):
             self._publish_zero_burst()
             return
 
-        if self._sync_obstacle_lock_state(now):
+        if (
+            command.obstacle_avoidance_enabled
+            and self._sync_obstacle_lock_state(now)
+        ):
             self._active_command = None
             self._stop_burst_remaining = 0
             self._publish_safety_zero(now)
@@ -326,13 +336,19 @@ class RosControlBridge(Node):
         # already-latched software emergency stop on the volatile ROS topic.
         if now - self._last_estop_publish_monotonic >= 0.5:
             self._publish_estop_state(now)
-        if self._estop_latched or self._sync_obstacle_lock_state(now):
+        command = self._active_command
+        obstacle_interlock_applies = bool(
+            command is None or command.obstacle_avoidance_enabled
+        )
+        if self._estop_latched or (
+            obstacle_interlock_applies
+            and self._sync_obstacle_lock_state(now)
+        ):
             self._active_command = None
             self._stop_burst_remaining = 0
             if now - self._last_safety_zero_monotonic >= 1 / self.command_rate_hz:
                 self._publish_safety_zero(now)
             return
-        command = self._active_command
         if command is not None:
             if self._legacy_override_active(now):
                 self._active_command = None
@@ -340,6 +356,7 @@ class RosControlBridge(Node):
             stale_ms = (now - self._last_receive_monotonic) * 1000
             if stale_ms > self.watchdog_ms:
                 self._active_command = None
+                self._publish_manual_obstacle_avoidance_mode(True)
                 self.get_logger().warning(
                     f"motion watchdog stopped output stale_ms={stale_ms:.1f}"
                 )
@@ -368,12 +385,14 @@ class RosControlBridge(Node):
         )
         self._active_command = None
         self._stop_burst_remaining = 0
+        self._publish_manual_obstacle_avoidance_mode(True)
 
     def _on_legacy_state(self, message: Bool) -> None:
         self._legacy_mode_active = bool(message.data)
         if self._legacy_mode_active:
             self._active_command = None
             self._stop_burst_remaining = 0
+            self._publish_manual_obstacle_avoidance_mode(True)
         else:
             self._legacy_override_until = max(
                 self._legacy_override_until,
@@ -383,6 +402,11 @@ class RosControlBridge(Node):
     def _on_obstacle_stop(self, message: Bool) -> None:
         now = time.monotonic()
         self._obstacle_interlock.update(bool(message.data), now)
+        if (
+            self._active_command is not None
+            and not self._active_command.obstacle_avoidance_enabled
+        ):
+            return
         if self._sync_obstacle_lock_state(now):
             self._active_command = None
             self._stop_burst_remaining = 0
@@ -401,6 +425,11 @@ class RosControlBridge(Node):
             self.get_logger().info(
                 f"obstacle direction mask changed mask={message.data}"
             )
+        if (
+            self._active_command is not None
+            and not self._active_command.obstacle_avoidance_enabled
+        ):
+            return
         if self._sync_obstacle_lock_state(now):
             self._active_command = None
             self._stop_burst_remaining = 0
@@ -446,16 +475,29 @@ class RosControlBridge(Node):
         angular_z = max(
             -self.max_angular, min(self.max_angular, command.angular_z)
         )
-        message.linear.x, message.angular.z = (
-            self._obstacle_interlock.filter_velocity(linear_x, angular_z, now)
+        self._publish_manual_obstacle_avoidance_mode(
+            command.obstacle_avoidance_enabled
         )
+        if command.obstacle_avoidance_enabled:
+            message.linear.x, message.angular.z = (
+                self._obstacle_interlock.filter_velocity(
+                    linear_x, angular_z, now
+                )
+            )
+        else:
+            message.linear.x, message.angular.z = linear_x, angular_z
         self.velocity_publisher.publish(message)
 
     def _publish_zero(self) -> None:
+        self._publish_manual_obstacle_avoidance_mode(True)
         self.velocity_publisher.publish(Twist())
+
+    def _publish_manual_obstacle_avoidance_mode(self, enabled: bool) -> None:
+        self.manual_obstacle_avoidance_publisher.publish(Bool(data=enabled))
 
     def _publish_safety_zero(self, now: float | None = None) -> None:
         message = Twist()
+        self._publish_manual_obstacle_avoidance_mode(True)
         # In mux mode this priority-255 input is the only velocity allowed
         # through while a safety lock is active. In parallel legacy mode the
         # regular web output is /cmd_vel, so publish zero there as well.

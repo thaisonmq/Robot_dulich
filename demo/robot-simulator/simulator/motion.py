@@ -26,7 +26,13 @@ class MotionSimulator:
         self.angular_z = 0.0
         self.last_command_monotonic = 0.0
 
-    def set_velocity(self, linear_x: float, angular_z: float) -> None:
+    def set_velocity(
+        self,
+        linear_x: float,
+        angular_z: float,
+        *,
+        obstacle_avoidance_enabled: bool = True,
+    ) -> None:
         self.linear_x = max(-self.config.max_reverse_speed, min(self.config.max_forward_speed, linear_x))
         self.angular_z = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, angular_z))
         self.last_command_monotonic = time.monotonic()

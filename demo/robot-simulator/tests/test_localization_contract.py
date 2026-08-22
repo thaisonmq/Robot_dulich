@@ -6,6 +6,9 @@ import yaml
 ADAPTER_SOURCE = (
     Path(__file__).parents[1] / "navigation-stack" / "adapter_node.py"
 ).read_text()
+NAVIGATION_CORE_SOURCE = (
+    Path(__file__).parents[1] / "navigation-stack" / "navigation_core.py"
+).read_text()
 EDGE_CLIENT_SOURCE = (
     Path(__file__).parents[1] / "simulator" / "client.py"
 ).read_text()
@@ -18,6 +21,19 @@ def _method_source(name: str, next_name: str) -> str:
     start = ADAPTER_SOURCE.index(f"    def {name}(")
     end = ADAPTER_SOURCE.index(f"    def {next_name}(", start)
     return ADAPTER_SOURCE[start:end]
+
+
+def test_stale_safety_subscription_accepts_a_restarted_sequence_epoch() -> None:
+    watchdog = _method_source(
+        "_safety_subscription_watchdog_tick", "_safety_status_callback"
+    )
+
+    reset = watchdog.index("self.safety_snapshot_sequence = -1")
+    recreate = watchdog.index("self.create_subscription(", reset)
+    assert "self.destroy_subscription(old_subscription)" in watchdog
+    assert reset < recreate
+    assert 'String, "/safety/status"' in watchdog
+    assert '"SAFETY_SUBSCRIPTION_REBIND"' in watchdog
 
 
 def test_only_recent_sustained_navigation_pose_gets_fast_local_verification() -> None:
@@ -366,14 +382,21 @@ def test_new_navigation_start_rechecks_fresh_raycast_without_canceling_route() -
     start_gate = _method_source(
         "_localization_start_evidence_ready", "_begin_localization_settling"
     )
+    wait_gate = _method_source(
+        "_wait_for_localization_start_evidence", "_begin_localization_settling"
+    )
     navigate = _method_source("_navigate", "_segment_execution_tick")
 
     assert "self._localization_tracking_evidence_ready(now)" in start_gate
     assert "self.localization_raycast_minimum_beams" in start_gate
     assert "self.localization_raycast_minimum_static_matches" in start_gate
     assert "self.localization_raycast_maximum_contradiction_ratio" in start_gate
+    assert "self._localization_start_evidence_ready(now)" in wait_gate
+    assert "self.localization_start_evidence_wait" in wait_gate
+    assert "time.sleep(min(0.025, remaining))" in wait_gate
     assert "not recovery_attempt" in navigate
-    assert "self._localization_start_evidence_ready(time.monotonic())" in navigate
+    assert "self._wait_for_localization_start_evidence()" in navigate
+    assert '"NAVIGATION_START_REJECTED"' in navigate
     assert "cancel_goal_async" not in start_gate
 
 
@@ -528,7 +551,7 @@ def test_post_turn_reanchor_enters_straight_inside_bounded_band() -> None:
     )
 
     assert "post_turn_reanchor_requires_turn" in prepare
-    assert "self.execution_turn_reentry_tolerance" in prepare
+    assert "self.straight_hard_heading_error" in prepare
     assert "self.straight_hard_cross_track" in prepare
     assert 'phase="STRAIGHT_ENTRY_CORRECTION"' in prepare
     correction = prepare.split('phase="STRAIGHT_ENTRY_CORRECTION"', 1)[1]
@@ -660,6 +683,9 @@ def test_persistent_clock_failure_revokes_navigation_but_has_a_grace_period() ->
 
 
 def test_transient_sensor_fault_keeps_context_then_replans_same_destination() -> None:
+    degrade = _method_source(
+        "_degrade_localization", "_restore_after_sensor_time_pause"
+    )
     restore = _method_source(
         "_restore_after_sensor_time_pause", "_fail_sustained_sensor_time_pause"
     )
@@ -674,6 +700,12 @@ def test_transient_sensor_fault_keeps_context_then_replans_same_destination() ->
     assert "self._navigate(" in resume
     assert '"mission_id": mission_id' in resume
     assert '"route_id": route_id' in resume
+    for active_recovery_state in (
+        '"WAIT_FOR_DYNAMIC_CLEAR"',
+        '"WAITING_FOR_DYNAMIC_CLEAR"',
+        '"DYNAMIC_REPLAN"',
+    ):
+        assert active_recovery_state in degrade
 
 
 def test_sensor_time_diagnostics_identify_the_failing_critical_stream() -> None:
@@ -688,6 +720,24 @@ def test_sensor_time_diagnostics_identify_the_failing_critical_stream() -> None:
         'f"{prefix}_ARRIVAL_STALE"', 'f"{prefix}_TIMESTAMP_INVALID"',
     ):
         assert required in timing
+
+
+def test_sensor_and_safety_heartbeats_have_a_dedicated_callback_group() -> None:
+    init = _method_source("__init__", "_nav_debug")
+
+    assert "self.critical_status_callback_group = MutuallyExclusiveCallbackGroup()" in init
+    assert (
+        'String, "/sensors/time_status", self._sensor_time_callback, 1,\n'
+        "            callback_group=self.critical_status_callback_group"
+    ) in init
+    assert (
+        'String, "/safety/status", self._safety_status_callback, 1,\n'
+        "            callback_group=self.critical_status_callback_group"
+    ) in init
+    assert (
+        "self._safety_subscription_watchdog_tick,\n"
+        "            callback_group=self.critical_status_callback_group"
+    ) in init
 
 
 def test_compute_path_uses_cached_stop_turn_geometry_and_live_validation() -> None:
@@ -1046,6 +1096,116 @@ def test_dynamic_wait_periodically_replans_and_success_resumes_same_goal() -> No
     assert "saved_map=self.saved_map" not in blocker
     assert "corridor_blocked" in tick
     assert 'self.dynamic_block_reason.startswith("CONTROLLER_ABORT")' not in tick
+
+
+def test_live_costmap_filters_static_cells_before_bounding_dynamic_overlay() -> None:
+    callback = _method_source("_costmap_callback", "_refresh_dynamic_obstacle_view")
+
+    complete = callback.index("max_cells=None")
+    static_filter = callback.index("if self.saved_map is not None:")
+    distance_priority = callback.index("obstacles.sort(")
+    bounded = callback.index("obstacles = obstacles[: self.dynamic_overlay_max_cells]")
+    observed = callback.index("self.dynamic_overlay.observe(")
+
+    assert complete < static_filter < distance_priority < bounded < observed
+    assert "saved_map=None" in callback
+
+
+def test_dynamic_recovery_waits_for_moving_people_and_replans_fixed_obstacles() -> None:
+    tick = _method_source("_dynamic_recovery_tick", "_attempt_dynamic_replan")
+    attempt = _method_source("_attempt_dynamic_replan", "_replan_execution_from_current")
+
+    assert "minimum_observations=3" in tick
+    assert 'action="PROACTIVE_ROUTE_INTERSECTION"' in tick
+    assert 'item.motion_state in {"MOVING", "STATIONARY"}' in tick
+    assert 'item.motion_state == "MOVING"' in tick
+    assert 'item.motion_state == "STATIONARY"' in tick
+    assert '"MOVING_OBSTACLE_HAS_PRIORITY"' in tick
+    assert "corridor_evidence_fresh" in tick
+    assert "stationary_route_blocked or controller_corridor_blocked" in tick
+    assert "self.dynamic_alternative_attempted" in tick
+    assert "not requires_alternative" in attempt
+    assert "requires_alternative or not obstacle_cleared" in attempt
+    assert "unconfirmed_replan_due" not in tick
+    assert 'result="RESUME_ORIGINAL_ROUTE"' in attempt
+    assert '"segment_directions": resume_directions' in attempt
+
+
+def test_dynamic_wait_evaluates_clearance_along_the_blocked_route() -> None:
+    heading = _method_source("_current_path_heading", "_speed_profile_state")
+    fresh = _method_source(
+        "_corridor_sample_fresh_for_path", "_record_controller_abort"
+    )
+
+    assert '"WAIT_FOR_DYNAMIC_CLEAR"' in heading
+    assert "self.dynamic_blocked_route[1:]" in heading
+    assert "self.dynamic_blocked_segment_directions[index]" in heading
+    assert "corridor.classification == \"PHYSICALLY_BLOCKED\"" in fresh
+    assert "corridor.physically_passable" in fresh
+
+
+def test_dynamic_clear_requires_sustained_route_aligned_samples() -> None:
+    project = Path(__file__).parents[1]
+    navigation = yaml.safe_load(
+        (project / "navigation-stack/config/nav2_params.yaml").read_text()
+    )
+    parameters = navigation["rovera_navigation_adapter"]["ros__parameters"]
+
+    assert parameters["dynamic_obstacle_clear_dwell_seconds"] >= 1.0
+
+
+def test_auto_route_requires_seven_centimetres_of_static_side_clearance() -> None:
+    project = Path(__file__).parents[1]
+    navigation = yaml.safe_load(
+        (project / "navigation-stack/config/nav2_params.yaml").read_text()
+    )
+    parameters = navigation["rovera_navigation_adapter"]["ros__parameters"]
+    compute = _method_source("_compute_path", "_navigate")
+    recovery = _method_source(
+        "_plan_stop_turn_from_current", "_resume_auto_from_current_pose"
+    )
+
+    assert parameters["corridor_side_margin"] == 0.07
+    assert parameters["stop_turn_minimum_route_side_clearance"] == 0.07
+    assert '"ROUTE_CLEARANCE_INSUFFICIENT"' in compute
+    assert '"ROUTE_CLEARANCE_INSUFFICIENT"' in recovery
+
+
+def test_controller_blocker_is_a_persistent_recovery_planning_keepout() -> None:
+    exclusions = _method_source(
+        "_dynamic_exclusions", "_dynamic_affects_remaining_route"
+    )
+    blocker = _method_source(
+        "_observe_controller_blocker", "_schedule_execution_replan"
+    )
+    wait = _method_source("_enter_dynamic_wait", "_dynamic_recovery_tick")
+    recovery = _method_source(
+        "_plan_stop_turn_from_current", "_resume_auto_from_current_pose"
+    )
+
+    assert "self.dynamic_blocked_keepout" in exclusions
+    assert "self.alternative_route_keepout_radius" in blocker
+    assert "force: bool = False" in blocker
+    assert "self._observe_controller_blocker(force=True)" in wait
+    assert "self._dynamic_planning_exclusions()" in recovery
+
+
+def test_map_changes_clear_latched_dynamic_recovery_state() -> None:
+    load_map = _method_source("_load_map", "_deactivate_map")
+    deactivate_map = _method_source("_deactivate_map", "_goal_pose")
+
+    for source in (load_map, deactivate_map):
+        assert "self.dynamic_blocked_keepout = None" in source
+        assert "self.dynamic_alternative_attempted = False" in source
+
+
+def test_planner_searches_a_bounded_waypoint_replacement_for_shallow_zigzags() -> None:
+    planner = NAVIGATION_CORE_SOURCE
+
+    assert "def _reduce_one_route_corner(" in planner
+    assert "replacement_local_length > old_local_length + 0.30" in planner
+    assert "result.metadata.turn_count" in planner
+    assert "maximum_reduced_length" in planner
 
 
 def test_dynamic_replan_pause_invalidates_inflight_route_restart() -> None:

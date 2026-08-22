@@ -7,7 +7,7 @@ import math
 import os
 import statistics
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -159,6 +159,14 @@ class DynamicObstacle:
     last_seen: float
     observation_count: int
     confidence: float
+    velocity_x: float = 0.0
+    velocity_y: float = 0.0
+    speed: float = 0.0
+    motion_state: str = "UNCONFIRMED"
+    stationary_since: float | None = None
+    motion_anchor_x: float | None = None
+    motion_anchor_y: float | None = None
+    motion_anchor_time: float | None = None
 
 
 class DynamicObstacleOverlay:
@@ -171,6 +179,8 @@ class DynamicObstacleOverlay:
         cluster_distance: float = 0.12,
         association_distance: float = 0.20,
         observation_radius: float = 0.025,
+        motion_threshold: float = 0.12,
+        stationary_confirmation_seconds: float = 1.0,
     ) -> None:
         self.ttl_seconds = max(0.05, float(ttl_seconds))
         self.cluster_distance = max(0.001, float(cluster_distance))
@@ -178,6 +188,10 @@ class DynamicObstacleOverlay:
             self.cluster_distance, float(association_distance)
         )
         self.observation_radius = max(0.0, float(observation_radius))
+        self.motion_threshold = max(0.01, float(motion_threshold))
+        self.stationary_confirmation_seconds = max(
+            0.10, float(stationary_confirmation_seconds)
+        )
         self._next_id = 1
         self._obstacles: dict[int, DynamicObstacle] = {}
 
@@ -185,17 +199,48 @@ class DynamicObstacleOverlay:
     def _clusters(
         points: tuple[tuple[float, float], ...], distance: float
     ) -> list[list[tuple[float, float]]]:
+        """Return distance-connected components using a metric spatial hash.
+
+        The previous implementation compared every pending point with every
+        other point. A 600-cell local costmap therefore monopolized the Python
+        callback group long enough for safety and sensor-time heartbeats to be
+        reported stale. Cells are now compared only with their eight adjacent
+        buckets while preserving the same transitive clustering semantics.
+        """
+        if not points:
+            return []
+        cell_size = max(1e-6, float(distance))
+
+        def bucket(point: tuple[float, float]) -> tuple[int, int]:
+            return (
+                math.floor(point[0] / cell_size),
+                math.floor(point[1] / cell_size),
+            )
+
+        buckets: dict[tuple[int, int], set[int]] = defaultdict(set)
+        for index, point in enumerate(points):
+            buckets[bucket(point)].add(index)
         remaining = set(range(len(points)))
         clusters: list[list[tuple[float, float]]] = []
         while remaining:
             seed = remaining.pop()
+            buckets[bucket(points[seed])].discard(seed)
             indices = [seed]
             pending = [seed]
             while pending:
                 current = pending.pop()
+                cell_x, cell_y = bucket(points[current])
+                candidates: set[int] = set()
+                for offset_x in (-1, 0, 1):
+                    for offset_y in (-1, 0, 1):
+                        candidates.update(
+                            buckets.get(
+                                (cell_x + offset_x, cell_y + offset_y), ()
+                            )
+                        )
                 joined = [
                     index
-                    for index in remaining
+                    for index in candidates
                     if math.hypot(
                         points[index][0] - points[current][0],
                         points[index][1] - points[current][1],
@@ -203,6 +248,7 @@ class DynamicObstacleOverlay:
                 ]
                 for index in joined:
                     remaining.remove(index)
+                    buckets[bucket(points[index])].discard(index)
                     indices.append(index)
                     pending.append(index)
             clusters.append([points[index] for index in indices])
@@ -271,20 +317,69 @@ class DynamicObstacleOverlay:
                 self._next_id += 1
                 first_seen = timestamp
                 count = 1
+                velocity_x = 0.0
+                velocity_y = 0.0
+                speed = 0.0
+                motion_state = "UNCONFIRMED"
+                stationary_since = timestamp
+                motion_anchor_x = center_x
+                motion_anchor_y = center_y
+                motion_anchor_time = timestamp
             else:
                 obstacle_id = associated.id
                 first_seen = associated.first_seen
                 count = associated.observation_count + 1
-                # A rolling center rejects one noisy costmap cell while still
-                # following a moving person/trolley.
-                weight = min(0.75, 1.0 / max(1, count))
+                motion_anchor_x = (
+                    associated.center_x
+                    if associated.motion_anchor_x is None
+                    else associated.motion_anchor_x
+                )
+                motion_anchor_y = (
+                    associated.center_y
+                    if associated.motion_anchor_y is None
+                    else associated.motion_anchor_y
+                )
+                motion_anchor_time = (
+                    associated.last_seen
+                    if associated.motion_anchor_time is None
+                    else associated.motion_anchor_time
+                )
+                velocity_x = associated.velocity_x
+                velocity_y = associated.velocity_y
+                elapsed = timestamp - motion_anchor_time
+                # Costmap endpoints can jump one 2.5 cm cell each frame even
+                # for a fixed chair leg. Estimate motion over a longer window
+                # so raster/pose jitter is not mistaken for a walking person.
+                if elapsed >= 0.50:
+                    velocity_x = (center_x - motion_anchor_x) / elapsed
+                    velocity_y = (center_y - motion_anchor_y) / elapsed
+                    motion_anchor_x = center_x
+                    motion_anchor_y = center_y
+                    motion_anchor_time = timestamp
+                speed = math.hypot(velocity_x, velocity_y)
+                if count >= 3 and speed >= self.motion_threshold:
+                    motion_state = "MOVING"
+                    stationary_since = None
+                else:
+                    stationary_since = (
+                        associated.stationary_since
+                        if associated.motion_state != "MOVING"
+                        and associated.stationary_since is not None
+                        else timestamp
+                    )
+                    motion_state = (
+                        "STATIONARY"
+                        if count >= 3
+                        and timestamp - stationary_since
+                        >= self.stationary_confirmation_seconds
+                        else "UNCONFIRMED"
+                    )
+                # A fixed exponential center follows a moving person without
+                # growing an unbounded historical trail, while still damping
+                # one-cell costmap jitter for a stationary chair.
+                weight = 0.50
                 center_x = associated.center_x * (1.0 - weight) + center_x * weight
                 center_y = associated.center_y * (1.0 - weight) + center_y * weight
-                minimum_x = min(minimum_x, associated.bounds[0])
-                minimum_y = min(minimum_y, associated.bounds[1])
-                maximum_x = max(maximum_x, associated.bounds[2])
-                maximum_y = max(maximum_y, associated.bounds[3])
-                radius = max(radius, associated.radius)
             self._obstacles[obstacle_id] = DynamicObstacle(
                 obstacle_id,
                 center_x,
@@ -295,6 +390,14 @@ class DynamicObstacleOverlay:
                 timestamp,
                 count,
                 min(1.0, count / 3.0),
+                velocity_x,
+                velocity_y,
+                speed,
+                motion_state,
+                stationary_since,
+                motion_anchor_x,
+                motion_anchor_y,
+                motion_anchor_time,
             )
         return self.snapshot(timestamp)
 
@@ -530,6 +633,24 @@ def controller_abort_is_live_blockage(
         or diagnostic_block
         or (controller_zero_linear and repeated_zero_linear_abort)
         or fresh_near_front
+    )
+
+
+def dynamic_block_requires_alternative(reason: str) -> bool:
+    """Return whether recovery must never resume the blocked geometry.
+
+    Moving tracked objects may clear and permit the preserved route. A hard
+    controller/corridor collision is different evidence: it invalidates that
+    geometry for the current encounter and permits only one planned detour.
+    """
+    value = str(reason or "")
+    return bool(
+        value.startswith("CONTROLLER_ABORT")
+        or value in {
+            "MOTION_SAFETY_DYNAMIC_BLOCK",
+            "CONFIRMED_DYNAMIC_ROUTE_BLOCK",
+            "LIVE_ROUTE_CLEARANCE_INSUFFICIENT",
+        }
     )
 
 
@@ -1893,6 +2014,63 @@ class StopTurnStateLatticePlanner:
                 return False
         return True
 
+    def _segment_has_side_clearance(
+        self,
+        left: dict[str, float],
+        right: dict[str, float],
+        minimum_side_clearance: float | None,
+    ) -> bool:
+        """Check the directional body-to-wall gap before simplifying a seed.
+
+        Euclidean cell clearance is useful for finding a topology, but it is
+        conservative around raster-cell corners and is not equivalent to the
+        lateral clearance of an oriented rectangular chassis.  A shortcut can
+        therefore miss the requested margin by millimetres even though
+        retaining one seed waypoint keeps the vehicle centered.  Use the same
+        lateral ray metric as final route metadata while choosing shortcuts.
+        """
+        if minimum_side_clearance is None:
+            return True
+        delta_x = float(right["x"]) - float(left["x"])
+        delta_y = float(right["y"]) - float(left["y"])
+        distance = math.hypot(delta_x, delta_y)
+        yaw = math.atan2(delta_y, delta_x)
+        count = max(
+            1,
+            math.ceil(distance / max(0.001, self.saved_map.resolution / 2.0)),
+        )
+        ray_limit = self.saved_map.resolution * math.hypot(
+            self.saved_map.width, self.saved_map.height
+        ) + self.saved_map.resolution
+        for sample in range(count + 1):
+            ratio = sample / count
+            x = float(left["x"]) + delta_x * ratio
+            y = float(left["y"]) + delta_y * ratio
+            left_width = self.saved_map.raycast_static_range(
+                x,
+                y,
+                yaw + math.pi / 2.0,
+                minimum_range=0.0,
+                maximum_range=ray_limit,
+                unknown_is_blocked=True,
+            )
+            right_width = self.saved_map.raycast_static_range(
+                x,
+                y,
+                yaw - math.pi / 2.0,
+                minimum_range=0.0,
+                maximum_range=ray_limit,
+                unknown_is_blocked=True,
+            )
+            if (
+                left_width is None
+                or right_width is None
+                or min(left_width, right_width) - self.half_width + 1e-9
+                < float(minimum_side_clearance)
+            ):
+                return False
+        return True
+
     def _turn_bay_candidate(
         self,
         start: dict[str, float],
@@ -2379,6 +2557,128 @@ class StopTurnStateLatticePlanner:
                     best = result
         return best
 
+    def _reduce_one_route_corner(
+        self,
+        baseline: StopTurnRoute,
+        exclusions: tuple[tuple[float, float, float], ...],
+        *,
+        maximum_total_length: float,
+        minimum_center_clearance: float,
+        start_yaw: float,
+        goal_yaw: float | None,
+        deadline_monotonic: float | None = None,
+    ) -> StopTurnRoute | None:
+        """Replace two adjacent waypoints with one exact-valid waypoint.
+
+        Grid visibility simplification can leave a short sequence of shallow
+        turns around a raster obstacle. Merely deleting either waypoint may
+        be invalid even though moving their shared corner slightly produces a
+        safe route with one fewer stop/turn cycle. Search turn-safe cell
+        centers inside the same clearance band and retain the shortest bounded
+        exact-valid replacement.
+        """
+        points = [dict(point) for point in baseline.points]
+        if len(points) < 4:
+            return None
+        required_side_clearance = max(
+            0.0,
+            float(minimum_center_clearance)
+            - self.half_width
+            - self.padding,
+        )
+        best: StopTurnRoute | None = None
+        for first_removed in range(1, len(points) - 2):
+            left = points[first_removed - 1]
+            right = points[first_removed + 2]
+            visible_replacements: list[tuple[float, dict[str, float]]] = []
+            old_local_length = sum(
+                math.hypot(
+                    float(segment_right["x"]) - float(segment_left["x"]),
+                    float(segment_right["y"]) - float(segment_left["y"]),
+                )
+                for segment_left, segment_right in zip(
+                    points[first_removed - 1:first_removed + 2],
+                    points[first_removed:first_removed + 3],
+                )
+            )
+            for row in range(self.saved_map.height):
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    return best
+                for column in range(self.saved_map.width):
+                    index = self.geometry.index(column, row)
+                    if (
+                        not self.geometry.turn_safe_mask[index]
+                        or self.geometry.static_clearance[index] + 1e-9
+                        < float(minimum_center_clearance)
+                    ):
+                        continue
+                    waypoint_x, waypoint_y = self.saved_map.cell_center(column, row)
+                    replacement_local_length = (
+                        math.hypot(
+                            waypoint_x - float(left["x"]),
+                            waypoint_y - float(left["y"]),
+                        )
+                        + math.hypot(
+                            float(right["x"]) - waypoint_x,
+                            float(right["y"]) - waypoint_y,
+                        )
+                    )
+                    if replacement_local_length > old_local_length + 0.30 + 1e-9:
+                        continue
+                    waypoint = {"x": waypoint_x, "y": waypoint_y}
+                    if (
+                        self._excluded(waypoint_x, waypoint_y, exclusions)
+                        or self._segment_excluded(left, waypoint, exclusions)
+                        or self._segment_excluded(waypoint, right, exclusions)
+                        or not self._segment_has_center_clearance(
+                            left, waypoint, minimum_center_clearance
+                        )
+                        or not self._segment_has_center_clearance(
+                            waypoint, right, minimum_center_clearance
+                        )
+                    ):
+                        continue
+                    visible_replacements.append(
+                        (replacement_local_length, waypoint)
+                    )
+            # Full swept-footprint and rotation validation is deliberately
+            # bounded. The visibility pass above can yield thousands of cell
+            # centers in an open room; shortest replacements are the useful
+            # candidates and keep the stop-turn planning budget deterministic.
+            visible_replacements.sort(key=lambda item: item[0])
+            for _, waypoint in visible_replacements[:96]:
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    return best
+                candidate = [
+                    *points[:first_removed],
+                    waypoint,
+                    *points[first_removed + 2:],
+                ]
+                result = self._route_result(
+                    candidate,
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                )
+                if (
+                    result is None
+                    or result.metadata.turn_count
+                    >= baseline.metadata.turn_count
+                    or result.metadata.total_length
+                    > float(maximum_total_length) + 1e-9
+                    or result.metadata.minimum_side_clearance + 1e-9
+                    < required_side_clearance
+                ):
+                    continue
+                if best is None or self.ranking_key(result) < self.ranking_key(best):
+                    best = result
+        return best
+
     def _canonical_route_from_seed(
         self,
         seed: list[tuple[int, int]],
@@ -2431,6 +2731,7 @@ class StopTurnStateLatticePlanner:
                     minimum_center_clearance,
                 ):
                     continue
+                edge = (index, following)
                 if index > 0 and abs(_angle_delta(outgoing_yaw, incoming_yaw)) > math.radians(1.0):
                     if self._excluded(raw[index]["x"], raw[index]["y"], exclusions):
                         continue
@@ -2447,7 +2748,6 @@ class StopTurnStateLatticePlanner:
                         turn_cache[turn_key] = turn_valid
                     if not turn_valid:
                         continue
-                edge = (index, following)
                 edge_valid = translation_cache.get(edge)
                 if edge_valid is None:
                     edge_valid = self._translation_valid(raw[index], raw[following])
@@ -2557,6 +2857,152 @@ class StopTurnStateLatticePlanner:
         )
         return StopTurnRoute(tuple(route), metadata, headings, directions)
 
+    def _widen_route_with_one_waypoint(
+        self,
+        baseline: StopTurnRoute,
+        exclusions: tuple[tuple[float, float, float], ...],
+        *,
+        required_side_clearance: float,
+        start_yaw: float,
+        goal_yaw: float | None,
+        deadline_monotonic: float | None = None,
+    ) -> StopTurnRoute | None:
+        """Undo an over-aggressive shortcut when it loses lateral margin.
+
+        A centered grid seed can be simplified into one shallow diagonal that
+        saves a corner but clips a narrow passage by a few millimetres. Search
+        one bounded corrective waypoint around the worst segment. Exact body,
+        turn-sweep and lateral-clearance checks remain authoritative.
+        """
+        required = max(0.0, float(required_side_clearance))
+        if baseline.metadata.minimum_side_clearance + 1e-9 >= required:
+            return baseline
+        points = [dict(point) for point in baseline.points]
+        best: StopTurnRoute | None = None
+        maximum_length = baseline.metadata.total_length + 2.0 * (
+            self.half_length + self.padding
+        )
+        ray_limit = self.saved_map.resolution * math.hypot(
+            self.saved_map.width, self.saved_map.height
+        ) + self.saved_map.resolution
+        offset_step = max(0.005, self.saved_map.resolution / 10.0)
+        maximum_offset = min(0.08, 4.0 * self.saved_map.resolution)
+
+        for segment_index, (left, right) in enumerate(zip(points, points[1:])):
+            delta_x = float(right["x"]) - float(left["x"])
+            delta_y = float(right["y"]) - float(left["y"])
+            distance = math.hypot(delta_x, delta_y)
+            if distance <= max(0.10, 2.0 * self.saved_map.resolution):
+                continue
+            yaw = math.atan2(delta_y, delta_x)
+            normal_x = -delta_y / distance
+            normal_y = delta_x / distance
+            count = max(
+                1,
+                math.ceil(
+                    distance / max(0.001, self.saved_map.resolution / 2.0)
+                ),
+            )
+            worst: tuple[float, float, float] | None = None
+            for sample in range(count + 1):
+                ratio = sample / count
+                x = float(left["x"]) + delta_x * ratio
+                y = float(left["y"]) + delta_y * ratio
+                left_width = self.saved_map.raycast_static_range(
+                    x,
+                    y,
+                    yaw + math.pi / 2.0,
+                    minimum_range=0.0,
+                    maximum_range=ray_limit,
+                    unknown_is_blocked=True,
+                )
+                right_width = self.saved_map.raycast_static_range(
+                    x,
+                    y,
+                    yaw - math.pi / 2.0,
+                    minimum_range=0.0,
+                    maximum_range=ray_limit,
+                    unknown_is_blocked=True,
+                )
+                clearance = (
+                    -self.half_width
+                    if left_width is None or right_width is None
+                    else min(left_width, right_width) - self.half_width
+                )
+                if worst is None or clearance < worst[0]:
+                    centering_offset = (
+                        0.0
+                        if left_width is None or right_width is None
+                        else (left_width - right_width) / 2.0
+                    )
+                    worst = (clearance, ratio, centering_offset)
+            if worst is None or worst[0] + 1e-9 >= required:
+                continue
+
+            ratio_candidates = [index / 20.0 for index in range(1, 20)]
+            ratio_candidates.sort(key=lambda value: abs(value - worst[1]))
+            predicted = max(-maximum_offset, min(maximum_offset, worst[2]))
+            offsets = [predicted]
+            steps = max(1, math.ceil(maximum_offset / offset_step))
+            offsets.extend(
+                direction * index * offset_step
+                for index in range(1, steps + 1)
+                for direction in (1.0, -1.0)
+            )
+            offsets = list(dict.fromkeys(round(value, 6) for value in offsets))
+            offsets.sort(key=lambda value: abs(value - predicted))
+
+            for ratio in ratio_candidates:
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    return best
+                if min(ratio, 1.0 - ratio) * distance < 0.10:
+                    continue
+                base_x = float(left["x"]) + delta_x * ratio
+                base_y = float(left["y"]) + delta_y * ratio
+                for offset in offsets:
+                    if abs(offset) < 1e-9:
+                        continue
+                    waypoint = {
+                        "x": base_x + normal_x * offset,
+                        "y": base_y + normal_y * offset,
+                    }
+                    if (
+                        self._excluded(waypoint["x"], waypoint["y"], exclusions)
+                        or self._segment_excluded(left, waypoint, exclusions)
+                        or self._segment_excluded(waypoint, right, exclusions)
+                        or not self._segment_has_side_clearance(
+                            left, waypoint, required
+                        )
+                        or not self._segment_has_side_clearance(
+                            waypoint, right, required
+                        )
+                    ):
+                        continue
+                    candidate_points = canonicalize_stop_turn_path([
+                        *points[: segment_index + 1],
+                        waypoint,
+                        *points[segment_index + 1 :],
+                    ])
+                    candidate = self._route_result(
+                        candidate_points,
+                        start_yaw=start_yaw,
+                        goal_yaw=goal_yaw,
+                    )
+                    if (
+                        candidate is None
+                        or candidate.metadata.total_length
+                        > maximum_length + 1e-9
+                        or candidate.metadata.minimum_side_clearance + 1e-9
+                        < required
+                    ):
+                        continue
+                    if best is None or self.ranking_key(candidate) < self.ranking_key(best):
+                        best = candidate
+        return best
+
     def plan(
         self,
         start: dict[str, float],
@@ -2662,6 +3108,13 @@ class StopTurnStateLatticePlanner:
                     level_results.append(result)
             if level_results:
                 baseline = min(level_results, key=self.ranking_key)
+                maximum_reduced_length = (
+                    min(
+                        result.metadata.total_length
+                        for result in level_results
+                    )
+                    + 2.0 * (self.half_length + self.padding)
+                )
                 if len(baseline.points) > 3:
                     # One removed stop has a geometry-scaled execution
                     # overhead equivalent to one chassis length of travel.
@@ -2671,11 +3124,7 @@ class StopTurnStateLatticePlanner:
                         goal,
                         forbidden,
                         maximum_total_length=(
-                            min(
-                                result.metadata.total_length
-                                for result in level_results
-                            )
-                            + 2.0 * (self.half_length + self.padding)
+                            maximum_reduced_length
                         ),
                         maximum_turn_count=baseline.metadata.turn_count - 1,
                         minimum_center_clearance=seed_clearance,
@@ -2685,6 +3134,21 @@ class StopTurnStateLatticePlanner:
                     )
                     if single_turn is not None:
                         level_results.append(single_turn)
+                reduced = min(level_results, key=self.ranking_key)
+                while len(reduced.points) > 3:
+                    replacement = self._reduce_one_route_corner(
+                        reduced,
+                        forbidden,
+                        maximum_total_length=maximum_reduced_length,
+                        minimum_center_clearance=seed_clearance,
+                        start_yaw=start_yaw,
+                        goal_yaw=goal_yaw,
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                    if replacement is None:
+                        break
+                    level_results.append(replacement)
+                    reduced = replacement
                 candidate_pool.extend(level_results)
                 seeded_result = min(level_results, key=self.ranking_key)
                 break
@@ -2692,7 +3156,22 @@ class StopTurnStateLatticePlanner:
         # Manhattan routes.  The full heading lattice is only needed if that
         # exact candidate cannot be built.
         if seeded_result is not None:
-            return min(candidate_pool, key=self.ranking_key)
+            selected = min(candidate_pool, key=self.ranking_key)
+            if (
+                selected.metadata.minimum_side_clearance + 1e-9
+                < self.preferred_side_margin
+            ):
+                widened = self._widen_route_with_one_waypoint(
+                    selected,
+                    forbidden,
+                    required_side_clearance=self.preferred_side_margin,
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                if widened is not None:
+                    return widened
+            return selected
         turn_bay_result = self._turn_bay_candidate(
             start,
             goal,
@@ -3127,13 +3606,18 @@ class StopTurnStateLatticePlanner:
         ) / max(1e-9, rotation_radius)
         safety_shortfall = passage_shortfall + side_shortfall + turn_shortfall
         safety_band = 0.0 if safety_shortfall <= 1e-9 else 1.0
+        # Each corner is a physical stop -> in-place turn -> settle cycle. Add
+        # a stronger operator-preference penalty than the nominal timing model
+        # while retaining a distance/time bound: this avoids both zig-zags and
+        # very long right-angle detours selected merely to remove one corner.
+        turn_preferred_time = metadata.estimated_time + 2.5 * metadata.turn_count
         return (
             safety_band,
             safety_shortfall,
-            metadata.estimated_time,
+            turn_preferred_time,
             metadata.turn_count,
-            metadata.total_turn_angle,
             metadata.total_length,
+            metadata.total_turn_angle,
             -min(
                 metadata.minimum_side_clearance,
                 required_side_clearance,
@@ -5205,7 +5689,7 @@ def compact_lethal_cells(
     message: Any,
     *,
     threshold: int = 100,
-    max_cells: int = 600,
+    max_cells: int | None = 600,
 ) -> list[dict[str, float]]:
     """Return only lethal cells, not the broad inflation-cost gradient."""
     output: list[dict[str, float]] = []
@@ -5218,6 +5702,9 @@ def compact_lethal_cells(
     )
     cosine, sine = math.cos(yaw), math.sin(yaw)
     resolution = float(message.info.resolution)
+    limit = None if max_cells is None else max(0, int(max_cells))
+    if limit == 0:
+        return output
     for index, raw in enumerate(message.data):
         if int(raw) < threshold:
             continue
@@ -5228,6 +5715,6 @@ def compact_lethal_cells(
             "x": round(float(origin.x) + cosine * local_x - sine * local_y, 3),
             "y": round(float(origin.y) + sine * local_x + cosine * local_y, 3),
         })
-        if len(output) >= max_cells:
+        if limit is not None and len(output) >= limit:
             break
     return output

@@ -99,6 +99,12 @@ class MotionSafetyNode(Node):
             qos_profile_sensor_data,
         )
         self.create_subscription(Bool, "/safety/estop", self._on_estop, 1)
+        self.create_subscription(
+            Bool,
+            "/safety/manual_obstacle_avoidance_enabled",
+            self._on_manual_obstacle_avoidance_mode,
+            1,
+        )
         self.create_subscription(Bool, "/safety/cliff", self._on_cliff, 1)
         self.create_subscription(Bool, "/safety/bumper", self._on_bumper, 1)
         self.create_subscription(Range, "/safety/range", self._on_range, qos_profile_sensor_data)
@@ -128,6 +134,8 @@ class MotionSafetyNode(Node):
         self.range_stop = False
         self.external_stop = False
         self.external_directions = Direction.NONE
+        self.manual_obstacle_avoidance_enabled = True
+        self.last_manual_obstacle_mode = 0.0
         self.fault_hysteresis = StopHysteresis(
             self.config.clear_hysteresis_seconds
         )
@@ -199,6 +207,17 @@ class MotionSafetyNode(Node):
         if self.estop:
             self._trip_immediately("estop")
 
+    def _on_manual_obstacle_avoidance_mode(self, message: Bool) -> None:
+        self.manual_obstacle_avoidance_enabled = bool(message.data)
+        self.last_manual_obstacle_mode = time.monotonic()
+
+    def _manual_obstacle_bypass_active(self, now: float) -> bool:
+        # Fail safe if the bridge disappears or the mode topic goes stale.
+        return bool(
+            not self.manual_obstacle_avoidance_enabled
+            and now - self.last_manual_obstacle_mode <= 0.35
+        )
+
     def _on_cliff(self, message: Bool) -> None:
         self.cliff = bool(message.data)
         if self.cliff:
@@ -211,12 +230,18 @@ class MotionSafetyNode(Node):
 
     def _on_range(self, message: Range) -> None:
         self.range_stop = math.isfinite(message.range) and message.min_range <= message.range <= 0.20
-        if self.range_stop:
+        if (
+            self.range_stop
+            and not self._manual_obstacle_bypass_active(time.monotonic())
+        ):
             self._trip_immediately("range")
 
     def _on_obstacle_stop(self, message: Bool) -> None:
         self.external_stop = bool(message.data)
-        if self.external_stop:
+        if (
+            self.external_stop
+            and not self._manual_obstacle_bypass_active(time.monotonic())
+        ):
             self._trip_immediately("external_obstacle")
 
     def _on_obstacle_directions(self, message: UInt8) -> None:
@@ -411,7 +436,14 @@ class MotionSafetyNode(Node):
 
     def _tick(self) -> None:
         now = time.monotonic()
-        if self.estop or self.cliff or self.bumper or self.range_stop or self.external_stop:
+        manual_obstacle_bypass = self._manual_obstacle_bypass_active(now)
+        if (
+            self.estop
+            or self.cliff
+            or self.bumper
+            or (self.range_stop and not manual_obstacle_bypass)
+            or (self.external_stop and not manual_obstacle_bypass)
+        ):
             reason = (
                 "estop"
                 if self.estop
@@ -426,16 +458,48 @@ class MotionSafetyNode(Node):
             self.fault_hysteresis.update(True, now)
             self._publish_zero(reason, Direction.FRONT | Direction.REAR | Direction.LEFT | Direction.RIGHT)
             return
+        if now - self.last_command > 0.35:
+            # A stationary robot with no active source is normal and safe. The
+            # output still goes to zero, but preflight may remain healthy.
+            self._publish_zero("command_timeout", Direction.NONE, healthy_idle=True)
+            return
+        if manual_obstacle_bypass:
+            # "Chống vật cản: TẮT" bypasses only geometric LiDAR/external
+            # obstacle gates (LiDAR, range and compatibility topics). E-stop,
+            # cliff, bumper and both command watchdogs remain fail-closed.
+            self.fault_hysteresis.stopped = False
+            self.fault_hysteresis.clear_since = None
+            for gate in self.direction_hysteresis.values():
+                gate.stopped = False
+                gate.clear_since = None
+            candidate = Twist()
+            candidate.linear.x = self.command.linear.x
+            candidate.linear.y = self.command.linear.y
+            candidate.angular.z = self.command.angular.z
+            self.output.publish(candidate)
+            self.stop_state.publish(Bool(data=False))
+            self.direction_state.publish(UInt8(data=0))
+            health = "HEALTHY:MANUAL_OBSTACLE_AVOIDANCE_DISABLED"
+            self.health.publish(String(data=health))
+            self.stop_source.publish(
+                String(data="MANUAL_OBSTACLE_AVOIDANCE_DISABLED")
+            )
+            self._publish_atomic_status(
+                health=health,
+                stop=False,
+                reason="MANUAL_OBSTACLE_AVOIDANCE_DISABLED",
+                source="MANUAL_OBSTACLE_AVOIDANCE_DISABLED",
+                blocked=Direction.NONE,
+                output_linear=candidate.linear.x,
+                output_angular=candidate.angular.z,
+                hard_stop=False,
+            )
+            return
         if self.fault_hysteresis.update(False, now):
             self._publish_zero(
                 "fault_hysteresis",
                 Direction.FRONT | Direction.REAR | Direction.LEFT | Direction.RIGHT,
             )
-            return
-        if now - self.last_command > 0.35:
-            # A stationary robot with no active source is normal and safe. The
-            # output still goes to zero, but preflight may remain healthy.
-            self._publish_zero("command_timeout", Direction.NONE, healthy_idle=True)
             return
         masked_linear, masked_angular = clip_motion_by_mask(
             self.command.linear.x,

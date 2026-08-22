@@ -11,6 +11,7 @@ export type PtzCommand =
   | { operation: "stop" };
 export interface IControlTransport {
   connect(robotId: string, sessionId: string, url: string): Promise<void>;
+  setObstacleAvoidanceEnabled(enabled: boolean): void;
   sendVelocity(command: VelocityCommand): void;
   sendStop(reason: string): void;
   sendPtz(command: PtzCommand): void;
@@ -44,6 +45,7 @@ export class WebSocketControlTransport implements IControlTransport {
   private reconnectAttempts = 0;
   private manualDisconnect = false;
   private sessionController = false;
+  private obstacleAvoidanceEnabled = true;
   private readonly clientId = createUuid();
   private connection: { robotId: string; sessionId: string; url: string } | null = null;
 
@@ -192,9 +194,16 @@ export class WebSocketControlTransport implements IControlTransport {
 
   sendVelocity(command: VelocityCommand): void {
     if (!this.isConnected()) return;
-    const message = this.envelope("control.velocity", { ...command });
+    const message = this.envelope("control.velocity", {
+      ...command,
+      obstacle_avoidance_enabled: this.obstacleAvoidanceEnabled,
+    });
     this.commandTypes.set(message.message_id, message.message_type);
     this.socket!.send(JSON.stringify(message));
+  }
+
+  setObstacleAvoidanceEnabled(enabled: boolean): void {
+    this.obstacleAvoidanceEnabled = enabled;
   }
 
   sendStop(reason: string): void {

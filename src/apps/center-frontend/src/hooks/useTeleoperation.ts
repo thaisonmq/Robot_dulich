@@ -9,6 +9,7 @@ export function useTeleoperation() {
   const setControlState = useAppStore((state) => state.setControlState);
   const [inputState, setInputState] = useState<InputState>(EMPTY_INPUT);
   const [speedLevel, setSpeedLevelState] = useState<MotionSpeedLevel>(DEFAULT_MOTION_SPEED_LEVEL);
+  const [obstacleAvoidanceEnabled, setObstacleAvoidanceEnabledState] = useState(true);
 
   const control = useMemo(
     () => new WebSocketControlTransport(
@@ -58,6 +59,18 @@ export function useTeleoperation() {
     manager.setSpeedLevel(level);
     setSpeedLevelState(level);
   }, [manager]);
+  const setObstacleAvoidanceEnabled = useCallback((enabled: boolean) => {
+    // A mode transition is atomic: stop the current hold first, then require a
+    // fresh press carrying the newly selected safety mode.
+    manager.clear("obstacle_avoidance_mode_changed", true);
+    control.setObstacleAvoidanceEnabled(enabled);
+    setObstacleAvoidanceEnabledState(enabled);
+    setCommandStatus(
+      enabled
+        ? "Chống vật cản thủ công đã bật"
+        : "Chống vật cản thủ công đã tắt",
+    );
+  }, [control, manager, setCommandStatus]);
 
   useEffect(() => {
     const unsubscribe = manager.subscribe(setInputState);
@@ -70,5 +83,14 @@ export function useTeleoperation() {
     };
   }, [control, manager]);
 
-  return { control, manager, screen, inputState, speedLevel, setSpeedLevel };
+  return {
+    control,
+    manager,
+    screen,
+    inputState,
+    speedLevel,
+    setSpeedLevel,
+    obstacleAvoidanceEnabled,
+    setObstacleAvoidanceEnabled,
+  };
 }

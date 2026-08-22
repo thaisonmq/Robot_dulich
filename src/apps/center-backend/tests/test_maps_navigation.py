@@ -242,6 +242,11 @@ def test_plan_failure_messages_distinguish_unknown_and_blocked_start() -> None:
     assert rejection is not None
     assert "vùng xuất phát" in rejection["message"]
 
+    mission.error_code = "ROUTE_CLEARANCE_INSUFFICIENT"
+    rejection = _mission_start_rejection(mission)
+    assert rejection is not None
+    assert "tối thiểu 7 cm mỗi bên" in rejection["message"]
+
 
 def bundle_bytes(*, unsafe: bool = False) -> bytes:
     output = io.BytesIO()
@@ -660,3 +665,54 @@ def test_navigation_runtime_preserves_failed_and_ignores_map_only_states() -> No
     )
     with SessionLocal() as database:
         assert database.get(NavigationMission, mission_id).status == "FAILED"
+
+
+@pytest.mark.parametrize(
+    ("runtime_state", "expected_status"),
+    [
+        ("WAIT_FOR_DYNAMIC_CLEAR", "RECOVERY"),
+        ("WAITING_FOR_DYNAMIC_CLEAR", "RECOVERY"),
+        ("DYNAMIC_REPLAN", "RECOVERY"),
+        ("SENSOR_TIME_INVALID", "RECOVERY"),
+        ("VERIFYING", "RECOVERY"),
+        ("LOCALIZATION_REQUIRED", "LOCALIZATION_LOST"),
+    ],
+)
+def test_navigation_runtime_projects_edge_recovery_states(
+    runtime_state: str,
+    expected_status: str,
+) -> None:
+    map_id = f"MAP-{runtime_state}"
+    mission_id = f"mission-{runtime_state.lower()}"
+    robot_id = f"ROBOT-{runtime_state}"
+    with SessionLocal.begin() as database:
+        database.add(MapRecord(
+            map_id=map_id,
+            name=f"Runtime state {runtime_state}",
+            image_url="",
+            width_pixels=1,
+            height_pixels=1,
+            resolution_m_per_pixel=0.05,
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            status="ACTIVE",
+        ))
+        database.add(NavigationMission(
+            mission_id=mission_id,
+            request_id=f"request-{runtime_state.lower()}",
+            robot_id=robot_id,
+            control_session_id=f"session-{runtime_state.lower()}",
+            map_id=map_id,
+            map_version=1,
+            status="NAVIGATING",
+            goal={"x": 0.5, "y": 0.5, "yaw": 0.0},
+            path=[],
+        ))
+
+    persist_robot_runtime_event(
+        robot_id,
+        "navigation.status",
+        {"mission_id": mission_id, "state": runtime_state},
+    )
+
+    with SessionLocal() as database:
+        assert database.get(NavigationMission, mission_id).status == expected_status
