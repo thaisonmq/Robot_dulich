@@ -2394,6 +2394,32 @@ def test_actual_project_map_rejects_direct_line_and_finds_exact_detour() -> None
     ).valid
 
 
+def test_recorded_project_map_planner_case_reaches_lattice_before_deadline() -> None:
+    """Regression for the 2026-08-18 zero-expansion 12-second timeout."""
+    project = Path(__file__).parents[3]
+    saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    start = {
+        "x": 0.2599872457,
+        "y": 0.7900053497,
+        "yaw": 2.7517760728,
+    }
+    goal = {"x": 2.4008163265, "y": 0.1951020408}
+
+    result = planner.plan_result(start, goal, planning_time_budget=12.0)
+
+    assert result.success
+    assert result.expansions > 0
+    assert result.route is not None
+    assert validate_stop_turn_route(
+        saved,
+        result.route.points,
+        half_length=0.15,
+        half_width=0.10,
+        segment_directions=result.route.segment_directions,
+    ).valid
+
+
 def test_actual_project_map_never_routes_through_preserved_unknown_space() -> None:
     project = Path(__file__).parents[3]
     saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
@@ -2545,7 +2571,7 @@ def test_turn_bay_direction_order_tracks_goal_projection() -> None:
 
     assert preferred_turn_bay_directions(
         start, {"x": 2.0, "y": 1.2}
-    ) == (1,)
+    ) == (1, -1)
     assert preferred_turn_bay_directions(
         start, {"x": 0.0, "y": 0.8}
     ) == (-1, 1)
@@ -2921,7 +2947,7 @@ def test_controller_zero_abort_with_fresh_near_front_evidence_is_live_blockage()
     )
 
 
-def test_controller_diagnostics_and_repeated_zero_abort_are_live_blockage() -> None:
+def test_controller_diagnostics_but_not_repeated_zero_alone_are_live_blockage() -> None:
     assert controller_abort_is_live_blockage(
         error_code=106,
         error_msg="No valid control: predicted collision ahead",
@@ -2933,7 +2959,7 @@ def test_controller_diagnostics_and_repeated_zero_abort_are_live_blockage() -> N
         corridor_front_clearance=math.inf,
         corridor_blockage_limit=0.17,
     )
-    assert controller_abort_is_live_blockage(
+    assert not controller_abort_is_live_blockage(
         error_code=None,
         error_msg="",
         atomic_motion_safety_block=False,
@@ -3428,6 +3454,7 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
         "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
     )
     assert follow["use_rotate_to_heading"] is False
+    assert follow["use_collision_detection"] is False
     assert follow["allow_reversing"] is True
     assert planner["plugin"] == "nav2_smac_planner/SmacPlannerLattice"
     assert planner["allow_unknown"] is False
@@ -3549,6 +3576,13 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert 12 <= localization[
         "localization_operator_hint_minimum_static_matches"
     ] <= localization["localization_operator_hint_minimum_comparable_beams"]
+    assert 0.65 <= localization[
+        "localization_operator_hint_minimum_static_match_ratio"
+    ] <= 0.80
+    assert localization["dynamic_unconfirmed_blocker_timeout_seconds"] >= (
+        localization["dynamic_obstacle_persistence_seconds"]
+    )
+    assert localization["dynamic_unconfirmed_blocker_log_interval_seconds"] >= 1.0
     assert 0 < localization[
         "localization_raycast_maximum_contradiction_ratio"
     ] <= 0.20

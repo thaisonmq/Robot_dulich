@@ -611,10 +611,11 @@ def controller_abort_is_live_blockage(
 ) -> bool:
     """Classify explicit/fresh blockage evidence without inferring from status.
 
-    Older Humble FollowPath results contain no diagnostics. In that case a
-    fresh near-front corridor sample or repeated zero-linear abort supplies
-    the missing controller-side evidence. None of these inputs proves a
-    static disconnection; they only select runtime wait/replan behavior.
+    Older Humble FollowPath results contain no diagnostics. In that case only
+    a fresh near-front corridor sample may supply the missing physical
+    evidence. Repeated zero-linear output is a controller symptom, not an
+    obstacle observation: treating it as one creates an endless false dynamic
+    wait when the controller rejects a trajectory for an internal reason.
     """
     normalized_message = str(error_msg or "").strip().upper()
     normalized_code = str(error_code or "").strip().upper()
@@ -643,7 +644,6 @@ def controller_abort_is_live_blockage(
         atomic_motion_safety_block
         or dynamic_route_intersection
         or diagnostic_block
-        or (controller_zero_linear and repeated_zero_linear_abort)
         or fresh_near_front
     )
 
@@ -1529,12 +1529,12 @@ def choose_turn_direction(
 def preferred_turn_bay_directions(
     start: dict[str, float], goal: dict[str, float]
 ) -> tuple[int, ...]:
-    """Prefer the straight relocation that progresses toward the destination.
+    """Order both straight relocation directions by goal progress.
 
     A positive direction is forward along the current chassis heading and a
-    negative direction is reverse with the chassis heading held fixed. Reverse
-    is eligible only when it lies in the destination half-plane; it is never a
-    fallback for a destination ahead of the chassis.
+    negative direction is reverse with the chassis heading held fixed.  A turn
+    bay is a clearance recovery, so moving briefly away from the destination is
+    still preferable to repeatedly trying an unsafe in-place rotation.
     """
     yaw = float(start.get("yaw", 0.0))
     goal_delta_x = float(goal["x"]) - float(start["x"])
@@ -1542,7 +1542,7 @@ def preferred_turn_bay_directions(
     forward_progress = (
         goal_delta_x * math.cos(yaw) + goal_delta_y * math.sin(yaw)
     )
-    return (1,) if forward_progress >= 0.0 else (-1, 1)
+    return (1, -1) if forward_progress >= 0.0 else (-1, 1)
 
 
 def validate_rotation_sweep_neighborhood(
@@ -1912,6 +1912,24 @@ class StopTurnStateLatticePlanner:
         *,
         robust: bool = True,
     ) -> bool:
+        # The exact rectangular sweep is expensive inside the lattice. A
+        # conservatively free bounding circle is sufficient proof of validity:
+        # geometry clearance is measured at the raster cell center, so subtract
+        # the query's within-cell offset before comparing it with the chassis
+        # corner radius. Borderline poses still use the authoritative sweep.
+        cell = self.saved_map.world_to_cell(float(x), float(y))
+        if cell is not None:
+            center_x, center_y = self.saved_map.cell_center(*cell)
+            available_clearance = self.geometry.clearance_at_cell(*cell) - math.hypot(
+                float(x) - center_x,
+                float(y) - center_y,
+            )
+            required_clearance = math.hypot(
+                self.half_length + self.padding,
+                self.half_width + self.hard_side_margin + self.padding,
+            ) + (self.turn_robustness_radius if robust else 0.0)
+            if available_clearance + 1e-9 >= required_clearance:
+                return True
         return validate_rotation_sweep_neighborhood(
             self.saved_map,
             x,
@@ -2780,6 +2798,84 @@ class StopTurnStateLatticePlanner:
             return []
         return canonicalize_stop_turn_path(raw[index] for index in indices)
 
+    def _simplify_exact_route_points(
+        self,
+        points: list[dict[str, float]],
+        *,
+        start_yaw: float,
+        exclusions: tuple[tuple[float, float, float], ...],
+        deadline_monotonic: float | None,
+    ) -> list[dict[str, float]]:
+        """Remove redundant lattice stops using exact edge and turn checks."""
+        if len(points) < 3:
+            return list(points)
+        translation_cache: dict[tuple[int, int], bool] = {}
+        turn_cache: dict[tuple[int, int], bool] = {}
+        failed: set[tuple[int, int]] = set()
+
+        def solve(index: int, incoming_yaw: float) -> list[int] | None:
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                return None
+            memo_key = (index, self.heading_bin(incoming_yaw))
+            if memo_key in failed:
+                return None
+            for following in range(len(points) - 1, index, -1):
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    return None
+                outgoing_yaw = math.atan2(
+                    points[following]["y"] - points[index]["y"],
+                    points[following]["x"] - points[index]["x"],
+                )
+                if self._segment_excluded(
+                    points[index], points[following], exclusions
+                ):
+                    continue
+                if (
+                    index > 0
+                    and abs(_angle_delta(outgoing_yaw, incoming_yaw))
+                    > math.radians(1.0)
+                ):
+                    turn_key = (index, self.heading_bin(outgoing_yaw))
+                    turn_valid = turn_cache.get(turn_key)
+                    if turn_valid is None:
+                        turn_valid = self._turn_valid(
+                            points[index]["x"],
+                            points[index]["y"],
+                            incoming_yaw,
+                            outgoing_yaw,
+                            robust=False,
+                        )
+                        turn_cache[turn_key] = turn_valid
+                    if not turn_valid:
+                        continue
+                edge = (index, following)
+                edge_valid = translation_cache.get(edge)
+                if edge_valid is None:
+                    edge_valid = self._translation_valid(
+                        points[index], points[following]
+                    )
+                    translation_cache[edge] = edge_valid
+                if not edge_valid:
+                    continue
+                if following == len(points) - 1:
+                    return [index, following]
+                suffix = solve(following, outgoing_yaw)
+                if suffix is not None:
+                    return [index, *suffix]
+            failed.add(memo_key)
+            return None
+
+        indices = solve(0, start_yaw)
+        if indices is None:
+            return list(points)
+        return canonicalize_stop_turn_path(points[index] for index in indices)
+
     def _route_result(
         self,
         route: list[dict[str, float]],
@@ -3031,6 +3127,24 @@ class StopTurnStateLatticePlanner:
     ) -> StopTurnRoute | None:
         self._last_plan_expansions = 0
         self._last_plan_limit = ""
+        planning_started = time.monotonic()
+        # Grid seeds are useful fast paths, but they must not consume the whole
+        # shared deadline before the exact heading lattice gets one expansion.
+        # Bound topology seeds to the first 25% and optional tight-start bay
+        # recovery to 68%, leaving a deterministic final lattice interval.
+        # With no deadline the existing exhaustive seed behaviour is unchanged.
+        seed_deadline_monotonic = deadline_monotonic
+        turn_bay_deadline_monotonic = deadline_monotonic
+        if deadline_monotonic is not None:
+            remaining = max(0.0, deadline_monotonic - planning_started)
+            seed_deadline_monotonic = min(
+                deadline_monotonic,
+                planning_started + remaining * 0.25,
+            )
+            turn_bay_deadline_monotonic = min(
+                deadline_monotonic,
+                planning_started + remaining * 0.68,
+            )
         start_x, start_y = float(start["x"]), float(start["y"])
         goal_x, goal_y = float(goal["x"]), float(goal["y"])
         start_cell = self.saved_map.world_to_cell(start_x, start_y)
@@ -3087,17 +3201,24 @@ class StopTurnStateLatticePlanner:
                 candidate_pool.append(result)
         seeded_result: StopTurnRoute | None = None
         for seed_clearance in self._clearance_levels():
+            if (
+                seed_deadline_monotonic is not None
+                and time.monotonic() >= seed_deadline_monotonic
+            ):
+                break
             level_results: list[StopTurnRoute] = []
             seen_routes: set[tuple[tuple[float, float], ...]] = set()
-            for seed_search in (
-                self._minimum_turn_grid_seed,
-                self._grid_seed,
-            ):
+            seed_searches = (
+                (self._grid_seed, self._minimum_turn_grid_seed)
+                if deadline_monotonic is not None
+                else (self._minimum_turn_grid_seed, self._grid_seed)
+            )
+            for seed_search in seed_searches:
                 seed = seed_search(
                     start_cell,
                     goal_cell,
                     forbidden,
-                    deadline_monotonic,
+                    seed_deadline_monotonic,
                     minimum_center_clearance=seed_clearance,
                 )
                 seeded_route = self._canonical_route_from_seed(
@@ -3105,7 +3226,7 @@ class StopTurnStateLatticePlanner:
                     start,
                     goal,
                     forbidden,
-                    deadline_monotonic,
+                    seed_deadline_monotonic,
                     minimum_center_clearance=seed_clearance,
                 )
                 if not seeded_route:
@@ -3148,7 +3269,7 @@ class StopTurnStateLatticePlanner:
                         minimum_center_clearance=seed_clearance,
                         start_yaw=start_yaw,
                         goal_yaw=goal_yaw,
-                        deadline_monotonic=deadline_monotonic,
+                        deadline_monotonic=seed_deadline_monotonic,
                     )
                     if single_turn is not None:
                         level_results.append(single_turn)
@@ -3161,7 +3282,7 @@ class StopTurnStateLatticePlanner:
                         minimum_center_clearance=seed_clearance,
                         start_yaw=start_yaw,
                         goal_yaw=goal_yaw,
-                        deadline_monotonic=deadline_monotonic,
+                        deadline_monotonic=seed_deadline_monotonic,
                     )
                     if replacement is None:
                         break
@@ -3185,17 +3306,26 @@ class StopTurnStateLatticePlanner:
                     required_side_clearance=self.preferred_side_margin,
                     start_yaw=start_yaw,
                     goal_yaw=goal_yaw,
-                    deadline_monotonic=deadline_monotonic,
+                    deadline_monotonic=seed_deadline_monotonic,
                 )
                 if widened is not None:
                     return widened
             return selected
-        turn_bay_result = self._turn_bay_candidate(
-            start,
-            goal,
-            forbidden,
-            deadline_monotonic,
-        )
+        initial_goal_heading = math.atan2(goal_y - start_y, goal_x - start_x)
+        turn_bay_result = None
+        if self._excluded(start_x, start_y, forbidden) or not self._turn_valid(
+            start_x,
+            start_y,
+            start_yaw,
+            initial_goal_heading,
+            robust=False,
+        ):
+            turn_bay_result = self._turn_bay_candidate(
+                start,
+                goal,
+                forbidden,
+                turn_bay_deadline_monotonic,
+            )
         if turn_bay_result is not None:
             candidate_pool.append(turn_bay_result)
             return min(candidate_pool, key=self.ranking_key)
@@ -3203,8 +3333,83 @@ class StopTurnStateLatticePlanner:
             deadline_monotonic is not None
             and time.monotonic() >= deadline_monotonic
         ):
+            if not candidate_pool:
+                self._last_plan_limit = "SEARCH_TIME_BUDGET_EXCEEDED"
             return min(candidate_pool, key=self.ranking_key) if candidate_pool else None
         start_heading = self.heading_bin(float(start.get("yaw", 0.0)))
+        # Bounded interactive requests favour finding an exact executable route
+        # over proving the globally least-time lattice route. A modest weighted
+        # A* heuristic sharply reduces open-room heading permutations; every
+        # returned route still passes the same footprint and rotation sweeps.
+        lattice_heuristic_weight = 1.25 if deadline_monotonic is not None else 1.0
+
+        # Reverse 8-connected grid costs add obstacle topology to the lattice
+        # heuristic. Euclidean distance alone expands thousands of headings on
+        # the wrong side of a wall before discovering the required detour.
+        grid_goal_costs: dict[int, float] = {
+            self.geometry.index(*goal_cell): 0.0
+        }
+        grid_queue: list[tuple[float, int]] = [
+            (0.0, self.geometry.index(*goal_cell))
+        ]
+        grid_directions = (
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, 1), (1, -1), (-1, 1), (-1, -1),
+        )
+        grid_expansions = 0
+        while grid_queue:
+            grid_expansions += 1
+            if (
+                grid_expansions % 256 == 0
+                and deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                break
+            grid_cost, grid_index = heapq.heappop(grid_queue)
+            if grid_cost > grid_goal_costs.get(grid_index, math.inf) + 1e-9:
+                continue
+            grid_row, grid_column = divmod(grid_index, self.saved_map.width)
+            for grid_dx, grid_dy in grid_directions:
+                next_column = grid_column + grid_dx
+                next_row = grid_row + grid_dy
+                if not (
+                    0 <= next_column < self.saved_map.width
+                    and 0 <= next_row < self.saved_map.height
+                ):
+                    continue
+                next_index = self.geometry.index(next_column, next_row)
+                if not self.geometry.robot_navigable_mask[next_index]:
+                    continue
+                if grid_dx and grid_dy:
+                    if not (
+                        self.geometry.robot_navigable_mask[
+                            self.geometry.index(grid_column + grid_dx, grid_row)
+                        ]
+                        and self.geometry.robot_navigable_mask[
+                            self.geometry.index(grid_column, grid_row + grid_dy)
+                        ]
+                    ):
+                        continue
+                next_cost = grid_cost + math.hypot(grid_dx, grid_dy)
+                if next_cost + 1e-9 >= grid_goal_costs.get(next_index, math.inf):
+                    continue
+                grid_goal_costs[next_index] = next_cost
+                heapq.heappush(grid_queue, (next_cost, next_index))
+
+        def lattice_heuristic(x: float, y: float) -> float:
+            euclidean = math.hypot(goal_x - x, goal_y - y)
+            cell = self.saved_map.world_to_cell(x, y)
+            if cell is None:
+                distance = euclidean
+            else:
+                grid_cost = grid_goal_costs.get(self.geometry.index(*cell))
+                distance = (
+                    euclidean
+                    if grid_cost is None
+                    else max(euclidean, grid_cost * self.saved_map.resolution)
+                )
+            return lattice_heuristic_weight * distance / self.linear_speed
+
         start_key = self._pose_key(start_x, start_y, start_heading)
         positions: dict[tuple[int, int, int], tuple[float, float]] = {
             start_key: (start_x, start_y)
@@ -3218,8 +3423,7 @@ class StopTurnStateLatticePlanner:
         heapq.heappush(
             queue,
             (
-                math.hypot(goal_x - start_x, goal_y - start_y)
-                / self.linear_speed,
+                lattice_heuristic(start_x, start_y),
                 sequence,
                 start_key,
             ),
@@ -3274,6 +3478,12 @@ class StopTurnStateLatticePlanner:
                         ),
                         direct,
                     ])
+                    candidate = self._simplify_exact_route_points(
+                        candidate,
+                        start_yaw=start_yaw,
+                        exclusions=forbidden,
+                        deadline_monotonic=deadline_monotonic,
+                    )
                     lattice_result = self._route_result(
                         candidate,
                         start_yaw=start_yaw,
@@ -3310,7 +3520,7 @@ class StopTurnStateLatticePlanner:
                         parents[next_key] = state
                         positions[next_key] = (next_x, next_y)
                         sequence += 1
-                        heuristic = math.hypot(goal_x - next_x, goal_y - next_y) / self.linear_speed
+                        heuristic = lattice_heuristic(next_x, next_y)
                         heapq.heappush(
                             queue, (next_cost + heuristic, sequence, next_key)
                         )
@@ -3340,7 +3550,7 @@ class StopTurnStateLatticePlanner:
                 parents[next_key] = state
                 positions[next_key] = (x, y)
                 sequence += 1
-                heuristic = math.hypot(goal_x - x, goal_y - y) / self.linear_speed
+                heuristic = lattice_heuristic(x, y)
                 heapq.heappush(queue, (next_cost + heuristic, sequence, next_key))
         if expansions >= self.max_expansions:
             self._last_plan_limit = "SEARCH_EXPANSION_LIMIT"

@@ -148,7 +148,7 @@ def test_global_search_is_passive_first_and_only_velocity_requires_authorization
     assert 'mode="PASSIVE_GLOBAL"' in global_search
 
 
-def test_operator_hint_resolves_alias_only_after_strict_multi_heading_evidence() -> None:
+def test_operator_hint_resolves_without_unsafe_rotation_only_with_strict_local_evidence() -> None:
     verdict = _method_source("_localization_verdict", "_localization_quality_ready")
     operator = _method_source("_set_initial_pose", "_deactivate_map")
 
@@ -158,12 +158,14 @@ def test_operator_hint_resolves_alias_only_after_strict_multi_heading_evidence()
     assert "self.localization_operator_hint_active = True" in operator
     assert "self.localization_seed_pose" in operator_branch
     assert "self.global_scan_hint_radius" in operator_branch
-    assert "self._global_heading_diversity_ready()" in operator_branch
-    assert '"INSUFFICIENT_HEADING_DIVERSITY"' in operator_branch
+    assert "self._global_heading_diversity_ready()" not in operator_branch
+    assert '"INSUFFICIENT_HEADING_DIVERSITY"' not in operator_branch
     assert "return verdict" in operator_branch
-    assert "hinted_multi_heading" in verdict
+    assert "hinted_candidate" in verdict
     assert "self.localization_operator_hint_minimum_raycast_beams" in verdict
     assert "self.localization_operator_hint_minimum_static_matches" in verdict
+    assert "self.localization_operator_hint_minimum_static_match_ratio" in verdict
+    assert '"OPERATOR_HINT_STATIC_MATCH_RATIO_TOO_LOW"' in verdict
     assert "self.particle_uniqueness.accepted" in verdict.split(
         "if self.localization_operator_hint_active:", 1
     )[0]
@@ -996,6 +998,9 @@ def test_turn_hysteresis_and_persistent_safety_block_are_bounded() -> None:
     assert "self.execution_turn_stable_dwell" in tick
     assert "self.execution_turn_safety_block_timeout" in tick
     assert '"PERSISTENT_SAFETY_BLOCK"' in tick
+    assert 'action="RELOCATE_TO_TURN_BAY"' in tick
+    assert "self._start_turn_bay_recovery(pose, generation)" in tick
+    assert 'action="ALTERNATIVE_DIRECTION"' not in tick
     assert "self._schedule_execution_replan" in tick
     assert '"TURN_CMD"' in tick
 
@@ -1127,7 +1132,7 @@ def test_navigation_pose_jump_stops_before_replan_and_preserves_destination() ->
     assert "self.pose =" in release
 
 
-def test_live_blockage_replan_exhaustion_waits_without_terminal_cleanup() -> None:
+def test_live_blockage_replan_exhaustion_enters_bounded_evidence_wait() -> None:
     schedule = _method_source(
         "_schedule_execution_replan", "_enter_dynamic_wait"
     )
@@ -1162,8 +1167,24 @@ def test_dynamic_wait_periodically_replans_and_success_resumes_same_goal() -> No
     assert "minimum_observations=self.dynamic_planning_minimum_observations" in blocker
     assert 'result="POSITION_UNCONFIRMED"' in blocker
     assert "observe_confirmed_blocker" not in blocker
+    assert "self.dynamic_unconfirmed_blocker_timeout" in tick
+    assert "self._stop_unconfirmed_dynamic_recovery()" in tick
+    terminal = _method_source(
+        "_stop_unconfirmed_dynamic_recovery", "_schedule_execution_replan"
+    )
+    assert 'self._set_state("BLOCKED"' in terminal
+    assert "self.paused_goal = goal" in terminal
+    assert "destination_preserved" in terminal
+    assert "keepout_created=False" in terminal
     assert "corridor_blocked" in tick
     assert 'self.dynamic_block_reason.startswith("CONTROLLER_ABORT")' not in tick
+    enter = _method_source("_enter_dynamic_wait", "_dynamic_recovery_tick")
+    navigate = _method_source("_navigate", "_start_escape_execution")
+    assert 'self.current_state == "NAVIGATING"' not in enter.split(
+        "new_physical_encounter = bool(", 1
+    )[1].split(")", 1)[0]
+    assert "if not recovery_attempt:" in navigate
+    assert '.split("-clear-resume", 1)[0]' in attempt
 
 
 def test_live_costmap_filters_static_cells_before_bounding_dynamic_overlay() -> None:

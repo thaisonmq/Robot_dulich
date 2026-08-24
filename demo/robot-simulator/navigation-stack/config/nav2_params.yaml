@@ -103,12 +103,13 @@ rovera_navigation_adapter:
     localization_raycast_minimum_reliable_structure_span: 0.75
     localization_raycast_minimum_static_matches: 20
     localization_raycast_maximum_contradiction_ratio: 0.20
-    # A user-provided nearby hint plus a completed multi-heading sweep already
-    # constrains the search region. Sparse endpoint headings may expose only
-    # 12-19 comparable static rays; retain 12 exact hits while leaving blind
-    # global localization on the stricter 25/20 acquisition thresholds.
+    # A user-provided nearby hint constrains the search region. Sparse endpoint
+    # headings may expose only 12-19 comparable static rays; retain 12 exact
+    # hits plus a 65% multi-frame static ratio, strict residual/covariance and
+    # unique-particle gates. Blind global localization remains at 25/20.
     localization_operator_hint_minimum_comparable_beams: 12
     localization_operator_hint_minimum_static_matches: 12
+    localization_operator_hint_minimum_static_match_ratio: 0.65
     # Acquisition uses a strict 5-of-7 consensus around one pose. Two transient
     # scans may be occluded, while three contradictory/bad frames still reject.
     localization_consensus_window_size: 7
@@ -153,6 +154,12 @@ rovera_navigation_adapter:
     dynamic_planning_minimum_observations: 6
     dynamic_overlay_max_cells: 600
     dynamic_obstacle_persistence_seconds: 1.5
+    # A controller corridor stop without a repeatedly located obstacle cannot
+    # create a safe keepout. Collect evidence for a bounded interval, then
+    # expose BLOCKED while preserving the destination instead of waiting and
+    # logging forever.
+    dynamic_unconfirmed_blocker_timeout_seconds: 8.0
+    dynamic_unconfirmed_blocker_log_interval_seconds: 1.0
     # Require sustained route-aligned clearance before resuming. A single
     # sideways scan while waiting must never restart the blocked segment.
     dynamic_obstacle_clear_dwell_seconds: 1.00
@@ -380,7 +387,14 @@ controller_server:
       use_velocity_scaled_lookahead_dist: true
       min_approach_linear_velocity: 0.05
       approach_velocity_scaling_dist: 0.35
-      use_collision_detection: true
+      # RPP predicts collision on its own curved carrot trajectory, but the
+      # adapter deliberately discards that curvature and executes a fixed-
+      # heading straight segment. On the Pi this rejected a 0.915 m clear
+      # corridor because an off-axis scan cell intersected the unused arc.
+      # Collision authority for the trajectory actually sent to the wheels is
+      # retained by the exact global footprint validator, live corridor gate
+      # and downstream raw-LiDAR motion-safety node.
+      use_collision_detection: false
       max_allowed_time_to_collision_up_to_carrot: 0.90
       use_regulated_linear_velocity_scaling: true
       regulated_linear_scaling_min_radius: 0.85

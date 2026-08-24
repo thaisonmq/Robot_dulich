@@ -514,8 +514,9 @@ class NavigationAdapter(Node):
             ).value
         ))
         # A bounded operator hint already supplies the missing spatial prior.
-        # After the physical multi-heading sweep, permit a smaller but still
-        # substantial static sample in sparse end-of-route geometry. Blind
+        # Permit a smaller but still substantial static sample in sparse
+        # end-of-route geometry, then require a strict multi-frame match ratio,
+        # pose/covariance gates and a unique AMCL particle cluster below. Blind
         # global localization keeps the stricter acquisition thresholds above.
         self.localization_operator_hint_minimum_raycast_beams = min(
             self.localization_raycast_minimum_beams,
@@ -528,6 +529,9 @@ class NavigationAdapter(Node):
             max(1, int(self.declare_parameter(
                 "localization_operator_hint_minimum_static_matches", 12
             ).value)),
+        )
+        self.localization_operator_hint_minimum_static_match_ratio = configured(
+            "localization_operator_hint_minimum_static_match_ratio", 0.65
         )
         self.localization_raycast_maximum_contradiction_ratio = configured(
             "localization_raycast_maximum_contradiction_ratio", 0.20
@@ -619,6 +623,13 @@ class NavigationAdapter(Node):
         )
         self.dynamic_obstacle_wait = configured(
             "dynamic_obstacle_persistence_seconds", 1.5
+        )
+        self.dynamic_unconfirmed_blocker_timeout = max(
+            self.dynamic_obstacle_wait,
+            configured("dynamic_unconfirmed_blocker_timeout_seconds", 8.0),
+        )
+        self.dynamic_unconfirmed_blocker_log_interval = configured(
+            "dynamic_unconfirmed_blocker_log_interval_seconds", 1.0
         )
         self.dynamic_clear_dwell = configured(
             "dynamic_obstacle_clear_dwell_seconds", 1.00
@@ -807,6 +818,7 @@ class NavigationAdapter(Node):
         self.dynamic_replan_attempt_count = 0
         self.dynamic_replan_requires_alternative = False
         self.dynamic_recovery_expires_monotonic = 0.0
+        self.dynamic_last_unconfirmed_log_monotonic = 0.0
         self.latest_global_costmap: OccupancyGrid | None = None
         self.latest_static_map: OccupancyGrid | None = None
         self.last_global_costmap_monotonic = 0.0
@@ -3048,6 +3060,7 @@ class NavigationAdapter(Node):
         self.dynamic_replan_attempt_count = 0
         self.dynamic_replan_requires_alternative = False
         self.dynamic_recovery_expires_monotonic = 0.0
+        self.dynamic_last_unconfirmed_log_monotonic = 0.0
 
     def _dynamic_affects_remaining_route(self) -> bool:
         return bool(self._dynamic_route_obstacles(
@@ -5773,18 +5786,15 @@ class NavigationAdapter(Node):
         required_scan_score: float,
         require_heading: bool,
     ) -> LocalizationVerification:
-        hinted_multi_heading = bool(
-            self.localization_operator_hint_active
-            and self._global_heading_diversity_ready()
-        )
+        hinted_candidate = bool(self.localization_operator_hint_active)
         minimum_raycast_beams = (
             self.localization_operator_hint_minimum_raycast_beams
-            if hinted_multi_heading
+            if hinted_candidate
             else self.localization_raycast_minimum_beams
         )
         minimum_raycast_static_matches = (
             self.localization_operator_hint_minimum_static_matches
-            if hinted_multi_heading
+            if hinted_candidate
             else self.localization_raycast_minimum_static_matches
         )
         consensus = localization_evidence_consensus(
@@ -5809,6 +5819,14 @@ class NavigationAdapter(Node):
         self.localization_consensus = consensus
         if not consensus.accepted:
             return LocalizationVerification(False, consensus.reason)
+        if (
+            hinted_candidate
+            and consensus.raycast_static_match_ratio
+            < self.localization_operator_hint_minimum_static_match_ratio
+        ):
+            return LocalizationVerification(
+                False, "OPERATOR_HINT_STATIC_MATCH_RATIO_TOO_LOW"
+            )
         self.scan_map_score = round(consensus.scan_score, 4)
         self.scan_map_valid_beams = consensus.valid_beams
         self.scan_map_residual_beams = consensus.residual_beams
@@ -5909,16 +5927,16 @@ class NavigationAdapter(Node):
                         False, "OPERATOR_HINT_CANDIDATE_OUTSIDE_REGION"
                     )
                 # An explicit nearby-position hint supplies the spatial prior
-                # that a blind global search lacks. Accept it only after fresh
-                # multi-heading observations plus every strict local geometry,
-                # consensus and particle-uniqueness gate above have passed.
+                # that a blind global search lacks. Accept it only after every
+                # strict multi-frame local geometry, pose/covariance and
+                # particle-uniqueness gate above has passed. Requiring the
+                # chassis to rotate here deadlocks a valid hinted candidate in
+                # a tight bay, even though the operator already bounded its
+                # position and stationary LiDAR evidence is independently
+                # strong.
                 # The coarse map-wide scorer is intentionally not a veto here:
                 # movable objects depress its absolute score even when the
                 # candidate's fine residual/raycast evidence is unequivocal.
-                if not self._global_heading_diversity_ready():
-                    return LocalizationVerification(
-                        False, "INSUFFICIENT_HEADING_DIVERSITY"
-                    )
                 return verdict
             self._request_global_scan_uniqueness()
             if self.global_scan_uniqueness_in_progress:
@@ -7766,13 +7784,14 @@ class NavigationAdapter(Node):
             self.paused_goal = dict(goal_payload)
             self.latest_global_path = list(points)
             self.selected_route_id = route_id
-            self.dynamic_block_reason = ""
-            self.dynamic_blocked_route = []
-            self.dynamic_blocked_segment_directions = []
-            self.dynamic_wait_started = None
-            self.dynamic_clear_started = None
-            self.dynamic_recovery_state = "IDLE"
-            self.dynamic_replan_requires_alternative = False
+            if not recovery_attempt:
+                self.dynamic_block_reason = ""
+                self.dynamic_blocked_route = []
+                self.dynamic_blocked_segment_directions = []
+                self.dynamic_wait_started = None
+                self.dynamic_clear_started = None
+                self.dynamic_recovery_state = "IDLE"
+                self.dynamic_replan_requires_alternative = False
             self.last_controller_blockage_monotonic = 0.0
             self.motion_owner = "NONE"
             self._set_state("NAVIGATING", "stop_turn_route_accepted")
@@ -8157,28 +8176,19 @@ class NavigationAdapter(Node):
                     blocked_since=self.execution_turn_blocked_since,
                     safety_sequence=self.safety_snapshot_sequence,
                 )
-                opposite = -direction
-                opposite_safe = bool(
-                    self._turn_static_safe(pose, target, opposite)
-                    and atomic_fresh
-                    and not self._safety_blocks_turn(opposite)
+                # A persistent block is geometric evidence that this pose is
+                # not a usable turning bay. Switching rotation direction here
+                # can merely drive to the other blocked side, then switch back
+                # forever. Keep the chassis heading fixed and relocate along
+                # it instead; the bay search considers both forward and
+                # reverse and motion-safety still gates the chosen translation.
+                self._nav_debug(
+                    "TURN_RECOVERY",
+                    action="RELOCATE_TO_TURN_BAY",
+                    blocked_direction=direction,
+                    target_heading=target,
                 )
-                if opposite_safe:
-                    self.execution_turn_direction = opposite
-                    self.execution_turn_blocked_since = None
-                    self.turn_block_tracker = TurnBlockTracker(
-                        clear_dwell_seconds=0.30
-                    )
-                    self.execution_phase = "TURN"
-                    self.latest_feedback["execution_phase"] = "TURN"
-                    self._nav_debug(
-                        "TURN_RECOVERY",
-                        action="ALTERNATIVE_DIRECTION",
-                        direction=opposite,
-                        target_heading=target,
-                    )
-                else:
-                    self._start_turn_bay_recovery(pose, generation)
+                self._start_turn_bay_recovery(pose, generation)
             return
         self.execution_phase = "TURN"
         self.latest_feedback["execution_phase"] = "TURN"
@@ -9243,16 +9253,24 @@ class NavigationAdapter(Node):
             minimum_observations=self.dynamic_planning_minimum_observations
         )
         if self.pose is None or not candidates:
-            self._nav_debug(
-                "DYNAMIC_BLOCKER",
-                source="CONTROLLER_CORRIDOR",
-                result="POSITION_UNCONFIRMED",
-                corridor_blocked=corridor_blocked,
-                front_clearance=self._finite_metric(front_clearance),
-                forced=bool(force),
-                keepout_created=False,
-                destination_preserved=bool(self.execution_goal or self.paused_goal),
-            )
+            if (
+                force
+                or now - self.dynamic_last_unconfirmed_log_monotonic
+                >= self.dynamic_unconfirmed_blocker_log_interval
+            ):
+                self.dynamic_last_unconfirmed_log_monotonic = now
+                self._nav_debug(
+                    "DYNAMIC_BLOCKER",
+                    source="CONTROLLER_CORRIDOR",
+                    result="POSITION_UNCONFIRMED",
+                    corridor_blocked=corridor_blocked,
+                    front_clearance=self._finite_metric(front_clearance),
+                    forced=bool(force),
+                    keepout_created=False,
+                    destination_preserved=bool(
+                        self.execution_goal or self.paused_goal
+                    ),
+                )
             return False
         obstacle = min(
             candidates,
@@ -9280,6 +9298,39 @@ class NavigationAdapter(Node):
             destination_preserved=bool(self.execution_goal or self.paused_goal),
         )
         return True
+
+    def _stop_unconfirmed_dynamic_recovery(self) -> None:
+        """End an evidence-deadlocked wait without inventing a map obstacle."""
+        goal = dict(self.execution_goal or self.paused_goal or {})
+        if goal:
+            self.paused_goal = goal
+        self.dynamic_recovery_state = "BLOCKED"
+        self.dynamic_replan_requires_alternative = False
+        self.execution_phase = "IDLE"
+        self.latest_feedback["execution_phase"] = "IDLE"
+        self.latest_feedback["recovery_reason"] = (
+            "BLOCKER_POSITION_UNCONFIRMED"
+        )
+        self.latest_feedback["terminal_reason"] = (
+            "BLOCKER_POSITION_UNCONFIRMED"
+        )
+        self.latest_feedback["destination_preserved"] = bool(goal)
+        self.motion_owner = "NONE"
+        self._set_state("BLOCKED", "blocker_position_unconfirmed")
+        self.navigation_velocity.publish(Twist())
+        self._nav_debug(
+            "DYNAMIC_OBSTACLE",
+            action="BLOCKED_UNCONFIRMED",
+            reason="BLOCKER_POSITION_UNCONFIRMED",
+            wait_seconds=(
+                None
+                if self.dynamic_wait_started is None
+                else round(time.monotonic() - self.dynamic_wait_started, 3)
+            ),
+            destination=goal or None,
+            destination_preserved=bool(goal),
+            keepout_created=False,
+        )
 
     def _schedule_execution_replan(
         self,
@@ -9332,8 +9383,7 @@ class NavigationAdapter(Node):
             return
         now = time.monotonic()
         new_physical_encounter = bool(
-            self.current_state == "NAVIGATING"
-            or self.dynamic_recovery_state == "IDLE"
+            self.dynamic_recovery_state == "IDLE"
             or now >= self.dynamic_recovery_expires_monotonic
         )
         blocked_route = self._remaining_execution_route()
@@ -9513,9 +9563,17 @@ class NavigationAdapter(Node):
         requires_alternative = bool(not clear_dwelled and replan_around)
         if requires_alternative and not self._observe_controller_blocker():
             # Continue collecting evidence. Never run an alternative search
-            # against a fabricated keepout near the robot.
+            # against a fabricated keepout near the robot. The wait is bounded:
+            # if no sensor can locate the blocker, stop in an explicit BLOCKED
+            # state and preserve the destination for operator retry/resume.
             self.dynamic_recovery_state = "WAITING"
             self.latest_feedback["recovery_reason"] = "BLOCKER_POSITION_UNCONFIRMED"
+            if (
+                self.dynamic_wait_started is not None
+                and now - self.dynamic_wait_started
+                >= self.dynamic_unconfirmed_blocker_timeout
+            ):
+                self._stop_unconfirmed_dynamic_recovery()
             return
         self.dynamic_recovery_state = "REPLAN_PENDING"
         self.dynamic_replan_requires_alternative = requires_alternative
@@ -9553,7 +9611,8 @@ class NavigationAdapter(Node):
             resume_directions = list(self.dynamic_blocked_segment_directions)
             if len(resume_directions) != max(0, len(resume_points) - 1):
                 resume_directions = [1 for _ in range(max(0, len(resume_points) - 1))]
-            resume_route_id = f"{self.execution_route_id}-clear-resume"
+            route_root = self.execution_route_id.split("-clear-resume", 1)[0]
+            resume_route_id = f"{route_root}-clear-resume"
             try:
                 self._navigate(
                     goal,
