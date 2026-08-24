@@ -3,7 +3,7 @@ import { useMutation } from "@tanstack/react-query";
 import { CircleStop, ExternalLink, RotateCcw, Save, Trash2 } from "lucide-react";
 import { api } from "../api/client";
 import { useI18n } from "../i18n/I18nProvider";
-import type { Health, MappingSession } from "../types";
+import type { Health, MappingInitialPose, MappingSession } from "../types";
 import { createUuid } from "../utils/uuid";
 
 type Translate = ReturnType<typeof useI18n>["t"];
@@ -22,6 +22,7 @@ const TERMINAL = new Set(["FINISHED", "CANCELED", "MAPPING_ERROR", "FAULT"]);
 const MAPPING_STATE_LABELS: Record<string, string> = {
   IDLE: "Chưa bắt đầu",
   MAPPING_STARTING: "Đang khởi động mapping",
+  MAPPING_LOCALIZING: "Đang khớp vị trí với map cũ",
   STARTING: "Đang khởi động mapping",
   MAPPING_RUNNING: "Đang mapping",
   MAPPING: "Đang mapping",
@@ -67,7 +68,11 @@ export function MappingControlPanel({
   const [floorId, setFloorId] = useState("");
   const [notes, setNotes] = useState("");
   const [error, setError] = useState("");
-  const [continuation, setContinuation] = useState<{ map_id?: string; source_version?: number }>({});
+  const [continuation, setContinuation] = useState<{
+    map_id?: string;
+    source_version?: number;
+    initial_pose?: MappingInitialPose;
+  }>({});
 
   useEffect(() => onMappingChanged?.(mapping), [mapping, onMappingChanged]);
   useEffect(() => {
@@ -76,10 +81,15 @@ export function MappingControlPanel({
       if (!raw) return;
       const intent = JSON.parse(raw) as {
         map_id?: string; source_version?: number; session_id?: string;
+        initial_pose?: MappingInitialPose;
         name?: string; site_id?: string; floor_id?: string; notes?: string;
       };
       sessionStorage.removeItem("rovera:mapping-intent");
-      setContinuation({ map_id: intent.map_id, source_version: intent.source_version });
+      setContinuation({
+        map_id: intent.map_id,
+        source_version: intent.source_version,
+        initial_pose: intent.initial_pose,
+      });
       setName(intent.name ?? "");
       setSiteId(intent.site_id ?? "");
       setFloorId(intent.floor_id ?? "");
@@ -127,6 +137,7 @@ export function MappingControlPanel({
   });
 
   const mappingHealth = health.mapping;
+  const relocalization = mappingHealth?.relocalization;
   const state = mapping?.status ?? "IDLE";
   const running = state === "MAPPING_RUNNING";
   const stopped = state === "MAPPING_STOPPED_UNSAVED";
@@ -174,6 +185,12 @@ export function MappingControlPanel({
         <span>{t("Odometry")} <i className={mappingHealth?.odomHealthy ? "is-ok" : "is-fault"} /> {mappingHealth?.odomHealthy ? t("Tốt") : t("Lỗi")}</span>
         <span>{t("TF")} <i className={mappingHealth?.tfHealthy ? "is-ok" : "is-fault"} /> {mappingHealth?.tfHealthy ? t("Tốt") : t("Lỗi")}</span>
         <span>{t("SLAM")} <i className={mappingHealth?.slamHealthy ? "is-ok" : "is-fault"} /> {mappingHealth?.slamHealthy ? t("Đang chạy") : t("Lỗi")}</span>
+        {relocalization && relocalization.state !== "NOT_REQUIRED" && <span>
+          {t("Pose map cũ")} <i className={relocalization.state === "CONFIRMED" ? "is-ok" : "is-fault"} /> {t(
+            relocalization.state === "CONFIRMED" ? "SLAM đã xác minh" : "Đang xác minh",
+          )}{relocalization.state === "CONFIRMED" && relocalization.required_confirmations
+            ? ` (${relocalization.geometry_confirmations ?? 0}/${relocalization.required_confirmations} scan)` : ""}
+        </span>}
       </div>
       <div className="mapping-timer"><small>{t("Thời gian")}</small><strong>{elapsedText}</strong></div>
       <p className="mapping-rviz-note">{t("RViz2 chỉ nhận các topic quan sát của phiên mapping; điều khiển robot vẫn đi qua Web.")}</p>

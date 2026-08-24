@@ -342,6 +342,18 @@ export interface Health {
     tfHealthy: boolean;
     slamHealthy: boolean;
     elapsedSeconds: number;
+    relocalization?: {
+      state: string;
+      hint_is_approximate?: boolean;
+      reason?: string;
+      probe_scans?: number;
+      position_correction_m?: number;
+      yaw_correction_rad?: number;
+      scan_map_score?: number;
+      geometry_confirmations?: number;
+      required_confirmations?: number;
+      searched_pose?: { x: number; y: number; yaw: number };
+    };
   } | null;
   map_registry?: { localCount: number; pendingSync: number; pendingDeletion?: number };
 }
@@ -413,7 +425,7 @@ export interface MappingSession {
   map_id: string;
   version: number;
   robot_id: string;
-  status: "MAPPING_STARTING" | "MAPPING_RUNNING" | "MAPPING_STOPPED_UNSAVED" | "MAPPING_SAVING" | "MAPPING_ERROR" | "STARTING" | "MAPPING" | "PAUSED" | "SAVED_DRAFT" | "FINISHED" | "CANCELED" | "FAULT";
+  status: "MAPPING_STARTING" | "MAPPING_LOCALIZING" | "MAPPING_RUNNING" | "MAPPING_STOPPED_UNSAVED" | "MAPPING_SAVING" | "MAPPING_ERROR" | "STARTING" | "MAPPING" | "PAUSED" | "SAVED_DRAFT" | "FINISHED" | "CANCELED" | "FAULT";
   metadata: { name: string; site_id: string; floor_id: string; notes: string };
   error_code?: string | null;
   error_message?: string | null;
@@ -421,6 +433,12 @@ export interface MappingSession {
   updated_at: string;
   local_status: string;
   sync_status: string;
+}
+
+export interface MappingInitialPose {
+  x: number;
+  y: number;
+  yaw: number;
 }
 
 export interface Point { x: number; y: number }

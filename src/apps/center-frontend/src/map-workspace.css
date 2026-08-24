@@ -339,6 +339,23 @@
 .map-create-safety-note svg { flex: 0 0 auto; color: #5074a9; }
 .map-create-safety-note strong { font-size: 12px; }
 .map-create-safety-note p { margin: 3px 0 0; font-size: 10px; line-height: 1.5; }
+.mapping-current-pose { padding: 13px; display: grid; gap: 10px; background: #f7f9fc; border: 1px solid #cfd9e7; border-radius: 10px; }
+.mapping-current-pose > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.mapping-current-pose > header strong { color: #283b57; font-size: 13px; }
+.mapping-current-pose > header p { margin: 3px 0 0; color: #68778c; font-size: 10px; line-height: 1.45; }
+.mapping-current-pose > header > span { padding: 3px 7px; color: var(--blue); background: #e7effc; border-radius: 999px; font-size: 10px; font-weight: 800; }
+.mapping-current-pose__message { min-height: 150px; margin: 0; display: grid; place-items: center; color: #68778c; background: #eef2f6; border-radius: 8px; font-size: 11px; }
+.mapping-current-pose__message.is-error { color: #a8332e; background: #fff1f0; }
+.mapping-pose-picker { display: grid; gap: 7px; }
+.mapping-pose-picker__canvas { min-height: 210px; position: relative; overflow: hidden; background: #eef2f6; border: 1px solid #c8d2df; border-radius: 8px; }
+.mapping-pose-picker__canvas canvas { width: 100%; height: 210px; display: block; cursor: crosshair; touch-action: none; }
+.mapping-pose-picker__state { position: absolute; inset: 0; display: grid; place-items: center; color: #68778c; background: rgba(238,242,246,.9); font-size: 11px; }
+.mapping-pose-picker > p { margin: 0; color: #68778c; font-size: 10px; }
+.mapping-pose-picker__coordinates { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.map-create-metadata .mapping-pose-picker__coordinates input { min-height: 36px; padding-block: 6px; }
+.map-create-metadata .mapping-current-pose__confirm { display: flex; align-items: flex-start; gap: 8px; color: #334b6e; font-size: 10px; line-height: 1.45; }
+.map-create-metadata .mapping-current-pose__confirm input { width: 15px; min-height: 15px; flex: 0 0 auto; margin-top: 1px; padding: 0; accent-color: var(--blue); }
+.map-create-metadata .mapping-current-pose__confirm span { display: inline; }
 .map-create-error { margin: 0; padding: 10px 12px; display: flex; align-items: center; gap: 8px; color: #94342e; background: #fff1ef; border-radius: 8px; font-size: 11px; }
 .map-create-metadata > footer { margin-top: auto; padding-top: 15px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-top: 1px solid #e1e6ed; }
 .map-create-metadata > footer > div { min-width: 0; display: grid; gap: 3px; }
@@ -471,6 +488,7 @@
   .map-create-metadata { gap: 8px; }
   .map-create-metadata input { min-height: 38px; padding-block: 7px; }
   .map-create-metadata textarea { min-height: 48px; padding-block: 7px; }
+  .mapping-pose-picker__canvas, .mapping-pose-picker__canvas canvas { min-height: 170px; height: 170px; }
   .map-create-safety-note { padding: 8px 10px; }
   .map-create-metadata > footer { padding-top: 8px; }
   .map-create-metadata > footer .button { min-height: 40px; }
@@ -506,6 +524,7 @@
   .map-robot-option__telemetry,
   .map-robot-option__status { display: none; }
   .map-create-field-row { grid-template-columns: 1fr; }
+  .mapping-pose-picker__coordinates { grid-template-columns: 1fr; }
   .map-create-metadata > footer { align-items: stretch; flex-direction: column; }
   .map-create-metadata > footer .button { width: 100%; }
 }

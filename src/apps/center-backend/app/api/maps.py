@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import re
 import tarfile
 from datetime import datetime, timezone
@@ -18,7 +19,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
@@ -68,12 +69,26 @@ class MapUpdateRequest(BaseModel):
     notes: str | None = Field(default=None, max_length=2000)
 
 
+class MappingInitialPose(BaseModel):
+    x: float
+    y: float
+    yaw: float
+
+    @field_validator("x", "y", "yaw")
+    @classmethod
+    def finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("Tọa độ robot phải là số hữu hạn")
+        return value
+
+
 class MappingStartRequest(MapCreateRequest):
     request_id: str = Field(min_length=8, max_length=64)
     robot_id: str = Field(min_length=3, max_length=64)
     expected_state: str = Field(default="IDLE", max_length=32)
     map_id: str | None = Field(default=None, min_length=3, max_length=64)
     source_version: int | None = Field(default=None, ge=1)
+    initial_pose: MappingInitialPose | None = None
 
 
 class MappingCommandRequest(BaseModel):
@@ -95,6 +110,36 @@ def _posegraph_basename(version: MapVersion) -> str | None:
         if name.endswith(".posegraph") and f"{name[:-10]}.data" in files:
             return name[:-10]
     return None
+
+
+def _mapping_pose_in_version(version: MapVersion, pose: MappingInitialPose) -> bool:
+    origin = dict(version.origin or {})
+    delta_x = pose.x - float(origin.get("x", 0.0))
+    delta_y = pose.y - float(origin.get("y", 0.0))
+    origin_yaw = float(origin.get("yaw", 0.0))
+    local_x = math.cos(origin_yaw) * delta_x + math.sin(origin_yaw) * delta_y
+    local_y = -math.sin(origin_yaw) * delta_x + math.cos(origin_yaw) * delta_y
+    return (
+        0.0 <= local_x < version.width * version.resolution
+        and 0.0 <= local_y < version.height * version.resolution
+    )
+
+
+def _mapping_pose_hint(
+    version: MapVersion,
+    pose: MappingInitialPose | None,
+) -> dict[str, float]:
+    if pose is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Phải chọn vùng gần đúng và hướng ước lượng của robot trên map trước khi tiếp tục mapping",
+        )
+    if not _mapping_pose_in_version(version, pose):
+        raise HTTPException(
+            status_code=422,
+            detail="Vùng robot được chọn nằm ngoài phạm vi version map",
+        )
+    return pose.model_dump()
 
 
 def _version_view(version: MapVersion) -> dict:
@@ -641,6 +686,7 @@ async def start_mapping(
         posegraph_basename = _posegraph_basename(source)
         if posegraph_basename is None:
             raise HTTPException(status_code=409, detail="Version map không có pose-graph để tiếp tục SLAM")
+        initial_pose = _mapping_pose_hint(source, body.initial_pose)
         # Only immutable uploaded versions reserve a version number. A canceled
         # or faulted session may have advanced its in-memory draft counter but
         # did not create an artifact, so that number is safe to reuse.
@@ -656,15 +702,21 @@ async def start_mapping(
             "floor_id": record.floor_id,
             "notes": record.notes,
             "continued_from_version": source.version,
+            "approximate_initial_pose_hint": initial_pose,
         }
         continuation = {
             "source_version": source.version,
             "source_checksum": source.checksum,
             "source_download_url": f"/api/maps/{source.map_id}/versions/{source.version}/download",
             "posegraph_basename": posegraph_basename,
-            "initial_pose": dict(source.metadata_json or {}).get("terminal_pose"),
+            "initial_pose": initial_pose,
         }
     else:
+        if body.initial_pose is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="Vị trí robot trên map chỉ áp dụng khi tiếp tục một version đã lưu",
+            )
         map_id = str(uuid4())
         version = 1
         metadata = {

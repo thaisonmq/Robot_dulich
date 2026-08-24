@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { api } from "../src/api/client";
 import { MappingControlPanel } from "../src/components/MappingControlPanel";
@@ -26,6 +26,13 @@ const health: Health = {
     tfHealthy: true,
     slamHealthy: true,
     elapsedSeconds: 125,
+    relocalization: {
+      state: "CONFIRMED",
+      hint_is_approximate: true,
+      probe_scans: 1,
+      geometry_confirmations: 3,
+      required_confirmations: 3,
+    },
   },
 };
 
@@ -96,6 +103,30 @@ describe("MappingControlPanel i18n display labels", () => {
     expect(screen.queryByText("Motion safety chưa sẵn sàng.")).not.toBeInTheDocument();
   });
 
+  it("forwards the operator's approximate pose hint when continuing a saved map", async () => {
+    const initialPose = { x: 1.2, y: -0.4, yaw: 0.8 };
+    sessionStorage.setItem("rovera:mapping-intent", JSON.stringify({
+      map_id: "MAP-1",
+      source_version: 1,
+      initial_pose: initialPose,
+      name: "Sảnh chính",
+      site_id: "Trụ sở",
+      floor_id: "Tầng 1",
+      notes: "",
+    }));
+    const startMapping = vi.spyOn(api, "startMapping").mockResolvedValue(mapping);
+    renderPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "Bắt đầu mapping" }));
+
+    await waitFor(() => expect(startMapping).toHaveBeenCalled());
+    expect(startMapping.mock.calls[0][0]).toMatchObject({
+      map_id: "MAP-1",
+      source_version: 1,
+      initial_pose: initialPose,
+    });
+  });
+
   it("localizes mapping, health, local storage, and sync statuses", async () => {
     vi.spyOn(api, "mappingSession").mockResolvedValue(mapping);
     sessionStorage.setItem("rovera:mapping-intent", JSON.stringify({
@@ -108,6 +139,7 @@ describe("MappingControlPanel i18n display labels", () => {
     await waitFor(() => expect(screen.getByText("Đang mapping")).toBeInTheDocument());
     expect(screen.getAllByText(/Tốt/)).toHaveLength(3);
     expect(screen.getByText(/SLAM.*Đang chạy/)).toBeInTheDocument();
+    expect(screen.getByText(/Pose map cũ.*SLAM đã xác minh.*3\/3 scan/)).toBeInTheDocument();
     expect(screen.getByText(/Dữ liệu cục bộ.*Có sẵn trên robot.*Đồng bộ.*Đã đồng bộ/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Dừng mapping" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Lưu bản nháp" })).toBeInTheDocument();

@@ -24,11 +24,11 @@ Trong màn Control chọn **Tạo bản đồ**. Camera và Manual Control khôn
 5. **Save** tạo và xác minh `map.yaml`, ảnh occupancy, `metadata.json`, preview và cặp pose-graph. Pi lưu local trước, rồi upload nền.
 6. **Discard** bỏ session chưa lưu, không ảnh hưởng Saved Map cũ.
 
-State chuẩn: `MAPPING_STARTING -> MAPPING_RUNNING -> MAPPING_STOPPED_UNSAVED -> MAPPING_SAVING -> FINISHED`; lỗi là `MAPPING_ERROR`.
+State chuẩn khi tạo mới: `MAPPING_STARTING -> MAPPING_RUNNING -> MAPPING_STOPPED_UNSAVED -> MAPPING_SAVING -> FINISHED`. Continue Mapping có thêm `MAPPING_LOCALIZING` trước `MAPPING_RUNNING`; lỗi là `MAPPING_ERROR`.
 
 Nếu Center chưa truy cập được, Save local vẫn thành công và registry Pi ghi `SYNC_PENDING`. Marker upload tồn tại qua restart và retry mỗi 10 giây. Center trả checksum; edge chỉ ghi `SYNCED` khi checksum trả về trùng bundle local.
 
-**Continue Mapping** tải version có đủ `.posegraph` + `.data`, deserialize SLAM, tạo version mới và không ghi đè version cũ. Trong mode này không chạy autonomous navigation.
+**Continue Mapping** tải version có đủ `.posegraph` + `.data`. Vì robot có thể đã được di chuyển sau phiên trước, người vận hành chỉ cần chọn vùng và hướng gần đúng trên đúng version map; đây là search hint, không phải pose được tin cậy. Center từ chối hint thiếu, không hữu hạn hoặc nằm ngoài map. Trước khi deserialize, adapter so scan mới với occupancy map trong bán kính 1,25 m quanh hint, tìm đủ 360° và từ chối khi vị trí/hướng thứ hai còn cạnh tranh. Pose tốt nhất mới được đưa vào `START_AT_GIVEN_POSE`; chỉ một probe scan đi vào SLAM, sau đó `/slam_toolbox/pose`, covariance và ba scan–map geometry check liên tiếp phải cùng đạt ngưỡng trước khi mở luồng mapping bình thường. Nếu không khớp/hết thời gian, adapter nạp lại pose-graph nguồn để bỏ probe scan và trả `MAPPING_ERROR`; version cũ luôn bất biến. Trong mode này không chạy autonomous navigation.
 
 ## Activate Saved Map và tự định vị
 

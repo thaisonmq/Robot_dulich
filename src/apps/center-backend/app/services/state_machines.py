@@ -6,7 +6,12 @@ class InvalidTransition(ValueError):
 
 
 MAPPING_TRANSITIONS: dict[str, frozenset[str]] = {
-    "MAPPING_STARTING": frozenset({"MAPPING_RUNNING", "MAPPING_ERROR", "CANCELED"}),
+    "MAPPING_STARTING": frozenset({
+        "MAPPING_LOCALIZING", "MAPPING_RUNNING", "MAPPING_ERROR", "CANCELED",
+    }),
+    "MAPPING_LOCALIZING": frozenset({
+        "MAPPING_RUNNING", "MAPPING_ERROR", "CANCELED",
+    }),
     "MAPPING_RUNNING": frozenset({
         "MAPPING_STOPPED_UNSAVED", "MAPPING_SAVING", "PAUSED", "CANCELED",
         "MAPPING_ERROR",

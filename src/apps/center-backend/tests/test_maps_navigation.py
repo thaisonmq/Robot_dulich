@@ -1,17 +1,22 @@
 import hashlib
 import io
 import json
+import math
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.api.maps import (
+    MappingInitialPose,
+    _mapping_pose_hint,
     _map_view,
     _mapping_action_reached,
+    _mapping_pose_in_version,
     _mapping_start_health_failures,
     _posegraph_basename,
 )
@@ -368,6 +373,8 @@ def test_map_bundle_rejects_path_traversal(tmp_path: Path) -> None:
 
 def test_mapping_and_navigation_state_machines_are_idempotent_and_strict() -> None:
     assert mapping_transition("MAPPING_STARTING", "MAPPING_RUNNING") == "MAPPING_RUNNING"
+    assert mapping_transition("MAPPING_STARTING", "MAPPING_LOCALIZING") == "MAPPING_LOCALIZING"
+    assert mapping_transition("MAPPING_LOCALIZING", "MAPPING_RUNNING") == "MAPPING_RUNNING"
     assert mapping_transition("MAPPING_RUNNING", "MAPPING_STOPPED_UNSAVED") == "MAPPING_STOPPED_UNSAVED"
     assert mapping_transition("MAPPING_STOPPED_UNSAVED", "MAPPING_SAVING") == "MAPPING_SAVING"
     assert mapping_transition("MAPPING_SAVING", "FINISHED") == "FINISHED"
@@ -453,6 +460,38 @@ def test_map_version_only_continues_with_complete_posegraph_pair() -> None:
     assert _posegraph_basename(version) == "posegraph"
     version.metadata_json = {"files": {"posegraph.posegraph": "x"}}
     assert _posegraph_basename(version) is None
+
+
+def test_continued_mapping_pose_must_be_finite_and_inside_source_version() -> None:
+    version = MapVersion(
+        map_id="MAP-CONTINUE-POSE",
+        version=3,
+        status="VALIDATING",
+        checksum="a" * 64,
+        storage_path="/tmp/map.tar.gz",
+        resolution=0.5,
+        origin={"x": 1.0, "y": 2.0, "yaw": math.pi / 2},
+        width=10,
+        height=8,
+        metadata_json={"files": {"posegraph.posegraph": "x", "posegraph.data": "y"}},
+        created_by_robot="ROBOT-001",
+    )
+
+    # Local map point (2, 3) transformed by the 90-degree map origin.
+    assert _mapping_pose_in_version(
+        version,
+        MappingInitialPose(x=-2.0, y=4.0, yaw=0.4),
+    )
+    assert not _mapping_pose_in_version(
+        version,
+        MappingInitialPose(x=1.0, y=1.9, yaw=0.4),
+    )
+    with pytest.raises(HTTPException) as missing:
+        _mapping_pose_hint(version, None)
+    assert getattr(missing.value, "status_code", None) == 422
+    assert "Phải chọn vùng gần đúng" in str(getattr(missing.value, "detail", ""))
+    with pytest.raises(ValueError, match="số hữu hạn"):
+        MappingInitialPose(x=float("nan"), y=0.0, yaw=0.0)
 
 
 def test_faulted_power_loss_session_is_exposed_as_recoverable() -> None:

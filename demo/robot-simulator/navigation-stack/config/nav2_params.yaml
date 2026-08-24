@@ -225,6 +225,10 @@ rovera_navigation_adapter:
     # alternatives.  Center waits longer than this, so a slow alternative
     # search cannot produce a false command-ACK timeout.
     stop_turn_planning_budget_seconds: 12.0
+    # A point-selection preview retries once only when the first exact search
+    # exhausts its bound.  12s + 15s stays below Center's 30s command timeout.
+    stop_turn_retry_planning_budget_seconds: 15.0
+    stop_turn_retry_expansion_multiplier: 4
     # Reject corners that work only at one exact localization coordinate.
     # This affects in-place turns only; straight narrow-corridor clearance is
     # still checked with the directional 0.30 x 0.20 m rectangle.

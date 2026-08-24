@@ -5,11 +5,12 @@ import {
   MapPinned, RadioTower, RefreshCw, Search, Wifi,
 } from "lucide-react";
 import { api } from "../api/client";
+import { MappingPosePicker } from "../components/MappingPosePicker";
 import { OperationsShell } from "../components/OperationsShell";
 import { useI18n } from "../i18n/I18nProvider";
 import { useNavigate } from "../router";
 import { useAppStore } from "../state/appStore";
-import type { Robot } from "../types";
+import type { MapData, MappingInitialPose, Robot } from "../types";
 
 interface MappingIntent {
   map_id?: string;
@@ -20,6 +21,8 @@ interface MappingIntent {
   site_id?: string;
   floor_id?: string;
   notes?: string;
+  initial_pose?: MappingInitialPose;
+  initial_pose_confirmed?: boolean;
 }
 
 function readMappingIntent(): MappingIntent {
@@ -62,6 +65,8 @@ export function CreateMapPage() {
   const [siteId, setSiteId] = useState(intent.site_id ?? "");
   const [floorId, setFloorId] = useState(intent.floor_id ?? "");
   const [notes, setNotes] = useState(intent.notes ?? "");
+  const [initialPose, setInitialPose] = useState<MappingInitialPose | null>(intent.initial_pose ?? null);
+  const [initialPoseConfirmed, setInitialPoseConfirmed] = useState(Boolean(intent.initial_pose_confirmed));
   const [search, setSearch] = useState("");
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState("");
@@ -77,6 +82,12 @@ export function CreateMapPage() {
     enabled: Boolean(intent.session_id),
     retry: 1,
   });
+  const sourceMapQuery = useQuery({
+    queryKey: ["mapping-source-map", intent.map_id],
+    queryFn: () => api.map(intent.map_id!),
+    enabled: Boolean(intent.map_id && !intent.session_id),
+    retry: 1,
+  });
   const robots = robotsQuery.data?.items ?? [];
   const visibleRobots = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
@@ -85,6 +96,24 @@ export function CreateMapPage() {
   }, [robots, search]);
   const selectedRobot = robots.find((robot) => robot.robot_id === selectedRobotId);
   const isContinuation = Boolean(intent.map_id || intent.session_id);
+  const requiresInitialPose = Boolean(intent.map_id && !intent.session_id);
+  const continuationMap = useMemo<MapData | null>(() => {
+    const detail = sourceMapQuery.data;
+    if (!detail) return null;
+    const version = detail.versions?.find((item) => item.version === intent.source_version);
+    if (!version) return null;
+    return {
+      ...detail,
+      active_version: version.version,
+      image_url: version.preview_url,
+      width_pixels: version.width_pixels,
+      height_pixels: version.height_pixels,
+      resolution_m_per_pixel: version.resolution,
+      origin: version.origin,
+    };
+  }, [intent.source_version, sourceMapQuery.data]);
+  const initialPoseReady = !requiresInitialPose
+    || Boolean(continuationMap && initialPose && initialPoseConfirmed);
 
   useEffect(() => {
     const mapping = mappingQuery.data;
@@ -102,6 +131,10 @@ export function CreateMapPage() {
 
   const openControl = async () => {
     if (!selectedRobot || !canStartMapping(selectedRobot)) return;
+    if (!initialPoseReady) {
+      setError(t("Hãy chọn vùng và hướng gần đúng của robot trên map cũ."));
+      return;
+    }
     setConnecting(true);
     setError("");
     const nextIntent: MappingIntent = {
@@ -111,6 +144,10 @@ export function CreateMapPage() {
       site_id: siteId.trim(),
       floor_id: floorId.trim(),
       notes: notes.trim(),
+      ...(requiresInitialPose && initialPose ? {
+        initial_pose: initialPose,
+        initial_pose_confirmed: true,
+      } : {}),
     };
     sessionStorage.setItem("rovera:mapping-intent", JSON.stringify(nextIntent));
     selectRobot(selectedRobot);
@@ -189,6 +226,25 @@ export function CreateMapPage() {
           </div>
           <label><span>{t("Ghi chú")} <em>{t("không bắt buộc")}</em></span><textarea value={notes} onChange={(event) => setNotes(event.target.value)} placeholder={t("Mô tả phạm vi mapping, lối đi cần kiểm tra…")} /></label>
 
+          {requiresInitialPose && <section className="mapping-current-pose" aria-labelledby="mapping-current-pose-title">
+            <header>
+              <div><strong id="mapping-current-pose-title">{t("Chỉ vùng robot đang đứng gần đó")}</strong>
+                <p>{t("Không cần đặt chính xác. Vị trí và hướng chỉ là gợi ý ban đầu; SLAM phải tự khớp và xác minh trước khi cập nhật map.")}</p></div>
+              <span>v{intent.source_version}</span>
+            </header>
+            {sourceMapQuery.isLoading && <p className="mapping-current-pose__message">{t("Đang tải Saved Map…")}</p>}
+            {sourceMapQuery.isError && <p className="mapping-current-pose__message is-error" role="alert">{t("Không tải được Saved Map")}</p>}
+            {!sourceMapQuery.isLoading && !sourceMapQuery.isError && !continuationMap
+              && <p className="mapping-current-pose__message is-error" role="alert">{t("Không tìm thấy version map cần tiếp tục.")}</p>}
+            {continuationMap && <MappingPosePicker map={continuationMap} value={initialPose}
+              onChange={(pose) => { setInitialPose(pose); setInitialPoseConfirmed(false); setError(""); }} />}
+            <label className="mapping-current-pose__confirm">
+              <input type="checkbox" checked={initialPoseConfirmed} disabled={!initialPose}
+                onChange={(event) => { setInitialPoseConfirmed(event.target.checked); setError(""); }} />
+              <span>{t("Tôi đã chọn vùng và hướng gần đúng; robot đang đứng yên để SLAM xác minh.")}</span>
+            </label>
+          </section>}
+
           <aside className="map-create-safety-note">
             <MapPinned size={20} />
             <div><strong>{t("Trước khi bắt đầu")}</strong><p>{t("Đặt robot tại vị trí an toàn, kiểm tra LiDAR và đảm bảo E-stop đã nhả. Bạn vẫn điều khiển robot trực tiếp trong Control.")}</p></div>
@@ -197,7 +253,7 @@ export function CreateMapPage() {
           {error && <p className="map-create-error" role="alert"><AlertTriangle size={17} /> {error}</p>}
           <footer>
             <div>{selectedRobot ? <><strong>{selectedRobot.name}</strong><small>{robotStatus(selectedRobot, t)}</small></> : <><strong>{t("Chưa chọn robot")}</strong><small>{t("Chọn một robot sẵn sàng ở danh sách bên trái.")}</small></>}</div>
-            <button type="submit" className="button button--primary" disabled={!selectedRobot || !canStartMapping(selectedRobot) || connecting}>
+            <button type="submit" className="button button--primary" disabled={!selectedRobot || !canStartMapping(selectedRobot) || connecting || !initialPoseReady}>
               {connecting ? <LoaderCircle className="is-spinning" size={18} /> : <ArrowRight size={18} />}
               {t(connecting ? "Đang mở Control…" : "Mở Control để mapping")}
             </button>

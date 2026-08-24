@@ -1911,12 +1911,20 @@ class StopTurnStateLatticePlanner:
         end_yaw: float,
         *,
         robust: bool = True,
+        measured_start: bool = False,
     ) -> bool:
         # The exact rectangular sweep is expensive inside the lattice. A
         # conservatively free bounding circle is sufficient proof of validity:
         # geometry clearance is measured at the raster cell center, so subtract
         # the query's within-cell offset before comparing it with the chassis
         # corner radius. Borderline poses still use the authoritative sweep.
+        # The current pose is measured rather than selected by the planner.
+        # Match _route_result() and the executor there: require the physical
+        # footprint, while retaining the configured side reserve at every
+        # planner-selected internal corner.
+        turn_half_width = self.half_width + (
+            0.0 if measured_start else self.hard_side_margin
+        )
         cell = self.saved_map.world_to_cell(float(x), float(y))
         if cell is not None:
             center_x, center_y = self.saved_map.cell_center(*cell)
@@ -1926,7 +1934,7 @@ class StopTurnStateLatticePlanner:
             )
             required_clearance = math.hypot(
                 self.half_length + self.padding,
-                self.half_width + self.hard_side_margin + self.padding,
+                turn_half_width + self.padding,
             ) + (self.turn_robustness_radius if robust else 0.0)
             if available_clearance + 1e-9 >= required_clearance:
                 return True
@@ -1937,7 +1945,7 @@ class StopTurnStateLatticePlanner:
             start_yaw,
             end_yaw,
             half_length=self.half_length,
-            half_width=self.half_width + self.hard_side_margin,
+            half_width=turn_half_width,
             padding=self.padding,
             robustness_radius=(self.turn_robustness_radius if robust else 0.0),
         ).valid
@@ -3124,9 +3132,15 @@ class StopTurnStateLatticePlanner:
         *,
         exclusions: Iterable[tuple[float, float, float]] = (),
         deadline_monotonic: float | None = None,
+        maximum_expansions: int | None = None,
     ) -> StopTurnRoute | None:
         self._last_plan_expansions = 0
         self._last_plan_limit = ""
+        expansion_limit = (
+            self.max_expansions
+            if maximum_expansions is None
+            else max(1, int(maximum_expansions))
+        )
         planning_started = time.monotonic()
         # Grid seeds are useful fast paths, but they must not consume the whole
         # shared deadline before the exact heading lattice gets one expansion.
@@ -3319,6 +3333,7 @@ class StopTurnStateLatticePlanner:
             start_yaw,
             initial_goal_heading,
             robust=False,
+            measured_start=True,
         ):
             turn_bay_result = self._turn_bay_candidate(
                 start,
@@ -3433,7 +3448,7 @@ class StopTurnStateLatticePlanner:
         expansions = 0
         while (
             queue
-            and expansions < self.max_expansions
+            and expansions < expansion_limit
             and (
                 deadline_monotonic is None
                 or time.monotonic() < deadline_monotonic
@@ -3533,12 +3548,16 @@ class StopTurnStateLatticePlanner:
                 cache_key = (state, next_heading)
                 valid = rotation_cache.get(cache_key)
                 if valid is None:
+                    at_measured_start = math.hypot(
+                        x - start_x, y - start_y
+                    ) <= max(1e-9, self.saved_map.resolution * 0.25)
                     valid = self._turn_valid(
                         x,
                         y,
                         yaw,
                         self.heading(next_heading),
                         robust=False,
+                        measured_start=at_measured_start,
                     )
                     rotation_cache[cache_key] = valid
                 if not valid:
@@ -3552,7 +3571,7 @@ class StopTurnStateLatticePlanner:
                 sequence += 1
                 heuristic = lattice_heuristic(x, y)
                 heapq.heappush(queue, (next_cost + heuristic, sequence, next_key))
-        if expansions >= self.max_expansions:
+        if expansions >= expansion_limit:
             self._last_plan_limit = "SEARCH_EXPANSION_LIMIT"
         elif (
             deadline_monotonic is not None
@@ -3568,6 +3587,7 @@ class StopTurnStateLatticePlanner:
         *,
         exclusions: Iterable[tuple[float, float, float]] = (),
         planning_time_budget: float | None = None,
+        search_expansion_limit: int | None = None,
         allow_start_escape: bool = False,
         maximum_start_escape_distance: float = 0.60,
         live_start_clear: bool = True,
@@ -3729,6 +3749,7 @@ class StopTurnStateLatticePlanner:
             goal,
             exclusions=forbidden,
             deadline_monotonic=deadline,
+            maximum_expansions=search_expansion_limit,
         )
         elapsed = time.monotonic() - started
         expansions = int(getattr(self, "_last_plan_expansions", 0))
@@ -3778,6 +3799,7 @@ class StopTurnStateLatticePlanner:
             start_yaw,
             start_yaw + self.heading_step,
             robust=False,
+            measured_start=True,
         )
         right_valid = self._turn_valid(
             float(planning_start["x"]),
@@ -3785,12 +3807,30 @@ class StopTurnStateLatticePlanner:
             start_yaw,
             start_yaw - self.heading_step,
             robust=False,
+            measured_start=True,
         )
-        if not forward_valid and not left_valid and not right_valid:
+        reverse_probe = {
+            "x": (
+                float(planning_start["x"])
+                - self.primitive_length * math.cos(start_yaw)
+            ),
+            "y": (
+                float(planning_start["y"])
+                - self.primitive_length * math.sin(start_yaw)
+            ),
+        }
+        reverse_valid = self._translation_valid(planning_start, reverse_probe)
+        if (
+            not forward_valid and not reverse_valid
+            and not left_valid and not right_valid
+        ):
             return PlannerResult(
                 "START_TURN_BLOCKED_STATIC",
                 reason="START_TURN_BLOCKED_STATIC",
-                message="Start cannot translate forward or begin either static turn",
+                message=(
+                    "Start cannot translate forward/reverse or begin either "
+                    "physical-footprint turn"
+                ),
                 start_escape=escape,
                 expansions=expansions,
                 elapsed_seconds=elapsed,
@@ -6357,6 +6397,8 @@ def global_scan_candidate_uniqueness(
     candidate_score_tolerance: float = 0.04,
     search_center: tuple[float, float] | None = None,
     search_radius: float | None = None,
+    require_candidate_match: bool = True,
+    alternative_yaw_separation: float | None = None,
 ) -> GlobalScanUniqueness:
     """Compare a scan with coarse hypotheses independent from AMCL.
 
@@ -6507,8 +6549,15 @@ def global_scan_candidate_uniqueness(
     coarse_modes: list[tuple[float, float, float, float]] = []
     for hypothesis in scored:
         if any(
-            math.hypot(hypothesis[1] - mode[1], hypothesis[2] - mode[2])
-            < separation
+            (
+                math.hypot(hypothesis[1] - mode[1], hypothesis[2] - mode[2])
+                < separation
+                and (
+                    alternative_yaw_separation is None
+                    or abs(_angle_delta(hypothesis[3], mode[3]))
+                    < max(math.radians(5.0), float(alternative_yaw_separation))
+                )
+            )
             for mode in coarse_modes
         ):
             continue
@@ -6529,7 +6578,7 @@ def global_scan_candidate_uniqueness(
         key=lambda item: item[0],
         default=None,
     )
-    if candidate_coarse is not None:
+    if require_candidate_match and candidate_coarse is not None:
         candidate_mode_index = next(
             (
                 index for index, mode in enumerate(coarse_modes)
@@ -6635,7 +6684,7 @@ def global_scan_candidate_uniqueness(
     )
     accepted = bool(
         best[0] >= max(0.0, min(1.0, float(minimum_best_score)))
-        and candidate_matches_best
+        and (candidate_matches_best or not require_candidate_match)
         and not competitive_alternative
     )
     reason = (
@@ -6787,6 +6836,71 @@ def localization_confidence(
     return round(
         max(0.0, min(1.0, covariance_score * stability * geometry_score)), 4
     )
+
+
+def mapping_pose_match_quality(
+    hint: tuple[float, float, float],
+    corrected: tuple[float, float, float],
+    covariance: list[float] | tuple[float, ...],
+    *,
+    maximum_position_correction: float,
+    maximum_yaw_correction: float,
+    maximum_xy_stddev: float,
+    maximum_yaw_stddev: float,
+) -> dict[str, Any]:
+    """Assess SLAM's corrected continuation pose against a coarse user hint.
+
+    The hint is intentionally not treated as ground truth. It only bounds the
+    local search so a repetitive corridor cannot silently attach the new scan
+    to a distant, unrelated part of the saved pose graph.
+    """
+    values = (*hint, *corrected)
+    if len(covariance) < 36 or not all(
+        math.isfinite(float(value)) for value in values
+    ):
+        return {"accepted": False, "reason": "INVALID_POSE"}
+    covariance_values = (
+        float(covariance[0]),
+        float(covariance[7]),
+        float(covariance[35]),
+    )
+    if not all(
+        math.isfinite(value) and value >= 0.0 for value in covariance_values
+    ):
+        return {"accepted": False, "reason": "INVALID_COVARIANCE"}
+
+    position_correction = math.hypot(
+        corrected[0] - hint[0], corrected[1] - hint[1]
+    )
+    yaw_correction = abs(math.atan2(
+        math.sin(corrected[2] - hint[2]),
+        math.cos(corrected[2] - hint[2]),
+    ))
+    xy_stddev = math.sqrt(max(covariance_values[0], covariance_values[1]))
+    yaw_stddev = math.sqrt(covariance_values[2])
+    diagnostics = {
+        "position_correction_m": round(position_correction, 4),
+        "yaw_correction_rad": round(yaw_correction, 4),
+        "xy_stddev_m": round(xy_stddev, 4),
+        "yaw_stddev_rad": round(yaw_stddev, 4),
+    }
+    if position_correction > maximum_position_correction:
+        return {
+            "accepted": False,
+            "reason": "POSITION_CORRECTION_TOO_LARGE",
+            **diagnostics,
+        }
+    if yaw_correction > maximum_yaw_correction:
+        return {
+            "accepted": False,
+            "reason": "YAW_CORRECTION_TOO_LARGE",
+            **diagnostics,
+        }
+    if xy_stddev > maximum_xy_stddev:
+        return {"accepted": False, "reason": "POSITION_UNCERTAIN", **diagnostics}
+    if yaw_stddev > maximum_yaw_stddev:
+        return {"accepted": False, "reason": "YAW_UNCERTAIN", **diagnostics}
+    return {"accepted": True, "reason": "SLAM_POSE_CONFIRMED", **diagnostics}
 
 
 def compact_lethal_cells(

@@ -108,6 +108,10 @@ services:
         target: /opt/rovera/config/nav2_params.yaml
         read_only: true
       - type: bind
+        source: ./navigation-stack/config/slam_toolbox.yaml
+        target: /opt/rovera/config/slam_toolbox.yaml
+        read_only: true
+      - type: bind
         source: ./navigation-stack/config/robot.urdf
         target: /opt/rovera/config/robot.urdf
         read_only: true

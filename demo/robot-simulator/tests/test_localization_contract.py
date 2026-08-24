@@ -73,6 +73,51 @@ def test_recent_verified_pose_is_not_broadened_into_an_adjacent_wall_cell() -> N
     assert "yaw_variance = 0.02" in exact
 
 
+def test_continue_mapping_gates_scans_until_slam_confirms_the_pose_hint() -> None:
+    scan = _method_source("_scan_callback", "_sensor_time_callback")
+    pose = _method_source("_mapping_pose_callback", "_amcl_pose_callback")
+    verify = _method_source(
+        "_verify_mapping_continuation_pose", "_load_mapping_posegraph"
+    )
+
+    assert 'self.current_state == "MAPPING_LOCALIZING"' in scan
+    assert "self.mapping_relocalization_max_probes" in scan
+    assert "mapping_pose_match_quality(" in pose
+    assert "self.mapping_relocalization_event.set()" in pose
+    assert "self.mapping_relocalization_event.wait(" in verify
+    assert "self._load_mapping_posegraph(filename, seed)" in verify
+    assert 'self.current_state = "MAPPING_ERROR"' in verify
+
+
+def test_continue_mapping_searches_full_heading_and_confirms_scan_geometry() -> None:
+    verify = _method_source(
+        "_verify_mapping_continuation_pose", "_load_mapping_posegraph"
+    )
+    callback = _method_source(
+        "_mapping_pose_callback", "_amcl_pose_callback"
+    )
+
+    assert "global_scan_candidate_uniqueness(" in verify
+    assert "require_candidate_match=False" in verify
+    assert "alternative_yaw_separation=math.radians(45.0)" in verify
+    assert 'source_yaml = Path(filename).parent / "map.yaml"' in verify
+    assert "self._load_mapping_posegraph(filename, seed)" in verify
+    assert "scan_to_map_match(" in callback
+    assert "self.mapping_relocalization_required_confirmations" in callback
+    assert '"SCAN_MAP_GEOMETRY_UNSTABLE"' in callback
+
+
+def test_continue_mapping_checks_deserialize_result_and_never_trusts_hint_directly() -> None:
+    load = _method_source("_load_mapping_posegraph", "_slam_process_ids")
+    command = _method_source("_mapping_command", "_verify_mapping_continuation_pose")
+
+    assert "START_AT_GIVEN_POSE" in load
+    assert 'hasattr(response, "result")' in load
+    assert "not bool(response.result)" in load
+    assert "_verify_mapping_continuation_pose(" in command
+    assert 'self.current_state = "MAPPING_RUNNING"' in command
+
+
 def test_each_localization_phase_discards_old_evidence_and_uses_full_threshold() -> None:
     global_localization = _method_source("_start_global_localization", "_safe_to_rotate")
     tick = _method_source("_localization_tick", "_load_map")
@@ -822,6 +867,24 @@ def test_compute_path_uses_cached_stop_turn_geometry_and_live_validation() -> No
     assert "segment_directions=directions" in serialize
     assert 'planner="StopTurnStateLattice24"' in compute_path
     assert "_request_path_once" not in compute_path
+
+
+def test_compute_path_retries_only_bounded_stop_turn_search_failures() -> None:
+    compute_path = _method_source("_compute_path", "_navigate")
+
+    assert '"SEARCH_EXPANSION_LIMIT", "SEARCH_TIME_BUDGET_EXCEEDED"' in compute_path
+    assert '"PLAN_SEARCH_RETRY"' in compute_path
+    assert "search_expansion_limit=retry_expansion_limit" in compute_path
+    assert "self.stop_turn_retry_planning_budget" in compute_path
+
+
+def test_measured_start_turn_matches_executor_physical_footprint() -> None:
+    assert "measured_start: bool = False" in NAVIGATION_CORE_SOURCE
+    assert (
+        "0.0 if measured_start else self.hard_side_margin"
+        in NAVIGATION_CORE_SOURCE
+    )
+    assert "measured_start=at_measured_start" in NAVIGATION_CORE_SOURCE
 
 
 def test_raw_plan_never_replaces_validated_visualization_or_follow_path() -> None:

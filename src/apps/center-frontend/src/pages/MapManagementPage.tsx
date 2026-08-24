@@ -49,6 +49,7 @@ function dataStatusLabel(status: string | undefined, t: (source: string) => stri
     FAILED: "Đồng bộ lỗi",
     RUNNING: "Đang chạy",
     MAPPING_RUNNING: "Đang mapping",
+    MAPPING_LOCALIZING: "Đang khớp vị trí",
   } as Record<string, string>)[status ?? ""];
   return label ? t(label) : status ?? t("Chưa xác định");
 }

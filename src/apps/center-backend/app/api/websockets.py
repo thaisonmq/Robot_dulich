@@ -96,6 +96,7 @@ def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict)
             if runtime_mode == "MAPPING" and runtime_state in {
                 "IDLE",
                 "MAPPING_STARTING",
+                "MAPPING_LOCALIZING",
                 "MAPPING_RUNNING",
                 "MAPPING_STOPPED_UNSAVED",
                 "MAPPING_SAVING",
@@ -135,7 +136,7 @@ def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict)
                     elif runtime_state != "IDLE":
                         mapping.status = runtime_state
                         if runtime_state in {
-                            "MAPPING", "MAPPING_RUNNING", "MAPPING_STOPPED_UNSAVED",
+                            "MAPPING", "MAPPING_LOCALIZING", "MAPPING_RUNNING", "MAPPING_STOPPED_UNSAVED",
                             "MAPPING_SAVING", "PAUSED", "FINISHED", "CANCELED",
                         }:
                             mapping.error_code = None

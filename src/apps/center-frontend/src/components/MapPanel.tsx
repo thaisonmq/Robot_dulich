@@ -149,6 +149,7 @@ interface Props {
   selectedRouteId?: string;
   selected: Destination | null;
   loading: boolean;
+  planningRoute?: boolean;
   navigationStatus: string;
   mapState?: string;
   localizationState?: string;
@@ -489,6 +490,7 @@ function MapCanvas({
 export function MapPanel({
   map, maps = [], selectedMapId, destinations, pose, route,
   routeCandidates = [], selectedRouteId = "", selected, loading,
+  planningRoute,
   navigationStatus, mapState = "READY", localizationState = mapState,
   localizationConfidence = 0, health, visualization, feedback,
   canStart = true, preflightFailures = [], errorMessage = "", noticeMessage = "", localized = false,
@@ -554,9 +556,11 @@ export function MapPanel({
     : route;
   const obstacles = visualizationMatches ? visualization?.dynamic_obstacles ?? [] : [];
   const recoveryCount = Math.max(0, Number(feedback?.recoveries ?? 0));
-  const routePlanning = loading && [
+  // Prefer the request lifecycle supplied by Dashboard. Runtime polling can
+  // briefly overwrite navigationStatus while the HTTP request is still open.
+  const routePlanning = planningRoute ?? (loading && [
     "previewing", "planning", "sending_goal",
-  ].includes(navigationStatus);
+  ].includes(navigationStatus));
 
   return <section className="map-section map-section--mini" aria-labelledby="map-title">
     <div className="section-heading"><div><p className="eyebrow">NAV2 · {navigationStateLabel(mapState, t)}</p><h2 id="map-title">{t("Bản đồ hành trình")}</h2></div>
@@ -570,7 +574,8 @@ export function MapPanel({
     <div className="mini-map-toolbar"><button type="button" onClick={() => { setFollowRobot(false); setCenterRobot(false); }}><RotateCcw size={13} /> {t("Vừa màn hình")}</button>
       <button type="button" disabled={!ready} onClick={() => { setFollowRobot(false); setCenterRobot(true); }}><LocateFixed size={13} /> {t("Tới robot")}</button>
       <button type="button" disabled={!ready} className={followRobot ? "is-active" : ""} onClick={() => { setCenterRobot(false); setFollowRobot((value) => !value); }}><Crosshair size={13} /> {t("Theo robot")}</button></div>
-    <div className="map-canvas map-canvas--mini" onDoubleClick={() => ready && !activeMission && setExpanded(true)}>
+    <div className="map-canvas map-canvas--mini" aria-busy={routePlanning}
+      onDoubleClick={() => ready && !activeMission && setExpanded(true)}>
       <MapCanvas map={map} destinations={[]} pose={pose} route={liveRoute}
         routeCandidates={routeCandidates} selectedRouteId={selectedRouteId} selected={selected}
         dynamicObstacles={obstacles} readOnly={readOnly || loading || activeMission}
@@ -588,7 +593,7 @@ export function MapPanel({
         {!localizationFailed && !["LOCALIZATION_REQUIRED", "SENSOR_TIME_INVALID"].includes(localizationState) && <span>{t("Robot đang quét môi trường…")} · {Math.round(localizationConfidence * 100)}%</span>}
         {localizationState === "SENSOR_TIME_INVALID" && <span>{sensorTimeMessage.detail}</span>}
       </div>}
-      {ready && routePlanning && <div className="route-planning-overlay" role="status" aria-live="polite">
+      {routePlanning && <div className="route-planning-overlay" role="status" aria-live="polite">
         <i aria-hidden="true" />
         <strong>{t("Đang tính tuyến đường an toàn…")}</strong>
         <span>{t("Đang kiểm tra độ rộng, vật cản và quỹ đạo của robot.")}</span>
@@ -674,7 +679,7 @@ export function MapPanel({
         <button type="button" aria-label={t("Đóng bản đồ mở rộng")} onClick={() => {
           setApproximateHintMode(false); setExpanded(false);
         }}><X /></button></header></div>
-        <div className="map-modal__canvas"><MapCanvas map={map}
+        <div className="map-modal__canvas" aria-busy={routePlanning}><MapCanvas map={map}
           destinations={approximateHintMode ? [] : destinations} pose={pose}
           route={liveRoute} routeCandidates={routeCandidates} selectedRouteId={selectedRouteId}
           selected={approximateHintMode ? null : selected} dynamicObstacles={obstacles}
@@ -687,7 +692,13 @@ export function MapPanel({
               return;
             }
             onSelect(destination);
-          }} onSelectRoute={approximateHintMode ? undefined : onSelectRoute} /></div>
+          }} onSelectRoute={approximateHintMode ? undefined : onSelectRoute} />
+          {routePlanning && <div className="route-planning-overlay" role="status" aria-live="polite">
+            <i aria-hidden="true" />
+            <strong>{t("Đang tính tuyến đường an toàn…")}</strong>
+            <span>{t("Đang kiểm tra độ rộng, vật cản và quỹ đạo của robot.")}</span>
+          </div>}
+        </div>
         {approximateHintMode && <p className="navigation-inline-notice" role="status">
           {t("Bấm vào khu vực gần robot. Đây chỉ là gợi ý tìm kiếm; LiDAR vẫn phải xác minh trước khi READY.")}
         </p>}

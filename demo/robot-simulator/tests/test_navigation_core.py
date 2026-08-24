@@ -50,6 +50,7 @@ from navigation_core import (  # noqa: E402
     localization_confidence,
     localization_evidence_consensus,
     localization_verification,
+    mapping_pose_match_quality,
     mask_scan_self_returns,
     normalize_trinary_unknown_metadata,
     path_overlap_ratio,
@@ -722,6 +723,55 @@ def test_localization_confidence_rejects_stable_wrong_pose_and_bad_clock() -> No
     ) == 0
 
 
+def test_mapping_pose_hint_is_corrected_by_slam_not_treated_as_ground_truth() -> None:
+    covariance = [0.0] * 36
+    covariance[0] = covariance[7] = 0.04
+    covariance[35] = math.radians(8) ** 2
+    result = mapping_pose_match_quality(
+        (1.0, 2.0, 0.0),
+        (1.45, 1.8, math.radians(30)),
+        covariance,
+        maximum_position_correction=1.5,
+        maximum_yaw_correction=math.radians(75),
+        maximum_xy_stddev=0.75,
+        maximum_yaw_stddev=math.radians(45),
+    )
+
+    assert result["accepted"]
+    assert result["reason"] == "SLAM_POSE_CONFIRMED"
+    assert result["position_correction_m"] > 0.4
+
+
+@pytest.mark.parametrize(
+    ("corrected", "variance", "reason"),
+    [
+        ((3.0, 2.0, 0.0), 0.01, "POSITION_CORRECTION_TOO_LARGE"),
+        ((1.0, 2.0, math.pi), 0.01, "YAW_CORRECTION_TOO_LARGE"),
+        ((1.1, 2.0, 0.1), 1.0, "POSITION_UNCERTAIN"),
+    ],
+)
+def test_mapping_pose_match_rejects_distant_or_uncertain_correction(
+    corrected: tuple[float, float, float],
+    variance: float,
+    reason: str,
+) -> None:
+    covariance = [0.0] * 36
+    covariance[0] = covariance[7] = variance
+    covariance[35] = 0.01
+    result = mapping_pose_match_quality(
+        (1.0, 2.0, 0.0),
+        corrected,
+        covariance,
+        maximum_position_correction=1.5,
+        maximum_yaw_correction=math.radians(75),
+        maximum_xy_stddev=0.75,
+        maximum_yaw_stddev=math.radians(45),
+    )
+
+    assert not result["accepted"]
+    assert result["reason"] == reason
+
+
 def _localization_frame(
     index: int,
     *,
@@ -934,6 +984,102 @@ def test_independent_global_scan_accepts_one_unique_room_center() -> None:
     assert result.accepted, result
     assert result.reason == "ACCEPTED"
     assert result.candidate_position_error <= 0.45
+
+
+def test_mapping_pose_search_discovers_heading_instead_of_trusting_wrong_hint() -> None:
+    width, height = 110, 80
+    occupancy = [-1] * (width * height)
+    for row in range(5, 76):
+        for column in range(5, 106):
+            occupancy[row * width + column] = 0
+    for column in range(5, 106):
+        occupancy[5 * width + column] = 100
+        occupancy[75 * width + column] = 100
+    for row in range(5, 76):
+        occupancy[row * width + 5] = 100
+        occupancy[row * width + 105] = 100
+    # Two asymmetric internal walls make the correct yaw distinguishable.
+    for row in range(15, 42):
+        occupancy[row * width + 70] = 100
+    for column in range(25, 48):
+        occupancy[55 * width + column] = 100
+    saved = SavedOccupancyMap(
+        width, height, 0.1, 0.0, 0.0, 0.0, occupancy
+    )
+    actual = (4.15, 3.25, math.radians(70.0))
+    angle_min = -math.pi
+    angle_increment = 2.0 * math.pi / 72
+    ranges = [
+        saved.raycast_static_range(
+            actual[0],
+            actual[1],
+            actual[2] + angle_min + index * angle_increment,
+            minimum_range=0.1,
+            maximum_range=8.0,
+        )
+        for index in range(72)
+    ]
+
+    result = global_scan_candidate_uniqueness(
+        saved,
+        [float(value) if value is not None else math.inf for value in ranges],
+        angle_min=angle_min,
+        angle_increment=angle_increment,
+        range_min=0.1,
+        range_max=8.0,
+        candidate_pose=(actual[0], actual[1], math.radians(-80.0)),
+        position_step=0.2,
+        heading_step=math.radians(15.0),
+        alternative_separation=0.75,
+        minimum_best_score=0.42,
+        minimum_score_margin=0.08,
+        minimum_score_ratio=1.12,
+        search_center=(actual[0], actual[1]),
+        search_radius=1.0,
+        require_candidate_match=False,
+        alternative_yaw_separation=math.radians(45.0),
+    )
+
+    assert result.accepted, result
+    assert math.hypot(
+        float(result.best_x) - actual[0], float(result.best_y) - actual[1]
+    ) <= 0.2
+    assert abs(math.atan2(
+        math.sin(float(result.best_yaw) - actual[2]),
+        math.cos(float(result.best_yaw) - actual[2]),
+    )) <= math.radians(10.0)
+
+
+def test_mapping_pose_search_rejects_competing_headings_at_same_position() -> None:
+    saved, laser_x, laser_y, increment, ranges = _boxed_raycast_fixture(72)
+    result = global_scan_candidate_uniqueness(
+        saved,
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=increment,
+        range_min=0.1,
+        range_max=8.0,
+        candidate_pose=(laser_x, laser_y, 0.3),
+        position_step=0.2,
+        heading_step=math.radians(15.0),
+        alternative_separation=0.75,
+        minimum_best_score=0.42,
+        minimum_score_margin=0.08,
+        minimum_score_ratio=1.12,
+        search_center=(laser_x, laser_y),
+        search_radius=0.3,
+        require_candidate_match=False,
+        alternative_yaw_separation=math.radians(45.0),
+    )
+
+    assert not result.accepted
+    assert result.reason == "GLOBAL_SCAN_ALTERNATIVE_COMPETITIVE"
+    assert result.best_x == pytest.approx(result.alternative_x)
+    assert result.best_y == pytest.approx(result.alternative_y)
+    assert abs(math.atan2(
+        math.sin(float(result.best_yaw) - float(result.alternative_yaw)),
+        math.cos(float(result.best_yaw) - float(result.alternative_yaw)),
+    )) >= math.radians(45.0)
 
 
 def test_execution_pose_continuity_accepts_the_same_motion_in_map_and_odom() -> None:
@@ -3050,6 +3196,86 @@ def test_real_expansion_bound_has_a_search_limit_reason(monkeypatch) -> None:
     )
     assert result.status == "SEARCH_EXPANSION_LIMIT"
     assert result.expansions == 1
+
+
+def test_plan_result_can_retry_with_a_larger_per_request_expansion_bound(
+    monkeypatch,
+) -> None:
+    free = _free_rectangle(2, 47, 2, 37) - _free_rectangle(22, 27, 10, 30)
+    saved = _manual_map(50, 40, free)
+    planner = StopTurnStateLatticePlanner(
+        saved, saved.navigation_geometry, max_expansions=1
+    )
+    monkeypatch.setattr(planner, "_grid_seed", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        planner, "_minimum_turn_grid_seed", lambda *args, **kwargs: []
+    )
+
+    result = planner.plan_result(
+        {"x": 0.30, "y": 1.00, "yaw": 0.0},
+        {"x": 2.20, "y": 1.00},
+        planning_time_budget=5.0,
+        search_expansion_limit=2,
+    )
+
+    assert result.status == "SEARCH_EXPANSION_LIMIT"
+    assert result.expansions == 2
+    assert planner.max_expansions == 1
+
+
+def test_measured_start_turn_uses_physical_width_not_corridor_reserve() -> None:
+    free = _free_rectangle(1, 38, 1, 38)
+    free.remove((16, 17))
+    saved = _manual_map(40, 40, free)
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.02,
+    )
+    yaw = math.radians(55.0)
+
+    assert saved.validate_footprint(
+        1.0,
+        1.0,
+        yaw,
+        half_length=0.15,
+        half_width=0.10,
+        code_prefix="START",
+    ).valid
+    assert planner._turn_valid(
+        1.0,
+        1.0,
+        yaw,
+        yaw + planner.heading_step,
+        robust=False,
+        measured_start=True,
+    )
+    assert not planner._turn_valid(
+        1.0,
+        1.0,
+        yaw,
+        yaw + planner.heading_step,
+        robust=False,
+    )
+
+
+def test_reverse_clear_start_is_not_misclassified_as_statically_trapped(
+    monkeypatch,
+) -> None:
+    saved = _manual_map(40, 40, _free_rectangle(1, 38, 1, 38))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    start = {"x": 1.0, "y": 1.0, "yaw": 0.0}
+    monkeypatch.setattr(planner, "plan", lambda *args, **kwargs: None)
+    monkeypatch.setattr(planner, "_turn_valid", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        planner,
+        "_translation_valid",
+        lambda left, right: float(right["x"]) < float(left["x"]),
+    )
+
+    result = planner.plan_result(start, {"x": 1.8, "y": 1.0})
+
+    assert result.status == "NO_EXACT_STOP_TURN_ROUTE"
 
 
 def test_turn_block_tracker_requires_atomic_clear_dwell() -> None:

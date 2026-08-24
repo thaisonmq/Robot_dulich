@@ -54,6 +54,9 @@ const PLAN_FAILURE_MESSAGES: Record<string, string> = {
   NO_PATH: "Không tìm thấy đường hợp lệ tới điểm đích.",
   UNKNOWN_SPACE: "Không thể lập đường vì lộ trình đi qua vùng chưa được lập bản đồ.",
   PLANNER_TIMEOUT: "Bộ lập đường không phản hồi đúng thời gian.",
+  SEARCH_EXPANSION_LIMIT: "Chưa tìm được đường trong giới hạn tính toán sau khi đã tự động thử mở rộng. Hãy chọn điểm gần hơn hoặc kiểm tra vùng vật cản.",
+  SEARCH_TIME_BUDGET_EXCEEDED: "Chưa tìm được đường trong thời gian tính toán cho phép sau khi đã tự động thử lại. Hãy chọn điểm gần hơn hoặc kiểm tra vùng vật cản.",
+  START_TURN_BLOCKED_STATIC: "Bản đồ tĩnh đang đánh dấu vật cản sát thân xe, nên robot chưa thể tiến, lùi hoặc bắt đầu quay an toàn.",
   TF_ERROR: "Không thể xác định vị trí robot trên bản đồ để lập đường.",
   COSTMAP_NOT_READY: "Costmap chưa sẵn sàng; vui lòng thử lại sau khi dữ liệu LiDAR được cập nhật.",
 };
@@ -1540,6 +1543,7 @@ export function DashboardPage() {
                 selectedRouteId={selectedRouteId}
                 selected={selectedDestination}
                 loading={preview.isPending || loadMap.isPending || relocalize.isPending || approximatePose.isPending || sendGoal.isPending || missionAction.isPending}
+                planningRoute={preview.isPending || sendGoal.isPending}
                 navigationStatus={navigationState}
                 mapState={mapState}
                 localizationState={displayedLocalizationState}

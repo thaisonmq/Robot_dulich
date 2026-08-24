@@ -4,7 +4,7 @@ import { api } from "../src/api/client";
 import { I18nProvider } from "../src/i18n/I18nProvider";
 import { CreateMapPage } from "../src/pages/CreateMapPage";
 import { useAppStore } from "../src/state/appStore";
-import type { Robot, Session } from "../src/types";
+import type { MapData, Robot, Session } from "../src/types";
 
 vi.mock("../src/components/OperationsShell", () => ({
   OperationsShell: ({ children }: { children: React.ReactNode }) => <main>{children}</main>,
@@ -40,6 +40,33 @@ const controlSession: Session = {
   media: { url: "", room_name: "", token: "" },
   control_websocket_url: "",
   telemetry_websocket_url: "",
+};
+
+const continuationMap: MapData = {
+  map_id: "MAP-CONTINUE-01",
+  name: "Sảnh hiện hữu",
+  image_url: "",
+  width_pixels: 100,
+  height_pixels: 80,
+  resolution_m_per_pixel: 0.05,
+  origin: { x: -2.5, y: -2, yaw: 0 },
+  status: "ACTIVE",
+  active_version: 2,
+  versions: [{
+    version: 2,
+    status: "ACTIVE",
+    checksum: "a".repeat(64),
+    resolution: 0.05,
+    origin: { x: -2.5, y: -2, yaw: 0 },
+    width_pixels: 100,
+    height_pixels: 80,
+    created_by_robot: robot.robot_id,
+    created_at: new Date().toISOString(),
+    download_url: "/api/maps/MAP-CONTINUE-01/versions/2/download",
+    preview_url: "data:image/png;base64,iVBORw0KGgo=",
+    has_posegraph: true,
+    can_continue: true,
+  }],
 };
 
 describe("CreateMapPage", () => {
@@ -81,5 +108,54 @@ describe("CreateMapPage", () => {
     });
     expect(useAppStore.getState().selectedRobot?.robot_id).toBe(robot.robot_id);
     expect(useAppStore.getState().session?.session_id).toBe(controlSession.session_id);
+  });
+
+  it("requires acknowledgement of the approximate pose hint before continuing", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      clearRect: vi.fn(),
+      fillRect: vi.fn(),
+      drawImage: vi.fn(),
+      save: vi.fn(),
+      translate: vi.fn(),
+      rotate: vi.fn(),
+      beginPath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      closePath: vi.fn(),
+      fill: vi.fn(),
+      stroke: vi.fn(),
+      arc: vi.fn(),
+      setLineDash: vi.fn(),
+      restore: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    sessionStorage.setItem("rovera:mapping-intent", JSON.stringify({
+      map_id: continuationMap.map_id,
+      source_version: 2,
+      name: continuationMap.name,
+      site_id: "Trụ sở chính",
+      floor_id: "Tầng 1",
+      initial_pose: { x: 1.25, y: -0.5, yaw: 0.75 },
+      initial_pose_confirmed: false,
+    }));
+    vi.spyOn(api, "map").mockResolvedValue(continuationMap);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={queryClient}><I18nProvider><CreateMapPage /></I18nProvider></QueryClientProvider>);
+
+    const startButton = await screen.findByRole("button", { name: "Mở Control để mapping" });
+    expect(await screen.findByText("Chỉ vùng robot đang đứng gần đó")).toBeInTheDocument();
+    expect(screen.getByText(/SLAM phải tự khớp và xác minh/)).toBeInTheDocument();
+    expect(startButton).toBeDisabled();
+
+    fireEvent.click(screen.getByLabelText(/Tôi đã chọn vùng và hướng gần đúng/));
+    expect(startButton).toBeEnabled();
+    fireEvent.click(startButton);
+
+    await waitFor(() => expect(api.createSession).toHaveBeenCalledWith(robot.robot_id));
+    expect(JSON.parse(sessionStorage.getItem("rovera:mapping-intent") ?? "{}")).toMatchObject({
+      map_id: continuationMap.map_id,
+      source_version: 2,
+      initial_pose: { x: 1.25, y: -0.5, yaw: 0.75 },
+      initial_pose_confirmed: true,
+    });
   });
 });

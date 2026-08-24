@@ -364,4 +364,19 @@ describe("MapPanel navigation controls", () => {
     expect(progress).toHaveTextContent("Đang kiểm tra độ rộng");
     expect(screen.getByRole("button", { name: "Chọn điểm đến" })).toBeDisabled();
   });
+
+  it("keeps route loading visible when runtime polling overwrites navigation status", () => {
+    panel({
+      localized: true,
+      localizationState: "READY",
+      mapState: "READY",
+      navigationStatus: "ready",
+      loading: true,
+      planningRoute: true,
+      selected: poi,
+    });
+
+    expect(screen.getByText("Đang tính tuyến đường an toàn…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Chọn điểm đến" })).toBeDisabled();
+  });
 });

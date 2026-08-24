@@ -86,6 +86,7 @@ from navigation_core import (
     localization_confidence,
     localization_evidence_consensus,
     localization_verification,
+    mapping_pose_match_quality,
     particle_cloud_uniqueness,
     normalize_trinary_unknown_metadata,
     path_overlap_ratio,
@@ -201,6 +202,61 @@ class NavigationAdapter(Node):
         self.map_id = ""
         self.map_version = 0
         self.mapping_payload: dict[str, Any] = {}
+        self.mapping_relocalization_event = threading.Event()
+        self.mapping_relocalization_active = False
+        self.mapping_relocalization_probe_count = 0
+        self.mapping_relocalization_max_probes = max(
+            1, int(os.getenv("MAPPING_RELOCALIZATION_MAX_PROBES", "1"))
+        )
+        self.mapping_relocalization_timeout = max(
+            2.0, float(os.getenv("MAPPING_RELOCALIZATION_TIMEOUT_SECONDS", "12"))
+        )
+        self.mapping_relocalization_max_position_correction = max(
+            0.1,
+            float(os.getenv("MAPPING_RELOCALIZATION_MAX_POSITION_CORRECTION_M", "1.5")),
+        )
+        self.mapping_relocalization_max_yaw_correction = math.radians(max(
+            5.0,
+            float(os.getenv("MAPPING_RELOCALIZATION_MAX_YAW_CORRECTION_DEG", "75")),
+        ))
+        self.mapping_relocalization_max_xy_stddev = max(
+            0.05, float(os.getenv("MAPPING_RELOCALIZATION_MAX_XY_STDDEV_M", "0.75"))
+        )
+        self.mapping_relocalization_max_yaw_stddev = math.radians(max(
+            5.0, float(os.getenv("MAPPING_RELOCALIZATION_MAX_YAW_STDDEV_DEG", "45"))
+        ))
+        self.mapping_relocalization_hint: tuple[float, float, float] | None = None
+        self.mapping_relocalization_result: dict[str, Any] | None = None
+        self.mapping_pose_search_event = threading.Event()
+        self.mapping_pose_search_active = False
+        self.mapping_pose_search_snapshot: dict[str, Any] | None = None
+        self.mapping_relocalization_latest_snapshot: dict[str, Any] | None = None
+        self.mapping_relocalization_source_map: SavedOccupancyMap | None = None
+        self.mapping_relocalization_corrected_pose: (
+            tuple[float, float, float] | None
+        ) = None
+        self.mapping_relocalization_geometry_confirmations = 0
+        self.mapping_relocalization_geometry_samples = 0
+        self.mapping_relocalization_required_confirmations = max(
+            2, int(os.getenv("MAPPING_RELOCALIZATION_CONFIRMATION_SCANS", "3"))
+        )
+        self.mapping_relocalization_max_validation_scans = max(
+            self.mapping_relocalization_required_confirmations,
+            int(os.getenv("MAPPING_RELOCALIZATION_MAX_VALIDATION_SCANS", "8")),
+        )
+        self.mapping_pose_search_minimum_score = float(
+            os.getenv("MAPPING_POSE_SEARCH_MINIMUM_SCORE", "0.42")
+        )
+        self.mapping_pose_search_minimum_margin = float(
+            os.getenv("MAPPING_POSE_SEARCH_MINIMUM_MARGIN", "0.08")
+        )
+        self.mapping_pose_search_minimum_ratio = float(
+            os.getenv("MAPPING_POSE_SEARCH_MINIMUM_RATIO", "1.12")
+        )
+        self.mapping_relocalization_diagnostics: dict[str, Any] = {
+            "state": "NOT_REQUIRED",
+            "hint_is_approximate": True,
+        }
         self.current_goal_handle: Any = None
         self.navigation_goal_generation = 0
         self.paused_goal: dict[str, float] | None = None
@@ -770,6 +826,14 @@ class NavigationAdapter(Node):
         self.stop_turn_planning_budget = configured(
             "stop_turn_planning_budget_seconds", 12.0
         )
+        self.stop_turn_retry_planning_budget = configured(
+            "stop_turn_retry_planning_budget_seconds", 15.0
+        )
+        self.stop_turn_retry_expansion_multiplier = max(1, int(
+            self.declare_parameter(
+                "stop_turn_retry_expansion_multiplier", 4
+            ).value
+        ))
         self.stop_turn_turn_robustness_radius = configured(
             "stop_turn_turn_robustness_radius", 0.01
         )
@@ -1137,6 +1201,12 @@ class NavigationAdapter(Node):
         )
         self.create_subscription(
             PoseWithCovarianceStamped, "/amcl_pose", self._amcl_pose_callback, 5
+        )
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            "/slam_toolbox/pose",
+            self._mapping_pose_callback,
+            5,
         )
         self.create_subscription(
             # Nav2 AMCL publishes ParticleCloud as BEST_EFFORT. A default
@@ -2139,6 +2209,9 @@ class NavigationAdapter(Node):
                         round(time.monotonic() - self.mapping_started_monotonic)
                         if self.mapping_started_monotonic else 0
                     ),
+                    "relocalization": dict(
+                        self.mapping_relocalization_diagnostics
+                    ),
                 } if self.mode == "MAPPING" else None,
             }
 
@@ -2444,6 +2517,211 @@ class NavigationAdapter(Node):
     @staticmethod
     def _yaw_delta(left: float, right: float) -> float:
         return math.atan2(math.sin(left - right), math.cos(left - right))
+
+    def _mapping_pose_callback(self, message: PoseWithCovarianceStamped) -> None:
+        """Start geometric confirmation from SLAM's corrected probe pose."""
+        with self.state_lock:
+            if (
+                self.mode != "MAPPING"
+                or not self.mapping_relocalization_active
+                or self.mapping_relocalization_probe_count < 1
+                or self.mapping_relocalization_hint is None
+                or self.mapping_relocalization_corrected_pose is not None
+            ):
+                return
+            pose = message.pose.pose
+            corrected = (
+                float(pose.position.x),
+                float(pose.position.y),
+                self._yaw_from_quaternion(pose.orientation),
+            )
+            assessment = mapping_pose_match_quality(
+                self.mapping_relocalization_hint,
+                corrected,
+                list(message.pose.covariance),
+                maximum_position_correction=(
+                    self.mapping_relocalization_max_position_correction
+                ),
+                maximum_yaw_correction=self.mapping_relocalization_max_yaw_correction,
+                maximum_xy_stddev=self.mapping_relocalization_max_xy_stddev,
+                maximum_yaw_stddev=self.mapping_relocalization_max_yaw_stddev,
+            )
+            if not assessment["accepted"]:
+                assessment.update({
+                    "state": "REJECTED",
+                    "hint_is_approximate": True,
+                    "probe_scans": self.mapping_relocalization_probe_count,
+                    "corrected_pose": {
+                        "x": corrected[0],
+                        "y": corrected[1],
+                        "yaw": corrected[2],
+                    },
+                })
+                self.mapping_relocalization_result = assessment
+                self.mapping_relocalization_diagnostics = dict(assessment)
+                self.mapping_relocalization_active = False
+                self.mapping_relocalization_event.set()
+                return
+            self.mapping_relocalization_corrected_pose = corrected
+            self.mapping_relocalization_diagnostics = {
+                **assessment,
+                "state": "VERIFYING_GEOMETRY",
+                "hint_is_approximate": True,
+                "probe_scans": self.mapping_relocalization_probe_count,
+                "corrected_pose": {
+                    "x": corrected[0], "y": corrected[1], "yaw": corrected[2]
+                },
+                "geometry_confirmations": 0,
+                "required_confirmations": (
+                    self.mapping_relocalization_required_confirmations
+                ),
+            }
+            snapshot = self.mapping_relocalization_latest_snapshot
+        if snapshot is not None:
+            self._confirm_mapping_geometry_snapshot(snapshot, corrected)
+
+    @staticmethod
+    def _mapping_scan_snapshot(
+        message: LaserScan,
+        laser_in_base: tuple[float, float, float] | None,
+    ) -> dict[str, Any]:
+        return {
+            "ranges": tuple(float(value) for value in message.ranges),
+            "angle_min": float(message.angle_min),
+            "angle_increment": float(message.angle_increment),
+            "range_min": float(message.range_min),
+            "range_max": float(message.range_max),
+            "laser_in_base": laser_in_base,
+            "captured_monotonic": time.monotonic(),
+        }
+
+    def _mapping_geometry_assessment(
+        self,
+        snapshot: dict[str, Any],
+        corrected_pose: tuple[float, float, float],
+    ) -> dict[str, Any]:
+        saved_map = self.mapping_relocalization_source_map
+        extrinsic = snapshot.get("laser_in_base")
+        if saved_map is None or extrinsic is None:
+            return {"accepted": False, "reason": "MAPPING_GEOMETRY_UNAVAILABLE"}
+        cosine, sine = math.cos(corrected_pose[2]), math.sin(corrected_pose[2])
+        laser_x = corrected_pose[0] + cosine * float(extrinsic[0]) - sine * float(extrinsic[1])
+        laser_y = corrected_pose[1] + sine * float(extrinsic[0]) + cosine * float(extrinsic[1])
+        laser_yaw = corrected_pose[2] + float(extrinsic[2])
+        match = scan_to_map_match(
+            saved_map,
+            snapshot["ranges"],
+            angle_min=float(snapshot["angle_min"]),
+            angle_increment=float(snapshot["angle_increment"]),
+            range_min=float(snapshot["range_min"]),
+            range_max=float(snapshot["range_max"]),
+            laser_x=laser_x,
+            laser_y=laser_y,
+            laser_yaw=laser_yaw,
+            maximum_beams=self.scan_map_maximum_beams,
+            minimum_usable_range=self.scan_map_minimum_range,
+            maximum_usable_range=self.scan_map_maximum_range,
+            endpoint_tolerance=self.global_scan_endpoint_tolerance,
+        )
+        accepted = bool(
+            match.valid_beams >= self.scan_map_minimum_beams
+            and match.score >= self.scan_map_threshold
+            and match.residual_beams >= self.localization_final_minimum_residual_beams
+            and match.median_residual <= self.localization_coarse_match_tolerance
+            and match.p90_residual <= self.global_scan_endpoint_tolerance
+        )
+        reason = (
+            "GEOMETRY_CONFIRMED"
+            if accepted
+            else "SCAN_INSUFFICIENT_BEAMS"
+            if match.valid_beams < self.scan_map_minimum_beams
+            else "SCAN_MAP_SCORE_TOO_LOW"
+            if match.score < self.scan_map_threshold
+            else "SCAN_MAP_RESIDUAL_TOO_HIGH"
+        )
+        return {
+            "accepted": accepted,
+            "reason": reason,
+            "scan_map_score": match.score,
+            "valid_beams": match.valid_beams,
+            "matched_beams": match.matched_beams,
+            "median_residual_m": self._finite_metric(match.median_residual),
+            "p90_residual_m": self._finite_metric(match.p90_residual),
+        }
+
+    def _confirm_mapping_geometry_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        corrected_pose: tuple[float, float, float],
+    ) -> None:
+        assessment = self._mapping_geometry_assessment(snapshot, corrected_pose)
+        with self.state_lock:
+            if (
+                not self.mapping_relocalization_active
+                or corrected_pose != self.mapping_relocalization_corrected_pose
+            ):
+                return
+            self.mapping_relocalization_geometry_samples += 1
+            if assessment["accepted"]:
+                self.mapping_relocalization_geometry_confirmations += 1
+            else:
+                # Require consecutive agreement so one shifted scan cannot be
+                # hidden by earlier samples that happened to touch old walls.
+                self.mapping_relocalization_geometry_confirmations = 0
+            confirmations = self.mapping_relocalization_geometry_confirmations
+            samples = self.mapping_relocalization_geometry_samples
+            diagnostics = {
+                **self.mapping_relocalization_diagnostics,
+                **assessment,
+                "state": "VERIFYING_GEOMETRY",
+                "geometry_confirmations": confirmations,
+                "geometry_samples": samples,
+                "required_confirmations": (
+                    self.mapping_relocalization_required_confirmations
+                ),
+            }
+            if confirmations >= self.mapping_relocalization_required_confirmations:
+                diagnostics.update({
+                    "accepted": True,
+                    "reason": "SLAM_POSE_AND_GEOMETRY_CONFIRMED",
+                    "state": "CONFIRMED",
+                })
+                self.mapping_relocalization_result = diagnostics
+                self.mapping_relocalization_diagnostics = dict(diagnostics)
+                self.mapping_relocalization_active = False
+                self.mapping_relocalization_event.set()
+            elif samples >= self.mapping_relocalization_max_validation_scans:
+                diagnostics.update({
+                    "accepted": False,
+                    "reason": "SCAN_MAP_GEOMETRY_UNSTABLE",
+                    "state": "REJECTED",
+                })
+                self.mapping_relocalization_result = diagnostics
+                self.mapping_relocalization_diagnostics = dict(diagnostics)
+                self.mapping_relocalization_active = False
+                self.mapping_relocalization_event.set()
+            else:
+                self.mapping_relocalization_diagnostics = diagnostics
+
+    def _collect_mapping_pose_evidence(
+        self,
+        message: LaserScan,
+        laser_in_base: tuple[float, float, float] | None,
+    ) -> None:
+        if self.mode != "MAPPING":
+            return
+        snapshot = self._mapping_scan_snapshot(message, laser_in_base)
+        corrected_pose: tuple[float, float, float] | None = None
+        with self.state_lock:
+            if self.mapping_pose_search_active:
+                self.mapping_pose_search_snapshot = snapshot
+                self.mapping_pose_search_active = False
+                self.mapping_pose_search_event.set()
+            if self.mapping_relocalization_active:
+                self.mapping_relocalization_latest_snapshot = snapshot
+                corrected_pose = self.mapping_relocalization_corrected_pose
+        if corrected_pose is not None:
+            self._confirm_mapping_geometry_snapshot(snapshot, corrected_pose)
 
     @localization_callback
     def _amcl_pose_callback(self, message: PoseWithCovarianceStamped) -> None:
@@ -4526,6 +4804,7 @@ class NavigationAdapter(Node):
         nearest_right = math.inf
         nearest_rotation_obstacle = math.inf
         extrinsic = self._laser_extrinsic(str(message.header.frame_id))
+        self._collect_mapping_pose_evidence(message, extrinsic)
         base_points: list[tuple[float, float]] = []
         for index, distance in enumerate(message.ranges):
             if (
@@ -4638,7 +4917,23 @@ class NavigationAdapter(Node):
         self._record_heading_observation(
             message, heading_observation_valid=heading_observation_valid
         )
-        if self.mode == "MAPPING" and self.current_state in {"MAPPING", "MAPPING_RUNNING"}:
+        publish_mapping_scan = False
+        if self.mode == "MAPPING":
+            with self.state_lock:
+                if self.current_state in {"MAPPING", "MAPPING_RUNNING"}:
+                    publish_mapping_scan = True
+                elif (
+                    self.current_state == "MAPPING_LOCALIZING"
+                    and self.mapping_relocalization_active
+                    and self.mapping_relocalization_probe_count
+                    < self.mapping_relocalization_max_probes
+                ):
+                    # Only a few probe scans may reach SLAM before its corrected
+                    # pose is verified. A rejected attempt is rolled back by
+                    # deserializing the immutable source graph again.
+                    self.mapping_relocalization_probe_count += 1
+                    publish_mapping_scan = True
+        if publish_mapping_scan:
             self.mapping_scan.publish(message)
         elif self.mode == "NAVIGATION":
             self.navigation_scan.publish(message)
@@ -7511,15 +7806,43 @@ class NavigationAdapter(Node):
             and not (self.safety_direction_mask & 1)
             and not self.estop_active
         )
+        dynamic_exclusions = self._dynamic_exclusions()
         planner_result = self.stop_turn_planner.plan_result(
             start_pose,
             resolved_goal,
-            exclusions=self._dynamic_exclusions(),
+            exclusions=dynamic_exclusions,
             planning_time_budget=self.stop_turn_planning_budget,
             allow_start_escape=True,
             maximum_start_escape_distance=self.start_escape_max_distance,
             live_start_clear=live_start_clear,
         )
+        if planner_result.status in {
+            "SEARCH_EXPANSION_LIMIT", "SEARCH_TIME_BUDGET_EXCEEDED"
+        }:
+            retry_expansion_limit = (
+                self.stop_turn_planner.max_expansions
+                * self.stop_turn_retry_expansion_multiplier
+            )
+            self._nav_debug(
+                "PLAN_SEARCH_RETRY",
+                first_status=planner_result.status,
+                first_expansions=planner_result.expansions,
+                first_duration_ms=round(
+                    planner_result.elapsed_seconds * 1000.0, 3
+                ),
+                planning_time_budget=self.stop_turn_retry_planning_budget,
+                expansion_limit=retry_expansion_limit,
+            )
+            planner_result = self.stop_turn_planner.plan_result(
+                start_pose,
+                resolved_goal,
+                exclusions=dynamic_exclusions,
+                planning_time_budget=self.stop_turn_retry_planning_budget,
+                search_expansion_limit=retry_expansion_limit,
+                allow_start_escape=True,
+                maximum_start_escape_distance=self.start_escape_max_distance,
+                live_start_clear=live_start_clear,
+            )
         hard_side_clearance = self._hard_route_side_clearance()
         if (
             planner_result.route is not None
@@ -7551,7 +7874,7 @@ class NavigationAdapter(Node):
                 maximum_candidates=1,
                 overlap_threshold=self.alternative_route_overlap_threshold,
                 planning_time_budget=self.stop_turn_planning_budget,
-                exclusions=self._dynamic_exclusions(),
+                exclusions=dynamic_exclusions,
                 primary_route=planner_result.route,
             )
         )
@@ -10627,7 +10950,15 @@ class NavigationAdapter(Node):
                 self.mapping_started_monotonic = time.monotonic()
             posegraph_path = str(payload.get("posegraph_path") or "")
             if posegraph_path:
-                self._load_mapping_posegraph(posegraph_path, payload.get("initial_pose"))
+                self._verify_mapping_continuation_pose(
+                    posegraph_path, payload.get("initial_pose")
+                )
+            else:
+                with self.state_lock:
+                    self.mapping_relocalization_diagnostics = {
+                        "state": "NOT_REQUIRED",
+                        "hint_is_approximate": True,
+                    }
             with self.state_lock:
                 self.current_state = "MAPPING_RUNNING"
             return {"status": "completed", "current_state": "MAPPING_RUNNING", "state": self._state()}
@@ -10664,6 +10995,214 @@ class NavigationAdapter(Node):
             return {"status": "completed", "current_state": "CANCELED", "state": self._state()}
         raise AdapterError("UNSUPPORTED_COMMAND", command)
 
+    def _verify_mapping_continuation_pose(self, filename: str, initial_pose: Any) -> None:
+        if not isinstance(initial_pose, dict) or not all(
+            axis in initial_pose and math.isfinite(float(initial_pose[axis]))
+            for axis in ("x", "y", "yaw")
+        ):
+            raise AdapterError(
+                "MAPPING_POSE_HINT_REQUIRED",
+                "Cần chọn vùng và hướng gần đúng trước khi tiếp tục map",
+            )
+        hint = (
+            float(initial_pose["x"]),
+            float(initial_pose["y"]),
+            float(initial_pose["yaw"]),
+        )
+        source_yaml = Path(filename).parent / "map.yaml"
+        try:
+            source_map = SavedOccupancyMap.load(source_yaml)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise AdapterError(
+                "MAPPING_SOURCE_MAP_INVALID",
+                f"Không đọc được occupancy map nguồn: {exc}",
+            ) from exc
+        with self.state_lock:
+            self.current_state = "MAPPING_LOCALIZING"
+            self.mapping_relocalization_active = False
+            self.mapping_relocalization_probe_count = 0
+            self.mapping_relocalization_hint = None
+            self.mapping_relocalization_result = None
+            self.mapping_relocalization_event.clear()
+            self.mapping_pose_search_event.clear()
+            self.mapping_pose_search_active = True
+            self.mapping_pose_search_snapshot = None
+            self.mapping_relocalization_latest_snapshot = None
+            self.mapping_relocalization_source_map = source_map
+            self.mapping_relocalization_corrected_pose = None
+            self.mapping_relocalization_geometry_confirmations = 0
+            self.mapping_relocalization_geometry_samples = 0
+            self.mapping_relocalization_diagnostics = {
+                "state": "SEARCHING_SAVED_MAP",
+                "hint_is_approximate": True,
+                "probe_scans": 0,
+                "operator_hint": {
+                    "x": hint[0], "y": hint[1], "yaw": hint[2]
+                },
+            }
+
+        if not self.mapping_pose_search_event.wait(min(
+            3.0, self.mapping_relocalization_timeout
+        )):
+            with self.state_lock:
+                self.mapping_pose_search_active = False
+                self.current_state = "MAPPING_ERROR"
+                self.mapping_relocalization_diagnostics.update({
+                    "state": "SEARCH_TIMEOUT",
+                    "reason": "NO_FRESH_SCAN_FOR_POSE_SEARCH",
+                })
+            raise AdapterError(
+                "MAPPING_POSE_SEARCH_TIMEOUT",
+                "Không nhận được scan mới để tìm hướng robot trên map cũ",
+            )
+        snapshot = dict(self.mapping_pose_search_snapshot or {})
+        extrinsic = snapshot.get("laser_in_base")
+        if not snapshot or extrinsic is None:
+            with self.state_lock:
+                self.current_state = "MAPPING_ERROR"
+            raise AdapterError(
+                "MAPPING_POSE_SEARCH_TF_UNAVAILABLE",
+                "Không có TF base_footprint → laser_frame để tìm pose",
+            )
+        search = global_scan_candidate_uniqueness(
+            source_map,
+            snapshot["ranges"],
+            angle_min=float(snapshot["angle_min"]),
+            angle_increment=float(snapshot["angle_increment"]),
+            range_min=float(snapshot["range_min"]),
+            range_max=float(snapshot["range_max"]),
+            candidate_pose=hint,
+            laser_x=float(extrinsic[0]),
+            laser_y=float(extrinsic[1]),
+            laser_yaw=float(extrinsic[2]),
+            maximum_beams=self.global_scan_maximum_beams,
+            minimum_usable_range=self.scan_map_minimum_range,
+            maximum_usable_range=self.scan_map_maximum_range,
+            endpoint_tolerance=self.global_scan_endpoint_tolerance,
+            position_step=self.global_scan_position_step,
+            heading_step=self.global_scan_heading_step,
+            alternative_separation=self.particle_alternative_separation,
+            minimum_best_score=self.mapping_pose_search_minimum_score,
+            minimum_score_margin=self.mapping_pose_search_minimum_margin,
+            minimum_score_ratio=self.mapping_pose_search_minimum_ratio,
+            candidate_position_tolerance=(
+                self.global_scan_candidate_position_tolerance
+            ),
+            candidate_yaw_tolerance=self.global_scan_candidate_yaw_tolerance,
+            search_center=(hint[0], hint[1]),
+            search_radius=self.global_scan_hint_radius,
+            require_candidate_match=False,
+            alternative_yaw_separation=math.radians(45.0),
+        )
+        if (
+            not search.accepted
+            or search.best_x is None
+            or search.best_y is None
+            or search.best_yaw is None
+        ):
+            with self.state_lock:
+                self.current_state = "MAPPING_ERROR"
+                self.mapping_relocalization_diagnostics.update({
+                    "state": "SEARCH_REJECTED",
+                    "reason": search.reason,
+                    "best_score": search.best_score,
+                    "alternative_score": search.alternative_score,
+                    "score_margin": search.score_margin,
+                    "score_ratio": self._finite_metric(search.score_ratio),
+                })
+            raise AdapterError(
+                "MAPPING_POSE_SEARCH_AMBIGUOUS",
+                "LiDAR chưa xác định được một vị trí–hướng duy nhất; hãy chọn vùng gần hơn",
+            )
+        seed = {
+            "x": float(search.best_x),
+            "y": float(search.best_y),
+            "yaw": float(search.best_yaw),
+        }
+        with self.state_lock:
+            self.mapping_relocalization_hint = (
+                seed["x"], seed["y"], seed["yaw"]
+            )
+            self.mapping_relocalization_diagnostics.update({
+                "state": "SLAM_REFINING",
+                "searched_pose": dict(seed),
+                "best_score": search.best_score,
+                "alternative_score": search.alternative_score,
+                "score_margin": search.score_margin,
+                "score_ratio": self._finite_metric(search.score_ratio),
+                "evaluated_candidates": search.evaluated_candidates,
+            })
+
+        try:
+            self._load_mapping_posegraph(filename, seed)
+        except AdapterError:
+            with self.state_lock:
+                self.current_state = "MAPPING_ERROR"
+                self.mapping_relocalization_diagnostics = {
+                    "state": "LOAD_FAILED",
+                    "hint_is_approximate": True,
+                    "probe_scans": 0,
+                }
+            raise
+        with self.state_lock:
+            self.mapping_relocalization_active = True
+        if not self.mapping_relocalization_event.wait(
+            self.mapping_relocalization_timeout
+        ):
+            with self.state_lock:
+                self.mapping_relocalization_active = False
+                geometry_started = (
+                    self.mapping_relocalization_corrected_pose is not None
+                )
+                self.mapping_relocalization_diagnostics = {
+                    "state": "TIMEOUT",
+                    "reason": (
+                        "GEOMETRY_CONFIRMATION_TIMEOUT"
+                        if geometry_started else "NO_CORRECTED_SLAM_POSE"
+                    ),
+                    "hint_is_approximate": True,
+                    "probe_scans": self.mapping_relocalization_probe_count,
+                    "geometry_confirmations": (
+                        self.mapping_relocalization_geometry_confirmations
+                    ),
+                    "required_confirmations": (
+                        self.mapping_relocalization_required_confirmations
+                    ),
+                }
+            failure = AdapterError(
+                "MAPPING_RELOCALIZATION_TIMEOUT",
+                (
+                    "Scan LiDAR chưa ổn định theo map cũ; hãy giữ robot đứng yên"
+                    if geometry_started
+                    else "SLAM không khớp được robot với map cũ; hãy chọn vùng gần hơn"
+                ),
+            )
+        else:
+            result = dict(self.mapping_relocalization_result or {})
+            if result.get("accepted"):
+                self.get_logger().info(
+                    "SLAM confirmed the approximate continuation pose "
+                    f"after {self.mapping_relocalization_probe_count} probe scan(s)"
+                )
+                return
+            failure = AdapterError(
+                "MAPPING_RELOCALIZATION_UNCERTAIN",
+                "Kết quả khớp pose chưa đủ tin cậy; hãy chọn vị trí hoặc hướng gần hơn",
+            )
+
+        # Probe scans must never remain in the working graph after a failed
+        # match. Reload the immutable source before exposing the error state.
+        try:
+            self._load_mapping_posegraph(filename, seed)
+        except AdapterError as rollback_error:
+            failure = AdapterError(
+                failure.code,
+                f"{failure}; không thể rollback pose-graph: {rollback_error}",
+            )
+        with self.state_lock:
+            self.current_state = "MAPPING_ERROR"
+        raise failure
+
     def _load_mapping_posegraph(self, filename: str, initial_pose: Any) -> None:
         posegraph = Path(filename)
         if not posegraph.is_absolute() or not posegraph.with_suffix(".posegraph").is_file() or not posegraph.with_suffix(".data").is_file():
@@ -10683,11 +11222,16 @@ class NavigationAdapter(Node):
             # from the first graph node is safe when the robot is returned to
             # its original mapping start position.
             request.match_type = DeserializePoseGraph.Request.START_AT_FIRST_NODE
-        self._call_empty_like(
+        response = self._call_empty_like(
             self.slam_deserialize_client,
             request,
             "POSEGRAPH_LOAD_FAILED",
         )
+        if hasattr(response, "result") and not bool(response.result):
+            raise AdapterError(
+                "POSEGRAPH_LOAD_FAILED",
+                "SLAM Toolbox rejected the serialized pose-graph",
+            )
         self.get_logger().info(f"continued mapping from pose-graph {posegraph}")
 
     @staticmethod

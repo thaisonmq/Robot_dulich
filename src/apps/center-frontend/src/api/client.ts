@@ -7,6 +7,7 @@ import type {
   RegisterInput, AdminUserCreateInput, ActiveControlSession, SessionCamera,
   SessionVideoProfile, VideoProfile,
   MappingSession,
+  MappingInitialPose,
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "";
@@ -286,7 +287,7 @@ export const api = {
   startMapping: (input: {
     request_id: string; robot_id: string; expected_state: string;
     name: string; site_id: string; floor_id: string; notes: string;
-    map_id?: string; source_version?: number;
+    map_id?: string; source_version?: number; initial_pose?: MappingInitialPose;
   }) => request<MappingSession>("/api/maps/mapping-sessions", {
     method: "POST",
     body: JSON.stringify(input),
