@@ -51,6 +51,8 @@ def generate_launch_description() -> LaunchDescription:
             name="rovera_navigation_adapter",
             parameters=["/opt/rovera/config/nav2_params.yaml"],
             output="screen",
+            respawn=True,
+            respawn_delay=1.0,
         ),
     ]
     # The deployed Yahboom runtime can disappear independently (for example
@@ -87,6 +89,8 @@ def generate_launch_description() -> LaunchDescription:
                 name="rovera_navigation_adapter",
                 parameters=["/opt/rovera/config/nav2_params.yaml"],
                 output="screen",
+                respawn=True,
+                respawn_delay=1.0,
             ),
         ]
     else:

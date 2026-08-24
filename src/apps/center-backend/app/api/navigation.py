@@ -45,8 +45,8 @@ PLAN_FAILURE_MESSAGES = {
     "TF_ERROR": "Không thể xác định vị trí robot trên bản đồ để lập đường.",
     "COSTMAP_NOT_READY": "Costmap chưa sẵn sàng; vui lòng thử lại sau khi dữ liệu LiDAR được cập nhật.",
     "ROUTE_CLEARANCE_INSUFFICIENT": (
-        "Không có lộ trình đủ rộng: hệ thống yêu cầu tối thiểu 7 cm "
-        "mỗi bên xe. Hãy chọn điểm khác hoặc cập nhật lại bản đồ."
+        "Không có lộ trình vượt hard safety margin của footprint thật, "
+        "độ bất định localization và độ phân giải bản đồ."
     ),
 }
 
@@ -431,16 +431,30 @@ async def set_initial_pose(
     body: InitialPoseRequest,
     user_id: str = Depends(current_user),
     database: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ) -> dict:
     _valid_lease(body.robot_id, body.session_id, user_id)
-    if _active_version(database, body.map_id, body.version) is None:
+    version = _active_version(database, body.map_id, body.version)
+    if version is None:
         raise HTTPException(status_code=409, detail="Map/version chưa ACTIVE")
-    raise HTTPException(
-        status_code=409,
-        detail=(
-            "Không dùng điểm bấm làm vị trí robot. "
-            "Hãy chạy định vị LiDAR toàn cục trước khi tự hành."
-        ),
+    if not _goal_in_map(version, body.pose):
+        raise HTTPException(status_code=422, detail="Khu vực gợi ý nằm ngoài bản đồ")
+    return await _command(
+        database,
+        settings,
+        request_id=body.request_id,
+        robot_id=body.robot_id,
+        command_type="map.set_initial_pose",
+        expected_state=body.expected_state,
+        payload={
+            "map_id": body.map_id,
+            "version": body.version,
+            # This endpoint conveys only a broad search center. The edge also
+            # discards yaw and cannot become READY without strict LiDAR and
+            # particle-cloud uniqueness verification.
+            "pose": {"x": body.pose.x, "y": body.pose.y, "yaw": 0.0},
+        },
+        timeout_seconds=settings.mapping_command_timeout_seconds,
     )
 
 
@@ -496,11 +510,13 @@ async def navigation_health(
             "localized": bool(health.get("localized")),
             "localizationState": health.get("localization_state", "IDLE"),
             "localizationConfidence": float(health.get("localization_confidence", 0)),
+            "localizationDiagnostics": health.get("localization_diagnostics", {}),
             "nav2Healthy": health.get("nav2") == "READY",
             "corridor": health.get("corridor"),
             "routeCandidates": health.get("route_candidates", []),
             "selectedRouteId": health.get("selected_route_id"),
             "manualHandoffReason": health.get("manual_handoff_reason"),
+            "trajectory": health.get("trajectory", []),
         } if mode == "NAVIGATION" else None,
         "mapRegistry": health.get("map_registry", {"localCount": 0, "pendingSync": 0}),
     }

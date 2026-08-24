@@ -41,13 +41,37 @@ describe("Control saved-map architecture", () => {
     const controlPad = readFileSync(resolve("src/components/ControlPad.tsx"), "utf8");
     const api = readFileSync(resolve("src/api/client.ts"), "utf8");
 
+    const streamSettings = dashboard.slice(
+      dashboard.indexOf('id="stream-settings-panel"'),
+      dashboard.indexOf('id="camera-ptz-panel"'),
+    );
+    const visibleControlRail = dashboard.slice(
+      dashboard.indexOf('<aside className="control-rail">'),
+      dashboard.indexOf('<div className="operation-panel">'),
+    );
+    expect(streamSettings).toContain("<ControlSettings");
+    expect(visibleControlRail).toContain("<ControlPad");
+    expect(visibleControlRail).not.toContain("<ControlSettings");
+    expect(dashboard).toContain('aria-controls="stream-settings-panel"');
     expect(controlPad).toContain("Tốc độ thủ công");
     expect(controlPad).toContain("Tốc độ tự động");
+    expect(controlPad).not.toContain("drive-speed-stack");
+    expect(controlPad).not.toContain("manual-obstacle-toggle");
     for (const mode of ["SLOW", "NORMAL", "FAST"]) {
       expect(controlPad).toContain(`value: "${mode}"`);
     }
     expect(dashboard).toContain("setAutoNavigationSpeedMode");
     expect(api).toContain('"/api/navigation/speed-mode"');
+  });
+
+  it("reserves less height for manual control so the route map can expand", () => {
+    const styles = readFileSync(resolve("src/styles.css"), "utf8");
+
+    expect(styles).toContain(
+      "grid-template-rows: clamp(220px, 38%, 248px) minmax(240px, 1fr)",
+    );
+    expect(styles).not.toContain("grid-template-rows: minmax(330px, .86fr)");
+    expect(styles).not.toContain("grid-template-rows: minmax(410px, .9fr)");
   });
 
   it("never starts a blocked or empty planned mission", () => {
@@ -58,7 +82,7 @@ describe("Control saved-map architecture", () => {
     expect(dashboard).toContain("Chưa có lộ trình an toàn để bắt đầu");
   });
 
-  it("reuses a live READY pose and localizes only when Auto Go has no pose", () => {
+  it("reuses READY pose and keeps approximate hints separate from Auto Go", () => {
     const dashboard = readFileSync(resolve("src/pages/DashboardPage.tsx"), "utf8");
     const sendGoal = dashboard.split("const sendGoal = useMutation({", 2)[1]
       .split("const missionAction = useMutation({", 1)[0];
@@ -76,7 +100,10 @@ describe("Control saved-map architecture", () => {
     expect(dashboard).toContain("allow_rotation: allowRotation");
     expect(dashboard).toContain("allowRotation = false");
     expect(sendGoal).toContain("preparedRoute = null");
-    expect(dashboard).not.toContain("setApproximatePose");
+    expect(dashboard).toContain("api.setApproximatePose({");
+    expect(dashboard).toContain("approximateHintAllowed={approximateHintAllowed}");
+    expect(dashboard).toContain("onApproximateHint={(point) => approximatePose.mutate(point)}");
+    expect(sendGoal).not.toContain("setApproximatePose");
     const relocalize = dashboard.split("const relocalize = useMutation({", 2)[1]
       .split("useEffect(() => {", 1)[0];
     expect(relocalize).not.toContain("setSelectedDestination(null)");

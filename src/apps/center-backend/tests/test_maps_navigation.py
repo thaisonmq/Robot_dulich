@@ -3,6 +3,7 @@ import io
 import json
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -18,6 +19,7 @@ from app.api import maps as maps_api
 from app.api import navigation as navigation_api
 from app.core.config import Settings
 from app.api.navigation import (
+    InitialPoseRequest,
     RelocalizeRequest,
     _mission_start_rejection,
     _normalized_route_candidates,
@@ -173,6 +175,50 @@ async def test_relocalize_allows_bounded_ros_mode_switch(monkeypatch) -> None:
     assert captured["timeout_seconds"] == 73.0
 
 
+@pytest.mark.asyncio
+async def test_approximate_pose_is_forwarded_as_search_center_without_yaw(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_command(database, settings, **kwargs):
+        del database, settings
+        captured.update(kwargs)
+        return {"status": "accepted", "current_state": "LOCALIZING_APPROXIMATE_POSE"}
+
+    monkeypatch.setattr(navigation_api, "_valid_lease", lambda *args: None)
+    monkeypatch.setattr(
+        navigation_api,
+        "_active_version",
+        lambda *args: SimpleNamespace(
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            width=100,
+            height=100,
+            resolution=0.05,
+        ),
+    )
+    monkeypatch.setattr(navigation_api, "_command", fake_command)
+    request = InitialPoseRequest(
+        request_id="request-approximate-search-hint",
+        robot_id="ROBOT-001",
+        session_id="session-approximate-search-hint",
+        expected_state="AMBIGUOUS",
+        map_id="MAP-001",
+        version=1,
+        pose={"x": 2.0, "y": 3.0, "yaw": 2.4},
+    )
+
+    result = await navigation_api.set_initial_pose(
+        request,
+        user_id="operator-1",
+        database=object(),
+        settings=Settings(mapping_command_timeout_seconds=73.0),
+    )
+
+    assert result["status"] == "accepted"
+    assert captured["command_type"] == "map.set_initial_pose"
+    assert captured["payload"]["pose"] == {"x": 2.0, "y": 3.0, "yaw": 0.0}
+    assert captured["timeout_seconds"] == 73.0
+
+
 def test_plan_failed_or_empty_navigation_mission_cannot_start() -> None:
     blocked = NavigationMission(
         mission_id="mission-blocked-route",
@@ -245,7 +291,7 @@ def test_plan_failure_messages_distinguish_unknown_and_blocked_start() -> None:
     mission.error_code = "ROUTE_CLEARANCE_INSUFFICIENT"
     rejection = _mission_start_rejection(mission)
     assert rejection is not None
-    assert "tối thiểu 7 cm mỗi bên" in rejection["message"]
+    assert "hard safety margin" in rejection["message"]
 
 
 def bundle_bytes(*, unsafe: bool = False) -> bytes:

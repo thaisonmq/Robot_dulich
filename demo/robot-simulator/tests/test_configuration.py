@@ -21,6 +21,7 @@ def test_pose_persistence_requires_sustained_independent_localization_evidence()
     state = {
         "localized": True,
         "localization_state": "READY",
+        "localization_verification_version": 2,
         "localization_diagnostics": {
             "scan_map_score": 0.55,
             "scan_map_threshold": 0.35,
@@ -31,6 +32,9 @@ def test_pose_persistence_requires_sustained_independent_localization_evidence()
     }
 
     assert localization_pose_safe_to_persist(state)
+    state["localization_verification_version"] = 1
+    assert not localization_pose_safe_to_persist(state)
+    state["localization_verification_version"] = 2
     state["localization_diagnostics"]["ready_evidence_hold_ms"] = 29_999
     assert not localization_pose_safe_to_persist(state)
     state["localization_diagnostics"]["ready_evidence_hold_ms"] = 30_001

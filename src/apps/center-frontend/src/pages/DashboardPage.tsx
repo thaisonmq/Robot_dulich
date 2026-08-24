@@ -8,9 +8,10 @@ import {
 } from "lucide-react";
 import { api } from "../api/client";
 import { Brand } from "../components/Brand";
-import { ControlPad } from "../components/ControlPad";
+import { ControlPad, ControlSettings } from "../components/ControlPad";
 import { GlobalLanguageSelect } from "../components/GlobalLanguageSelect";
 import { MapPanel } from "../components/MapPanel";
+import { authoritativeRouteId } from "../utils/routeSelection";
 import { MappingControlPanel } from "../components/MappingControlPanel";
 import { getLanguage } from "../data/languages";
 import { useTeleoperation } from "../hooks/useTeleoperation";
@@ -33,7 +34,7 @@ type PoseVerificationState = "required" | "requesting" | "localizing" | "confirm
 const LOCALIZATION_IN_PROGRESS_STATES = new Set([
   "LOCALIZATION_INITIALIZING", "LOCALIZING", "LOCALIZING_LAST_POSE",
   "LOCALIZING_APPROXIMATE_POSE", "LOCALIZING_GLOBAL", "LOCALIZING_ROTATING",
-  "LOCALIZING_SETTLING",
+  "LOCALIZING_SETTLING", "PASSIVE_LOCALIZING", "CANDIDATE",
   "LOW_CONFIDENCE", "LOCALIZATION_LOST", "VERIFYING", "SENSOR_TIME_INVALID",
 ]);
 
@@ -79,8 +80,15 @@ async function waitForLocalizationReady(mapId: string, mapVersion: number): Prom
     if (runtime.connectionState !== "connected") {
       throw new Error("Mất kết nối trong khi xác định vị trí robot.");
     }
-    if (Date.now() - started >= 1_000 && state === "LOCALIZATION_FAILED") {
-      throw new Error("Không thể tự xác định chính xác vị trí robot.");
+    if (
+      Date.now() - started >= 1_000
+      && ["LOCALIZATION_FAILED", "AMBIGUOUS"].includes(state)
+    ) {
+      throw new Error(
+        state === "AMBIGUOUS"
+          ? "Vị trí robot còn mơ hồ; hãy chỉ khu vực gần đúng hoặc quét lại khi an toàn."
+          : "Không thể tự xác định chính xác vị trí robot.",
+      );
     }
     await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
   }
@@ -629,6 +637,33 @@ export function DashboardPage() {
     },
     onSettled: () => { navigationRequestInFlightRef.current = false; },
   });
+  const approximatePose = useMutation({
+    mutationFn: (point: { x: number; y: number }) => api.setApproximatePose({
+      request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
+      expected_state: mapState, map_id: map!.map_id, version: map!.active_version!,
+      pose: { x: point.x, y: point.y, yaw: 0 },
+    }),
+    onMutate: () => {
+      navigationRequestInFlightRef.current = true;
+      setNavigationError("");
+      setMapLocalized(false);
+      setRoute(null);
+      setRouteCandidates([]);
+      setSelectedRouteId("");
+      updatePoseVerification("localizing");
+      setNavigationState("localizing");
+    },
+    onSuccess: (result) => {
+      setMapState(String(result.current_state ?? "LOCALIZING_APPROXIMATE_POSE").toUpperCase());
+      setMapLocalized(false);
+      setNavigationNotice(t("Đã gửi khu vực gần đúng. LiDAR đang xác minh vị trí thực của robot."));
+    },
+    onError: (reason) => {
+      updatePoseVerification("failed");
+      setNavigationError(reason instanceof Error ? reason.message : t("Không thể gửi khu vực gần đúng"));
+    },
+    onSettled: () => { navigationRequestInFlightRef.current = false; },
+  });
   useEffect(() => {
     if (
       isSpectator || !session || connectionState !== "connected" || sessionEndedReason
@@ -662,7 +697,7 @@ export function DashboardPage() {
     }
     if (![
       "READY", "SUCCEEDED", "ARRIVED", "CANCELED", "CANCELLED", "FAILED",
-      "BLOCKED", "LOCALIZATION_FAILED", "LOCALIZATION_REQUIRED",
+      "BLOCKED", "LOCALIZATION_FAILED", "LOCALIZATION_REQUIRED", "AMBIGUOUS",
     ].includes(runtimeState)) return;
     // Adopt runtime localization state only. Opening a Control session must
     // never authorize global localization or publish angular velocity.
@@ -722,7 +757,7 @@ export function DashboardPage() {
         const startedRoute = await api.startNavigation({
           request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
           expected_state: "READY", mission_id: preparedRoute.mission_id,
-          route_id: selectedRouteId || preparedRoute.selected_route_id || preparedRoute.route_id,
+          route_id: authoritativeRouteId(preparedRoute, route, selectedRouteId),
         });
         return startedRoute;
       }
@@ -818,11 +853,20 @@ export function DashboardPage() {
     "READY", "SUCCEEDED", "ARRIVED", "CANCELED", "CANCELLED", "FAILED", "BLOCKED",
   ].includes(mapState);
   const reportedLocalizationState = String(health.localization_state ?? mapState).toUpperCase();
-  const displayedLocalizationState = !isSpectator && poseVerificationState === "failed"
+  const displayedLocalizationState = reportedLocalizationState === "AMBIGUOUS"
+    ? "AMBIGUOUS"
+    : !isSpectator && poseVerificationState === "failed"
     ? "LOCALIZATION_FAILED"
     : !poseVerified && reportedLocalizationState === "READY"
       ? "LOCALIZING"
       : reportedLocalizationState;
+  const approximateHintAllowed = Boolean(
+    health.localization_diagnostics?.approximate_hint_allowed,
+  );
+  const manualControlDisabled = controlState === "disabled" || controlState === "robot_offline";
+  const autoSpeedControlDisabled = Boolean(
+    operationMode !== "navigation" || changeAutoSpeed.isPending || manualControlDisabled,
+  );
 
   function stopPtz() {
     if (ptzRepeatRef.current !== null) {
@@ -1194,6 +1238,29 @@ export function DashboardPage() {
 
               <div className="stream-settings__divider" />
 
+              <header className="conversation-dock__header stream-settings__header">
+                <span className="conversation-dock__identity">
+                  <Gauge size={18} />
+                  <span>
+                    <small>{t("Điều khiển")}</small>
+                    <strong>{t("Tốc độ thủ công")} · {t("Tốc độ tự động")} · {t("Chống vật cản")}</strong>
+                  </span>
+                </span>
+              </header>
+
+              <ControlSettings
+                disabled={manualControlDisabled}
+                speedLevel={speedLevel}
+                onSpeedLevelChange={setSpeedLevel}
+                autoSpeedMode={autoSpeedMode}
+                autoSpeedDisabled={autoSpeedControlDisabled}
+                onAutoSpeedModeChange={(mode) => changeAutoSpeed.mutate(mode)}
+                obstacleAvoidanceEnabled={obstacleAvoidanceEnabled}
+                onObstacleAvoidanceEnabledChange={setObstacleAvoidanceEnabled}
+              />
+
+              <div className="stream-settings__divider" />
+
               <header className="conversation-dock__header">
                 <span className="conversation-dock__identity">
                   <MessageCircleMore size={18} />
@@ -1438,19 +1505,7 @@ export function DashboardPage() {
                   <ControlPad
                     adapter={screen}
                     input={inputState}
-                    disabled={controlState === "disabled" || controlState === "robot_offline"}
-                    speedLevel={speedLevel}
-                    onSpeedLevelChange={setSpeedLevel}
-                    autoSpeedMode={autoSpeedMode}
-                    autoSpeedDisabled={Boolean(
-                      operationMode !== "navigation"
-                      || changeAutoSpeed.isPending
-                      || controlState === "disabled"
-                      || controlState === "robot_offline"
-                    )}
-                    onAutoSpeedModeChange={(mode) => changeAutoSpeed.mutate(mode)}
-                    obstacleAvoidanceEnabled={obstacleAvoidanceEnabled}
-                    onObstacleAvoidanceEnabledChange={setObstacleAvoidanceEnabled}
+                    disabled={manualControlDisabled}
                   />
                   <div className="command-readout">
                     <span className="command-readout__icon"><Speaker size={20} /></span>
@@ -1484,7 +1539,7 @@ export function DashboardPage() {
                 routeCandidates={routeCandidates}
                 selectedRouteId={selectedRouteId}
                 selected={selectedDestination}
-                loading={preview.isPending || loadMap.isPending || relocalize.isPending || sendGoal.isPending || missionAction.isPending}
+                loading={preview.isPending || loadMap.isPending || relocalize.isPending || approximatePose.isPending || sendGoal.isPending || missionAction.isPending}
                 navigationStatus={navigationState}
                 mapState={mapState}
                 localizationState={displayedLocalizationState}
@@ -1505,6 +1560,7 @@ export function DashboardPage() {
                 noticeMessage={navigationNotice}
                 mapActivationError={mapActivationError}
                 localized={poseVerified}
+                approximateHintAllowed={approximateHintAllowed}
                 readOnly={isSpectator}
                 onMapChange={(mapId) => {
                   if (navigationRequestInFlightRef.current) return;
@@ -1530,6 +1586,7 @@ export function DashboardPage() {
                   allowRotation: true,
                   forceGlobal: true,
                 })}
+                onApproximateHint={(point) => approximatePose.mutate(point)}
                 onGo={() => sendGoal.mutate()}
                 onPause={() => {
                   if (route?.mission_id) missionAction.mutate({ action: "pause" });

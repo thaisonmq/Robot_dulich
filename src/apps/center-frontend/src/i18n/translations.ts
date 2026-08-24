@@ -193,6 +193,7 @@ const ENGLISH: Record<string, string> = {
   "Chọn nơi muốn đến": "Choose a destination",
   "{distance} m · khoảng {seconds} giây": "{distance} m · about {seconds} seconds",
   "Đang tính tuyến đường an toàn…": "Calculating a safe route…",
+  "Đang kiểm tra độ rộng, vật cản và quỹ đạo của robot.": "Checking route width, obstacles, and the robot trajectory.",
   "Sẵn sàng xem trước tuyến đường.": "Route preview is ready.",
   "Chọn một điểm trên bản đồ. Trung tâm sẽ kiểm tra và trả về tuyến phù hợp.": "Choose a point on the map. The center will check and return a suitable route.",
   "Điểm cần đến": "Destination",

@@ -18,6 +18,111 @@ from simulator.navigation_backends import (
 
 
 @pytest.mark.asyncio
+async def test_ros2_backend_raises_unix_reader_limit_for_diagnostic_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, int] = {}
+
+    class Reader:
+        async def readline(self) -> bytes:
+            return b'{"status":"completed","state":{"state":"READY"}}\n'
+
+    class Writer:
+        def write(self, _: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            pass
+
+    async def open_connection(_: str, *, limit: int):
+        captured["limit"] = limit
+        return Reader(), Writer()
+
+    monkeypatch.setattr(asyncio, "open_unix_connection", open_connection)
+    backend = Ros2NavigationBackend("/tmp/navigation-test.sock")
+
+    result = await backend._call_adapter("system.status", {}, 1.0)
+
+    assert result["state"]["state"] == "READY"
+    assert captured["limit"] == 262_144
+
+
+def test_navigation_trajectory_is_sampled_below_websocket_budget() -> None:
+    from simulator.client import bounded_navigation_trajectory
+
+    trajectory = [
+        {
+            "timestamp": 1_787_392_000.0 + index,
+            "odom_x": index / 10,
+            "odom_y": index / 20,
+            "odom_yaw": index / 100,
+            "x": index / 8,
+            "y": index / 9,
+            "yaw": index / 100,
+            "quality": "TRUSTED",
+            "map_id": "76de0da3-8bc5-4208-9a1d-e6864f11d0f8",
+            "map_version": 1,
+        }
+        for index in range(200)
+    ]
+
+    sampled = bounded_navigation_trajectory(trajectory)
+    message = json.dumps({"message_type": "navigation.status", "trajectory": sampled})
+
+    assert len(sampled) == 40
+    assert sampled[0] == trajectory[0]
+    assert sampled[-1] == trajectory[-1]
+    assert len(message.encode()) < 65_536
+
+
+def test_navigation_command_ack_bounds_nested_state_trajectory() -> None:
+    from simulator.client import bounded_navigation_command_details
+
+    trajectory = [
+        {
+            "timestamp": 1_787_392_000.0 + index,
+            "odom_x": index / 10,
+            "odom_y": index / 20,
+            "odom_yaw": index / 100,
+            "x": index / 8,
+            "y": index / 9,
+            "yaw": index / 100,
+            "quality": "TRUSTED",
+            "map_id": "76de0da3-8bc5-4208-9a1d-e6864f11d0f8",
+            "map_version": 1,
+        }
+        for index in range(200)
+    ]
+    details = {
+        "status": "completed",
+        "points": [{"x": index, "y": index / 2} for index in range(5)],
+        "route_candidates": [
+            {
+                "route_id": "stop-turn-example",
+                "points": [{"x": index, "y": index / 2} for index in range(5)],
+                "segment_directions": [1, 1, 1, 1],
+            }
+        ],
+        "state": {"state": "READY", "trajectory": trajectory},
+    }
+
+    bounded = bounded_navigation_command_details(details)
+    message = json.dumps({"message_type": "command.ack", "payload": bounded})
+
+    assert len(bounded["state"]["trajectory"]) == 40
+    assert bounded["state"]["trajectory"][0] == trajectory[0]
+    assert bounded["state"]["trajectory"][-1] == trajectory[-1]
+    assert len(details["state"]["trajectory"]) == 200
+    assert len(message.encode()) < 65_536
+
+
+@pytest.mark.asyncio
 async def test_simulator_backend_uses_same_compute_start_pause_cancel_flow() -> None:
     motion = MotionSimulator(SimulatorConfig())
     navigation = NavigationSimulator(motion)

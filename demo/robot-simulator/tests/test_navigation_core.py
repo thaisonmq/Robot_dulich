@@ -15,6 +15,7 @@ import navigation_core  # noqa: E402
 from navigation_core import (  # noqa: E402
     ActiveSegment,
     DynamicObstacleOverlay,
+    LocalizationEvidenceFrame,
     MapNavigationGeometry,
     NavigationDebugLog,
     RouteMetadata,
@@ -24,6 +25,7 @@ from navigation_core import (  # noqa: E402
     StopTurnRoute,
     TurnBlockTracker,
     UnwrappedYawProgress,
+    bounded_heading_evidence,
     canonicalize_stop_turn_path,
     choose_turn_direction,
     classify_planning_failure,
@@ -32,19 +34,26 @@ from navigation_core import (  # noqa: E402
     densify_straight_segment,
     dynamic_block_requires_alternative,
     dynamic_exclusions_intersect_route,
+    dynamic_trajectory_conflict_ttc,
     endpoint_braking_speed_limit,
     evaluate_corridor,
     exact_euclidean_distance_transform,
     execution_pose_continuity,
     filter_static_map_scan,
     find_start_escape,
+    global_scan_candidate_uniqueness,
+    global_scan_alternative_is_competitive,
     heading_diversity,
     heading_position_spread,
+    image_grayscale_values,
     deskew_scan_points,
     localization_confidence,
+    localization_evidence_consensus,
     localization_verification,
     mask_scan_self_returns,
+    normalize_trinary_unknown_metadata,
     path_overlap_ratio,
+    particle_cloud_uniqueness,
     position_within_tolerance,
     preferred_turn_bay_directions,
     post_turn_reanchor_requires_turn,
@@ -56,6 +65,7 @@ from navigation_core import (  # noqa: E402
     segment_travel_watchdog,
     straight_heading_lock,
     straight_segment_progress,
+    turn_braking_speed_limit,
     turn_hysteresis_transition,
     validate_executable_grid_path,
     validate_rotation_sweep,
@@ -80,6 +90,34 @@ def _saved_map(tmp_path: Path) -> SavedOccupancyMap:
         "negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\nmode: trinary\n"
     )
     return SavedOccupancyMap.load(tmp_path / "map.yaml")
+
+
+def test_trinary_gray_205_remains_unknown_with_unsafe_slam_threshold(
+    tmp_path: Path,
+) -> None:
+    image = Image.new("L", (3, 1), 254)
+    image.putpixel((1, 0), 205)
+    image.putpixel((2, 0), 0)
+    image.save(tmp_path / "map.pgm")
+    metadata = {
+        "image": "map.pgm",
+        "resolution": 0.05,
+        "origin": [0, 0, 0],
+        "negate": 0,
+        "occupied_thresh": 0.65,
+        "free_thresh": 0.25,
+        "mode": "trinary",
+    }
+    (tmp_path / "map.yaml").write_text(yaml.safe_dump(metadata))
+
+    normalized, changed = normalize_trinary_unknown_metadata(
+        metadata, image_grayscale_values(image)
+    )
+    saved = SavedOccupancyMap.load(tmp_path / "map.yaml")
+
+    assert changed
+    assert normalized["free_thresh"] == pytest.approx(0.196)
+    assert saved.occupancy == [0, -1, 100]
 
 
 def _verification_result(**overrides: object):
@@ -684,6 +722,220 @@ def test_localization_confidence_rejects_stable_wrong_pose_and_bad_clock() -> No
     ) == 0
 
 
+def _localization_frame(
+    index: int,
+    *,
+    good: bool = True,
+    x: float = 1.0,
+    dynamic_occlusions: int = 4,
+) -> LocalizationEvidenceFrame:
+    return LocalizationEvidenceFrame(
+        timestamp=float(index),
+        pose_x=x,
+        pose_y=2.0,
+        pose_yaw=0.2,
+        scan_score=0.84 if good else 0.18,
+        valid_beams=80,
+        residual_beams=60 if good else 8,
+        median_residual=0.035 if good else 0.30,
+        p90_residual=0.075 if good else 0.50,
+        mean_residual=0.045 if good else 0.35,
+        raycast_comparable_beams=60,
+        raycast_static_matches=32 if good else 3,
+        raycast_dynamic_occlusions=dynamic_occlusions,
+        raycast_map_contradictions=3 if good else 35,
+        raycast_inconclusive_map_hits=2,
+        raycast_static_match_ratio=0.53 if good else 0.05,
+        raycast_dynamic_occlusion_ratio=dynamic_occlusions / 60.0,
+        raycast_contradiction_ratio=0.05 if good else 0.58,
+        raycast_median_error=0.03 if good else 0.30,
+        raycast_p90_error=0.07 if good else 0.50,
+    )
+
+
+def _localization_consensus(frames: list[LocalizationEvidenceFrame]):
+    return localization_evidence_consensus(
+        frames,
+        window_size=7,
+        required_frames=5,
+        candidate_position_tolerance=0.10,
+        candidate_yaw_tolerance=math.radians(10),
+        minimum_scan_beams=25,
+        required_scan_score=0.70,
+        minimum_residual_beams=20,
+        maximum_median_residual=0.075,
+        maximum_p90_residual=0.115,
+        minimum_raycast_beams=25,
+        minimum_raycast_static_matches=20,
+        maximum_raycast_contradiction_ratio=0.20,
+    )
+
+
+def test_localization_k_of_n_survives_two_transient_bad_scans_including_latest() -> None:
+    frames = [_localization_frame(index) for index in range(5)]
+    frames.extend([
+        _localization_frame(5, good=False),
+        _localization_frame(6, good=False),
+    ])
+
+    consensus = _localization_consensus(frames)
+
+    assert consensus.accepted
+    assert consensus.agreeing_frames == 5
+    assert consensus.scan_score == pytest.approx(0.84)
+
+
+def test_localization_accepts_dynamic_occlusion_only_with_static_structure() -> None:
+    frames = [
+        _localization_frame(index, dynamic_occlusions=25)
+        for index in range(7)
+    ]
+
+    consensus = _localization_consensus(frames)
+
+    assert consensus.accepted
+    assert consensus.raycast_static_matches == 32
+    assert consensus.raycast_dynamic_occlusions == 25
+
+
+def test_localization_rejects_persistent_contradiction_and_pose_alias_split() -> None:
+    contradictory = [
+        *[_localization_frame(index) for index in range(4)],
+        *[_localization_frame(index, good=False) for index in range(4, 7)],
+    ]
+    aliases = [
+        *[_localization_frame(index, x=1.0) for index in range(4)],
+        *[_localization_frame(index, x=2.0) for index in range(4, 7)],
+    ]
+
+    assert _localization_consensus(contradictory).reason == "CONSENSUS_K_OF_N_FAILED"
+    assert _localization_consensus(aliases).reason == "CANDIDATE_POSE_CONSENSUS_FAILED"
+
+
+def test_particle_cloud_requires_one_dominant_spatial_hypothesis() -> None:
+    unique = particle_cloud_uniqueness(
+        [(1.0, 1.0, 0.35), (1.05, 1.02, 0.35), (3.0, 1.0, 0.30)],
+        cluster_radius=0.30,
+        alternative_separation=0.75,
+        minimum_best_weight=0.55,
+        minimum_dominance_ratio=2.0,
+    )
+    ambiguous = particle_cloud_uniqueness(
+        [(1.0, 1.0, 0.52), (3.0, 1.0, 0.48)],
+        cluster_radius=0.30,
+        alternative_separation=0.75,
+        minimum_best_weight=0.55,
+        minimum_dominance_ratio=2.0,
+    )
+
+    assert unique.accepted
+    assert unique.dominance_ratio > 2.0
+    assert not ambiguous.accepted
+    assert ambiguous.reason == "BEST_PARTICLE_CLUSTER_TOO_WEAK"
+
+
+def test_independent_global_scan_rejects_collapsed_amcl_alias() -> None:
+    width, height = 180, 100
+    occupancy = [-1] * (width * height)
+
+    def add_room(left: int, right: int) -> None:
+        for row in range(10, 91):
+            for column in range(left, right + 1):
+                occupancy[row * width + column] = 0
+        for column in range(left, right + 1):
+            occupancy[10 * width + column] = 100
+            occupancy[90 * width + column] = 100
+        for row in range(10, 91):
+            occupancy[row * width + left] = 100
+            occupancy[row * width + right] = 100
+
+    add_room(10, 70)
+    add_room(100, 160)
+    saved = SavedOccupancyMap(width, height, 0.1, 0.0, 0.0, 0.0, occupancy)
+    angle_min = -math.pi
+    angle_increment = 2.0 * math.pi / 72
+    source_pose = (4.05, 5.05, 0.0)
+    ranges = [
+        saved.raycast_static_range(
+            source_pose[0],
+            source_pose[1],
+            source_pose[2] + angle_min + index * angle_increment,
+            minimum_range=0.1,
+            maximum_range=8.0,
+        )
+        for index in range(72)
+    ]
+    assert all(distance is not None for distance in ranges)
+
+    result = global_scan_candidate_uniqueness(
+        saved,
+        [float(distance) for distance in ranges if distance is not None],
+        angle_min=angle_min,
+        angle_increment=angle_increment,
+        range_min=0.1,
+        range_max=8.0,
+        candidate_pose=source_pose,
+        position_step=0.2,
+        heading_step=math.radians(15.0),
+        alternative_separation=1.5,
+        minimum_best_score=0.65,
+        minimum_score_margin=0.12,
+        minimum_score_ratio=1.15,
+    )
+
+    assert not result.accepted
+    assert result.reason == "GLOBAL_SCAN_ALTERNATIVE_COMPETITIVE"
+    assert result.best_score == pytest.approx(result.alternative_score)
+    assert math.hypot(
+        float(result.best_x) - float(result.alternative_x),
+        float(result.best_y) - float(result.alternative_y),
+    ) >= 1.5
+
+
+def test_global_scan_modes_accept_either_absolute_or_relative_separation() -> None:
+    assert not global_scan_alternative_is_competitive(
+        0.5133,
+        0.4394,
+        minimum_margin=0.12,
+        minimum_ratio=1.15,
+    )
+    assert not global_scan_alternative_is_competitive(
+        0.80,
+        0.67,
+        minimum_margin=0.12,
+        minimum_ratio=1.25,
+    )
+    assert global_scan_alternative_is_competitive(
+        0.50,
+        0.47,
+        minimum_margin=0.12,
+        minimum_ratio=1.15,
+    )
+
+
+def test_independent_global_scan_accepts_one_unique_room_center() -> None:
+    saved, laser_x, laser_y, increment, ranges = _boxed_raycast_fixture(72)
+    result = global_scan_candidate_uniqueness(
+        saved,
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=increment,
+        range_min=0.1,
+        range_max=8.0,
+        candidate_pose=(laser_x, laser_y, 0.0),
+        position_step=0.2,
+        heading_step=math.radians(15.0),
+        alternative_separation=1.5,
+        minimum_best_score=0.65,
+        minimum_score_margin=0.10,
+        minimum_score_ratio=1.10,
+    )
+
+    assert result.accepted, result
+    assert result.reason == "ACCEPTED"
+    assert result.candidate_position_error <= 0.45
+
+
 def test_execution_pose_continuity_accepts_the_same_motion_in_map_and_odom() -> None:
     local_x, local_y = 0.10, 0.02
 
@@ -1171,6 +1423,34 @@ def test_force_rescan_heading_bins_progress_during_rotation() -> None:
     assert observed_counts[0] == 1
     assert observed_counts == sorted(observed_counts)
     assert observed_counts[-1] >= 5
+
+
+def test_heading_evidence_is_bounded_by_angular_bins() -> None:
+    evidence: list[float] = []
+    for index in range(10_000):
+        evidence = bounded_heading_evidence(
+            evidence,
+            math.radians((index % 360) + 0.1),
+            bin_count=8,
+        )
+
+    observed = heading_diversity(evidence, bin_count=8)
+
+    assert len(evidence) == 8
+    assert observed.observed_bins == tuple(range(8))
+    assert math.degrees(observed.span_radians) >= 170
+
+
+def test_heading_diversity_keeps_exact_wraparound_span_for_large_input() -> None:
+    headings = [
+        math.radians(value)
+        for _ in range(1_000)
+        for value in (350, 5, 170)
+    ]
+
+    observed = heading_diversity(headings, bin_count=8)
+
+    assert math.degrees(observed.span_radians) == pytest.approx(180)
 
 
 def test_repeated_layout_candidate_must_stay_consistent_across_headings() -> None:
@@ -2114,7 +2394,7 @@ def test_actual_project_map_rejects_direct_line_and_finds_exact_detour() -> None
     ).valid
 
 
-def test_actual_project_map_prefers_small_detour_with_more_side_clearance() -> None:
+def test_actual_project_map_never_routes_through_preserved_unknown_space() -> None:
     project = Path(__file__).parents[3]
     saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
     start = {"x": -3.265, "y": 4.415, "yaw": 0.0}
@@ -2125,30 +2405,13 @@ def test_actual_project_map_prefers_small_detour_with_more_side_clearance() -> N
         half_length=0.15,
         half_width=0.10,
     )
-    direct_metadata = route_geometry_metadata(
-        saved,
-        saved.navigation_geometry,
-        (start, goal),
-        half_length=0.15,
-        half_width=0.10,
-        start_yaw=0.0,
-    )
-
     route = StopTurnStateLatticePlanner(
         saved, saved.navigation_geometry
     ).plan(start, goal)
 
-    assert direct.valid
-    assert route is not None
-    assert len(route.points) > 2
-    assert route.points[0] == {"x": start["x"], "y": start["y"]}
-    assert route.points[-1] == goal
-    assert direct_metadata.minimum_side_clearance < 0.05
-    assert route.metadata.minimum_side_clearance >= 0.05
-    assert route.metadata.minimum_side_clearance > (
-        direct_metadata.minimum_side_clearance
-    )
-    assert route.metadata.total_length < direct_metadata.total_length + 0.10
+    assert not direct.valid
+    assert direct.code == "PATH_UNKNOWN_COLLISION"
+    assert route is None
 
 
 def test_actual_runtime_start_overlap_is_classified_and_escapes_forward() -> None:
@@ -2243,6 +2506,38 @@ def test_actual_runtime_pose_prefers_goal_aligned_turn_bay_direction() -> None:
             half_width=0.10,
             segment_directions=result.route.segment_directions,
         ).valid
+
+
+def test_near_wall_runtime_start_does_not_apply_translation_margin_to_turn() -> None:
+    """Regression for the post-arrival 12-second search-budget failure."""
+    project = Path(__file__).parents[3]
+    saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        turn_bay_max_distance=0.80,
+        hard_side_margin=0.02,
+        preferred_side_margin=0.07,
+    )
+    start = {
+        "x": 1.9242407874035217,
+        "y": 1.10615200144539,
+        "yaw": -1.1734686632699747,
+    }
+    goal = {"x": -1.069591836734694, "y": 1.9012244897959194}
+
+    result = planner.plan_result(
+        start,
+        goal,
+        planning_time_budget=3.0,
+        allow_start_escape=True,
+    )
+
+    assert result.success
+    assert result.status != "SEARCH_TIME_BUDGET_EXCEEDED"
+    assert result.route is not None
+    assert result.route.points[0] == {"x": start["x"], "y": start["y"]}
+    assert result.route.points[-1] == goal
 
 
 def test_turn_bay_direction_order_tracks_goal_projection() -> None:
@@ -2377,6 +2672,24 @@ def test_dynamic_overlay_clusters_points_filters_static_wall_and_expires() -> No
     assert moved[0].id == snapshot[0].id
     assert moved[0].observation_count == 2
     assert overlay.snapshot(11.3) == ()
+
+
+def test_dynamic_overlay_counts_at_most_one_observation_per_track_per_frame() -> None:
+    overlay = DynamicObstacleOverlay(
+        ttl_seconds=2.0,
+        cluster_distance=0.05,
+        association_distance=0.20,
+    )
+
+    # Separate cell clusters can both fit the association radius of the first
+    # tentative track. One costmap callback still represents only one frame.
+    first_frame = overlay.observe(((0.00, 0.00), (0.10, 0.00)), now=10.0)
+
+    assert len(first_frame) == 2
+    assert {item.observation_count for item in first_frame} == {1}
+    second_frame = overlay.observe(((0.01, 0.00), (0.11, 0.00)), now=10.2)
+    assert len(second_frame) == 2
+    assert {item.observation_count for item in second_frame} == {2}
 
 
 def test_dynamic_overlay_classifies_fixed_chair_after_confirmation_window() -> None:
@@ -2522,6 +2835,61 @@ def test_dynamic_obstacles_only_affect_the_upcoming_route_horizon() -> None:
     assert not dynamic_exclusions_intersect_route(
         route, ((3.0, 0.0, 0.20),), horizon=2.0
     )
+
+
+def test_dynamic_trajectory_conflict_requires_moving_ttc_not_static_intersection() -> None:
+    route = [{"x": 0.0, "y": 0.0}, {"x": 2.0, "y": 0.0}]
+    stationary = navigation_core.DynamicObstacle(
+        1, 0.45, 0.0, 0.05, (0.4, -0.05, 0.5, 0.05),
+        1.0, 2.0, 10, 1.0, motion_state="STATIONARY",
+    )
+    crossing = navigation_core.DynamicObstacle(
+        2, 0.45, 0.35, 0.05, (0.4, 0.3, 0.5, 0.4),
+        1.0, 2.0, 10, 1.0,
+        velocity_x=0.0, velocity_y=-0.15, speed=0.15,
+        motion_state="MOVING",
+    )
+    nearby_away = navigation_core.DynamicObstacle(
+        3, 0.45, 0.35, 0.05, (0.4, 0.3, 0.5, 0.4),
+        1.0, 2.0, 10, 1.0,
+        velocity_x=0.0, velocity_y=0.15, speed=0.15,
+        motion_state="MOVING",
+    )
+
+    assert dynamic_trajectory_conflict_ttc(
+        route, stationary, robot_speed=0.17, footprint_inflation=0.12
+    ) is None
+    assert dynamic_trajectory_conflict_ttc(
+        route, crossing, robot_speed=0.17, footprint_inflation=0.12
+    ) == pytest.approx(1.8, abs=0.2)
+    assert dynamic_trajectory_conflict_ttc(
+        route, nearby_away, robot_speed=0.17, footprint_inflation=0.12
+    ) is None
+
+
+def test_turn_braking_speed_limit_reduces_before_completion_band() -> None:
+    tolerance = math.radians(3.0)
+    far = turn_braking_speed_limit(
+        math.radians(45.0),
+        completion_tolerance=tolerance,
+        angular_deceleration=2.0,
+        reaction_time=0.12,
+    )
+    near = turn_braking_speed_limit(
+        math.radians(8.0),
+        completion_tolerance=tolerance,
+        angular_deceleration=2.0,
+        reaction_time=0.12,
+    )
+
+    assert far > 0.60
+    assert 0.0 < near < 0.40
+    assert turn_braking_speed_limit(
+        math.radians(2.9),
+        completion_tolerance=tolerance,
+        angular_deceleration=2.0,
+        reaction_time=0.12,
+    ) == 0.0
 
 
 def test_controller_zero_abort_with_fresh_near_front_evidence_is_live_blockage() -> None:
@@ -2733,6 +3101,39 @@ def test_adequate_clearance_ranking_does_not_reward_many_extra_turns() -> None:
     long = route(5.4, 7, 45.0)
 
     assert planner.ranking_key(short) < planner.ranking_key(long)
+
+
+def test_equal_routes_use_dominant_map_axis_as_a_bounded_tie_breaker() -> None:
+    saved = _manual_map(20, 20, _free_rectangle(1, 18, 1, 18))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    metadata = RouteMetadata(
+        total_length=2.0,
+        minimum_passage_width=0.50,
+        minimum_static_clearance=0.25,
+        minimum_turn_clearance=0.05,
+        turn_count=0,
+        total_turn_angle=0.0,
+        initial_turn_angle=0.0,
+        internal_turn_angle=0.0,
+        final_turn_angle=0.0,
+        execution_total_turn_angle=0.0,
+        narrow_segments=(),
+        estimated_time=10.0,
+        turn_safe=True,
+        minimum_side_clearance=0.08,
+    )
+    axis = StopTurnRoute(
+        ({"x": 0.0, "y": 0.0}, {"x": 2.0, "y": 0.0}),
+        metadata,
+        (0,),
+    )
+    diagonal = StopTurnRoute(
+        ({"x": 0.0, "y": 0.0}, {"x": 2.0, "y": 0.0}),
+        metadata,
+        (3,),
+    )
+
+    assert planner.ranking_key(axis) < planner.ranking_key(diagonal)
 
 
 def test_stop_turn_planner_handles_a_true_90_degree_l_route() -> None:
@@ -3142,6 +3543,12 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert localization["localization_raycast_minimum_static_matches"] <= localization[
         "localization_raycast_minimum_comparable_beams"
     ]
+    assert 12 <= localization[
+        "localization_operator_hint_minimum_comparable_beams"
+    ] < localization["localization_raycast_minimum_comparable_beams"]
+    assert 12 <= localization[
+        "localization_operator_hint_minimum_static_matches"
+    ] <= localization["localization_operator_hint_minimum_comparable_beams"]
     assert 0 < localization[
         "localization_raycast_maximum_contradiction_ratio"
     ] <= 0.20

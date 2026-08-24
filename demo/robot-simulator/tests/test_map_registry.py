@@ -98,14 +98,18 @@ def test_new_map_activation_uses_terminal_pose_until_navigation_pose_exists(tmp_
         "source": "mapping_terminal_pose",
     }
 
-    cache.save_last_pose("MAP-NEW", 1, {"x": 2, "y": 3, "yaw": 1.5})
+    cache.save_last_pose("MAP-NEW", 1, {
+        "x": 2, "y": 3, "yaw": 1.5, "verification_version": 2,
+    })
     recent = cache.activation_pose("MAP-NEW", 1, destination)
     assert recent["x"] == 2
     assert recent["covariance"] == 0.25
     assert recent["source"] == "recent_navigation_pose"
 
 
-def test_runtime_restores_active_map_without_reusing_robot_pose(tmp_path: Path) -> None:
+def test_runtime_restores_active_map_with_recent_verified_navigation_pose(
+    tmp_path: Path,
+) -> None:
     destination = tmp_path / "MAP-A" / "v2"
     destination.mkdir(parents=True)
     (destination / "map.yaml").write_text(
@@ -113,13 +117,33 @@ def test_runtime_restores_active_map_without_reusing_robot_pose(tmp_path: Path) 
     )
     cache = RobotMapCacheManager(tmp_path, "https://center", _token)
     cache.mark_active("MAP-A", 2, "a" * 64, destination)
-    cache.save_last_pose("MAP-A", 2, {"x": 1.0, "y": -2.0, "yaw": 0.5})
+    # Legacy READY records predate independent global alias verification and
+    # must never seed AMCL as a trusted pose after an upgrade.
+    cache.save_last_pose("MAP-A", 2, {"x": 9.0, "y": 9.0, "yaw": 0.5})
+    assert "last_known_pose" not in cache.active_load_payload()
+    cache.save_last_pose("MAP-A", 2, {
+        "x": 1.0,
+        "y": -2.0,
+        "yaw": 0.5,
+        "verification_version": 2,
+    })
 
     assert cache.active_load_payload() == {
         "expected_state": "NO_ACTIVE_MAP",
         "map_id": "MAP-A",
         "version": 2,
         "map_path": str(destination),
+        "last_known_pose": {
+            "map_id": "MAP-A",
+            "map_version": 2,
+            "x": 1.0,
+            "y": -2.0,
+            "yaw": 0.5,
+            "covariance": 0.25,
+            "verification_version": 2,
+            "timestamp": cache.last_pose("MAP-A", 2)["timestamp"],
+            "source": "recent_navigation_pose",
+        },
     }
 
 

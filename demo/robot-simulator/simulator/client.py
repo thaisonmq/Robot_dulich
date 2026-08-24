@@ -77,6 +77,7 @@ def localization_pose_safe_to_persist(state: dict[str, Any]) -> bool:
     return (
         bool(state.get("localized"))
         and state.get("localization_state") == "READY"
+        and int(state.get("localization_verification_version", 0)) >= 2
         and bool(stability.get("passed"))
         and sensor_time.get("clock_state") == "SYNCED"
         and score >= threshold
@@ -122,6 +123,38 @@ def navigation_visualization_delta(
         "global_path": path,
         "dynamic_obstacles": obstacles,
     }
+
+
+def bounded_navigation_trajectory(
+    trajectory: Any, *, maximum_points: int = 40
+) -> list[dict[str, Any]]:
+    """Uniformly sample a trail before placing it in frequent WS messages."""
+    values = [dict(point) for point in (trajectory or []) if isinstance(point, dict)]
+    limit = max(2, int(maximum_points))
+    if len(values) <= limit:
+        return values
+    last_index = len(values) - 1
+    indexes = {
+        round(index * last_index / (limit - 1))
+        for index in range(limit)
+    }
+    return [values[index] for index in sorted(indexes)]
+
+
+def bounded_navigation_command_details(
+    details: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Bound the nested runtime state before sending a command acknowledgement."""
+    result = dict(details or {})
+    state = result.get("state")
+    if not isinstance(state, dict):
+        return result
+    bounded_state = dict(state)
+    bounded_state["trajectory"] = bounded_navigation_trajectory(
+        bounded_state.get("trajectory")
+    )
+    result["state"] = bounded_state
+    return result
 
 
 class RobotConnectionClient:
@@ -1525,10 +1558,23 @@ class RobotConnectionClient:
                 download_url=str(payload["download_url"]),
             )
             command_payload["map_path"] = str(destination)
-            # A powered-off or carried robot may be nowhere near its last
-            # persisted pose. Loading a map therefore starts unlocalized; Auto
-            # Go explicitly requests a fresh global LiDAR localization before
-            # Center computes any path.
+            recent_pose = self.map_cache.last_pose(
+                str(payload["map_id"]),
+                int(payload["version"]),
+                max_age_seconds=3600,
+            )
+            if (
+                recent_pose is not None
+                and int(recent_pose.get("verification_version", 0)) >= 2
+            ):
+                # This is only a bounded AMCL seed. The adapter still requires
+                # fresh LiDAR K-of-N, covariance, stability and uniqueness
+                # evidence before exposing a map pose or READY.
+                recent_pose["covariance"] = max(
+                    0.01, min(0.25, float(recent_pose.get("covariance", 0.25)))
+                )
+                recent_pose["source"] = "recent_navigation_pose"
+                command_payload["last_known_pose"] = recent_pose
         if (
             command == "mapping.start"
             and self.config.navigation_backend == "ros2"
@@ -1818,6 +1864,9 @@ class RobotConnectionClient:
                     logger.info("ROS 2 navigation adapter connection recovered")
                     adapter_was_unavailable = False
                 state = dict(result.get("state") or {})
+                state["trajectory"] = bounded_navigation_trajectory(
+                    state.get("trajectory")
+                )
                 if (
                     str(state.get("state", "")).upper() == "NO_ACTIVE_MAP"
                     and time.monotonic() - last_restore_attempt >= 10.0
@@ -1830,6 +1879,11 @@ class RobotConnectionClient:
                             state = dict(restored.get("state") or state)
                     except (NavigationBackendError, MapCacheError, OSError, ValueError) as exc:
                         logger.warning("active map restore pending error=%s", exc)
+                # A map-restore command returns a fresh state object, so apply
+                # the same transport budget after that replacement as well.
+                state["trajectory"] = bounded_navigation_trajectory(
+                    state.get("trajectory")
+                )
                 await socket.send(
                     json.dumps(
                         make_message(
@@ -1907,6 +1961,9 @@ class RobotConnectionClient:
                             int(state["map_version"]),
                             {
                                 **pose,
+                                "verification_version": int(
+                                    state.get("localization_verification_version", 0)
+                                ),
                                 "covariance": max(
                                     0.01,
                                     1.0 - float(state.get("localization_confidence", 0)),
@@ -1935,7 +1992,7 @@ class RobotConnectionClient:
             "command_message_id": str(command.message_id),
             "request_id": request_id,
             "status": status,
-            **(details or {}),
+            **bounded_navigation_command_details(details),
         }
         await socket.send(
             json.dumps(
@@ -2100,6 +2157,9 @@ class RobotConnectionClient:
                             "route_candidates": backend_state.get("route_candidates", []),
                             "selected_route_id": backend_state.get("selected_route_id", ""),
                             "manual_handoff_reason": backend_state.get("manual_handoff_reason", ""),
+                            "trajectory": bounded_navigation_trajectory(
+                                backend_state.get("trajectory")
+                            ),
                         },
                     )
                 )
@@ -2111,6 +2171,9 @@ class RobotConnectionClient:
 
     async def _navigation_status(self, socket: Any) -> None:
         backend_state = self.navigation_backend.state()
+        backend_state["trajectory"] = bounded_navigation_trajectory(
+            backend_state.get("trajectory")
+        )
         await socket.send(
             json.dumps(
                 make_message(

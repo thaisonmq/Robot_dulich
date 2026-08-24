@@ -374,6 +374,10 @@
 .localization-overlay { gap: 7px; }
 .localization-overlay strong { font-size: 11px; }
 .localization-overlay span { font-size: 9px; }
+.route-planning-overlay { gap: 7px; }
+.route-planning-overlay i { width: 24px; height: 24px; }
+.route-planning-overlay strong { font-size: 11px; }
+.route-planning-overlay span { font-size: 9px; }
 .map-modal__heading { min-width: 0; display: grid; gap: 8px; }
 .map-modal__hint {
   margin: 0;

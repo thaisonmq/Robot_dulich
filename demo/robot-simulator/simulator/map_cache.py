@@ -198,6 +198,9 @@ class RobotMapCacheManager:
                 "y": float(pose["y"]),
                 "yaw": float(pose["yaw"]),
                 "covariance": float(pose.get("covariance", 0.25)),
+                "verification_version": int(
+                    pose.get("verification_version", 0)
+                ),
                 "timestamp": time.time(),
             }
             self._write_registry(registry)
@@ -224,7 +227,10 @@ class RobotMapCacheManager:
         # search when current LiDAR evidence does not agree (for example when
         # the chassis was carried while powered off).
         pose = self.last_pose(map_id, version, max_age_seconds=3600)
-        if pose is not None:
+        if (
+            pose is not None
+            and int(pose.get("verification_version", 0)) >= 2
+        ):
             pose["covariance"] = max(
                 0.04, min(0.25, float(pose.get("covariance", 0.25)))
             )
@@ -274,12 +280,23 @@ class RobotMapCacheManager:
             raise MapCacheError("deleted map cannot be restored as active")
         if not (destination / "map.yaml").is_file():
             raise MapCacheError("active map.yaml is missing")
-        return {
+        payload = {
             "expected_state": expected_state,
             "map_id": map_id,
             "version": version,
             "map_path": str(destination),
         }
+        recent_pose = self.last_pose(map_id, version, max_age_seconds=3600)
+        if (
+            recent_pose is not None
+            and int(recent_pose.get("verification_version", 0)) >= 2
+        ):
+            recent_pose["covariance"] = max(
+                0.01, min(0.25, float(recent_pose.get("covariance", 0.25)))
+            )
+            recent_pose["source"] = "recent_navigation_pose"
+            payload["last_known_pose"] = recent_pose
+        return payload
 
     def delete_local(self, map_id: str, *, deleted_at: float | None = None) -> None:
         if not MAP_ID_PATTERN.fullmatch(map_id) or map_id.lower() in RESERVED_MAP_IDS:

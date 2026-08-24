@@ -103,6 +103,37 @@ rovera_navigation_adapter:
     localization_raycast_minimum_reliable_structure_span: 0.75
     localization_raycast_minimum_static_matches: 20
     localization_raycast_maximum_contradiction_ratio: 0.20
+    # A user-provided nearby hint plus a completed multi-heading sweep already
+    # constrains the search region. Sparse endpoint headings may expose only
+    # 12-19 comparable static rays; retain 12 exact hits while leaving blind
+    # global localization on the stricter 25/20 acquisition thresholds.
+    localization_operator_hint_minimum_comparable_beams: 12
+    localization_operator_hint_minimum_static_matches: 12
+    # Acquisition uses a strict 5-of-7 consensus around one pose. Two transient
+    # scans may be occluded, while three contradictory/bad frames still reject.
+    localization_consensus_window_size: 7
+    localization_consensus_required_frames: 5
+    localization_consensus_position_tolerance: 0.10
+    localization_consensus_yaw_tolerance_degrees: 10.0
+    localization_particle_cloud_freshness_seconds: 2.0
+    localization_particle_cluster_radius: 0.30
+    localization_particle_alternative_separation: 0.75
+    localization_particle_minimum_best_weight: 0.55
+    localization_particle_minimum_dominance_ratio: 2.0
+    # AMCL can resample all particles into a wrong repeated-layout alias. Run
+    # one bounded, independent Saved-Map endpoint search before global READY.
+    localization_global_scan_maximum_beams: 45
+    localization_global_scan_endpoint_tolerance: 0.15
+    localization_global_scan_position_step: 0.20
+    localization_global_scan_heading_step_degrees: 15.0
+    # Hybrid endpoint + expected-range score. Recorded good hint: 0.513;
+    # rejected wrong hypothesis: <= 0.404 on the same active map.
+    localization_global_scan_minimum_best_score: 0.45
+    localization_global_scan_minimum_score_margin: 0.12
+    localization_global_scan_minimum_score_ratio: 1.15
+    localization_global_scan_candidate_position_tolerance: 0.45
+    localization_global_scan_candidate_yaw_tolerance_degrees: 25.0
+    localization_global_scan_hint_radius: 1.25
     # Planning scan filtering has different semantics: compare measured range
     # with a map raycast, and never reuse the localization coarse tolerance.
     planning_static_match_tolerance: 0.08
@@ -113,6 +144,13 @@ rovera_navigation_adapter:
     # Moving people keep right-of-way; a stable chair becomes replanable.
     dynamic_obstacle_motion_threshold: 0.12
     dynamic_obstacle_stationary_confirmation_seconds: 1.0
+    # Mission-level stop authority requires a confirmed moving track whose
+    # predicted footprint meets the driven route inside this TTC horizon.
+    dynamic_obstacle_conflict_ttc_seconds: 3.0
+    # One fresh return may stop the chassis. Planning/keepout authority needs
+    # the same obstacle in six independent costmap frames; motion safety still
+    # retains immediate stop authority while this planning evidence matures.
+    dynamic_planning_minimum_observations: 6
     dynamic_overlay_max_cells: 600
     dynamic_obstacle_persistence_seconds: 1.5
     # Require sustained route-aligned clearance before resuming. A single
@@ -159,10 +197,11 @@ rovera_navigation_adapter:
     # Must match motion-safety's hard straight swept-body envelope. The wider
     # corridor_side_margin below remains comfort/narrow metadata only.
     translation_lateral_margin: 0.01
-    # Auto routes must keep a real comfort reserve instead of accepting the
-    # former 5 cm threshold, which became only 2-4 cm with map/pose error.
+    # Seven centimetres is the route-ranking comfort target. Hard feasibility
+    # is the physical rectangle plus 2 cm, current localization uncertainty,
+    # and a map-resolution allowance calculated by the adapter.
     corridor_side_margin: 0.07
-    stop_turn_minimum_route_side_clearance: 0.07
+    stop_turn_minimum_route_side_clearance: 0.02
     corridor_localization_uncertainty_max: 0.04
     corridor_front_clearance: 0.14
     corridor_lookahead: 1.00
@@ -199,6 +238,10 @@ rovera_navigation_adapter:
     stop_turn_safety_block_timeout_seconds: 5.0
     stop_turn_heading_kp: 1.8
     stop_turn_max_angular_speed: 0.60
+    # Brake a pivot before the settle band so smoother/chassis momentum does
+    # not carry it past the target and cause a reverse correction.
+    stop_turn_angular_deceleration: 2.0
+    stop_turn_angular_reaction_seconds: 0.12
     straight_max_angular_correction: 0.18
     straight_path_pose_spacing: 0.05
     execution_pose_freshness_seconds: 0.30

@@ -296,7 +296,14 @@ class Ros2NavigationBackend:
     async def _call_adapter(self, command: str, payload: dict, timeout: float) -> dict:
         request = {"command": command, "payload": payload}
         reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(str(self.socket_path)), timeout=2.0
+            # Adapter responses are newline framed.  Keep enough headroom for
+            # diagnostics while the edge applies its stricter WebSocket
+            # payload budget; asyncio's 64 KiB default raises LimitOverrunError
+            # before a valid response can be decoded.
+            asyncio.open_unix_connection(
+                str(self.socket_path), limit=262_144
+            ),
+            timeout=2.0,
         )
         try:
             writer.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")

@@ -15,6 +15,12 @@ EDGE_CLIENT_SOURCE = (
 MAP_CACHE_SOURCE = (
     Path(__file__).parents[1] / "simulator" / "map_cache.py"
 ).read_text()
+LAUNCH_SOURCE = (
+    Path(__file__).parents[1]
+    / "navigation-stack"
+    / "launch"
+    / "navigation_stack.launch.py"
+).read_text()
 
 
 def _method_source(name: str, next_name: str) -> str:
@@ -90,7 +96,9 @@ def test_localization_never_rotates_without_explicit_authorization() -> None:
 
     assert 'payload.get("allow_rotation", False)' in dispatch
     assert "self.localization_rotation_authorized = False" in automatic
-    assert "self.localization_rotation_authorized = False" in operator
+    assert "rotation_was_authorized = self.localization_rotation_authorized" in operator
+    assert "self.localization_rotation_authorized = rotation_was_authorized" in operator
+    assert "self.localization_rotation_authorized = False" not in operator
     assert "if not self.localization_rotation_authorized" in tick
 
 
@@ -114,30 +122,51 @@ def test_localization_rotation_keeps_every_live_safety_gate() -> None:
     assert "self.scan_map_valid_beams" not in safe
     assert "self.rotation_angle >= self.rotation_max_angle" in tick
     assert "self._stop_localization_rotation()" in tick
-    assert 'self.localization_state = "LOCALIZING_GLOBAL"' in tick
+    assert 'self.localization_state = "AMBIGUOUS"' in tick
+    assert "self.approximate_hint_allowed = True" in tick
     assert "self.localization_rotation_blocked_timeout" in tick
     assert '"rotation_clearance_blocked"' in tick
 
 
-def test_global_search_is_stationary_first_then_requires_authorized_rotation() -> None:
+def test_global_search_is_passive_first_and_only_velocity_requires_authorization() -> None:
     global_search = _method_source("_start_global_localization", "_safe_to_rotate")
     evidence = _method_source("_localization_evidence_ready", "_localization_tick")
     verdict = _method_source("_localization_verdict", "_localization_quality_ready")
     tick = _method_source("_localization_tick", "_load_map")
 
-    guard = global_search.index("if not self.localization_rotation_authorized")
-    stationary = global_search.index("self.global_search_requires_rotation = False", guard)
-    assert guard < stationary
+    assert "if not self.localization_rotation_authorized" not in global_search
+    assert 'self.localization_state = "PASSIVE_LOCALIZING"' in global_search
     assert "self.global_search_rotation_pending = True" in global_search
     assert "self.global_rotate_delay" in tick
     assert "if not self.localization_rotation_authorized" in tick
     assert "if self.global_search_rotation_pending" in tick
-    assert "self.global_search_requires_rotation = True" in tick
-    assert "self.global_search_untrusted" in evidence
-    assert "require_heading=self.global_search_untrusted" in evidence
-    assert "self._global_heading_diversity_ready()" in verdict
+    assert "self.global_search_requires_rotation = not strong_candidate" in tick
+    assert "self.global_search_untrusted" in verdict
+    assert "require_heading=False" in evidence
+    assert "self.particle_uniqueness.accepted" in verdict
     assert "self._start_next_localization_rotation(now)" in tick
-    assert 'self.localization_state = "LOCALIZATION_REQUIRED"' in global_search
+    assert 'mode="PASSIVE_GLOBAL"' in global_search
+
+
+def test_operator_hint_resolves_alias_only_after_strict_multi_heading_evidence() -> None:
+    verdict = _method_source("_localization_verdict", "_localization_quality_ready")
+    operator = _method_source("_set_initial_pose", "_deactivate_map")
+
+    operator_branch = verdict.split(
+        "if self.localization_operator_hint_active:", 1
+    )[1].split("self._request_global_scan_uniqueness()", 1)[0]
+    assert "self.localization_operator_hint_active = True" in operator
+    assert "self.localization_seed_pose" in operator_branch
+    assert "self.global_scan_hint_radius" in operator_branch
+    assert "self._global_heading_diversity_ready()" in operator_branch
+    assert '"INSUFFICIENT_HEADING_DIVERSITY"' in operator_branch
+    assert "return verdict" in operator_branch
+    assert "hinted_multi_heading" in verdict
+    assert "self.localization_operator_hint_minimum_raycast_beams" in verdict
+    assert "self.localization_operator_hint_minimum_static_matches" in verdict
+    assert "self.particle_uniqueness.accepted" in verdict.split(
+        "if self.localization_operator_hint_active:", 1
+    )[0]
 
 
 def test_ready_session_reuses_continuously_verified_pose_without_reset() -> None:
@@ -170,7 +199,7 @@ def test_repeated_force_global_does_not_reset_an_active_scan() -> None:
         'elif self.localized and self.localization_state == "READY":', 1
     )[0]
 
-    active_guard = force_branch.index('"LOCALIZING_GLOBAL", "LOCALIZING_ROTATING"')
+    active_guard = force_branch.index('"PASSIVE_LOCALIZING", "CANDIDATE", "VERIFYING"')
     accepted = force_branch.index('"status": "accepted"', active_guard)
     restart = force_branch.index("self._start_global_localization()", accepted)
     assert active_guard < accepted < restart
@@ -200,20 +229,23 @@ def test_completed_rotation_settles_then_uses_fresh_stationary_evidence() -> Non
     assert "self.localization_rotation_settle" in tick
 
 
-def test_map_load_does_not_inject_a_persisted_robot_pose() -> None:
+def test_map_load_only_injects_a_recent_verified_navigation_pose() -> None:
     load_branch = EDGE_CLIENT_SOURCE.split(
         'if command == "map.load" and self.config.navigation_backend == "ros2":', 1
     )[1].split('if (\n            command == "mapping.start"', 1)[0]
 
     assert 'command_payload["map_path"]' in load_branch
-    assert 'command_payload["last_known_pose"]' not in load_branch
-    assert "self.map_cache.activation_pose" not in load_branch
+    assert 'command_payload["last_known_pose"] = recent_pose' in load_branch
+    assert 'recent_pose["source"] = "recent_navigation_pose"' in load_branch
+    assert "max_age_seconds=3600" in load_branch
+    assert 'recent_pose.get("verification_version", 0)' in load_branch
 
     restore_payload = MAP_CACHE_SOURCE.split(
         "    def active_load_payload(", 1
     )[1].split("    def delete_local(", 1)[0]
-    assert '"last_known_pose"' not in restore_payload
-    assert "self.activation_pose" not in restore_payload
+    assert 'payload["last_known_pose"] = recent_pose' in restore_payload
+    assert 'recent_pose["source"] = "recent_navigation_pose"' in restore_payload
+    assert 'recent_pose.get("verification_version", 0)' in restore_payload
 
 
 def test_existing_amcl_pose_is_passively_verified_before_authorized_global_search() -> None:
@@ -292,20 +324,26 @@ def test_verify_timeout_does_not_restart_an_accepted_candidate_during_ready_hold
     assert "self._start_global_localization()" in verify_timeout
 
 
-def test_stationary_global_search_rejects_weak_alias_and_resamples_when_turn_blocked() -> None:
+def test_stationary_global_search_rejects_weak_alias_without_reset_loop() -> None:
     threshold = _method_source(
         "_required_localization_scan_score", "_localization_verdict"
     )
     tick = _method_source("_localization_tick", "_load_map")
 
-    assert 'self.localization_state == "LOCALIZING_GLOBAL"' in threshold
+    assert '"PASSIVE_LOCALIZING", "LOCALIZING_GLOBAL"' in threshold
     assert "self.global_search_rotation_pending" in threshold
     assert "self.global_scan_map_threshold" in threshold
     assert "self.global_final_scan_map_threshold" in threshold
     assert "self.stationary_global_candidate_ambiguous" in tick
-    assert "self.stationary_global_retry_delay" in tick
-    assert 'action="GLOBAL_RESAMPLE"' in tick
-    assert "self._start_global_localization()" in tick
+    assert 'self.localization_state = "AMBIGUOUS"' in tick
+    assert "self.passive_global_retry_delay" not in tick
+    assert "self.last_passive_global_retry_monotonic" not in tick
+    hint_timeout = tick.split("if broad_seed:", 1)[1].split(
+        "try:\n                self._start_global_localization()", 1
+    )[0]
+    assert 'self.localization_state = "AMBIGUOUS"' in hint_timeout
+    assert "evidence_preserved=True" in hint_timeout
+    assert "self._reset_localization_evidence()" not in hint_timeout
 
 
 def test_map_initialization_cannot_timeout_before_session_clock_is_started() -> None:
@@ -340,6 +378,29 @@ def test_heading_observation_uses_basic_quality_not_final_raycast_gate() -> None
     assert callback.index("self._update_scan_map_match(message)") < callback.index(
         "self._record_heading_observation("
     )
+
+
+def test_localization_callbacks_are_serialized_and_pose_unpack_uses_snapshot() -> None:
+    observation = _method_source(
+        "_record_heading_observation", "_update_scan_map_match"
+    )
+
+    assert "self.localization_lock = threading.RLock()" in ADAPTER_SOURCE
+    for callback in (
+        "_amcl_pose_callback",
+        "_particle_cloud_callback",
+        "_scan_callback",
+        "_localization_tick",
+    ):
+        assert f"@localization_callback\n    def {callback}(" in ADAPTER_SOURCE
+    assert "pose_snapshot = self.last_amcl_pose" in observation
+    assert "candidate_x, candidate_y, _ = pose_snapshot" in observation
+    assert "candidate_x, candidate_y, _ = self.last_amcl_pose" not in observation
+
+
+def test_adapter_process_is_respawned_if_an_unhandled_failure_escapes() -> None:
+    assert LAUNCH_SOURCE.count('executable="adapter_node"') == 2
+    assert LAUNCH_SOURCE.count("respawn=True") >= 3  # two adapters plus SLAM
 
 
 def test_localization_verify_log_contains_every_mandatory_gate_metric() -> None:
@@ -388,8 +449,12 @@ def test_new_navigation_start_rechecks_fresh_raycast_without_canceling_route() -
     navigate = _method_source("_navigate", "_segment_execution_tick")
 
     assert "self._localization_tracking_evidence_ready(now)" in start_gate
-    assert "self.localization_raycast_minimum_beams" in start_gate
-    assert "self.localization_raycast_minimum_static_matches" in start_gate
+    assert "self.tracking_scan_map_sanity_threshold" in start_gate
+    assert "self.localization_final_minimum_residual_beams" in start_gate
+    assert "self.localization_final_max_median_residual" in start_gate
+    assert "self.localization_final_max_p90_residual" in start_gate
+    assert "self.localization_raycast_minimum_beams" not in start_gate
+    assert "self.localization_raycast_minimum_static_matches" not in start_gate
     assert "self.localization_raycast_maximum_contradiction_ratio" in start_gate
     assert "self._localization_start_evidence_ready(now)" in wait_gate
     assert "self.localization_start_evidence_wait" in wait_gate
@@ -431,7 +496,7 @@ def test_scan_tf_uses_bounded_wait_and_age_checked_fallback() -> None:
     assert '"SCAN_REJECTED_TF"' in transform
 
 
-def test_untrusted_global_cannot_ready_from_one_heading() -> None:
+def test_untrusted_global_requires_unique_particle_region_not_heading_count() -> None:
     evidence = _method_source(
         "_localization_evidence_ready", "_localization_rejection_reason"
     )
@@ -440,9 +505,10 @@ def test_untrusted_global_cannot_ready_from_one_heading() -> None:
     )
 
     assert "self.global_search_untrusted = True" in global_search
-    assert "require_heading=self.global_search_untrusted" in evidence
+    assert "require_heading=False" in evidence
     verdict = _method_source("_localization_verdict", "_localization_quality_ready")
-    assert "self._global_heading_diversity_ready()" in verdict
+    assert "self.particle_uniqueness.accepted" in verdict
+    assert '"PARTICLE_CLOUD_STALE"' in verdict
 
 
 def test_adaptive_global_heading_requirements_allow_strong_early_exit() -> None:
@@ -458,7 +524,8 @@ def test_adaptive_global_heading_requirements_allow_strong_early_exit() -> None:
     assert "self.global_strong_minimum_heading_span" in requirement
     assert "self.global_minimum_heading_bins" in requirement
     assert "self.global_minimum_heading_span" in requirement
-    assert "if not self.stationary_global_candidate_ambiguous" in rotation
+    assert "math.radians(15.0)" in rotation
+    assert "math.radians(30.0)" in rotation
     assert "self.localization_next_observation_angle" in rotation
     assert "localization_ready = self._localization_evidence_ready(now)" in tick
 
@@ -1092,8 +1159,9 @@ def test_dynamic_wait_periodically_replans_and_success_resumes_same_goal() -> No
     assert "self._navigate(" in attempt
     assert 'self._set_state("WAITING_FOR_DYNAMIC_CLEAR"' in attempt
     assert "destination_preserved=True" in attempt
-    assert "self.dynamic_overlay.observe_confirmed_blocker" in blocker
-    assert "saved_map=self.saved_map" not in blocker
+    assert "minimum_observations=self.dynamic_planning_minimum_observations" in blocker
+    assert 'result="POSITION_UNCONFIRMED"' in blocker
+    assert "observe_confirmed_blocker" not in blocker
     assert "corridor_blocked" in tick
     assert 'self.dynamic_block_reason.startswith("CONTROLLER_ABORT")' not in tick
 
@@ -1115,17 +1183,19 @@ def test_dynamic_recovery_waits_for_moving_people_and_replans_fixed_obstacles() 
     tick = _method_source("_dynamic_recovery_tick", "_attempt_dynamic_replan")
     attempt = _method_source("_attempt_dynamic_replan", "_replan_execution_from_current")
 
-    assert "minimum_observations=3" in tick
-    assert 'action="PROACTIVE_ROUTE_INTERSECTION"' in tick
-    assert 'item.motion_state in {"MOVING", "STATIONARY"}' in tick
+    assert "self.dynamic_planning_minimum_observations" in tick
+    assert 'action="PROACTIVE_TRAJECTORY_CONFLICT"' in tick
+    assert "dynamic_trajectory_conflict_ttc" in tick
+    assert 'item.motion_state in {"MOVING", "STATIONARY"}' not in tick
     assert 'item.motion_state == "MOVING"' in tick
     assert 'item.motion_state == "STATIONARY"' in tick
     assert '"MOVING_OBSTACLE_HAS_PRIORITY"' in tick
     assert "corridor_evidence_fresh" in tick
     assert "stationary_route_blocked or controller_corridor_blocked" in tick
-    assert "self.dynamic_alternative_attempted" in tick
+    for state in ("CLASSIFYING", "REPLAN_PENDING", "REPLAN_RUNNING", "WAITING"):
+        assert f'self.dynamic_recovery_state = "{state}"' in tick
     assert "not requires_alternative" in attempt
-    assert "requires_alternative or not obstacle_cleared" in attempt
+    assert "requires_alternative" in attempt
     assert "unconfirmed_replan_due" not in tick
     assert 'result="RESUME_ORIGINAL_ROUTE"' in attempt
     assert '"segment_directions": resume_directions' in attempt
@@ -1154,7 +1224,7 @@ def test_dynamic_clear_requires_sustained_route_aligned_samples() -> None:
     assert parameters["dynamic_obstacle_clear_dwell_seconds"] >= 1.0
 
 
-def test_auto_route_requires_seven_centimetres_of_static_side_clearance() -> None:
+def test_auto_route_uses_two_centimetre_hard_and_seven_centimetre_preferred_margin() -> None:
     project = Path(__file__).parents[1]
     navigation = yaml.safe_load(
         (project / "navigation-stack/config/nav2_params.yaml").read_text()
@@ -1166,7 +1236,9 @@ def test_auto_route_requires_seven_centimetres_of_static_side_clearance() -> Non
     )
 
     assert parameters["corridor_side_margin"] == 0.07
-    assert parameters["stop_turn_minimum_route_side_clearance"] == 0.07
+    assert parameters["stop_turn_minimum_route_side_clearance"] == 0.02
+    assert "self._hard_route_side_clearance()" in compute
+    assert "self.corridor_side_margin" in compute
     assert '"ROUTE_CLEARANCE_INSUFFICIENT"' in compute
     assert '"ROUTE_CLEARANCE_INSUFFICIENT"' in recovery
 
@@ -1195,8 +1267,7 @@ def test_map_changes_clear_latched_dynamic_recovery_state() -> None:
     deactivate_map = _method_source("_deactivate_map", "_goal_pose")
 
     for source in (load_map, deactivate_map):
-        assert "self.dynamic_blocked_keepout = None" in source
-        assert "self.dynamic_alternative_attempted = False" in source
+        assert "self._reset_dynamic_recovery()" in source
 
 
 def test_planner_searches_a_bounded_waypoint_replacement_for_shallow_zigzags() -> None:
@@ -1236,7 +1307,9 @@ def test_dynamic_recovery_rejects_same_blocked_geometry_without_retry_burn() -> 
     assert "path_overlap_ratio" in attempt
     assert "self.dynamic_blocked_route" in attempt
     assert 'self._set_state("WAITING_FOR_DYNAMIC_CLEAR"' in attempt
-    assert 'reason="SAME_BLOCKED_ROUTE"' in attempt
+    assert 'result="ALTERNATIVE_REJECTED"' in attempt
+    assert '"STILL_INTERSECTS_BLOCKER"' in attempt
+    assert "self.dynamic_failed_route_signatures" in attempt
     assert "self.execution_replan_attempts += 1" not in attempt
 
 
@@ -1248,6 +1321,115 @@ def test_true_static_disconnect_remains_terminal_during_runtime_recovery() -> No
     assert "self._set_recovery_terminal" in dynamic
     assert 'exc.code == "GOAL_PHYSICALLY_UNREACHABLE"' in ordinary
     assert "self._set_recovery_terminal" in ordinary
+
+
+def test_no_last_pose_starts_passive_localization_without_velocity_ownership() -> None:
+    automatic = _method_source("_begin_auto_localization", "_start_global_localization")
+    passive = _method_source("_start_global_localization", "_safe_to_rotate")
+
+    assert "self._start_global_localization()" in automatic
+    assert 'self.localization_state = "PASSIVE_LOCALIZING"' in passive
+    assert "self.localization_velocity.publish" not in passive
+    assert "self.motion_owner = \"LOCALIZATION\"" not in passive
+
+
+def test_acquisition_uses_configurable_multi_frame_consensus_and_uniqueness() -> None:
+    verdict = _method_source("_localization_verdict", "_localization_quality_ready")
+    callback = _method_source("_particle_cloud_callback", "_pose_is_stable")
+    project = Path(__file__).parents[1]
+    parameters = yaml.safe_load(
+        (project / "navigation-stack/config/nav2_params.yaml").read_text()
+    )["rovera_navigation_adapter"]["ros__parameters"]
+
+    assert parameters["localization_consensus_window_size"] == 7
+    assert parameters["localization_consensus_required_frames"] == 5
+    assert "localization_evidence_consensus(" in verdict
+    assert "self.localization_evidence_frames" in verdict
+    assert "particle_cloud_uniqueness(" in callback
+    assert "self.particle_uniqueness.accepted" in verdict
+    assert "self._request_global_scan_uniqueness()" in verdict
+    assert "self.global_scan_uniqueness.accepted" in verdict
+    assert '"GLOBAL_SCAN_UNIQUENESS"' in ADAPTER_SOURCE
+    assert (
+        'ParticleCloud,\n            "/particle_cloud",\n'
+        "            self._particle_cloud_callback,\n"
+        "            qos_profile_sensor_data"
+    ) in ADAPTER_SOURCE
+
+
+def test_untrusted_pose_cannot_create_map_relative_dynamic_planning_authority() -> None:
+    scan = _method_source("_planning_scan_message", "_scan_callback")
+    costmap = _method_source("_costmap_callback", "_refresh_dynamic_obstacle_view")
+    safety = _method_source("_safety_status_callback", "_safety_source_callback")
+    ready_reset = _method_source(
+        "_reset_pre_ready_planning_evidence", "_publish_failed_segments"
+    )
+
+    assert 'self.localization_state != "READY"' in scan
+    assert "[math.inf for _ in message.ranges]" in scan
+    assert 'self.localization_state != "READY"' in costmap
+    assert "and self.localized" in safety
+    assert 'and self.localization_state == "READY"' in safety
+    assert "self.dynamic_overlay = DynamicObstacleOverlay(" in ready_reset
+    assert "ClearEntireCostmap.Request()" in ready_reset
+
+
+def test_costmap_transform_prefers_message_timestamp_and_bounds_latest_fallback() -> None:
+    callback = _method_source("_costmap_callback", "_refresh_dynamic_obstacle_view")
+
+    assert '"map", source_frame, Time.from_msg(message.header.stamp)' in callback
+    assert '"map", source_frame, Time()' in callback
+    assert "transform_age > self.scan_tf_fallback_max_age" in callback
+    assert 'reason="LATEST_TF_STALE_FOR_MESSAGE"' in callback
+    assert 'fallback="BOUNDED_FRESH_LATEST"' in callback
+
+
+def test_approximate_hint_discards_yaw_and_never_sets_ready() -> None:
+    operator = _method_source("_set_initial_pose", "_deactivate_map")
+
+    assert '"yaw": 0.0' in operator
+    assert "self.global_search_untrusted = True" in operator
+    assert "self.localization_operator_hint_active = True" in operator
+    assert 'self.localization_state = "LOCALIZING_APPROXIMATE_POSE"' in operator
+    assert '"localized": False' in operator
+    assert 'self.localization_state = "READY"' not in operator
+
+
+def test_odometry_trajectory_is_unanchored_until_first_trusted_localization() -> None:
+    record = _method_source("_record_odometry_trajectory", "_anchor_odometry_trajectory")
+    anchor = _method_source("_anchor_odometry_trajectory", "_update_pose")
+    update = _method_source("_update_pose", "_publish_initial_pose")
+
+    assert '"quality": "UNANCHORED"' in record
+    assert '"frame": "odom"' in record
+    assert '"quality": "TRUSTED"' in record
+    assert '"quality": "RECONSTRUCTED"' in anchor
+    assert "self._record_odometry_trajectory(odom_transform)" in update
+
+
+def test_status_trajectory_is_bounded_before_transport() -> None:
+    state = _method_source("_state", "_wait")
+
+    assert '"trajectory": self._status_trajectory()' in state
+    assert "self.odometry_trajectory[-200:]" in state
+    assert "maximum_points: int = 40" in state
+    assert '"trajectory": list(self.odometry_trajectory[-200:])' not in state
+
+
+def test_localization_loss_preserves_revalidates_and_resumes_mission() -> None:
+    lost = _method_source("_localization_lost", "_global_heading_requirement")
+    resume = _method_source(
+        "_resume_localization_navigation_if_ready", "_localization_lost"
+    )
+
+    assert "self.localization_resume_context" in lost
+    assert "self.paused_goal" in lost
+    assert "handle.cancel_goal_async()" in lost
+    assert "original_points" in resume
+    assert "self._navigate(" in resume
+    assert "self._plan_stop_turn_from_current(goal)" in resume
+    assert 'action="WAIT_AND_RETRY"' in resume
+    assert "destination_preserved=True" in resume
 
 
 def test_final_position_short_circuit_is_before_turn_and_endpoint_replan() -> None:

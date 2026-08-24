@@ -188,6 +188,31 @@ describe("MapPanel navigation controls", () => {
     expect(onRetryLocalization).toHaveBeenCalledOnce();
   });
 
+  it("offers a broad location hint only when the adapter reports ambiguity", () => {
+    const onApproximateHint = vi.fn();
+    const rendered = panel({
+      mapState: "AMBIGUOUS",
+      localizationState: "AMBIGUOUS",
+      approximateHintAllowed: true,
+      onApproximateHint,
+    });
+
+    const hint = screen.getByRole("button", { name: "Chỉ vị trí robot gần đúng" });
+    fireEvent.click(hint);
+    expect(screen.getByRole("dialog", { name: "Chỉ vị trí robot gần đúng" })).toBeInTheDocument();
+    expect(screen.getByText(/chỉ là gợi ý tìm kiếm/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Đi đến đây" })).not.toBeInTheDocument();
+
+    rendered.unmount();
+    panel({
+      mapState: "AMBIGUOUS",
+      localizationState: "AMBIGUOUS",
+      approximateHintAllowed: false,
+      onApproximateHint,
+    });
+    expect(screen.queryByRole("button", { name: "Chỉ vị trí robot gần đúng" })).not.toBeInTheDocument();
+  });
+
   it("does not expose operator-supplied robot coordinates even while ready", () => {
     const onRetryLocalization = vi.fn();
     panel({
@@ -322,5 +347,21 @@ describe("MapPanel navigation controls", () => {
     expect(screen.getByRole("button", { name: "Tạm dừng" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Dừng điều hướng" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Chọn điểm đến" })).not.toBeInTheDocument();
+  });
+
+  it("shows a blocking progress state while a safe route is being computed", () => {
+    panel({
+      localized: true,
+      localizationState: "READY",
+      mapState: "READY",
+      navigationStatus: "previewing",
+      loading: true,
+      selected: poi,
+    });
+
+    const progress = screen.getByText("Đang tính tuyến đường an toàn…").closest("[role='status']");
+    expect(progress).toHaveTextContent("Đang tính tuyến đường an toàn…");
+    expect(progress).toHaveTextContent("Đang kiểm tra độ rộng");
+    expect(screen.getByRole("button", { name: "Chọn điểm đến" })).toBeDisabled();
   });
 });

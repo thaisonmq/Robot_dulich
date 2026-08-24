@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import json
 import heapq
 import logging
@@ -283,6 +284,15 @@ class DynamicObstacleOverlay:
                 )
             )
         )
+        # A costmap callback is one observation frame. Several disconnected
+        # lethal-cell clusters in that same frame may all fall inside one
+        # track's association radius; allowing each cluster to update the same
+        # track made ``observation_count`` count clusters instead of independent
+        # frames. Besides overstating confidence, one noisy costmap could then
+        # immediately acquire planning/stop authority. Keep association
+        # one-to-one inside this frame. Unmatched nearby clusters remain
+        # separate tentative tracks and may be associated on a later frame.
+        observed_track_ids: set[int] = set()
         for cluster in self._clusters(filtered, self.cluster_distance):
             minimum_x = min(point[0] for point in cluster)
             maximum_x = max(point[0] for point in cluster)
@@ -301,7 +311,8 @@ class DynamicObstacleOverlay:
                 (
                     obstacle
                     for obstacle in self._obstacles.values()
-                    if math.hypot(
+                    if obstacle.id not in observed_track_ids
+                    and math.hypot(
                         obstacle.center_x - center_x,
                         obstacle.center_y - center_y,
                     ) <= self.association_distance + obstacle.radius + radius
@@ -380,6 +391,7 @@ class DynamicObstacleOverlay:
                 weight = 0.50
                 center_x = associated.center_x * (1.0 - weight) + center_x * weight
                 center_y = associated.center_y * (1.0 - weight) + center_y * weight
+            observed_track_ids.add(obstacle_id)
             self._obstacles[obstacle_id] = DynamicObstacle(
                 obstacle_id,
                 center_x,
@@ -2801,7 +2813,12 @@ class StopTurnStateLatticePlanner:
             float(start_yaw),
             first_heading,
             half_length=self.half_length,
-            half_width=self.half_width + self.hard_side_margin,
+            # The initial pose is measured, not selected by the planner. Match
+            # the executor's exact physical-footprint turn check here; applying
+            # the translation side reserve can reject a safe current pose and
+            # force the lattice to exhaust its time budget. Planned internal
+            # corners still retain hard_side_margin below.
+            half_width=self.half_width,
             padding=self.padding,
         ).valid:
             return None
@@ -2818,7 +2835,8 @@ class StopTurnStateLatticePlanner:
             last_heading,
             float(goal_yaw),
             half_length=self.half_length,
-            half_width=self.half_width + self.hard_side_margin,
+            # Final in-place execution uses the same physical sweep authority.
+            half_width=self.half_width,
             padding=self.padding,
         ).valid:
             return None
@@ -3578,7 +3596,7 @@ class StopTurnStateLatticePlanner:
 
     def ranking_key(
         self, route: StopTurnRoute
-    ) -> tuple[float, float, float, int, float, float, float, float]:
+    ) -> tuple[float, float, float, int, float, float, float, float, float]:
         metadata = route.metadata
         # Exact footprint and turn-sweep validation are hard filters before
         # ranking. Prefer a centered comfort-clear route before considering
@@ -3610,6 +3628,16 @@ class StopTurnStateLatticePlanner:
         # a stronger operator-preference penalty than the nominal timing model
         # while retaining a distance/time bound: this avoids both zig-zags and
         # very long right-angle detours selected merely to remove one corner.
+        dominant_axis_deviation = (
+            0.0
+            if not route.heading_bins
+            else sum(
+                min(int(heading) % 6, 6 - int(heading) % 6)
+                for heading in route.heading_bins
+            ) / len(route.heading_bins) * self.heading_step
+        )
+        # Dominant map axes are a tie-breaker, not permission to take a large
+        # detour merely to make every line horizontal or vertical.
         turn_preferred_time = metadata.estimated_time + 2.5 * metadata.turn_count
         return (
             safety_band,
@@ -3617,6 +3645,7 @@ class StopTurnStateLatticePlanner:
             turn_preferred_time,
             metadata.turn_count,
             metadata.total_length,
+            dominant_axis_deviation,
             metadata.total_turn_angle,
             -min(
                 metadata.minimum_side_clearance,
@@ -3957,6 +3986,99 @@ class LocalizationVerification:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalizationEvidenceFrame:
+    """One scan evaluated against one AMCL pose hypothesis."""
+
+    timestamp: float
+    pose_x: float
+    pose_y: float
+    pose_yaw: float
+    scan_score: float
+    valid_beams: int
+    residual_beams: int
+    median_residual: float
+    p90_residual: float
+    mean_residual: float
+    raycast_comparable_beams: int
+    raycast_static_matches: int
+    raycast_dynamic_occlusions: int
+    raycast_map_contradictions: int
+    raycast_inconclusive_map_hits: int
+    raycast_static_match_ratio: float
+    raycast_dynamic_occlusion_ratio: float
+    raycast_contradiction_ratio: float
+    raycast_median_error: float
+    raycast_p90_error: float
+
+
+@dataclass(frozen=True, slots=True)
+class LocalizationConsensus:
+    accepted: bool
+    reason: str
+    total_frames: int
+    required_frames: int
+    passing_frames: int
+    agreeing_frames: int
+    scan_score: float = 0.0
+    valid_beams: int = 0
+    residual_beams: int = 0
+    median_residual: float = math.inf
+    p90_residual: float = math.inf
+    mean_residual: float = math.inf
+    raycast_comparable_beams: int = 0
+    raycast_static_matches: int = 0
+    raycast_dynamic_occlusions: int = 0
+    raycast_map_contradictions: int = 0
+    raycast_inconclusive_map_hits: int = 0
+    raycast_static_match_ratio: float = 0.0
+    raycast_dynamic_occlusion_ratio: float = 0.0
+    raycast_contradiction_ratio: float = 0.0
+    raycast_median_error: float = math.inf
+    raycast_p90_error: float = math.inf
+
+
+@dataclass(frozen=True, slots=True)
+class ParticleCloudUniqueness:
+    accepted: bool
+    reason: str
+    particle_count: int
+    cluster_count: int
+    best_weight: float
+    alternative_weight: float
+    dominance_ratio: float
+    best_x: float | None = None
+    best_y: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GlobalScanUniqueness:
+    """Independent coarse Saved-Map search around one stationary scan.
+
+    AMCL may resample every particle into one locally plausible hypothesis;
+    that collapse is not proof that another part of a repeated map is worse.
+    This result compares the current scan against free poses across the map
+    (or an explicitly hinted broad region) without using AMCL's particles.
+    """
+
+    accepted: bool
+    reason: str
+    evaluated_candidates: int
+    usable_beams: int
+    best_score: float
+    alternative_score: float
+    score_margin: float
+    score_ratio: float
+    best_x: float | None = None
+    best_y: float | None = None
+    best_yaw: float | None = None
+    alternative_x: float | None = None
+    alternative_y: float | None = None
+    alternative_yaw: float | None = None
+    candidate_position_error: float = math.inf
+    candidate_yaw_error: float = math.inf
+
+
+@dataclass(frozen=True, slots=True)
 class PlanningScanFilter:
     ranges: list[float]
     total_beams: int
@@ -3996,19 +4118,62 @@ def heading_diversity(
 ) -> HeadingDiversity:
     """Summarize independent physical scan headings on a circle."""
     count = max(1, int(bin_count))
-    normalized = [float(value) % (2.0 * math.pi) for value in headings]
+    normalized = sorted(
+        float(value) % (2.0 * math.pi) for value in headings
+    )
     bins = tuple(sorted({
         min(count - 1, int(value / (2.0 * math.pi) * count))
         for value in normalized
     }))
+    if len(normalized) < 2:
+        return HeadingDiversity(bins, 0.0)
+
+    # The largest geodesic separation from one angle is attained next to its
+    # antipode. Searching those neighbours keeps this exact calculation
+    # O(n log n), instead of comparing an ever-growing list all-pairs.
+    size = len(normalized)
+    extended = normalized + [value + 2.0 * math.pi for value in normalized]
     span = 0.0
-    for left in normalized:
-        for right in normalized:
+    for index, left in enumerate(normalized):
+        insertion = bisect.bisect_left(
+            extended,
+            left + math.pi,
+            index + 1,
+            index + size,
+        )
+        for candidate_index in (insertion - 1, insertion):
+            if not index < candidate_index < index + size:
+                continue
+            right = extended[candidate_index]
             span = max(
                 span,
                 abs(math.atan2(math.sin(left - right), math.cos(left - right))),
             )
     return HeadingDiversity(bins, span)
+
+
+def bounded_heading_evidence(
+    headings: Iterable[float],
+    heading: float,
+    *,
+    bin_count: int = 8,
+) -> list[float]:
+    """Keep at most one physical heading observation per angular bin.
+
+    Repeated stationary scans remain independent consensus frames, but they
+    are not independent headings. This bounded collection owns only angular
+    diversity and therefore must never grow with timer or scan count.
+    """
+    count = max(1, int(bin_count))
+    by_bin: dict[int, float] = {}
+    for value in (*tuple(headings), float(heading)):
+        normalized = float(value) % (2.0 * math.pi)
+        heading_bin = min(
+            count - 1,
+            int(normalized / (2.0 * math.pi) * count),
+        )
+        by_bin[heading_bin] = float(value)
+    return [by_bin[index] for index in sorted(by_bin)]
 
 
 def heading_position_spread(
@@ -4269,6 +4434,103 @@ def dynamic_exclusions_intersect_route(
         if remaining_horizon <= 1e-9:
             break
     return False
+
+
+def dynamic_trajectory_conflict_ttc(
+    points: Iterable[dict[str, float]],
+    obstacle: DynamicObstacle,
+    *,
+    robot_speed: float,
+    footprint_inflation: float,
+    ttc_horizon: float = 3.0,
+    sample_period: float = 0.10,
+) -> float | None:
+    """Return the first predicted swept-route conflict time for a moving track.
+
+    A confirmed costmap cluster merely lying somewhere on the next two metres
+    is not sufficient reason to cancel the controller. Project both the
+    chassis along the maintained route and the obstacle with its measured map
+    velocity, then grant proactive stop authority only when their inflated
+    footprints overlap inside the bounded TTC horizon. Stationary tracks stay
+    under controller/corridor and independent motion-safety authority.
+    """
+    route = list(points)
+    if len(route) < 2 or obstacle.motion_state != "MOVING":
+        return None
+    speed = abs(float(robot_speed))
+    horizon = max(0.0, float(ttc_horizon))
+    if speed <= 1e-6 or horizon <= 0.0:
+        return None
+
+    segments: list[tuple[float, float, float, float, float]] = []
+    total_length = 0.0
+    for left, right in zip(route, route[1:]):
+        left_x, left_y = float(left["x"]), float(left["y"])
+        delta_x = float(right["x"]) - left_x
+        delta_y = float(right["y"]) - left_y
+        length = math.hypot(delta_x, delta_y)
+        if length <= 1e-9:
+            continue
+        segments.append((left_x, left_y, delta_x, delta_y, length))
+        total_length += length
+    if not segments:
+        return None
+
+    inflated_radius = max(
+        0.0, float(obstacle.radius) + max(0.0, float(footprint_inflation))
+    )
+    period = max(0.02, float(sample_period))
+    steps = max(1, int(math.ceil(horizon / period)))
+    segment_index = 0
+    segment_start_distance = 0.0
+    for step in range(steps + 1):
+        timestamp = min(horizon, step * period)
+        route_distance = min(total_length, speed * timestamp)
+        while (
+            segment_index + 1 < len(segments)
+            and route_distance
+            > segment_start_distance + segments[segment_index][4]
+        ):
+            segment_start_distance += segments[segment_index][4]
+            segment_index += 1
+        left_x, left_y, delta_x, delta_y, length = segments[segment_index]
+        ratio = max(
+            0.0,
+            min(1.0, (route_distance - segment_start_distance) / length),
+        )
+        robot_x = left_x + ratio * delta_x
+        robot_y = left_y + ratio * delta_y
+        obstacle_x = obstacle.center_x + obstacle.velocity_x * timestamp
+        obstacle_y = obstacle.center_y + obstacle.velocity_y * timestamp
+        if math.hypot(robot_x - obstacle_x, robot_y - obstacle_y) <= inflated_radius:
+            return round(timestamp, 3)
+    return None
+
+
+def turn_braking_speed_limit(
+    heading_error: float,
+    *,
+    completion_tolerance: float,
+    angular_deceleration: float,
+    reaction_time: float,
+) -> float:
+    """Maximum angular speed that can settle without crossing the target."""
+    remaining = max(
+        0.0, abs(float(heading_error)) - abs(float(completion_tolerance))
+    )
+    if remaining <= 0.0:
+        return 0.0
+    deceleration = max(0.01, abs(float(angular_deceleration)))
+    reaction = max(0.0, float(reaction_time))
+    # Solve v * reaction + v^2 / (2a) <= remaining angle.
+    return max(
+        0.0,
+        -deceleration * reaction
+        + math.sqrt(
+            (deceleration * reaction) ** 2
+            + 2.0 * deceleration * remaining
+        ),
+    )
 
 
 def environment_flag(name: str, default: bool = False) -> bool:
@@ -4801,6 +5063,45 @@ def mask_scan_self_returns(
     return output, masked
 
 
+TRINARY_UNKNOWN_GRAYSCALE = 205
+
+
+def image_grayscale_values(image: Image.Image) -> list[int]:
+    """Read pixels across both current and pre-Pillow-14 runtimes."""
+    flattened = getattr(image, "get_flattened_data", None)
+    values = flattened() if callable(flattened) else image.getdata()
+    return [int(value) for value in values]
+
+
+def normalize_trinary_unknown_metadata(
+    metadata: dict[str, Any], pixels: Iterable[int]
+) -> tuple[dict[str, Any], bool]:
+    """Keep slam_toolbox's canonical gray unknown cells unknown.
+
+    Some deployed slam_toolbox builds save unknown cells as gray 205 while
+    writing ``free_thresh: 0.25``.  Nav2 then interprets their occupancy
+    probability (50/255) as free.  Normalize the threshold below that exact
+    value so Nav2 and this loader both preserve the cells as unknown.
+    """
+    normalized = dict(metadata)
+    if (
+        str(normalized.get("mode", "trinary")).lower() != "trinary"
+        or int(normalized.get("negate", 0)) != 0
+        or TRINARY_UNKNOWN_GRAYSCALE not in {int(value) for value in pixels}
+    ):
+        return normalized, False
+    unknown_probability = (
+        255 - TRINARY_UNKNOWN_GRAYSCALE
+    ) / 255.0
+    free_threshold = float(normalized.get("free_thresh", 0.196))
+    if free_threshold < unknown_probability:
+        return normalized, False
+    # 0.196 is Nav2's conventional trinary threshold and is strictly below
+    # 50/255 (~0.196078), so 205 falls between free and occupied thresholds.
+    normalized["free_thresh"] = 0.196
+    return normalized, True
+
+
 @dataclass(slots=True)
 class SavedOccupancyMap:
     """Exact saved-map grid used for goal validation (never downsampled)."""
@@ -4829,6 +5130,10 @@ class SavedOccupancyMap:
         if not image_path.is_absolute():
             image_path = yaml_path.parent / image_path
         image = Image.open(image_path).convert("L")
+        pixels = image_grayscale_values(image)
+        metadata, _ = normalize_trinary_unknown_metadata(
+            metadata, pixels
+        )
         resolution = float(metadata["resolution"])
         origin = list(metadata["origin"])
         if resolution <= 0 or len(origin) < 3:
@@ -4842,7 +5147,6 @@ class SavedOccupancyMap:
 
         # PIL rows start at the top while OccupancyGrid row zero is the lower
         # image edge. Store the same row-major orientation ROS publishes.
-        pixels = list(image.getdata())
         occupancy: list[int] = []
         for ros_row in range(image.height):
             image_row = image.height - 1 - ros_row
@@ -5561,6 +5865,596 @@ def find_start_escape(
                     motion_direction=direction,
                 )
     return None
+
+
+def localization_evidence_consensus(
+    frames: Iterable[LocalizationEvidenceFrame],
+    *,
+    window_size: int,
+    required_frames: int,
+    candidate_position_tolerance: float,
+    candidate_yaw_tolerance: float,
+    minimum_scan_beams: int,
+    required_scan_score: float,
+    minimum_residual_beams: int,
+    maximum_median_residual: float,
+    maximum_p90_residual: float,
+    minimum_raycast_beams: int,
+    minimum_raycast_static_matches: int,
+    maximum_raycast_contradiction_ratio: float,
+) -> LocalizationConsensus:
+    """Require a configurable majority of scans around one pose hypothesis.
+
+    Every frame still passes all strict geometry gates independently. Robust
+    medians are then computed only from the agreeing, passing candidate frames,
+    so one person crossing the laser cannot invalidate an otherwise consistent
+    acquisition and several contradictory frames still prevent acceptance.
+    """
+    size = max(1, int(window_size))
+    required = max(1, min(size, int(required_frames)))
+    values = tuple(frames)[-size:]
+    if len(values) < size:
+        return LocalizationConsensus(
+            False,
+            "CONSENSUS_WINDOW_INCOMPLETE",
+            len(values),
+            required,
+            0,
+            0,
+        )
+
+    def frame_passes(frame: LocalizationEvidenceFrame) -> bool:
+        return bool(
+            frame.valid_beams >= int(minimum_scan_beams)
+            and frame.scan_score >= float(required_scan_score)
+            and frame.residual_beams >= int(minimum_residual_beams)
+            and frame.median_residual <= float(maximum_median_residual)
+            and frame.p90_residual <= float(maximum_p90_residual)
+            and frame.raycast_comparable_beams >= int(minimum_raycast_beams)
+            and frame.raycast_static_matches
+            >= int(minimum_raycast_static_matches)
+            and frame.raycast_contradiction_ratio
+            <= float(maximum_raycast_contradiction_ratio)
+        )
+
+    passing = tuple(frame for frame in values if frame_passes(frame))
+    if len(passing) < required:
+        return LocalizationConsensus(
+            False,
+            "CONSENSUS_K_OF_N_FAILED",
+            len(values),
+            required,
+            len(passing),
+            0,
+        )
+
+    position_tolerance = max(0.0, float(candidate_position_tolerance))
+    yaw_tolerance = max(0.0, float(candidate_yaw_tolerance))
+
+    def agrees(
+        left: LocalizationEvidenceFrame,
+        right: LocalizationEvidenceFrame,
+    ) -> bool:
+        return bool(
+            math.hypot(left.pose_x - right.pose_x, left.pose_y - right.pose_y)
+            <= position_tolerance
+            and abs(_angle_delta(left.pose_yaw, right.pose_yaw)) <= yaw_tolerance
+        )
+
+    candidate_groups = [
+        tuple(other for other in passing if agrees(seed, other))
+        for seed in passing
+    ]
+    agreeing = max(candidate_groups, key=len, default=())
+    if len(agreeing) < required:
+        return LocalizationConsensus(
+            False,
+            "CANDIDATE_POSE_CONSENSUS_FAILED",
+            len(values),
+            required,
+            len(passing),
+            len(agreeing),
+        )
+
+    def median_number(attribute: str) -> float:
+        return float(statistics.median(
+            float(getattr(frame, attribute)) for frame in agreeing
+        ))
+
+    def median_count(attribute: str) -> int:
+        return int(round(median_number(attribute)))
+
+    return LocalizationConsensus(
+        True,
+        "ACCEPTED",
+        len(values),
+        required,
+        len(passing),
+        len(agreeing),
+        scan_score=median_number("scan_score"),
+        valid_beams=median_count("valid_beams"),
+        residual_beams=median_count("residual_beams"),
+        median_residual=median_number("median_residual"),
+        p90_residual=median_number("p90_residual"),
+        mean_residual=median_number("mean_residual"),
+        raycast_comparable_beams=median_count("raycast_comparable_beams"),
+        raycast_static_matches=median_count("raycast_static_matches"),
+        raycast_dynamic_occlusions=median_count("raycast_dynamic_occlusions"),
+        raycast_map_contradictions=median_count("raycast_map_contradictions"),
+        raycast_inconclusive_map_hits=median_count(
+            "raycast_inconclusive_map_hits"
+        ),
+        raycast_static_match_ratio=median_number(
+            "raycast_static_match_ratio"
+        ),
+        raycast_dynamic_occlusion_ratio=median_number(
+            "raycast_dynamic_occlusion_ratio"
+        ),
+        raycast_contradiction_ratio=median_number(
+            "raycast_contradiction_ratio"
+        ),
+        raycast_median_error=median_number("raycast_median_error"),
+        raycast_p90_error=median_number("raycast_p90_error"),
+    )
+
+
+def particle_cloud_uniqueness(
+    particles: Iterable[tuple[float, float, float]],
+    *,
+    cluster_radius: float,
+    alternative_separation: float,
+    minimum_best_weight: float,
+    minimum_dominance_ratio: float,
+) -> ParticleCloudUniqueness:
+    """Compare spatially separated weighted AMCL particle regions.
+
+    Nearby coarse clusters are counted as the same pose region. A second
+    region beyond ``alternative_separation`` must carry sufficiently less
+    probability than the best region; otherwise repeated-layout aliases remain
+    ambiguous and READY is rejected.
+    """
+    values = tuple(
+        (float(x), float(y), max(0.0, float(weight)))
+        for x, y, weight in particles
+        if math.isfinite(float(x))
+        and math.isfinite(float(y))
+        and math.isfinite(float(weight))
+        and float(weight) > 0.0
+    )
+    if not values:
+        return ParticleCloudUniqueness(
+            False, "PARTICLE_CLOUD_UNAVAILABLE", 0, 0, 0.0, 0.0, 0.0
+        )
+    total_weight = sum(weight for _, _, weight in values)
+    if total_weight <= 0.0:
+        return ParticleCloudUniqueness(
+            False, "PARTICLE_CLOUD_UNAVAILABLE", len(values), 0, 0.0, 0.0, 0.0
+        )
+
+    radius = max(0.01, float(cluster_radius))
+    # Deterministic weighted leader clustering avoids the single-link bridge
+    # that can merge two real hypotheses through a sparse trail of particles.
+    clusters: list[list[float]] = []
+    for x, y, weight in sorted(values, key=lambda item: (item[0], item[1])):
+        nearest_index = -1
+        nearest_distance = math.inf
+        for index, (center_x, center_y, cluster_weight) in enumerate(clusters):
+            distance = math.hypot(x - center_x, y - center_y)
+            if distance <= radius and distance < nearest_distance:
+                nearest_index = index
+                nearest_distance = distance
+        if nearest_index < 0:
+            clusters.append([x, y, weight])
+            continue
+        center_x, center_y, cluster_weight = clusters[nearest_index]
+        updated_weight = cluster_weight + weight
+        clusters[nearest_index] = [
+            (center_x * cluster_weight + x * weight) / updated_weight,
+            (center_y * cluster_weight + y * weight) / updated_weight,
+            updated_weight,
+        ]
+
+    strongest = max(clusters, key=lambda cluster: cluster[2])
+    separation = max(radius, float(alternative_separation))
+
+    def region_weight(seed: list[float]) -> float:
+        return sum(
+            cluster[2]
+            for cluster in clusters
+            if math.hypot(cluster[0] - seed[0], cluster[1] - seed[1])
+            < separation
+        ) / total_weight
+
+    best_weight = region_weight(strongest)
+    alternatives = [
+        region_weight(cluster)
+        for cluster in clusters
+        if math.hypot(cluster[0] - strongest[0], cluster[1] - strongest[1])
+        >= separation
+    ]
+    alternative_weight = max(alternatives, default=0.0)
+    dominance = (
+        math.inf
+        if alternative_weight <= 1e-12
+        else best_weight / alternative_weight
+    )
+    accepted = bool(
+        best_weight >= max(0.0, min(1.0, float(minimum_best_weight)))
+        and dominance >= max(1.0, float(minimum_dominance_ratio))
+    )
+    reason = (
+        "ACCEPTED"
+        if accepted
+        else "BEST_PARTICLE_CLUSTER_TOO_WEAK"
+        if best_weight < float(minimum_best_weight)
+        else "ALTERNATIVE_PARTICLE_CLUSTER_COMPETITIVE"
+    )
+    return ParticleCloudUniqueness(
+        accepted,
+        reason,
+        len(values),
+        len(clusters),
+        round(best_weight, 6),
+        round(alternative_weight, 6),
+        math.inf if math.isinf(dominance) else round(dominance, 6),
+        strongest[0],
+        strongest[1],
+    )
+
+
+def global_scan_alternative_is_competitive(
+    best_score: float,
+    alternative_score: float,
+    *,
+    minimum_margin: float,
+    minimum_ratio: float,
+) -> bool:
+    """Return true only when neither absolute nor relative evidence separates modes."""
+    if alternative_score <= 0.0:
+        return False
+    margin = best_score - alternative_score
+    ratio = best_score / alternative_score
+    return bool(
+        margin < max(0.0, float(minimum_margin))
+        and ratio < max(1.0, float(minimum_ratio))
+    )
+
+
+def global_scan_candidate_uniqueness(
+    saved_map: SavedOccupancyMap,
+    ranges: Iterable[float],
+    *,
+    angle_min: float,
+    angle_increment: float,
+    range_min: float,
+    range_max: float,
+    candidate_pose: tuple[float, float, float],
+    laser_x: float = 0.0,
+    laser_y: float = 0.0,
+    laser_yaw: float = 0.0,
+    maximum_beams: int = 45,
+    minimum_usable_range: float = 0.20,
+    maximum_usable_range: float = 6.0,
+    endpoint_tolerance: float = 0.15,
+    position_step: float = 0.20,
+    heading_step: float = math.radians(15.0),
+    alternative_separation: float = 0.75,
+    minimum_best_score: float = 0.45,
+    minimum_score_margin: float = 0.12,
+    minimum_score_ratio: float = 1.15,
+    candidate_position_tolerance: float = 0.45,
+    candidate_yaw_tolerance: float = math.radians(25.0),
+    candidate_score_tolerance: float = 0.04,
+    search_center: tuple[float, float] | None = None,
+    search_radius: float | None = None,
+) -> GlobalScanUniqueness:
+    """Compare a scan with coarse hypotheses independent from AMCL.
+
+    Only known-free candidate cells and endpoints close to Saved-Map occupied
+    cells participate.  The search is deliberately coarse and bounded: its
+    purpose is to find a spatially separated competitive alias, not to replace
+    AMCL's continuous pose estimate.  It is suitable for an occasional
+    background acquisition check and must not run on every scan callback.
+    """
+    measurements = tuple(float(value) for value in ranges)
+    if not measurements or saved_map.width <= 0 or saved_map.height <= 0:
+        return GlobalScanUniqueness(
+            False, "GLOBAL_SCAN_UNAVAILABLE", 0, 0, 0.0, 0.0, 0.0, 0.0
+        )
+    beam_stride = max(
+        1, math.ceil(len(measurements) / max(1, int(maximum_beams)))
+    )
+    lower = max(float(range_min), float(minimum_usable_range))
+    upper = min(float(range_max), float(maximum_usable_range))
+    beams = tuple(
+        (index, distance)
+        for index, distance in enumerate(measurements)
+        if index % beam_stride == 0
+        and math.isfinite(distance)
+        and lower <= distance <= upper
+    )
+    if len(beams) < 12:
+        return GlobalScanUniqueness(
+            False,
+            "GLOBAL_SCAN_INSUFFICIENT_BEAMS",
+            0,
+            len(beams),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    endpoint_radius_cells = max(
+        1, math.ceil(max(0.0, float(endpoint_tolerance)) / saved_map.resolution)
+    )
+    nearby_static: set[int] = set()
+    for row in range(saved_map.height):
+        for column in range(saved_map.width):
+            if saved_map.value_at(column, row) < 65:
+                continue
+            for offset_y in range(-endpoint_radius_cells, endpoint_radius_cells + 1):
+                check_row = row + offset_y
+                if not 0 <= check_row < saved_map.height:
+                    continue
+                for offset_x in range(
+                    -endpoint_radius_cells, endpoint_radius_cells + 1
+                ):
+                    if (
+                        offset_x * offset_x + offset_y * offset_y
+                        > endpoint_radius_cells * endpoint_radius_cells
+                    ):
+                        continue
+                    check_column = column + offset_x
+                    if 0 <= check_column < saved_map.width:
+                        nearby_static.add(
+                            check_row * saved_map.width + check_column
+                        )
+
+    cell_stride = max(
+        1, round(max(saved_map.resolution, float(position_step)) / saved_map.resolution)
+    )
+    constrained_radius = (
+        None if search_center is None or search_radius is None
+        else max(0.0, float(search_radius))
+    )
+    candidate_cells: list[tuple[float, float]] = []
+    for row in range(0, saved_map.height, cell_stride):
+        for column in range(0, saved_map.width, cell_stride):
+            if saved_map.value_at(column, row) != 0:
+                continue
+            x, y = saved_map.cell_center(column, row)
+            if (
+                constrained_radius is not None
+                and math.hypot(x - search_center[0], y - search_center[1])
+                > constrained_radius
+            ):
+                continue
+            candidate_cells.append((x, y))
+    if not candidate_cells:
+        return GlobalScanUniqueness(
+            False,
+            "GLOBAL_SCAN_NO_FREE_CANDIDATES",
+            0,
+            len(beams),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    map_cosine = math.cos(saved_map.origin_yaw)
+    map_sine = math.sin(saved_map.origin_yaw)
+    yaw_step = max(math.radians(5.0), float(heading_step))
+    heading_count = max(1, math.ceil(2.0 * math.pi / yaw_step))
+    scored: list[tuple[float, float, float, float]] = []
+    evaluated = 0
+    for heading_index in range(heading_count):
+        yaw = _angle_delta(-math.pi + heading_index * 2.0 * math.pi / heading_count, 0.0)
+        heading_cosine = math.cos(yaw)
+        heading_sine = math.sin(yaw)
+        laser_offset_x = heading_cosine * float(laser_x) - heading_sine * float(laser_y)
+        laser_offset_y = heading_sine * float(laser_x) + heading_cosine * float(laser_y)
+        offsets = tuple(
+            (
+                laser_offset_x + distance * math.cos(
+                    yaw + float(laser_yaw) + float(angle_min)
+                    + index * float(angle_increment)
+                ),
+                laser_offset_y + distance * math.sin(
+                    yaw + float(laser_yaw) + float(angle_min)
+                    + index * float(angle_increment)
+                ),
+            )
+            for index, distance in beams
+        )
+        for x, y in candidate_cells:
+            matches = 0
+            for offset_x, offset_y in offsets:
+                delta_x = x + offset_x - saved_map.origin_x
+                delta_y = y + offset_y - saved_map.origin_y
+                local_x = map_cosine * delta_x + map_sine * delta_y
+                local_y = -map_sine * delta_x + map_cosine * delta_y
+                column = math.floor(local_x / saved_map.resolution)
+                row = math.floor(local_y / saved_map.resolution)
+                if (
+                    0 <= column < saved_map.width
+                    and 0 <= row < saved_map.height
+                    and row * saved_map.width + column in nearby_static
+                ):
+                    matches += 1
+            evaluated += 1
+            scored.append((matches / len(beams), x, y, yaw))
+
+    scored.sort(reverse=True, key=lambda item: item[0])
+    separation = max(0.0, float(alternative_separation))
+
+    # Endpoint-only scoring creates broad plateaus: several adjacent cells in
+    # one room all receive the same score and an arbitrary grid cell can look
+    # like an independent alias.  First perform spatial non-maximum
+    # suppression, then compare a bounded set of actual pose modes using the
+    # full expected range to the first saved-map wall on every beam.
+    coarse_modes: list[tuple[float, float, float, float]] = []
+    for hypothesis in scored:
+        if any(
+            math.hypot(hypothesis[1] - mode[1], hypothesis[2] - mode[2])
+            < separation
+            for mode in coarse_modes
+        ):
+            continue
+        coarse_modes.append(hypothesis)
+        if len(coarse_modes) >= 12:
+            break
+
+    candidate_coarse = max(
+        (
+            item for item in scored
+            if math.hypot(
+                float(candidate_pose[0]) - item[1],
+                float(candidate_pose[1]) - item[2],
+            ) <= max(0.0, float(candidate_position_tolerance))
+            and abs(_angle_delta(float(candidate_pose[2]), item[3]))
+            <= max(0.0, float(candidate_yaw_tolerance))
+        ),
+        key=lambda item: item[0],
+        default=None,
+    )
+    if candidate_coarse is not None:
+        candidate_mode_index = next(
+            (
+                index for index, mode in enumerate(coarse_modes)
+                if math.hypot(
+                    candidate_coarse[1] - mode[1],
+                    candidate_coarse[2] - mode[2],
+                ) <= max(saved_map.resolution, float(candidate_position_tolerance))
+            ),
+            None,
+        )
+        if candidate_mode_index is None:
+            coarse_modes.append(candidate_coarse)
+        else:
+            # Orientation aliases at one physical position are not an
+            # independent *spatial* mode.  Retain AMCL's orientation for that
+            # basin and leave yaw corroboration to its dedicated gates.
+            coarse_modes[candidate_mode_index] = candidate_coarse
+
+    def range_score(hypothesis: tuple[float, float, float, float]) -> float:
+        endpoint_score, x, y, yaw = hypothesis
+        agreements: list[float] = []
+        tolerance = max(saved_map.resolution, float(endpoint_tolerance))
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        scan_x = x + cosine * float(laser_x) - sine * float(laser_y)
+        scan_y = y + sine * float(laser_x) + cosine * float(laser_y)
+        scan_yaw = yaw + float(laser_yaw)
+        for index, measured in beams:
+            expected = saved_map.raycast_static_range(
+                scan_x,
+                scan_y,
+                scan_yaw + float(angle_min) + index * float(angle_increment),
+                minimum_range=lower,
+                maximum_range=upper,
+            )
+            if expected is None:
+                continue
+            error = float(measured) - float(expected)
+            if error > tolerance:
+                # A return beyond the first saved wall means this hypothesis
+                # sees through static structure and is strongly contradictory.
+                agreements.append(0.0)
+            else:
+                # Shorter returns may be furniture/people, but must not be
+                # silently discarded: doing so lets a wrong pose win with only
+                # a handful of convenient beams.
+                agreements.append(math.exp(-abs(error) / tolerance))
+        if len(agreements) < max(12, len(beams) // 3):
+            return 0.0
+        residual_score = statistics.fmean(agreements)
+        return 0.25 * endpoint_score + 0.75 * residual_score
+
+    refined_modes = sorted(
+        (
+            (range_score(mode), mode[1], mode[2], mode[3])
+            for mode in coarse_modes
+        ),
+        reverse=True,
+        key=lambda item: item[0],
+    )
+    best = refined_modes[0]
+    alternative = (
+        refined_modes[1]
+        if len(refined_modes) > 1
+        else (0.0, math.nan, math.nan, math.nan)
+    )
+    margin = best[0] - alternative[0]
+    ratio = math.inf if alternative[0] <= 1e-12 else best[0] / alternative[0]
+    matching_hypothesis = max(
+        (
+            item for item in refined_modes
+            if math.hypot(
+                float(candidate_pose[0]) - item[1],
+                float(candidate_pose[1]) - item[2],
+            ) <= max(0.0, float(candidate_position_tolerance))
+            and abs(_angle_delta(float(candidate_pose[2]), item[3]))
+            <= max(0.0, float(candidate_yaw_tolerance))
+        ),
+        key=lambda item: item[0],
+        default=None,
+    )
+    candidate_position_error = (
+        math.inf if matching_hypothesis is None else math.hypot(
+            float(candidate_pose[0]) - matching_hypothesis[1],
+            float(candidate_pose[1]) - matching_hypothesis[2],
+        )
+    )
+    candidate_yaw_error = (
+        math.inf if matching_hypothesis is None else abs(
+            _angle_delta(float(candidate_pose[2]), matching_hypothesis[3])
+        )
+    )
+    candidate_matches_best = bool(
+        matching_hypothesis is not None
+        and best[0] - matching_hypothesis[0]
+        <= max(0.0, float(candidate_score_tolerance))
+    )
+    competitive_alternative = global_scan_alternative_is_competitive(
+        best[0],
+        alternative[0],
+        minimum_margin=minimum_score_margin,
+        minimum_ratio=minimum_score_ratio,
+    )
+    accepted = bool(
+        best[0] >= max(0.0, min(1.0, float(minimum_best_score)))
+        and candidate_matches_best
+        and not competitive_alternative
+    )
+    reason = (
+        "ACCEPTED"
+        if accepted
+        else "GLOBAL_SCAN_BEST_SCORE_TOO_WEAK"
+        if best[0] < float(minimum_best_score)
+        else "GLOBAL_SCAN_ALTERNATIVE_COMPETITIVE"
+        if competitive_alternative
+        else "GLOBAL_SCAN_CANDIDATE_NOT_BEST"
+    )
+    return GlobalScanUniqueness(
+        accepted=accepted,
+        reason=reason,
+        evaluated_candidates=evaluated,
+        usable_beams=len(beams),
+        best_score=round(best[0], 4),
+        alternative_score=round(alternative[0], 4),
+        score_margin=round(margin, 4),
+        score_ratio=math.inf if math.isinf(ratio) else round(ratio, 4),
+        best_x=best[1],
+        best_y=best[2],
+        best_yaw=best[3],
+        alternative_x=None if math.isnan(alternative[1]) else alternative[1],
+        alternative_y=None if math.isnan(alternative[2]) else alternative[2],
+        alternative_yaw=None if math.isnan(alternative[3]) else alternative[3],
+        candidate_position_error=round(candidate_position_error, 4),
+        candidate_yaw_error=round(candidate_yaw_error, 4),
+    )
 
 
 def localization_verification(
