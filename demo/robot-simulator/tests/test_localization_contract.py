@@ -1354,13 +1354,15 @@ def test_map_changes_clear_latched_dynamic_recovery_state() -> None:
         assert "self._reset_dynamic_recovery()" in source
 
 
-def test_planner_searches_a_bounded_waypoint_replacement_for_shallow_zigzags() -> None:
+def test_planner_keeps_local_reducer_but_uses_global_visibility_topology() -> None:
     planner = NAVIGATION_CORE_SOURCE
 
     assert "def _reduce_one_route_corner(" in planner
     assert "replacement_local_length > old_local_length + 0.30" in planner
     assert "result.metadata.turn_count" in planner
-    assert "maximum_reduced_length" in planner
+    assert "def _minimum_turn_visibility_route(" in planner
+    assert "start_state = (0, -1)" in planner
+    assert "visibility_result, minimum_turn_proven" in planner
 
 
 def test_dynamic_replan_pause_invalidates_inflight_route_restart() -> None:

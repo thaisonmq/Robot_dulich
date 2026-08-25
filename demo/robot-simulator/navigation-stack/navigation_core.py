@@ -18,6 +18,10 @@ import yaml
 from PIL import Image
 
 
+LOGGER = logging.getLogger(__name__)
+STOP_TURN_ANGLE_TOLERANCE = math.radians(3.0)
+
+
 @dataclass(frozen=True, slots=True)
 class GoalValidation:
     valid: bool
@@ -143,6 +147,7 @@ class PlannerResult:
     start_escape: StartEscape | None = None
     expansions: int = 0
     elapsed_seconds: float = 0.0
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def success(self) -> bool:
@@ -923,7 +928,7 @@ def execution_pose_continuity(
 def canonicalize_stop_turn_path(
     points: Iterable[dict[str, float]],
     *,
-    angular_tolerance: float = math.radians(1.0),
+    angular_tolerance: float = STOP_TURN_ANGLE_TOLERANCE,
 ) -> list[dict[str, float]]:
     """Remove duplicate and collinear points without rounding corner geometry."""
     route: list[dict[str, float]] = []
@@ -1782,7 +1787,7 @@ def route_geometry_metadata(
         if directions[index] < 0:
             outgoing = _angle_delta(outgoing + math.pi, 0.0)
         angle = abs(_angle_delta(outgoing, incoming))
-        if angle <= 1e-6:
+        if angle <= STOP_TURN_ANGLE_TOLERANCE:
             continue
         internal_turn_count += 1
         internal_turn_angle += angle
@@ -1822,15 +1827,23 @@ def route_geometry_metadata(
         if goal_yaw is not None:
             final_turn_angle = abs(_angle_delta(goal_yaw, last_heading))
     executed_turn_angles = (
-        (initial_turn_angle if initial_turn_angle > 1e-6 else 0.0),
+        (
+            initial_turn_angle
+            if initial_turn_angle > STOP_TURN_ANGLE_TOLERANCE
+            else 0.0
+        ),
         internal_turn_angle,
-        (final_turn_angle if final_turn_angle > 1e-6 else 0.0),
+        (
+            final_turn_angle
+            if final_turn_angle > STOP_TURN_ANGLE_TOLERANCE
+            else 0.0
+        ),
     )
     execution_total_turn_angle = sum(executed_turn_angles)
     turn_count = (
         internal_turn_count
-        + int(initial_turn_angle > 1e-6)
-        + int(final_turn_angle > 1e-6)
+        + int(initial_turn_angle > STOP_TURN_ANGLE_TOLERANCE)
+        + int(final_turn_angle > STOP_TURN_ANGLE_TOLERANCE)
     )
     return RouteMetadata(
         total_length=total_length,
@@ -1902,6 +1915,128 @@ class StopTurnStateLatticePlanner:
             self.hard_side_margin, float(preferred_side_margin)
         )
         self.heading_step = 2.0 * math.pi / self.HEADING_BINS
+        self._last_plan_diagnostics: dict[str, Any] = {}
+
+    @staticmethod
+    def _grid_seed_turn_count(seed: list[tuple[int, int]]) -> int:
+        directions = [
+            (right[0] - left[0], right[1] - left[1])
+            for left, right in zip(seed, seed[1:])
+        ]
+        return sum(
+            left != right for left, right in zip(directions, directions[1:])
+        )
+
+    @staticmethod
+    def _route_internal_turn_count(route: StopTurnRoute) -> int:
+        points = list(route.points)
+        directions = tuple(
+            route.segment_directions
+            or (1 for _ in range(max(0, len(points) - 1)))
+        )
+        count = 0
+        for index in range(1, len(points) - 1):
+            incoming = math.atan2(
+                points[index]["y"] - points[index - 1]["y"],
+                points[index]["x"] - points[index - 1]["x"],
+            )
+            outgoing = math.atan2(
+                points[index + 1]["y"] - points[index]["y"],
+                points[index + 1]["x"] - points[index]["x"],
+            )
+            if directions[index - 1] < 0:
+                incoming = _angle_delta(incoming + math.pi, 0.0)
+            if directions[index] < 0:
+                outgoing = _angle_delta(outgoing + math.pi, 0.0)
+            if (
+                abs(_angle_delta(outgoing, incoming))
+                > STOP_TURN_ANGLE_TOLERANCE
+            ):
+                count += 1
+        return count
+
+    def _record_turn_route_rejection(
+        self,
+        turn_count: int,
+        reason: str,
+        **details: Any,
+    ) -> None:
+        rejections = self._last_plan_diagnostics.setdefault(
+            "turn_route_rejections", []
+        )
+        rejection = {
+            "turn_count": max(0, int(turn_count)),
+            "reason": str(reason),
+            **details,
+        }
+        if rejection in rejections or len(rejections) >= 48:
+            return
+        rejections.append(rejection)
+        LOGGER.info(
+            "[TURN_ROUTE_REJECT] %s",
+            " ".join(f"{key}={value!r}" for key, value in rejection.items()),
+        )
+
+    def _complete_plan_diagnostics(
+        self,
+        selected: StopTurnRoute | None,
+        *,
+        candidate_count: int,
+        minimum_turn_proven: bool,
+    ) -> None:
+        diagnostics = self._last_plan_diagnostics
+        diagnostics["candidate_count"] = int(candidate_count)
+        diagnostics["minimum_turn_proven"] = bool(minimum_turn_proven)
+        diagnostics["hard_clearance_required"] = self.hard_side_margin
+        diagnostics["preferred_clearance"] = self.preferred_side_margin
+        if selected is None:
+            diagnostics.update({
+                "selected_points": 0,
+                "selected_segments": 0,
+                "selected_turn_count": 0,
+                "normal_route_segments": 0,
+                "normal_route_turns": 0,
+                "initial_alignment_turn": 0,
+                "total_execution_turns": 0,
+                "route_length": 0.0,
+                "total_rotation_deg": 0.0,
+                "minimum_route_clearance": None,
+            })
+            return
+        normal_turns = self._route_internal_turn_count(selected)
+        initial_turn = int(
+            selected.metadata.initial_turn_angle
+            > STOP_TURN_ANGLE_TOLERANCE
+        )
+        final_turn = int(
+            selected.metadata.final_turn_angle
+            > STOP_TURN_ANGLE_TOLERANCE
+        )
+        for turn_count in range(normal_turns):
+            if not any(
+                int(item.get("turn_count", -1)) == turn_count
+                for item in diagnostics.get("turn_route_rejections", [])
+            ):
+                self._record_turn_route_rejection(
+                    turn_count,
+                    "NO_VISIBILITY_TOPOLOGY",
+                )
+        diagnostics.update({
+            "selected_points": len(selected.points),
+            "selected_segments": max(0, len(selected.points) - 1),
+            "selected_turn_count": normal_turns,
+            "normal_route_segments": max(0, len(selected.points) - 1),
+            "normal_route_turns": normal_turns,
+            "initial_alignment_turn": initial_turn,
+            "total_execution_turns": normal_turns + initial_turn + final_turn,
+            "route_length": round(selected.metadata.total_length, 4),
+            "total_rotation_deg": round(
+                math.degrees(selected.metadata.total_turn_angle), 3
+            ),
+            "minimum_route_clearance": _finite_or_none(
+                selected.metadata.minimum_side_clearance
+            ),
+        })
 
     def _turn_valid(
         self,
@@ -1997,9 +2132,9 @@ class StopTurnStateLatticePlanner:
                 return True
         return False
 
-    def _translation_valid(
+    def _translation_validation(
         self, left: dict[str, float], right: dict[str, float]
-    ) -> bool:
+    ) -> ExecutablePathValidation:
         return validate_executable_grid_path(
             (left, right),
             width=self.saved_map.width,
@@ -2015,7 +2150,53 @@ class StopTurnStateLatticePlanner:
             ),
             allow_unknown=False,
             lethal_threshold=65,
-        ).valid
+        )
+
+    def _translation_valid(
+        self, left: dict[str, float], right: dict[str, float]
+    ) -> bool:
+        return self._translation_validation(left, right).valid
+
+    def _visibility_translation_validation(
+        self,
+        left: dict[str, float],
+        right: dict[str, float],
+    ) -> ExecutablePathValidation:
+        """Use a conservative clearance-circle proof before exact SAT checks."""
+        delta_x = float(right["x"]) - float(left["x"])
+        delta_y = float(right["y"]) - float(left["y"])
+        distance = math.hypot(delta_x, delta_y)
+        if distance <= 1e-9:
+            return ExecutablePathValidation(False, "PATH_HAS_NO_LENGTH")
+        required = math.hypot(
+            self.half_length + self.padding,
+            self.half_width + self.padding + self.hard_side_margin,
+        )
+        count = max(
+            1,
+            math.ceil(distance / max(0.001, self.saved_map.resolution / 2.0)),
+        )
+        circle_proves_edge = True
+        for sample in range(count + 1):
+            ratio = sample / count
+            x = float(left["x"]) + delta_x * ratio
+            y = float(left["y"]) + delta_y * ratio
+            cell = self.saved_map.world_to_cell(x, y)
+            if cell is None:
+                circle_proves_edge = False
+                break
+            center_x, center_y = self.saved_map.cell_center(*cell)
+            available = self.geometry.clearance_at_cell(*cell) - math.hypot(
+                x - center_x, y - center_y
+            )
+            if available + 1e-9 < required:
+                circle_proves_edge = False
+                break
+        if circle_proves_edge:
+            return ExecutablePathValidation(
+                True, samples_checked=count + 1
+            )
+        return self._translation_validation(left, right)
 
     def _segment_has_center_clearance(
         self,
@@ -2489,19 +2670,670 @@ class StopTurnStateLatticePlanner:
         return output
 
     def _clearance_levels(self) -> tuple[float, ...]:
-        """Center-clearance bands, widest first, down to the hard reserve."""
+        """Search the hard-safe band first; wider bands are soft candidates.
+
+        A preferred-clearance route is never proof that a hard-safe topology
+        with fewer stops does not exist. Starting at the hard band also makes
+        bounded requests spend their first work on the complete feasible set.
+        """
         preferred = self.half_width + self.padding + self.preferred_side_margin
         hard = self.half_width + self.padding + self.hard_side_margin
         if preferred <= hard + 1e-9:
             return (hard,)
         # One-centimetre bands are finer than the 5 cm Saved Map cells while
-        # keeping recovery planning bounded. The first exact-valid band wins;
-        # distance and minimum-turn seeds compete only within that width class.
+        # keeping recovery planning bounded. Every band remains a candidate;
+        # preferred width is considered only after turn/time/distance/rotation.
         step = 0.01
         count = max(1, math.ceil((preferred - hard) / step))
-        levels = [max(hard, preferred - index * step) for index in range(count + 1)]
-        levels[-1] = hard
+        levels = [hard]
+        levels.extend(
+            max(hard, preferred - index * step)
+            for index in range(count + 1)
+        )
         return tuple(dict.fromkeys(round(value, 6) for value in levels))
+
+    def _orthogonal_projection_waypoints(
+        self,
+        seed_routes: Iterable[Iterable[dict[str, float]]],
+        *,
+        deadline_monotonic: float | None,
+    ) -> list[dict[str, float]]:
+        """Extend long axis-aligned seed segments to nearby route anchors.
+
+        Grid seeds often describe a square obstacle corner as two or three
+        short diagonal steps.  The original sparse graph kept those seed
+        points but omitted the actual perpendicular intersection, so the
+        minimum-turn search could not represent the simpler square corner.
+        Keep this set deliberately small: for each useful straight segment,
+        retain only the three nearest projections beyond either endpoint.
+        Exact translation and swept-rotation validation still decides whether
+        any projected corner is executable.
+        """
+        resolution = self.saved_map.resolution
+        minimum_segment_length = max(0.20, 4.0 * resolution)
+        axis_tolerance = max(1e-6, resolution * 0.10)
+        quantum = max(1e-6, resolution / 4.0)
+        candidates: dict[
+            tuple[int, int], tuple[tuple[float, float, int, int], dict[str, float]]
+        ] = {}
+
+        for route_index, route_points in enumerate(seed_routes):
+            route = [
+                {"x": float(point["x"]), "y": float(point["y"])}
+                for point in route_points
+            ]
+            if len(route) < 3:
+                continue
+            for segment_index, (left, right) in enumerate(
+                zip(route, route[1:])
+            ):
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    return [
+                        value[1]
+                        for value in sorted(
+                            candidates.values(), key=lambda item: item[0]
+                        )[:32]
+                    ]
+                delta_x = right["x"] - left["x"]
+                delta_y = right["y"] - left["y"]
+                length = math.hypot(delta_x, delta_y)
+                if length + 1e-9 < minimum_segment_length:
+                    continue
+                horizontal = abs(delta_y) <= axis_tolerance
+                vertical = abs(delta_x) <= axis_tolerance
+                if not horizontal and not vertical:
+                    continue
+
+                if horizontal:
+                    level = (left["y"] + right["y"]) / 2.0
+                    lower, upper = sorted((left["x"], right["x"]))
+                else:
+                    level = (left["x"] + right["x"]) / 2.0
+                    lower, upper = sorted((left["y"], right["y"]))
+
+                side_candidates: dict[
+                    int, list[tuple[float, int, dict[str, float]]]
+                ] = {
+                    -1: [],
+                    1: [],
+                }
+                for anchor_index, anchor in enumerate(route):
+                    along = anchor["x"] if horizontal else anchor["y"]
+                    if along < lower - axis_tolerance:
+                        side = -1
+                        extension = lower - along
+                    elif along > upper + axis_tolerance:
+                        side = 1
+                        extension = along - upper
+                    else:
+                        continue
+                    point = (
+                        {"x": anchor["x"], "y": level}
+                        if horizontal
+                        else {"x": level, "y": anchor["y"]}
+                    )
+                    cell = self.saved_map.world_to_cell(point["x"], point["y"])
+                    if cell is None:
+                        continue
+                    column, row = cell
+                    if not self.geometry.turn_safe_mask[
+                        self.geometry.index(column, row)
+                    ]:
+                        continue
+                    side_candidates[side].append((extension, anchor_index, point))
+
+                for side in (-1, 1):
+                    side_candidates[side].sort(key=lambda item: (item[0], item[1]))
+                    for extension, anchor_index, point in side_candidates[side][:3]:
+                        key = (
+                            round(point["x"] / quantum),
+                            round(point["y"] / quantum),
+                        )
+                        score = (
+                            float(extension),
+                            float(length),
+                            int(route_index),
+                            abs(anchor_index - segment_index),
+                        )
+                        previous = candidates.get(key)
+                        if previous is None or score < previous[0]:
+                            candidates[key] = (score, point)
+
+        return [
+            value[1]
+            for value in sorted(candidates.values(), key=lambda item: item[0])[:32]
+        ]
+
+    def _orthogonalized_seed_routes(
+        self,
+        seed_routes: Iterable[Iterable[dict[str, float]]],
+        *,
+        deadline_monotonic: float | None,
+    ) -> list[list[dict[str, float]]]:
+        """Replace diagonal stair-steps around a straight with square corners."""
+        resolution = self.saved_map.resolution
+        minimum_segment_length = max(0.20, 4.0 * resolution)
+        axis_tolerance = max(1e-6, resolution * 0.10)
+        proposals: list[
+            tuple[tuple[float, int, int, int], list[dict[str, float]]]
+        ] = []
+        seen: set[tuple[tuple[float, float], ...]] = set()
+
+        for route_index, route_points in enumerate(seed_routes):
+            route = [
+                {"x": float(point["x"]), "y": float(point["y"])}
+                for point in route_points
+            ]
+            if len(route) < 5:
+                continue
+            for segment_index, (left, right) in enumerate(
+                zip(route, route[1:])
+            ):
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    break
+                delta_x = right["x"] - left["x"]
+                delta_y = right["y"] - left["y"]
+                length = math.hypot(delta_x, delta_y)
+                if length + 1e-9 < minimum_segment_length:
+                    continue
+                horizontal = abs(delta_y) <= axis_tolerance
+                vertical = abs(delta_x) <= axis_tolerance
+                if not horizontal and not vertical:
+                    continue
+                if horizontal:
+                    level = (left["y"] + right["y"]) / 2.0
+                    lower, upper = sorted((left["x"], right["x"]))
+                else:
+                    level = (left["x"] + right["x"]) / 2.0
+                    lower, upper = sorted((left["y"], right["y"]))
+
+                def projected_anchor(
+                    anchor_index: int,
+                ) -> tuple[float, dict[str, float]] | None:
+                    anchor = route[anchor_index]
+                    along = anchor["x"] if horizontal else anchor["y"]
+                    if lower - axis_tolerance <= along <= upper + axis_tolerance:
+                        return None
+                    extension = (
+                        lower - along if along < lower else along - upper
+                    )
+                    point = (
+                        {"x": anchor["x"], "y": level}
+                        if horizontal
+                        else {"x": level, "y": anchor["y"]}
+                    )
+                    cell = self.saved_map.world_to_cell(point["x"], point["y"])
+                    if cell is None:
+                        return None
+                    column, row = cell
+                    if not self.geometry.turn_safe_mask[
+                        self.geometry.index(column, row)
+                    ]:
+                        return None
+                    return extension, point
+
+                before = [
+                    (value[0], index, value[1])
+                    # Start and goal are immutable route endpoints; only
+                    # internal stair-step anchors may be replaced.
+                    for index in range(1, segment_index)
+                    if (value := projected_anchor(index)) is not None
+                ]
+                after = [
+                    (value[0], index, value[1])
+                    for index in range(segment_index + 2, len(route) - 1)
+                    if (value := projected_anchor(index)) is not None
+                ]
+                before.sort(key=lambda item: (item[0], -item[1]))
+                after.sort(key=lambda item: (item[0], item[1]))
+                for before_extension, before_index, before_point in before[:3]:
+                    for after_extension, after_index, after_point in after[:3]:
+                        candidate = canonicalize_stop_turn_path([
+                            *route[:before_index],
+                            before_point,
+                            after_point,
+                            *route[after_index + 1 :],
+                        ])
+                        if len(candidate) < 2:
+                            continue
+                        key = tuple(
+                            (round(point["x"], 6), round(point["y"], 6))
+                            for point in candidate
+                        )
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        proposals.append((
+                            (
+                                before_extension + after_extension,
+                                route_index,
+                                segment_index,
+                                before_index,
+                            ),
+                            candidate,
+                        ))
+
+        proposals.sort(key=lambda item: item[0])
+        return [candidate for _, candidate in proposals[:24]]
+
+    def _sparse_visibility_waypoints(
+        self,
+        start: dict[str, float],
+        goal: dict[str, float],
+        seeds: Iterable[list[tuple[int, int]]],
+        seed_routes: Iterable[Iterable[dict[str, float]]],
+        *,
+        deadline_monotonic: float | None,
+    ) -> list[dict[str, float]]:
+        """Build sparse topology landmarks from seeds and turn-safe frontiers."""
+        points: list[dict[str, float]] = []
+        seen: set[tuple[int, int]] = set()
+        quantum = max(1e-6, self.saved_map.resolution / 4.0)
+
+        def add(point: dict[str, float]) -> None:
+            key = (
+                round(float(point["x"]) / quantum),
+                round(float(point["y"]) / quantum),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            points.append({"x": float(point["x"]), "y": float(point["y"])})
+
+        add(start)
+        add(goal)
+        route_landmarks = [
+            [dict(point) for point in route]
+            for route in seed_routes
+        ]
+        for route in route_landmarks:
+            for point in route:
+                add(point)
+
+        for point in self._orthogonal_projection_waypoints(
+            route_landmarks,
+            deadline_monotonic=deadline_monotonic,
+        ):
+            add(point)
+
+        for seed in seeds:
+            if len(seed) < 2:
+                continue
+            directions = [
+                (right[0] - left[0], right[1] - left[1])
+                for left, right in zip(seed, seed[1:])
+            ]
+            selected_indices = {0, len(seed) - 1}
+            corner_indices: list[int] = []
+            for index, (incoming, outgoing) in enumerate(
+                zip(directions, directions[1:]), start=1
+            ):
+                if incoming != outgoing:
+                    corner_indices.append(index)
+            if len(corner_indices) > 4:
+                corner_indices = [
+                    corner_indices[
+                        round(index * (len(corner_indices) - 1) / 3)
+                    ]
+                    for index in range(4)
+                ]
+            for index in corner_indices:
+                selected_indices.add(index)
+            for index in sorted(selected_indices):
+                if not 0 <= index < len(seed):
+                    continue
+                x, y = self.saved_map.cell_center(*seed[index])
+                add({"x": x, "y": y})
+
+        # Cells on the boundary of a safe rotation region approximate the
+        # useful visibility vertices around obstacles and corridor mouths.
+        # Spatial buckets keep this frontier sparse on large open maps.
+        stride = max(2, round(0.20 / self.saved_map.resolution))
+        frontier: dict[
+            tuple[int, int], tuple[tuple[float, float, float], dict[str, float]]
+        ] = {}
+        ring = (
+            (1, 0), (1, 1), (0, 1), (-1, 1),
+            (-1, 0), (-1, -1), (0, -1), (1, -1),
+        )
+        turn_radius = math.hypot(
+            self.half_length + self.padding,
+            self.half_width + self.padding + self.hard_side_margin,
+        )
+        for row in range(self.saved_map.height):
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                break
+            for column in range(self.saved_map.width):
+                index = self.geometry.index(column, row)
+                if not self.geometry.turn_safe_mask[index]:
+                    continue
+                neighbor_safe = []
+                for delta_x, delta_y in ring:
+                    neighbor_column = column + delta_x
+                    neighbor_row = row + delta_y
+                    neighbor_safe.append(
+                        0 <= neighbor_column < self.saved_map.width
+                        and 0 <= neighbor_row < self.saved_map.height
+                        and self.geometry.turn_safe_mask[
+                            self.geometry.index(neighbor_column, neighbor_row)
+                        ]
+                    )
+                if all(neighbor_safe):
+                    continue
+                transitions = sum(
+                    left != right
+                    for left, right in zip(
+                        neighbor_safe,
+                        neighbor_safe[1:] + neighbor_safe[:1],
+                    )
+                )
+                x, y = self.saved_map.cell_center(column, row)
+                clearance = self.geometry.clearance_at_cell(column, row)
+                score = (
+                    float(transitions),
+                    -abs(clearance - turn_radius),
+                    -math.hypot(
+                        x - (float(start["x"]) + float(goal["x"])) / 2.0,
+                        y - (float(start["y"]) + float(goal["y"])) / 2.0,
+                    ),
+                )
+                bucket = (column // stride, row // stride)
+                if bucket not in frontier or score > frontier[bucket][0]:
+                    frontier[bucket] = (score, {"x": x, "y": y})
+
+        frontier_points = sorted(
+            frontier.values(), key=lambda item: item[0], reverse=True
+        )
+        for _, point in frontier_points[:8]:
+            add(point)
+        return points
+
+    def _minimum_turn_visibility_route(
+        self,
+        start: dict[str, float],
+        goal: dict[str, float],
+        waypoints: Iterable[dict[str, float]],
+        exclusions: tuple[tuple[float, float, float], ...],
+        *,
+        goal_yaw: float | None,
+        maximum_internal_turns: int | None,
+        deadline_monotonic: float | None,
+        maximum_expansions: int | None = None,
+    ) -> tuple[StopTurnRoute | None, bool]:
+        """Lexicographic shortest path over ``(node, incoming heading)``.
+
+        Every visibility edge uses the exact rectangular translation check.
+        Every change of incoming heading uses the existing exact swept-turn
+        validation before the transition can enter the queue.
+        """
+        nodes = [
+            {"x": float(point["x"]), "y": float(point["y"])}
+            for point in waypoints
+        ]
+        if len(nodes) < 2:
+            return None, True
+        start_yaw = float(start.get("yaw", 0.0))
+        stop_overhead = (
+            2.0 * (self.half_length + self.padding) / self.linear_speed
+        )
+        start_state = (0, -1)
+        costs: dict[tuple[int, int], tuple[int, float, float, float]] = {
+            start_state: (0, 0.0, 0.0, 0.0)
+        }
+        parents: dict[tuple[int, int], tuple[int, int] | None] = {
+            start_state: None
+        }
+        initial_remaining = math.hypot(
+            float(goal["x"]) - float(start["x"]),
+            float(goal["y"]) - float(start["y"]),
+        )
+        queue: list[
+            tuple[
+                int,
+                float,
+                float,
+                float,
+                int,
+                tuple[int, float, float, float],
+                tuple[int, int],
+            ]
+        ] = [(
+            0,
+            initial_remaining / self.linear_speed,
+            initial_remaining,
+            0.0,
+            0,
+            (0, 0.0, 0.0, 0.0),
+            start_state,
+        )]
+        sequence = 0
+        edge_cache: dict[tuple[int, int], ExecutablePathValidation] = {}
+        turn_cache: dict[tuple[int, int, int], bool] = {}
+        self._last_visibility_expansions = 0
+
+        while queue:
+            if (
+                maximum_expansions is not None
+                and self._last_visibility_expansions
+                >= max(1, int(maximum_expansions))
+            ):
+                return None, False
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                return None, False
+            _, _, _, _, _, current_cost, state = heapq.heappop(queue)
+            if current_cost != costs.get(state):
+                continue
+            self._last_visibility_expansions += 1
+            turns, estimated_time, distance, rotation = current_cost
+            current_index, previous_index = state
+            if current_index == 1:
+                state_path: list[int] = []
+                cursor: tuple[int, int] | None = state
+                while cursor is not None:
+                    state_path.append(cursor[0])
+                    cursor = parents[cursor]
+                state_path.reverse()
+                route_points = canonicalize_stop_turn_path(
+                    nodes[index] for index in state_path
+                )
+                result = self._route_result(
+                    route_points,
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                )
+                if result is not None:
+                    return result, True
+                self._record_turn_route_rejection(
+                    turns,
+                    "EXACT_ROUTE_VALIDATION",
+                )
+                continue
+
+            current = nodes[current_index]
+            incoming_yaw = (
+                None
+                if previous_index < 0
+                else math.atan2(
+                    current["y"] - nodes[previous_index]["y"],
+                    current["x"] - nodes[previous_index]["x"],
+                )
+            )
+            for next_index, following in enumerate(nodes):
+                if next_index in {current_index, previous_index, 0}:
+                    continue
+                outgoing_yaw = math.atan2(
+                    following["y"] - current["y"],
+                    following["x"] - current["x"],
+                )
+                internal_turn = int(
+                    incoming_yaw is not None
+                    and abs(_angle_delta(outgoing_yaw, incoming_yaw))
+                    > STOP_TURN_ANGLE_TOLERANCE
+                )
+                next_turns = turns + internal_turn
+                if (
+                    maximum_internal_turns is not None
+                    and next_turns > int(maximum_internal_turns)
+                ):
+                    continue
+                if self._segment_excluded(current, following, exclusions):
+                    self._record_turn_route_rejection(
+                        next_turns,
+                        "DYNAMIC_EXCLUSION",
+                        segment=current_index,
+                    )
+                    continue
+                if incoming_yaw is None:
+                    turn_angle = abs(_angle_delta(outgoing_yaw, start_yaw))
+                    if turn_angle > STOP_TURN_ANGLE_TOLERANCE:
+                        initial_rotation = validate_rotation_sweep(
+                            self.saved_map,
+                            current["x"],
+                            current["y"],
+                            start_yaw,
+                            outgoing_yaw,
+                            half_length=self.half_length,
+                            half_width=self.half_width,
+                            padding=self.padding,
+                        )
+                        if not initial_rotation.valid:
+                            self._record_turn_route_rejection(
+                                next_turns,
+                                initial_rotation.code
+                                or "ROTATION_SWEEP_COLLISION",
+                                waypoint=current_index,
+                            )
+                            continue
+                else:
+                    turn_angle = abs(_angle_delta(outgoing_yaw, incoming_yaw))
+                    if internal_turn:
+                        turn_key = (
+                            previous_index,
+                            current_index,
+                            next_index,
+                        )
+                        turn_valid = turn_cache.get(turn_key)
+                        if turn_valid is None:
+                            turn_valid = self._turn_valid(
+                                current["x"],
+                                current["y"],
+                                incoming_yaw,
+                                outgoing_yaw,
+                                robust=False,
+                            )
+                            turn_cache[turn_key] = turn_valid
+                        if not turn_valid:
+                            self._record_turn_route_rejection(
+                                next_turns,
+                                "ROTATION_SWEEP_COLLISION",
+                                waypoint=current_index,
+                            )
+                            continue
+                    else:
+                        turn_angle = 0.0
+
+                edge_key = (
+                    min(current_index, next_index),
+                    max(current_index, next_index),
+                )
+                validation = edge_cache.get(edge_key)
+                if validation is None:
+                    validation = self._visibility_translation_validation(
+                        current, following
+                    )
+                    edge_cache[edge_key] = validation
+                if not validation.valid:
+                    self._record_turn_route_rejection(
+                        next_turns,
+                        "SEGMENT_COLLISION",
+                        segment=current_index,
+                        code=validation.code,
+                    )
+                    continue
+
+                edge_distance = math.hypot(
+                    following["x"] - current["x"],
+                    following["y"] - current["y"],
+                )
+                next_distance = distance + edge_distance
+                next_rotation = rotation + turn_angle
+                initial_turn = int(
+                    previous_index < 0
+                    and turn_angle > STOP_TURN_ANGLE_TOLERANCE
+                )
+                final_angle = 0.0
+                final_turn = 0
+                if next_index == 1 and goal_yaw is not None:
+                    final_angle = abs(_angle_delta(goal_yaw, outgoing_yaw))
+                    if final_angle > STOP_TURN_ANGLE_TOLERANCE:
+                        final_validation = validate_rotation_sweep(
+                            self.saved_map,
+                            following["x"],
+                            following["y"],
+                            outgoing_yaw,
+                            goal_yaw,
+                            half_length=self.half_length,
+                            half_width=self.half_width,
+                            padding=self.padding,
+                        )
+                        if not final_validation.valid:
+                            self._record_turn_route_rejection(
+                                next_turns,
+                                final_validation.code
+                                or "ROTATION_SWEEP_COLLISION",
+                                waypoint=next_index,
+                            )
+                            continue
+                        final_turn = 1
+                next_rotation += final_angle
+                next_time = (
+                    estimated_time
+                    + edge_distance / self.linear_speed
+                    + (turn_angle + final_angle) / self.angular_speed
+                    + (initial_turn + internal_turn + final_turn)
+                    * stop_overhead
+                )
+                next_state = (next_index, current_index)
+                next_cost = (
+                    next_turns,
+                    next_time,
+                    next_distance,
+                    next_rotation,
+                )
+                if next_cost >= costs.get(
+                    next_state,
+                    (math.inf, math.inf, math.inf, math.inf),
+                ):
+                    continue
+                costs[next_state] = next_cost
+                parents[next_state] = state
+                sequence += 1
+                remaining_distance = math.hypot(
+                    float(goal["x"]) - following["x"],
+                    float(goal["y"]) - following["y"],
+                )
+                heapq.heappush(queue, (
+                    next_turns,
+                    next_time + remaining_distance / self.linear_speed,
+                    next_distance + remaining_distance,
+                    next_rotation,
+                    sequence,
+                    next_cost,
+                    next_state,
+                ))
+        return None, True
 
     def _single_turn_visibility_candidate(
         self,
@@ -2770,7 +3602,11 @@ class StopTurnStateLatticePlanner:
                 ):
                     continue
                 edge = (index, following)
-                if index > 0 and abs(_angle_delta(outgoing_yaw, incoming_yaw)) > math.radians(1.0):
+                if (
+                    index > 0
+                    and abs(_angle_delta(outgoing_yaw, incoming_yaw))
+                    > STOP_TURN_ANGLE_TOLERANCE
+                ):
                     if self._excluded(raw[index]["x"], raw[index]["y"], exclusions):
                         continue
                     turn_key = (index, self.heading_bin(outgoing_yaw))
@@ -2847,7 +3683,7 @@ class StopTurnStateLatticePlanner:
                 if (
                     index > 0
                     and abs(_angle_delta(outgoing_yaw, incoming_yaw))
-                    > math.radians(1.0)
+                    > STOP_TURN_ANGLE_TOLERANCE
                 ):
                     turn_key = (index, self.heading_bin(outgoing_yaw))
                     turn_valid = turn_cache.get(turn_key)
@@ -3136,18 +3972,24 @@ class StopTurnStateLatticePlanner:
     ) -> StopTurnRoute | None:
         self._last_plan_expansions = 0
         self._last_plan_limit = ""
+        self._last_plan_diagnostics = {
+            "raw_seed_points": 0,
+            "raw_seed_turns": 0,
+            "minimum_turn_seed_points": 0,
+            "minimum_turn_seed_turns": 0,
+            "turn_route_rejections": [],
+        }
         expansion_limit = (
             self.max_expansions
             if maximum_expansions is None
             else max(1, int(maximum_expansions))
         )
         planning_started = time.monotonic()
-        # Grid seeds are useful fast paths, but they must not consume the whole
-        # shared deadline before the exact heading lattice gets one expansion.
-        # Bound topology seeds to the first 25% and optional tight-start bay
-        # recovery to 68%, leaving a deterministic final lattice interval.
-        # With no deadline the existing exhaustive seed behaviour is unchanged.
+        # Seeds only provide graph landmarks and an upper bound. Reserve a
+        # separate interval for the global visibility proof before the heading
+        # lattice fallback.
         seed_deadline_monotonic = deadline_monotonic
+        topology_deadline_monotonic = deadline_monotonic
         turn_bay_deadline_monotonic = deadline_monotonic
         if deadline_monotonic is not None:
             remaining = max(0.0, deadline_monotonic - planning_started)
@@ -3155,20 +3997,30 @@ class StopTurnStateLatticePlanner:
                 deadline_monotonic,
                 planning_started + remaining * 0.25,
             )
+            topology_deadline_monotonic = min(
+                deadline_monotonic,
+                planning_started + remaining * 0.72,
+            )
             turn_bay_deadline_monotonic = min(
                 deadline_monotonic,
-                planning_started + remaining * 0.68,
+                planning_started + remaining * 0.72,
             )
         start_x, start_y = float(start["x"]), float(start["y"])
         goal_x, goal_y = float(goal["x"]), float(goal["y"])
         start_cell = self.saved_map.world_to_cell(start_x, start_y)
         goal_cell = self.saved_map.world_to_cell(goal_x, goal_y)
         if start_cell is None or goal_cell is None:
+            self._complete_plan_diagnostics(
+                None, candidate_count=0, minimum_turn_proven=True
+            )
             return None
         # This conservative component test catches physically disconnected
         # clicks quickly. The oriented lattice below remains the authority for
         # narrow straight passages that are not turn-safe.
         if not self.geometry.same_component(start_cell, goal_cell):
+            self._complete_plan_diagnostics(
+                None, candidate_count=0, minimum_turn_proven=True
+            )
             return None
         forbidden = tuple(
             (float(x), float(y), max(0.0, float(radius)))
@@ -3189,6 +4041,14 @@ class StopTurnStateLatticePlanner:
             )
             if direct is not None:
                 candidate_pool.append(direct)
+                # Zero normal direction changes is the global lower bound;
+                # no seed, clearance band or lattice search can improve it.
+                self._complete_plan_diagnostics(
+                    direct,
+                    candidate_count=1,
+                    minimum_turn_proven=True,
+                )
+                return direct
 
         for simple in (
             [
@@ -3213,15 +4073,18 @@ class StopTurnStateLatticePlanner:
             )
             if result is not None:
                 candidate_pool.append(result)
-        seeded_result: StopTurnRoute | None = None
-        for seed_clearance in self._clearance_levels():
+        visibility_seeds: list[list[tuple[int, int]]] = []
+        visibility_seed_routes: list[list[dict[str, float]]] = []
+        seen_seed_routes: set[tuple[tuple[float, float], ...]] = set()
+        clearance_levels = self._clearance_levels()
+        for clearance_level_index, seed_clearance in enumerate(
+            clearance_levels
+        ):
             if (
                 seed_deadline_monotonic is not None
                 and time.monotonic() >= seed_deadline_monotonic
             ):
                 break
-            level_results: list[StopTurnRoute] = []
-            seen_routes: set[tuple[tuple[float, float], ...]] = set()
             seed_searches = (
                 (self._grid_seed, self._minimum_turn_grid_seed)
                 if deadline_monotonic is not None
@@ -3235,6 +4098,23 @@ class StopTurnStateLatticePlanner:
                     seed_deadline_monotonic,
                     minimum_center_clearance=seed_clearance,
                 )
+                if seed and clearance_level_index == 0:
+                    visibility_seeds.append(seed)
+                if seed:
+                    diagnostic_prefix = (
+                        "minimum_turn_seed"
+                        if seed_search.__name__ == "_minimum_turn_grid_seed"
+                        else "raw_seed"
+                    )
+                    if not self._last_plan_diagnostics[
+                        f"{diagnostic_prefix}_points"
+                    ]:
+                        self._last_plan_diagnostics[
+                            f"{diagnostic_prefix}_points"
+                        ] = len(seed)
+                        self._last_plan_diagnostics[
+                            f"{diagnostic_prefix}_turns"
+                        ] = self._grid_seed_turn_count(seed)
                 seeded_route = self._canonical_route_from_seed(
                     seed,
                     start,
@@ -3249,82 +4129,45 @@ class StopTurnStateLatticePlanner:
                     (round(point["x"], 6), round(point["y"], 6))
                     for point in seeded_route
                 )
-                if route_key in seen_routes:
+                if route_key in seen_seed_routes:
                     continue
-                seen_routes.add(route_key)
+                seen_seed_routes.add(route_key)
+                if clearance_level_index in {0, len(clearance_levels) - 1}:
+                    visibility_seed_routes.append(seeded_route)
                 result = self._route_result(
                     seeded_route,
                     start_yaw=start_yaw,
                     goal_yaw=goal_yaw,
                 )
                 if result is not None:
-                    level_results.append(result)
-            if level_results:
-                baseline = min(level_results, key=self.ranking_key)
-                maximum_reduced_length = (
-                    min(
-                        result.metadata.total_length
-                        for result in level_results
-                    )
-                    + 2.0 * (self.half_length + self.padding)
-                )
-                if len(baseline.points) > 3:
-                    # One removed stop has a geometry-scaled execution
-                    # overhead equivalent to one chassis length of travel.
-                    # Use that as the maximum extra distance worth searching.
-                    single_turn = self._single_turn_visibility_candidate(
-                        start,
-                        goal,
-                        forbidden,
-                        maximum_total_length=(
-                            maximum_reduced_length
-                        ),
-                        maximum_turn_count=baseline.metadata.turn_count - 1,
-                        minimum_center_clearance=seed_clearance,
-                        start_yaw=start_yaw,
-                        goal_yaw=goal_yaw,
-                        deadline_monotonic=seed_deadline_monotonic,
-                    )
-                    if single_turn is not None:
-                        level_results.append(single_turn)
-                reduced = min(level_results, key=self.ranking_key)
-                while len(reduced.points) > 3:
-                    replacement = self._reduce_one_route_corner(
-                        reduced,
-                        forbidden,
-                        maximum_total_length=maximum_reduced_length,
-                        minimum_center_clearance=seed_clearance,
-                        start_yaw=start_yaw,
-                        goal_yaw=goal_yaw,
-                        deadline_monotonic=seed_deadline_monotonic,
-                    )
-                    if replacement is None:
-                        break
-                    level_results.append(replacement)
-                    reduced = replacement
-                candidate_pool.extend(level_results)
-                seeded_result = min(level_results, key=self.ranking_key)
-                break
-        # The 8-connected topology seed exposes oblique alternatives to both
-        # Manhattan routes.  The full heading lattice is only needed if that
-        # exact candidate cannot be built.
-        if seeded_result is not None:
-            selected = min(candidate_pool, key=self.ranking_key)
+                    candidate_pool.append(result)
+
+        # Evaluate the most useful square-corner rewrites directly.  Waiting
+        # for the general visibility proof can consume the bounded planning
+        # window even when the exact lower-turn route is already implied by a
+        # long horizontal/vertical seed segment.
+        for square_route in self._orthogonalized_seed_routes(
+            visibility_seed_routes,
+            deadline_monotonic=topology_deadline_monotonic,
+        ):
             if (
-                selected.metadata.minimum_side_clearance + 1e-9
-                < self.preferred_side_margin
+                topology_deadline_monotonic is not None
+                and time.monotonic() >= topology_deadline_monotonic
             ):
-                widened = self._widen_route_with_one_waypoint(
-                    selected,
-                    forbidden,
-                    required_side_clearance=self.preferred_side_margin,
-                    start_yaw=start_yaw,
-                    goal_yaw=goal_yaw,
-                    deadline_monotonic=seed_deadline_monotonic,
-                )
-                if widened is not None:
-                    return widened
-            return selected
+                break
+            if any(
+                self._segment_excluded(left, right, forbidden)
+                for left, right in zip(square_route, square_route[1:])
+            ):
+                continue
+            square_result = self._route_result(
+                square_route,
+                start_yaw=start_yaw,
+                goal_yaw=goal_yaw,
+            )
+            if square_result is not None:
+                candidate_pool.append(square_result)
+
         initial_goal_heading = math.atan2(goal_y - start_y, goal_x - start_x)
         turn_bay_result = None
         if self._excluded(start_x, start_y, forbidden) or not self._turn_valid(
@@ -3341,16 +4184,178 @@ class StopTurnStateLatticePlanner:
                 forbidden,
                 turn_bay_deadline_monotonic,
             )
+            if turn_bay_result is not None:
+                candidate_pool.append(turn_bay_result)
+
+        # Direct visibility was already rejected above. Therefore any exact
+        # one-corner route proves the global minimum normal turn count is one.
+        # Scan all turn-safe cell centers once so this proof is not limited to
+        # waypoints lying on either seed.
+        best_known_internal_turns = (
+            None
+            if not candidate_pool
+            else min(
+                self._route_internal_turn_count(route)
+                for route in candidate_pool
+            )
+        )
+        if (
+            (best_known_internal_turns is None or best_known_internal_turns > 1)
+            and self.saved_map.width * self.saved_map.height <= 12_000
+        ):
+            single_turn = self._single_turn_visibility_candidate(
+                start,
+                goal,
+                forbidden,
+                maximum_total_length=(
+                    min(
+                        route.metadata.total_length
+                        for route in candidate_pool
+                    )
+                    + 2.0 * (self.half_length + self.padding)
+                    if candidate_pool
+                    else 2.0
+                    * self.saved_map.resolution
+                    * math.hypot(
+                        self.saved_map.width, self.saved_map.height
+                    )
+                ),
+                maximum_turn_count=3,
+                minimum_center_clearance=(
+                    self.half_width
+                    + self.padding
+                    + self.hard_side_margin
+                ),
+                start_yaw=start_yaw,
+                goal_yaw=goal_yaw,
+                deadline_monotonic=topology_deadline_monotonic,
+            )
+            if single_turn is not None:
+                candidate_pool.append(single_turn)
+        one_turn_candidates = [
+            route
+            for route in candidate_pool
+            if self._route_internal_turn_count(route) == 1
+        ]
+        if one_turn_candidates:
+            selected = min(one_turn_candidates, key=self.ranking_key)
+            self._complete_plan_diagnostics(
+                selected,
+                candidate_count=len(candidate_pool),
+                minimum_turn_proven=True,
+            )
+            return selected
+
+        # Candidate routes and grid seeds only bound the search. The sparse
+        # graph can connect landmarks across unrelated seeds, so it can replace
+        # the complete A->B->... topology instead of deleting corners locally.
+        if candidate_pool:
+            best_candidate_points = [
+                dict(point)
+                for point in min(candidate_pool, key=self.ranking_key).points
+            ]
+            visibility_seed_routes.append(best_candidate_points)
+            # Bounded seed searches do not always finish the same clearance
+            # band before their deadline.  Re-run the small square-corner
+            # rewrite on the best exact-valid route so the result is stable
+            # even when that route arrived through a different seed branch.
+            for square_route in self._orthogonalized_seed_routes(
+                [best_candidate_points],
+                deadline_monotonic=topology_deadline_monotonic,
+            ):
+                if any(
+                    self._segment_excluded(left, right, forbidden)
+                    for left, right in zip(square_route, square_route[1:])
+                ):
+                    continue
+                square_result = self._route_result(
+                    square_route,
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                )
+                if square_result is not None:
+                    candidate_pool.append(square_result)
+        visibility_waypoints = self._sparse_visibility_waypoints(
+            start,
+            goal,
+            visibility_seeds,
+            visibility_seed_routes,
+            deadline_monotonic=topology_deadline_monotonic,
+        )
+        maximum_internal_turns = (
+            None
+            if not candidate_pool
+            else min(
+                self._route_internal_turn_count(route)
+                for route in candidate_pool
+            )
+        )
+        visibility_result, minimum_turn_proven = (
+            self._minimum_turn_visibility_route(
+                start,
+                goal,
+                visibility_waypoints,
+                forbidden,
+                goal_yaw=goal_yaw,
+                maximum_internal_turns=maximum_internal_turns,
+                deadline_monotonic=topology_deadline_monotonic,
+                maximum_expansions=expansion_limit,
+            )
+        )
+        if visibility_result is not None:
+            candidate_pool.append(visibility_result)
+            selected = min(candidate_pool, key=self.ranking_key)
+            self._last_plan_expansions = int(
+                getattr(self, "_last_visibility_expansions", 0)
+            )
+            self._complete_plan_diagnostics(
+                selected,
+                candidate_count=len(candidate_pool),
+                minimum_turn_proven=minimum_turn_proven,
+            )
+            return selected
+        if turn_bay_result is None and (
+            self._excluded(start_x, start_y, forbidden) or not self._turn_valid(
+            start_x,
+            start_y,
+            start_yaw,
+            initial_goal_heading,
+            robust=False,
+            measured_start=True,
+            )
+        ):
+            turn_bay_result = self._turn_bay_candidate(
+                start,
+                goal,
+                forbidden,
+                turn_bay_deadline_monotonic,
+            )
         if turn_bay_result is not None:
             candidate_pool.append(turn_bay_result)
-            return min(candidate_pool, key=self.ranking_key)
+            selected = min(candidate_pool, key=self.ranking_key)
+            self._complete_plan_diagnostics(
+                selected,
+                candidate_count=len(candidate_pool),
+                minimum_turn_proven=False,
+            )
+            return selected
         if (
             deadline_monotonic is not None
             and time.monotonic() >= deadline_monotonic
         ):
             if not candidate_pool:
                 self._last_plan_limit = "SEARCH_TIME_BUDGET_EXCEEDED"
-            return min(candidate_pool, key=self.ranking_key) if candidate_pool else None
+            selected = (
+                min(candidate_pool, key=self.ranking_key)
+                if candidate_pool
+                else None
+            )
+            self._complete_plan_diagnostics(
+                selected,
+                candidate_count=len(candidate_pool),
+                minimum_turn_proven=False,
+            )
+            return selected
         start_heading = self.heading_bin(float(start.get("yaw", 0.0)))
         # Bounded interactive requests favour finding an exact executable route
         # over proving the globally least-time lattice route. A modest weighted
@@ -3506,7 +4511,13 @@ class StopTurnStateLatticePlanner:
                     )
                     if lattice_result is not None:
                         candidate_pool.append(lattice_result)
-                        return min(candidate_pool, key=self.ranking_key)
+                        selected = min(candidate_pool, key=self.ranking_key)
+                        self._complete_plan_diagnostics(
+                            selected,
+                            candidate_count=len(candidate_pool),
+                            minimum_turn_proven=False,
+                        )
+                        return selected
 
             next_x = x + self.primitive_length * math.cos(yaw)
             next_y = y + self.primitive_length * math.sin(yaw)
@@ -3578,7 +4589,17 @@ class StopTurnStateLatticePlanner:
             and time.monotonic() >= deadline_monotonic
         ):
             self._last_plan_limit = "SEARCH_TIME_BUDGET_EXCEEDED"
-        return min(candidate_pool, key=self.ranking_key) if candidate_pool else None
+        selected = (
+            min(candidate_pool, key=self.ranking_key)
+            if candidate_pool
+            else None
+        )
+        self._complete_plan_diagnostics(
+            selected,
+            candidate_count=len(candidate_pool),
+            minimum_turn_proven=False,
+        )
+        return selected
 
     def plan_result(
         self,
@@ -3753,6 +4774,8 @@ class StopTurnStateLatticePlanner:
         )
         elapsed = time.monotonic() - started
         expansions = int(getattr(self, "_last_plan_expansions", 0))
+        plan_diagnostics = dict(self._last_plan_diagnostics)
+        plan_diagnostics["start_escape_segments"] = int(escape is not None)
         if route is not None:
             return PlannerResult(
                 "SUCCESS",
@@ -3760,6 +4783,7 @@ class StopTurnStateLatticePlanner:
                 start_escape=escape,
                 expansions=expansions,
                 elapsed_seconds=elapsed,
+                diagnostics=plan_diagnostics,
             )
         limit = str(getattr(self, "_last_plan_limit", ""))
         if limit:
@@ -3770,6 +4794,7 @@ class StopTurnStateLatticePlanner:
                 start_escape=escape,
                 expansions=expansions,
                 elapsed_seconds=elapsed,
+                diagnostics=plan_diagnostics,
             )
         if forbidden:
             static_route = self.plan(
@@ -3786,6 +4811,7 @@ class StopTurnStateLatticePlanner:
                     start_escape=escape,
                     expansions=expansions,
                     elapsed_seconds=time.monotonic() - started,
+                    diagnostics=plan_diagnostics,
                 )
         start_yaw = float(planning_start.get("yaw", 0.0))
         forward_probe = {
@@ -3834,6 +4860,7 @@ class StopTurnStateLatticePlanner:
                 start_escape=escape,
                 expansions=expansions,
                 elapsed_seconds=elapsed,
+                diagnostics=plan_diagnostics,
             )
         return PlannerResult(
             "NO_EXACT_STOP_TURN_ROUTE",
@@ -3842,20 +4869,17 @@ class StopTurnStateLatticePlanner:
             start_escape=escape,
             expansions=expansions,
             elapsed_seconds=elapsed,
+            diagnostics=plan_diagnostics,
         )
 
     def ranking_key(
         self, route: StopTurnRoute
-    ) -> tuple[float, float, float, int, float, float, float, float, float]:
+    ) -> tuple[int, float, float, float, float, float, float, float]:
         metadata = route.metadata
-        # Exact footprint and turn-sweep validation are hard filters before
-        # ranking. Prefer a centered comfort-clear route before considering
-        # execution time: total passage width cannot reveal that the centerline
-        # is only a few millimetres from one wall.
-        rotation_radius = math.hypot(
-            self.half_length + self.padding,
-            self.half_width + self.padding + self.hard_side_margin,
-        )
+        # Footprint, hard side margin and rotation sweep are hard filters in
+        # _route_result(). Ranking is deliberately lexicographic: no amount of
+        # preferred clearance may buy an additional normal stop-turn.
+        internal_turn_count = self._route_internal_turn_count(route)
         required_side_clearance = self.preferred_side_margin
         required_passage = 2.0 * (
             self.half_width + self.padding + required_side_clearance
@@ -3868,16 +4892,7 @@ class StopTurnStateLatticePlanner:
             0.0,
             required_side_clearance - metadata.minimum_side_clearance,
         ) / max(1e-9, required_side_clearance)
-        turn_shortfall = max(
-            0.0,
-            -metadata.minimum_turn_clearance,
-        ) / max(1e-9, rotation_radius)
-        safety_shortfall = passage_shortfall + side_shortfall + turn_shortfall
-        safety_band = 0.0 if safety_shortfall <= 1e-9 else 1.0
-        # Each corner is a physical stop -> in-place turn -> settle cycle. Add
-        # a stronger operator-preference penalty than the nominal timing model
-        # while retaining a distance/time bound: this avoids both zig-zags and
-        # very long right-angle detours selected merely to remove one corner.
+        clearance_penalty = passage_shortfall + side_shortfall
         dominant_axis_deviation = (
             0.0
             if not route.heading_bins
@@ -3886,22 +4901,18 @@ class StopTurnStateLatticePlanner:
                 for heading in route.heading_bins
             ) / len(route.heading_bins) * self.heading_step
         )
-        # Dominant map axes are a tie-breaker, not permission to take a large
-        # detour merely to make every line horizontal or vertical.
-        turn_preferred_time = metadata.estimated_time + 2.5 * metadata.turn_count
         return (
-            safety_band,
-            safety_shortfall,
-            turn_preferred_time,
-            metadata.turn_count,
+            internal_turn_count,
+            metadata.estimated_time,
             metadata.total_length,
-            dominant_axis_deviation,
             metadata.total_turn_angle,
+            clearance_penalty,
             -min(
                 metadata.minimum_side_clearance,
                 required_side_clearance,
             ),
             -min(metadata.minimum_passage_width, required_passage),
+            dominant_axis_deviation,
         )
 
     def plan_candidates(

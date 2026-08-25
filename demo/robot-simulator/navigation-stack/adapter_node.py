@@ -3726,14 +3726,15 @@ class NavigationAdapter(Node):
             else [-1 if int(value) < 0 else 1 for value in segment_directions]
         )
         directions_valid = len(directions) == max(0, len(canonical) - 1)
-        try:
-            live_validation = self._validate_executable_path(
-                canonical,
-                context="ROUTE_METADATA",
-            )
-            valid = live_validation.valid and directions_valid
-        except AdapterError:
-            valid = False
+        # Infrastructure failures (especially a stale/not-ready costmap) are
+        # not invalid-route results. Preserve the AdapterError so callers can
+        # report COSTMAP_NOT_READY instead of collapsing SUCCESS into an empty
+        # candidate list.
+        live_validation = self._validate_executable_path(
+            canonical,
+            context="ROUTE_METADATA",
+        )
+        valid = live_validation.valid and directions_valid
         if self.saved_map is None or self.map_navigation_geometry is None:
             valid = False
             geometry_metadata = None
@@ -7844,6 +7845,18 @@ class NavigationAdapter(Node):
                 live_start_clear=live_start_clear,
             )
         hard_side_clearance = self._hard_route_side_clearance()
+        turn_diagnostics = dict(planner_result.diagnostics)
+        if turn_diagnostics:
+            rejections = list(
+                turn_diagnostics.pop("turn_route_rejections", [])
+            )
+            turn_diagnostics["hard_clearance_required"] = hard_side_clearance
+            self._nav_debug(
+                "TURN_ROUTE_DIAGNOSTICS",
+                **turn_diagnostics,
+            )
+            for rejection in rejections:
+                self._nav_debug("TURN_ROUTE_REJECT", **rejection)
         if (
             planner_result.route is not None
             and planner_result.route.metadata.minimum_side_clearance + 1e-9
@@ -7878,7 +7891,20 @@ class NavigationAdapter(Node):
                 primary_route=planner_result.route,
             )
         )
-        candidates = self._serialize_stop_turn_candidates(planned)
+        try:
+            candidates = self._serialize_stop_turn_candidates(planned)
+        except AdapterError as exc:
+            mark_plan_failed(f"route_validation_failed:{exc.code}")
+            self._record_planning_failure(
+                exc, requested_goal, resolved_goal, planning_started
+            )
+            raise
+        if candidates and planner_result.diagnostics:
+            candidate_diagnostics = dict(planner_result.diagnostics)
+            candidate_diagnostics[
+                "hard_clearance_required"
+            ] = hard_side_clearance
+            candidates[0]["planning_diagnostics"] = candidate_diagnostics
         if candidates and planner_result.start_escape is not None:
             escape = planner_result.start_escape
             planned_points = list(candidates[0]["points"])
@@ -7899,6 +7925,8 @@ class NavigationAdapter(Node):
             )
         if not candidates:
             code = planner_result.reason or planner_result.status
+            if code == "SUCCESS":
+                code = "NO_FEASIBLE_ROUTE"
             public_code = (
                 "GOAL_PHYSICALLY_UNREACHABLE"
                 if code == "GOAL_DISCONNECTED"

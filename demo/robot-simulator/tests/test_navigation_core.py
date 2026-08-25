@@ -1,6 +1,8 @@
 import json
 import math
 import sys
+import ast
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 from xml.etree import ElementTree
@@ -15,6 +17,7 @@ import navigation_core  # noqa: E402
 from navigation_core import (  # noqa: E402
     ActiveSegment,
     DynamicObstacleOverlay,
+    ExecutablePathValidation,
     LocalizationEvidenceFrame,
     MapNavigationGeometry,
     NavigationDebugLog,
@@ -2231,7 +2234,7 @@ def test_route_metadata_rejects_total_width_as_proof_of_side_clearance() -> None
     assert centered.minimum_side_clearance > 0.50
 
 
-def test_clearance_bands_prefer_centerline_over_shorter_wall_hugging_path() -> None:
+def test_clearance_bands_keep_hard_safe_faster_minimum_turn_path() -> None:
     free = _free_rectangle(2, 77, 2, 57) - _free_rectangle(30, 40, 10, 38)
     saved = _manual_map(80, 60, free)
     start = {"x": 0.50, "y": 1.50, "yaw": 0.0}
@@ -2254,8 +2257,8 @@ def test_clearance_bands_prefer_centerline_over_shorter_wall_hugging_path() -> N
     assert shortest is not None
     assert clearance_aware is not None
     assert shortest.metadata.minimum_side_clearance < 0.03
-    assert clearance_aware.metadata.minimum_side_clearance >= 0.05
-    assert clearance_aware.metadata.total_length > shortest.metadata.total_length
+    assert clearance_aware.metadata.minimum_side_clearance >= 0.01
+    assert len(clearance_aware.points) <= len(shortest.points)
 
 
 def test_shallow_shortcut_is_widened_before_fewer_turns_are_preferred() -> None:
@@ -2357,8 +2360,10 @@ def test_minimum_turn_seed_removes_extra_stop_without_losing_width() -> None:
 
     selected = planner.plan(start, goal)
     assert selected is not None
-    assert selected.points == minimum_turn.points
+    assert planner._route_internal_turn_count(selected) == 1
     assert selected.metadata.turn_count == 2
+    assert selected.metadata.estimated_time <= minimum_turn.metadata.estimated_time
+    assert selected.metadata.minimum_side_clearance >= planner.hard_side_margin
 
 
 def test_visibility_waypoint_removes_grid_seed_turn_with_small_detour() -> None:
@@ -2399,10 +2404,326 @@ def test_visibility_waypoint_removes_grid_seed_turn_with_small_detour() -> None:
     assert seeded.metadata.turn_count == 3
     assert len(selected.points) == 3
     assert selected.metadata.turn_count == 2
-    assert selected.metadata.minimum_side_clearance >= 0.05
-    assert selected.metadata.total_length > seeded.metadata.total_length
+    assert selected.metadata.minimum_side_clearance >= planner.hard_side_margin
     assert selected.metadata.total_length <= seeded.metadata.total_length + 0.30
     assert selected.metadata.estimated_time < seeded.metadata.estimated_time
+
+
+def test_minimum_turn_direct_path_has_one_segment_and_zero_internal_turns() -> None:
+    saved = _manual_map(60, 40, _free_rectangle(1, 58, 1, 38))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+
+    route = planner.plan(
+        {"x": 0.50, "y": 1.00, "yaw": 0.0},
+        {"x": 2.50, "y": 1.00},
+    )
+
+    assert route is not None
+    assert len(route.points) == 2
+    assert planner._route_internal_turn_count(route) == 0
+    assert planner._last_plan_diagnostics["selected_segments"] == 1
+    assert planner._last_plan_diagnostics["selected_turn_count"] == 0
+    assert planner._last_plan_diagnostics["minimum_turn_proven"] is True
+
+
+def test_minimum_turn_obstacle_route_beats_zigzag_seed() -> None:
+    free = _free_rectangle(2, 77, 2, 57) - _free_rectangle(32, 42, 6, 32)
+    saved = _manual_map(80, 60, free)
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.01,
+        preferred_side_margin=0.05,
+        turn_robustness_radius=0.0,
+    )
+    start = {"x": 1.20, "y": 0.40, "yaw": -0.70}
+    goal = {"x": 3.00, "y": 1.60}
+    start_cell = saved.world_to_cell(start["x"], start["y"])
+    goal_cell = saved.world_to_cell(goal["x"], goal["y"])
+    assert start_cell is not None and goal_cell is not None
+    raw_seed = planner._grid_seed(
+        start_cell,
+        goal_cell,
+        (),
+        minimum_center_clearance=0.11,
+    )
+
+    route = planner.plan(start, goal)
+
+    assert route is not None
+    assert planner._route_internal_turn_count(route) <= 2
+    assert planner._route_internal_turn_count(route) < planner._grid_seed_turn_count(
+        raw_seed
+    )
+    assert validate_stop_turn_route(
+        saved,
+        route.points,
+        half_length=0.15,
+        half_width=0.11,
+    ).valid
+
+
+def test_orthogonal_seed_rewrite_replaces_diagonal_stairs_with_square_corners() -> None:
+    saved = _manual_map(100, 70, _free_rectangle(1, 98, 1, 68))
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.01,
+    )
+    seed_route = [
+        {"x": 0.50, "y": 0.50},
+        {"x": 1.00, "y": 0.60},
+        {"x": 1.20, "y": 1.50},
+        {"x": 1.40, "y": 1.80},
+        {"x": 1.80, "y": 2.00},
+        {"x": 3.00, "y": 2.00},
+        {"x": 3.30, "y": 1.80},
+        {"x": 3.50, "y": 0.50},
+    ]
+    start_yaw = math.atan2(0.10, 0.50)
+    original = planner._route_result(seed_route, start_yaw=start_yaw)
+
+    rewritten_points = planner._orthogonalized_seed_routes(
+        [seed_route],
+        deadline_monotonic=None,
+    )
+    rewritten = [
+        route
+        for points in rewritten_points
+        if (route := planner._route_result(points, start_yaw=start_yaw))
+        is not None
+    ]
+
+    assert original is not None
+    assert rewritten
+    assert all(route.points[0] == seed_route[0] for route in rewritten)
+    assert all(route.points[-1] == seed_route[-1] for route in rewritten)
+    selected = min(rewritten, key=planner.ranking_key)
+    assert planner._route_internal_turn_count(selected) < (
+        planner._route_internal_turn_count(original)
+    )
+    horizontal = [
+        (left, right)
+        for left, right in zip(selected.points, selected.points[1:])
+        if math.isclose(left["y"], 2.00)
+        and math.isclose(right["y"], 2.00)
+    ]
+    assert horizontal
+    assert validate_stop_turn_route(
+        saved,
+        selected.points,
+        half_length=0.15,
+        half_width=0.11,
+    ).valid
+
+
+def test_minimum_turn_ranking_beats_preferred_clearance_and_time() -> None:
+    saved = _manual_map(120, 80, _free_rectangle(1, 118, 1, 78))
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.01,
+        preferred_side_margin=0.05,
+    )
+
+    def candidate(
+        points: tuple[dict[str, float], ...],
+        *,
+        turns: int,
+        estimated_time: float,
+        clearance: float,
+    ) -> StopTurnRoute:
+        return StopTurnRoute(
+            points,
+            RouteMetadata(
+                total_length=float(len(points)),
+                minimum_passage_width=0.50,
+                minimum_static_clearance=0.20,
+                minimum_turn_clearance=0.05,
+                turn_count=turns,
+                total_turn_angle=turns * math.pi / 2.0,
+                initial_turn_angle=0.0,
+                internal_turn_angle=turns * math.pi / 2.0,
+                final_turn_angle=0.0,
+                execution_total_turn_angle=turns * math.pi / 2.0,
+                narrow_segments=(),
+                estimated_time=estimated_time,
+                turn_safe=True,
+                minimum_side_clearance=clearance,
+            ),
+            tuple(0 for _ in range(len(points) - 1)),
+        )
+
+    three_turn = candidate(
+        (
+            {"x": 0.0, "y": 0.0},
+            {"x": 1.0, "y": 0.0},
+            {"x": 1.0, "y": 1.0},
+            {"x": 2.0, "y": 1.0},
+            {"x": 2.0, "y": 2.0},
+        ),
+        turns=3,
+        estimated_time=50.0,
+        clearance=0.02,
+    )
+    six_turn = candidate(
+        (
+            {"x": 0.0, "y": 0.0},
+            {"x": 1.0, "y": 0.0},
+            {"x": 1.0, "y": 1.0},
+            {"x": 2.0, "y": 1.0},
+            {"x": 2.0, "y": 2.0},
+            {"x": 3.0, "y": 2.0},
+            {"x": 3.0, "y": 3.0},
+            {"x": 4.0, "y": 3.0},
+        ),
+        turns=6,
+        estimated_time=20.0,
+        clearance=0.08,
+    )
+
+    assert planner.ranking_key(three_turn) < planner.ranking_key(six_turn)
+
+
+def test_visibility_search_rejects_unrotatable_lower_turn_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = _manual_map(100, 60, _free_rectangle(1, 98, 1, 58))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    nodes = [
+        {"x": 0.50, "y": 0.50},  # start
+        {"x": 4.00, "y": 0.50},  # goal
+        {"x": 1.20, "y": 1.10},
+        {"x": 3.20, "y": 1.10},  # lower-turn route, turn blocked here
+        {"x": 1.00, "y": 1.80},
+        {"x": 2.20, "y": 2.10},
+        {"x": 3.40, "y": 1.80},
+    ]
+    allowed = {
+        frozenset((0, 2)), frozenset((2, 3)), frozenset((3, 1)),
+        frozenset((0, 4)), frozenset((4, 5)), frozenset((5, 6)),
+        frozenset((6, 1)),
+    }
+    indices = {(point["x"], point["y"]): index for index, point in enumerate(nodes)}
+
+    def edge(left: dict[str, float], right: dict[str, float]):
+        key = frozenset((indices[(left["x"], left["y"])], indices[(right["x"], right["y"])]))
+        return ExecutablePathValidation(
+            key in allowed,
+            "" if key in allowed else "PATH_FOOTPRINT_COLLISION",
+        )
+
+    monkeypatch.setattr(planner, "_visibility_translation_validation", edge)
+    monkeypatch.setattr(
+        planner,
+        "_turn_valid",
+        lambda x, y, *args, **kwargs: not (
+            math.isclose(x, nodes[3]["x"]) and math.isclose(y, nodes[3]["y"])
+        ),
+    )
+
+    route, proven = planner._minimum_turn_visibility_route(
+        {**nodes[0], "yaw": 0.0},
+        nodes[1],
+        nodes,
+        (),
+        goal_yaw=None,
+        maximum_internal_turns=None,
+        deadline_monotonic=None,
+    )
+
+    assert proven is True
+    assert route is not None
+    assert planner._route_internal_turn_count(route) == 3
+    assert any(
+        item["reason"] == "ROTATION_SWEEP_COLLISION"
+        for item in planner._last_plan_diagnostics["turn_route_rejections"]
+    )
+
+
+def test_visibility_search_changes_topology_beyond_local_corner_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = _manual_map(120, 70, _free_rectangle(1, 118, 1, 68))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    nodes = [
+        {"x": 0.50, "y": 0.50},  # A
+        {"x": 5.00, "y": 0.50},  # F / goal
+        {"x": 1.00, "y": 1.00},  # B
+        {"x": 1.80, "y": 1.50},  # C
+        {"x": 2.70, "y": 1.00},  # D
+        {"x": 3.60, "y": 1.50},  # E
+        {"x": 1.50, "y": 2.50},  # X
+        {"x": 4.00, "y": 2.50},  # Y
+    ]
+    baseline_edges = [(0, 2), (2, 3), (3, 4), (4, 5), (5, 1)]
+    replacement_edges = [(0, 6), (6, 7), (7, 1)]
+    allowed = {
+        frozenset(edge) for edge in (*baseline_edges, *replacement_edges)
+    }
+    indices = {(point["x"], point["y"]): index for index, point in enumerate(nodes)}
+
+    def edge(left: dict[str, float], right: dict[str, float]):
+        key = frozenset((indices[(left["x"], left["y"])], indices[(right["x"], right["y"])]))
+        return ExecutablePathValidation(
+            key in allowed,
+            "" if key in allowed else "PATH_FOOTPRINT_COLLISION",
+        )
+
+    monkeypatch.setattr(planner, "_visibility_translation_validation", edge)
+    monkeypatch.setattr(planner, "_turn_valid", lambda *args, **kwargs: True)
+
+    route, proven = planner._minimum_turn_visibility_route(
+        {**nodes[0], "yaw": 0.0},
+        nodes[1],
+        nodes,
+        (),
+        goal_yaw=None,
+        maximum_internal_turns=4,
+        deadline_monotonic=None,
+    )
+
+    assert proven is True
+    assert route is not None
+    assert list(route.points[1:-1]) == nodes[6:8]
+    assert planner._route_internal_turn_count(route) == 2
+
+
+def test_route_metadata_preserves_costmap_not_ready_error() -> None:
+    adapter_path = Path(__file__).parents[1] / "navigation-stack" / "adapter_node.py"
+    source = adapter_path.read_text()
+    tree = ast.parse(source)
+    method = next(
+        node
+        for class_node in tree.body
+        if isinstance(class_node, ast.ClassDef)
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_route_metadata"
+    )
+    method_source = textwrap.dedent(ast.get_source_segment(source, method) or "")
+
+    class CostmapNotReady(Exception):
+        code = "COSTMAP_NOT_READY"
+
+    namespace = {
+        "canonicalize_stop_turn_path": lambda points: list(points),
+    }
+    exec("from __future__ import annotations\n" + method_source, namespace)
+
+    class Adapter:
+        def _validate_executable_path(self, *args, **kwargs):
+            raise CostmapNotReady("stale global costmap")
+
+    with pytest.raises(CostmapNotReady) as error:
+        namespace["_route_metadata"](
+            Adapter(),
+            [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}],
+            original=[{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}],
+        )
+
+    assert error.value.code == "COSTMAP_NOT_READY"
+    assert 'if code == "SUCCESS":' in source
+    assert 'code = "NO_FEASIBLE_ROUTE"' in source
 
 
 def test_adjacent_shallow_corners_can_move_to_one_safe_waypoint() -> None:
@@ -2967,7 +3288,7 @@ def test_dynamic_exclusion_detours_without_mutating_saved_map() -> None:
     assert result.route is not None
     assert result.route.points != direct.points
     assert any(point["y"] > 2.0 for point in result.route.points[1:-1])
-    assert result.route.metadata.minimum_side_clearance >= 0.05
+    assert result.route.metadata.minimum_side_clearance >= planner.hard_side_margin
     assert tuple(saved.occupancy) == before
 
 
