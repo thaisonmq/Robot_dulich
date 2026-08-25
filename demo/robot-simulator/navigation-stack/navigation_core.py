@@ -2692,27 +2692,109 @@ class StopTurnStateLatticePlanner:
         )
         return tuple(dict.fromkeys(round(value, 6) for value in levels))
 
-    def _orthogonal_projection_waypoints(
+    @staticmethod
+    def _support_line_intersection(
+        first_left: dict[str, float],
+        first_right: dict[str, float],
+        second_left: dict[str, float],
+        second_right: dict[str, float],
+    ) -> tuple[dict[str, float], float, float, float] | None:
+        """Intersect two directed support lines without assuming map axes.
+
+        The returned parameters locate the intersection on each directed
+        segment: zero is the left endpoint and one is the right endpoint.
+        The final value is the total extrapolation beyond both finite
+        segments, used only to bound and rank candidate generation.
+        """
+        first_dx = float(first_right["x"]) - float(first_left["x"])
+        first_dy = float(first_right["y"]) - float(first_left["y"])
+        second_dx = float(second_right["x"]) - float(second_left["x"])
+        second_dy = float(second_right["y"]) - float(second_left["y"])
+        first_length = math.hypot(first_dx, first_dy)
+        second_length = math.hypot(second_dx, second_dy)
+        if first_length <= 1e-9 or second_length <= 1e-9:
+            return None
+        denominator = first_dx * second_dy - first_dy * second_dx
+        normalized_cross = abs(denominator) / (first_length * second_length)
+        minimum_cross = math.sin(max(
+            STOP_TURN_ANGLE_TOLERANCE,
+            math.radians(5.0),
+        ))
+        if normalized_cross <= minimum_cross:
+            return None
+        offset_x = float(second_left["x"]) - float(first_left["x"])
+        offset_y = float(second_left["y"]) - float(first_left["y"])
+        first_parameter = (
+            offset_x * second_dy - offset_y * second_dx
+        ) / denominator
+        second_parameter = (
+            offset_x * first_dy - offset_y * first_dx
+        ) / denominator
+        point = {
+            "x": float(first_left["x"]) + first_parameter * first_dx,
+            "y": float(first_left["y"]) + first_parameter * first_dy,
+        }
+        extension = (
+            max(0.0, -first_parameter, first_parameter - 1.0) * first_length
+            + max(0.0, -second_parameter, second_parameter - 1.0)
+            * second_length
+        )
+        return point, first_parameter, second_parameter, extension
+
+    def _support_line_segments(
+        self,
+        route: list[dict[str, float]],
+    ) -> list[tuple[int, dict[str, float], dict[str, float], float]]:
+        minimum_length = max(0.20, 4.0 * self.saved_map.resolution)
+        return [
+            (index, left, right, length)
+            for index, (left, right) in enumerate(zip(route, route[1:]))
+            if (length := math.hypot(
+                float(right["x"]) - float(left["x"]),
+                float(right["y"]) - float(left["y"]),
+            )) + 1e-9 >= minimum_length
+        ]
+
+    def _support_intersection_is_turn_safe(
+        self,
+        point: dict[str, float],
+    ) -> bool:
+        cell = self.saved_map.world_to_cell(point["x"], point["y"])
+        if cell is None:
+            return False
+        column, row = cell
+        return self.geometry.turn_safe_mask[
+            self.geometry.index(column, row)
+        ]
+
+    @staticmethod
+    def _point_route_turn_count(points: list[dict[str, float]]) -> int:
+        headings = [
+            math.atan2(
+                float(right["y"]) - float(left["y"]),
+                float(right["x"]) - float(left["x"]),
+            )
+            for left, right in zip(points, points[1:])
+        ]
+        return sum(
+            abs(_angle_delta(outgoing, incoming))
+            > STOP_TURN_ANGLE_TOLERANCE
+            for incoming, outgoing in zip(headings, headings[1:])
+        )
+
+    def _support_line_intersection_waypoints(
         self,
         seed_routes: Iterable[Iterable[dict[str, float]]],
         *,
         deadline_monotonic: float | None,
     ) -> list[dict[str, float]]:
-        """Extend long axis-aligned seed segments to nearby route anchors.
-
-        Grid seeds often describe a square obstacle corner as two or three
-        short diagonal steps.  The original sparse graph kept those seed
-        points but omitted the actual perpendicular intersection, so the
-        minimum-turn search could not represent the simpler square corner.
-        Keep this set deliberately small: for each useful straight segment,
-        retain only the three nearest projections beyond either endpoint.
-        Exact translation and swept-rotation validation still decides whether
-        any projected corner is executable.
-        """
-        resolution = self.saved_map.resolution
-        minimum_segment_length = max(0.20, 4.0 * resolution)
-        axis_tolerance = max(1e-6, resolution * 0.10)
-        quantum = max(1e-6, resolution / 4.0)
+        """Add bounded intersections of non-adjacent route support lines."""
+        quantum = max(1e-6, self.saved_map.resolution / 4.0)
+        map_diagonal = self.saved_map.resolution * math.hypot(
+            self.saved_map.width,
+            self.saved_map.height,
+        )
+        maximum_extension = max(1.0, 0.10 * map_diagonal)
         candidates: dict[
             tuple[int, int], tuple[tuple[float, float, int, int], dict[str, float]]
         ] = {}
@@ -2724,9 +2806,8 @@ class StopTurnStateLatticePlanner:
             ]
             if len(route) < 3:
                 continue
-            for segment_index, (left, right) in enumerate(
-                zip(route, route[1:])
-            ):
+            supports = self._support_line_segments(route)
+            for first_position, first in enumerate(supports):
                 if (
                     deadline_monotonic is not None
                     and time.monotonic() >= deadline_monotonic
@@ -2737,190 +2818,220 @@ class StopTurnStateLatticePlanner:
                             candidates.values(), key=lambda item: item[0]
                         )[:32]
                     ]
-                delta_x = right["x"] - left["x"]
-                delta_y = right["y"] - left["y"]
-                length = math.hypot(delta_x, delta_y)
-                if length + 1e-9 < minimum_segment_length:
-                    continue
-                horizontal = abs(delta_y) <= axis_tolerance
-                vertical = abs(delta_x) <= axis_tolerance
-                if not horizontal and not vertical:
-                    continue
-
-                if horizontal:
-                    level = (left["y"] + right["y"]) / 2.0
-                    lower, upper = sorted((left["x"], right["x"]))
-                else:
-                    level = (left["x"] + right["x"]) / 2.0
-                    lower, upper = sorted((left["y"], right["y"]))
-
-                side_candidates: dict[
-                    int, list[tuple[float, int, dict[str, float]]]
-                ] = {
-                    -1: [],
-                    1: [],
-                }
-                for anchor_index, anchor in enumerate(route):
-                    along = anchor["x"] if horizontal else anchor["y"]
-                    if along < lower - axis_tolerance:
-                        side = -1
-                        extension = lower - along
-                    elif along > upper + axis_tolerance:
-                        side = 1
-                        extension = along - upper
-                    else:
+                first_index, first_left, first_right, first_length = first
+                for second in supports[first_position + 1 :]:
+                    second_index, second_left, second_right, second_length = second
+                    if second_index <= first_index + 1:
                         continue
-                    point = (
-                        {"x": anchor["x"], "y": level}
-                        if horizontal
-                        else {"x": level, "y": anchor["y"]}
+                    intersection = self._support_line_intersection(
+                        first_left,
+                        first_right,
+                        second_left,
+                        second_right,
                     )
-                    cell = self.saved_map.world_to_cell(point["x"], point["y"])
-                    if cell is None:
+                    if intersection is None:
                         continue
-                    column, row = cell
-                    if not self.geometry.turn_safe_mask[
-                        self.geometry.index(column, row)
-                    ]:
+                    point, first_parameter, second_parameter, extension = (
+                        intersection
+                    )
+                    if (
+                        first_parameter <= 0.0
+                        or second_parameter >= 1.0
+                        or extension > maximum_extension
+                        or not self._support_intersection_is_turn_safe(point)
+                    ):
                         continue
-                    side_candidates[side].append((extension, anchor_index, point))
-
-                for side in (-1, 1):
-                    side_candidates[side].sort(key=lambda item: (item[0], item[1]))
-                    for extension, anchor_index, point in side_candidates[side][:3]:
-                        key = (
-                            round(point["x"] / quantum),
-                            round(point["y"] / quantum),
-                        )
-                        score = (
-                            float(extension),
-                            float(length),
-                            int(route_index),
-                            abs(anchor_index - segment_index),
-                        )
-                        previous = candidates.get(key)
-                        if previous is None or score < previous[0]:
-                            candidates[key] = (score, point)
+                    key = (
+                        round(point["x"] / quantum),
+                        round(point["y"] / quantum),
+                    )
+                    score = (
+                        float(extension),
+                        -min(first_length, second_length),
+                        int(route_index),
+                        first_index,
+                    )
+                    previous = candidates.get(key)
+                    if previous is None or score < previous[0]:
+                        candidates[key] = (score, point)
 
         return [
             value[1]
             for value in sorted(candidates.values(), key=lambda item: item[0])[:32]
         ]
 
-    def _orthogonalized_seed_routes(
+    def _support_line_seed_routes(
         self,
         seed_routes: Iterable[Iterable[dict[str, float]]],
         *,
         deadline_monotonic: float | None,
     ) -> list[list[dict[str, float]]]:
-        """Replace diagonal stair-steps around a straight with square corners."""
-        resolution = self.saved_map.resolution
-        minimum_segment_length = max(0.20, 4.0 * resolution)
-        axis_tolerance = max(1e-6, resolution * 0.10)
+        """Replace seed stair-steps using directed support-line intersections.
+
+        Pair rewrites remove one cluster of intermediate bends. Triple
+        rewrites join an ingress, traverse and egress in one topology change.
+        The construction is rotation-invariant; exact route validation remains
+        the authority after this bounded proposal stage.
+        """
+        map_diagonal = self.saved_map.resolution * math.hypot(
+            self.saved_map.width,
+            self.saved_map.height,
+        )
+        maximum_extension = max(1.0, 0.10 * map_diagonal)
         proposals: list[
-            tuple[tuple[float, int, int, int], list[dict[str, float]]]
+            tuple[
+                tuple[int, float, float, int, int, int],
+                list[dict[str, float]],
+            ]
         ] = []
         seen: set[tuple[tuple[float, float], ...]] = set()
+
+        def route_length(points: list[dict[str, float]]) -> float:
+            return sum(
+                math.hypot(
+                    float(right["x"]) - float(left["x"]),
+                    float(right["y"]) - float(left["y"]),
+                )
+                for left, right in zip(points, points[1:])
+            )
+
+        def add_proposal(
+            route: list[dict[str, float]],
+            candidate_points: Iterable[dict[str, float]],
+            *,
+            extension: float,
+            route_index: int,
+            first_index: int,
+            last_index: int,
+        ) -> None:
+            candidate = canonicalize_stop_turn_path(candidate_points)
+            if (
+                len(candidate) < 2
+                or candidate[0] != route[0]
+                or candidate[-1] != route[-1]
+            ):
+                return
+            candidate_turns = self._point_route_turn_count(candidate)
+            if candidate_turns >= self._point_route_turn_count(route):
+                return
+            key = tuple(
+                (round(point["x"], 6), round(point["y"], 6))
+                for point in candidate
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            proposals.append((
+                (
+                    candidate_turns,
+                    float(extension),
+                    route_length(candidate),
+                    route_index,
+                    first_index,
+                    last_index,
+                ),
+                candidate,
+            ))
 
         for route_index, route_points in enumerate(seed_routes):
             route = [
                 {"x": float(point["x"]), "y": float(point["y"])}
                 for point in route_points
             ]
-            if len(route) < 5:
+            if len(route) < 4:
                 continue
-            for segment_index, (left, right) in enumerate(
-                zip(route, route[1:])
-            ):
+            supports = self._support_line_segments(route)
+            for first_position, first in enumerate(supports):
                 if (
                     deadline_monotonic is not None
                     and time.monotonic() >= deadline_monotonic
                 ):
                     break
-                delta_x = right["x"] - left["x"]
-                delta_y = right["y"] - left["y"]
-                length = math.hypot(delta_x, delta_y)
-                if length + 1e-9 < minimum_segment_length:
-                    continue
-                horizontal = abs(delta_y) <= axis_tolerance
-                vertical = abs(delta_x) <= axis_tolerance
-                if not horizontal and not vertical:
-                    continue
-                if horizontal:
-                    level = (left["y"] + right["y"]) / 2.0
-                    lower, upper = sorted((left["x"], right["x"]))
-                else:
-                    level = (left["x"] + right["x"]) / 2.0
-                    lower, upper = sorted((left["y"], right["y"]))
-
-                def projected_anchor(
-                    anchor_index: int,
-                ) -> tuple[float, dict[str, float]] | None:
-                    anchor = route[anchor_index]
-                    along = anchor["x"] if horizontal else anchor["y"]
-                    if lower - axis_tolerance <= along <= upper + axis_tolerance:
-                        return None
-                    extension = (
-                        lower - along if along < lower else along - upper
+                first_index, first_left, first_right, _ = first
+                for second_position in range(first_position + 1, len(supports)):
+                    second = supports[second_position]
+                    second_index, second_left, second_right, _ = second
+                    if second_index <= first_index + 1:
+                        continue
+                    intersection = self._support_line_intersection(
+                        first_left,
+                        first_right,
+                        second_left,
+                        second_right,
                     )
-                    point = (
-                        {"x": anchor["x"], "y": level}
-                        if horizontal
-                        else {"x": level, "y": anchor["y"]}
+                    if intersection is None:
+                        continue
+                    point, first_parameter, second_parameter, extension = (
+                        intersection
                     )
-                    cell = self.saved_map.world_to_cell(point["x"], point["y"])
-                    if cell is None:
-                        return None
-                    column, row = cell
-                    if not self.geometry.turn_safe_mask[
-                        self.geometry.index(column, row)
-                    ]:
-                        return None
-                    return extension, point
+                    if (
+                        first_parameter <= 0.0
+                        or second_parameter >= 1.0
+                        or extension > maximum_extension
+                        or not self._support_intersection_is_turn_safe(point)
+                    ):
+                        continue
+                    add_proposal(
+                        route,
+                        [
+                            *route[: first_index + 1],
+                            point,
+                            *route[second_index + 1 :],
+                        ],
+                        extension=extension,
+                        route_index=route_index,
+                        first_index=first_index,
+                        last_index=second_index,
+                    )
 
-                before = [
-                    (value[0], index, value[1])
-                    # Start and goal are immutable route endpoints; only
-                    # internal stair-step anchors may be replaced.
-                    for index in range(1, segment_index)
-                    if (value := projected_anchor(index)) is not None
-                ]
-                after = [
-                    (value[0], index, value[1])
-                    for index in range(segment_index + 2, len(route) - 1)
-                    if (value := projected_anchor(index)) is not None
-                ]
-                before.sort(key=lambda item: (item[0], -item[1]))
-                after.sort(key=lambda item: (item[0], item[1]))
-                for before_extension, before_index, before_point in before[:3]:
-                    for after_extension, after_index, after_point in after[:3]:
-                        candidate = canonicalize_stop_turn_path([
-                            *route[:before_index],
-                            before_point,
-                            after_point,
-                            *route[after_index + 1 :],
-                        ])
-                        if len(candidate) < 2:
+                    # A middle support can remove independent bend clusters
+                    # on both ends. Preserve its forward direction by ordering
+                    # the two intersection parameters along that line.
+                    for third in supports[second_position + 1 :]:
+                        third_index, third_left, third_right, _ = third
+                        if third_index <= second_index:
                             continue
-                        key = tuple(
-                            (round(point["x"], 6), round(point["y"], 6))
-                            for point in candidate
+                        following_intersection = self._support_line_intersection(
+                            second_left,
+                            second_right,
+                            third_left,
+                            third_right,
                         )
-                        if key in seen:
+                        if following_intersection is None:
                             continue
-                        seen.add(key)
-                        proposals.append((
-                            (
-                                before_extension + after_extension,
-                                route_index,
-                                segment_index,
-                                before_index,
-                            ),
-                            candidate,
-                        ))
+                        (
+                            following_point,
+                            following_second_parameter,
+                            third_parameter,
+                            following_extension,
+                        ) = following_intersection
+                        if (
+                            second_parameter
+                            >= following_second_parameter - 1e-9
+                            or third_parameter >= 1.0
+                            or extension + following_extension
+                            > maximum_extension
+                            or not self._support_intersection_is_turn_safe(
+                                following_point
+                            )
+                        ):
+                            continue
+                        add_proposal(
+                            route,
+                            [
+                                *route[: first_index + 1],
+                                point,
+                                following_point,
+                                *route[third_index + 1 :],
+                            ],
+                            extension=extension + following_extension,
+                            route_index=route_index,
+                            first_index=first_index,
+                            last_index=third_index,
+                        )
 
         proposals.sort(key=lambda item: item[0])
-        return [candidate for _, candidate in proposals[:24]]
+        return [candidate for _, candidate in proposals[:64]]
 
     def _sparse_visibility_waypoints(
         self,
@@ -2956,7 +3067,7 @@ class StopTurnStateLatticePlanner:
             for point in route:
                 add(point)
 
-        for point in self._orthogonal_projection_waypoints(
+        for point in self._support_line_intersection_waypoints(
             route_landmarks,
             deadline_monotonic=deadline_monotonic,
         ):
@@ -4142,11 +4253,11 @@ class StopTurnStateLatticePlanner:
                 if result is not None:
                     candidate_pool.append(result)
 
-        # Evaluate the most useful square-corner rewrites directly.  Waiting
+        # Evaluate the most useful support-line rewrites directly. Waiting
         # for the general visibility proof can consume the bounded planning
-        # window even when the exact lower-turn route is already implied by a
-        # long horizontal/vertical seed segment.
-        for square_route in self._orthogonalized_seed_routes(
+        # window even when the exact lower-turn route is already implied by
+        # the directed support lines of long seed segments.
+        for simplified_route in self._support_line_seed_routes(
             visibility_seed_routes,
             deadline_monotonic=topology_deadline_monotonic,
         ):
@@ -4157,16 +4268,16 @@ class StopTurnStateLatticePlanner:
                 break
             if any(
                 self._segment_excluded(left, right, forbidden)
-                for left, right in zip(square_route, square_route[1:])
+                for left, right in zip(simplified_route, simplified_route[1:])
             ):
                 continue
-            square_result = self._route_result(
-                square_route,
+            simplified_result = self._route_result(
+                simplified_route,
                 start_yaw=start_yaw,
                 goal_yaw=goal_yaw,
             )
-            if square_result is not None:
-                candidate_pool.append(square_result)
+            if simplified_result is not None:
+                candidate_pool.append(simplified_result)
 
         initial_goal_heading = math.atan2(goal_y - start_y, goal_x - start_x)
         turn_bay_result = None
@@ -4256,25 +4367,27 @@ class StopTurnStateLatticePlanner:
             ]
             visibility_seed_routes.append(best_candidate_points)
             # Bounded seed searches do not always finish the same clearance
-            # band before their deadline.  Re-run the small square-corner
+            # band before their deadline. Re-run the bounded support-line
             # rewrite on the best exact-valid route so the result is stable
             # even when that route arrived through a different seed branch.
-            for square_route in self._orthogonalized_seed_routes(
+            for simplified_route in self._support_line_seed_routes(
                 [best_candidate_points],
                 deadline_monotonic=topology_deadline_monotonic,
             ):
                 if any(
                     self._segment_excluded(left, right, forbidden)
-                    for left, right in zip(square_route, square_route[1:])
+                    for left, right in zip(
+                        simplified_route, simplified_route[1:]
+                    )
                 ):
                     continue
-                square_result = self._route_result(
-                    square_route,
+                simplified_result = self._route_result(
+                    simplified_route,
                     start_yaw=start_yaw,
                     goal_yaw=goal_yaw,
                 )
-                if square_result is not None:
-                    candidate_pool.append(square_result)
+                if simplified_result is not None:
+                    candidate_pool.append(simplified_result)
         visibility_waypoints = self._sparse_visibility_waypoints(
             start,
             goal,

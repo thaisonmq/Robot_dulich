@@ -2463,7 +2463,7 @@ def test_minimum_turn_obstacle_route_beats_zigzag_seed() -> None:
     ).valid
 
 
-def test_orthogonal_seed_rewrite_replaces_diagonal_stairs_with_square_corners() -> None:
+def test_support_line_seed_rewrite_handles_rotated_staircase() -> None:
     saved = _manual_map(100, 70, _free_rectangle(1, 98, 1, 68))
     planner = StopTurnStateLatticePlanner(
         saved,
@@ -2476,14 +2476,24 @@ def test_orthogonal_seed_rewrite_replaces_diagonal_stairs_with_square_corners() 
         {"x": 1.20, "y": 1.50},
         {"x": 1.40, "y": 1.80},
         {"x": 1.80, "y": 2.00},
-        {"x": 3.00, "y": 2.00},
-        {"x": 3.30, "y": 1.80},
+        {"x": 3.00, "y": 2.10},
+        {"x": 3.30, "y": 1.85},
         {"x": 3.50, "y": 0.50},
     ]
     start_yaw = math.atan2(0.10, 0.50)
     original = planner._route_result(seed_route, start_yaw=start_yaw)
+    expected = planner._support_line_intersection(
+        seed_route[1],
+        seed_route[2],
+        seed_route[4],
+        seed_route[5],
+    )
 
-    rewritten_points = planner._orthogonalized_seed_routes(
+    rewritten_points = planner._support_line_seed_routes(
+        [seed_route],
+        deadline_monotonic=None,
+    )
+    visibility_points = planner._support_line_intersection_waypoints(
         [seed_route],
         deadline_monotonic=None,
     )
@@ -2495,26 +2505,100 @@ def test_orthogonal_seed_rewrite_replaces_diagonal_stairs_with_square_corners() 
     ]
 
     assert original is not None
+    assert expected is not None
     assert rewritten
+    expected_point = expected[0]
+    assert any(
+        math.hypot(
+            point["x"] - expected_point["x"],
+            point["y"] - expected_point["y"],
+        ) < 1e-6
+        for point in visibility_points
+    )
+    assert any(
+        any(
+            math.hypot(
+                point["x"] - expected_point["x"],
+                point["y"] - expected_point["y"],
+            ) < 1e-6
+            for point in points
+        )
+        for points in rewritten_points
+    )
     assert all(route.points[0] == seed_route[0] for route in rewritten)
     assert all(route.points[-1] == seed_route[-1] for route in rewritten)
     selected = min(rewritten, key=planner.ranking_key)
     assert planner._route_internal_turn_count(selected) < (
         planner._route_internal_turn_count(original)
     )
-    horizontal = [
-        (left, right)
-        for left, right in zip(selected.points, selected.points[1:])
-        if math.isclose(left["y"], 2.00)
-        and math.isclose(right["y"], 2.00)
-    ]
-    assert horizontal
+    assert not math.isclose(seed_route[4]["y"], seed_route[5]["y"])
     assert validate_stop_turn_route(
         saved,
         selected.points,
         half_length=0.15,
         half_width=0.11,
     ).valid
+
+
+@pytest.mark.parametrize("rotation", [0.31, 0.79, 1.37])
+def test_support_line_seed_rewrite_is_rotation_invariant(rotation: float) -> None:
+    saved = _manual_map(
+        120,
+        100,
+        _free_rectangle(1, 118, 1, 98),
+        origin_x=-1.0,
+        origin_y=-1.0,
+    )
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.01,
+    )
+    base_route = [
+        {"x": 0.50, "y": 0.50},
+        {"x": 1.00, "y": 0.60},
+        {"x": 1.20, "y": 1.50},
+        {"x": 1.40, "y": 1.80},
+        {"x": 1.80, "y": 2.00},
+        {"x": 3.00, "y": 2.10},
+        {"x": 3.30, "y": 1.85},
+        {"x": 3.50, "y": 0.50},
+    ]
+    center_x, center_y = 2.0, 1.5
+    cosine, sine = math.cos(rotation), math.sin(rotation)
+    route = [
+        {
+            "x": center_x
+            + (point["x"] - center_x) * cosine
+            - (point["y"] - center_y) * sine,
+            "y": center_y
+            + (point["x"] - center_x) * sine
+            + (point["y"] - center_y) * cosine,
+        }
+        for point in base_route
+    ]
+    start_yaw = math.atan2(
+        route[1]["y"] - route[0]["y"],
+        route[1]["x"] - route[0]["x"],
+    )
+    original = planner._route_result(route, start_yaw=start_yaw)
+    rewritten = [
+        result
+        for points in planner._support_line_seed_routes(
+            [route], deadline_monotonic=None
+        )
+        if (result := planner._route_result(points, start_yaw=start_yaw))
+        is not None
+    ]
+
+    assert original is not None
+    assert rewritten
+    selected = min(rewritten, key=planner.ranking_key)
+    assert planner._route_internal_turn_count(selected) < (
+        planner._route_internal_turn_count(original)
+    )
+    assert selected.points[0] == route[0]
+    assert selected.points[-1] == route[-1]
 
 
 def test_minimum_turn_ranking_beats_preferred_clearance_and_time() -> None:
