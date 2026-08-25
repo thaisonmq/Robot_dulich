@@ -42,16 +42,20 @@ def test_stale_safety_subscription_accepts_a_restarted_sequence_epoch() -> None:
     assert '"SAFETY_SUBSCRIPTION_REBIND"' in watchdog
 
 
-def test_only_recent_sustained_navigation_pose_gets_fast_local_verification() -> None:
+def test_only_trusted_pose_sources_get_fast_local_verification() -> None:
     automatic = _method_source("_begin_auto_localization", "_start_global_localization")
     operator = _method_source("_set_initial_pose", "_deactivate_map")
+    odometry = _method_source("_begin_odometry_prior", "_begin_operator_pose_hint")
+    fallback = _method_source("_begin_operator_pose_hint", "_set_initial_pose")
 
     assert 'last_pose.get("source", "")' in automatic
     assert '"recent_navigation_pose"' in automatic
     assert "self.localization_seed_approximate = not recent_verified_pose" in automatic
     assert "self.global_search_requires_rotation = False" in automatic
-    assert "approximate=True" in operator
-    assert "approximate=False" not in operator
+    assert "self._odometry_predicted_map_pose()" in operator
+    assert "self._begin_odometry_prior(" in operator
+    assert "approximate=False" in odometry
+    assert "approximate=True" in fallback
 
 
 def test_approximate_pose_searches_near_position_over_every_heading() -> None:
@@ -71,6 +75,20 @@ def test_recent_verified_pose_is_not_broadened_into_an_adjacent_wall_cell() -> N
     exact = publish.split("else:", 1)[1]
     assert 'position_variance = max(0.01, float(pose.get("covariance", 0.25)))' in exact
     assert "yaw_variance = 0.02" in exact
+
+
+def test_trusted_continuity_pose_tolerates_live_occlusion_after_restart() -> None:
+    verdict = _method_source(
+        "_localization_verdict", "_localization_quality_ready"
+    )
+
+    assert "trusted_continuity_candidate = bool(" in verdict
+    assert 'in {"LOCALIZING_LAST_POSE", "VERIFYING"}' in verdict
+    assert "self.localization_odometry_prior_active" in verdict
+    assert "not self.global_search_untrusted" in verdict
+    assert "not self.localization_seed_approximate" in verdict
+    assert "self.localization_tracking_maximum_contradiction_ratio" in verdict
+    assert verdict.count("maximum_raycast_contradiction_ratio=(") == 2
 
 
 def test_continue_mapping_gates_scans_until_slam_confirms_the_pose_hint() -> None:
@@ -195,7 +213,10 @@ def test_global_search_is_passive_first_and_only_velocity_requires_authorization
 
 def test_operator_hint_resolves_without_unsafe_rotation_only_with_strict_local_evidence() -> None:
     verdict = _method_source("_localization_verdict", "_localization_quality_ready")
-    operator = _method_source("_set_initial_pose", "_deactivate_map")
+    operator = _method_source("_begin_operator_pose_hint", "_set_initial_pose")
+    required_score = _method_source(
+        "_required_localization_scan_score", "_localization_verdict"
+    )
 
     operator_branch = verdict.split(
         "if self.localization_operator_hint_active:", 1
@@ -209,8 +230,10 @@ def test_operator_hint_resolves_without_unsafe_rotation_only_with_strict_local_e
     assert "hinted_candidate" in verdict
     assert "self.localization_operator_hint_minimum_raycast_beams" in verdict
     assert "self.localization_operator_hint_minimum_static_matches" in verdict
-    assert "self.localization_operator_hint_minimum_static_match_ratio" in verdict
-    assert '"OPERATOR_HINT_STATIC_MATCH_RATIO_TOO_LOW"' in verdict
+    assert "self.localization_operator_hint_minimum_explained_ratio" in verdict
+    assert "consensus.raycast_dynamic_occlusion_ratio" in verdict
+    assert '"OPERATOR_HINT_EXPLAINED_RATIO_TOO_LOW"' in verdict
+    assert "self.localization_operator_hint_minimum_scan_score" in required_score
     assert "self.particle_uniqueness.accepted" in verdict.split(
         "if self.localization_operator_hint_active:", 1
     )[0]
@@ -237,6 +260,8 @@ def test_auto_go_force_global_bypasses_ready_and_old_amcl_pose() -> None:
     assert 'payload.get("force_global", False)' in dispatch
     assert "if not allow_rotation" in force_branch
     assert "self.localization_rotation_authorized = True" in force_branch
+    assert "self._odometry_predicted_map_pose()" in force_branch
+    assert "self._begin_odometry_prior(" in force_branch
     assert "self._start_global_localization()" in force_branch
 
 
@@ -333,6 +358,23 @@ def test_cancel_discards_transaction_local_route_and_destination_state() -> None
         "self.latest_global_path = []",
     ):
         assert required in cancel
+
+
+def test_success_discards_transaction_local_route_and_destination_state() -> None:
+    finish = _method_source("_finish_execution_success", "_restart_segment_from_current")
+
+    for required in (
+        "self.paused_goal = None",
+        "self.execution_goal = None",
+        'self.execution_route_id = ""',
+        "self.execution_points = []",
+        "self.execution_segment_directions = []",
+        "self.route_candidates = {}",
+        'self.selected_route_id = ""',
+        'self.current_mission_id = ""',
+        "self.latest_global_path = []",
+    ):
+        assert required in finish
 
 
 def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
@@ -502,7 +544,8 @@ def test_new_navigation_start_rechecks_fresh_raycast_without_canceling_route() -
     assert "self.localization_final_max_p90_residual" in start_gate
     assert "self.localization_raycast_minimum_beams" not in start_gate
     assert "self.localization_raycast_minimum_static_matches" not in start_gate
-    assert "self.localization_raycast_maximum_contradiction_ratio" in start_gate
+    assert "self.localization_tracking_maximum_contradiction_ratio" in start_gate
+    assert "self.localization_raycast_maximum_contradiction_ratio" not in start_gate
     assert "self._localization_start_evidence_ready(now)" in wait_gate
     assert "self.localization_start_evidence_wait" in wait_gate
     assert "time.sleep(min(0.025, remaining))" in wait_gate
@@ -861,7 +904,7 @@ def test_compute_path_uses_cached_stop_turn_geometry_and_live_validation() -> No
     )
 
     assert "resolved_goal, goal_adjusted = self._resolve_planning_goal" in compute_path
-    assert "self.stop_turn_planner.plan_candidates" in compute_path
+    assert "request_planner.plan_candidates" in compute_path
     assert "self._serialize_stop_turn_candidates(planned)" in compute_path
     assert "self._route_metadata(" in serialize
     assert "segment_directions=directions" in serialize
@@ -876,6 +919,8 @@ def test_compute_path_retries_only_bounded_stop_turn_search_failures() -> None:
     assert '"PLAN_SEARCH_RETRY"' in compute_path
     assert "search_expansion_limit=retry_expansion_limit" in compute_path
     assert "self.stop_turn_retry_planning_budget" in compute_path
+    assert "and not live_obstacle_search" in compute_path
+    assert "self.stop_turn_live_obstacle_planning_budget" in compute_path
 
 
 def test_measured_start_turn_matches_executor_physical_footprint() -> None:
@@ -897,7 +942,7 @@ def test_raw_plan_never_replaces_validated_visualization_or_follow_path() -> Non
 
     assert "self.latest_planner_raw_path = path" in callback
     assert "self.latest_global_path = path" not in callback
-    assert "self.stop_turn_planner.plan_candidates" in compute
+    assert "request_planner.plan_candidates" in compute
     assert '"PRE_FOLLOW_PATH"' in navigate
     assert "metadata = self._route_metadata" in serialize
     assert "points = self._ensure_executable_path" in navigate
@@ -1120,7 +1165,7 @@ def test_initial_preview_produces_candidates_without_persistent_scratch_state() 
     assert "self.failed_segments =" not in alternatives
     assert "_publish_failed_segments" not in alternatives
     assert 'source="EXPLICIT_ALTERNATIVE_SEARCH"' in alternatives
-    assert "self.stop_turn_planner.plan_candidates" in alternatives
+    assert "request_planner.plan_candidates" in alternatives
 
 
 def test_live_narrow_uncertainty_does_not_cancel_prevalidated_auto_route() -> None:
@@ -1322,9 +1367,34 @@ def test_auto_route_uses_two_centimetre_hard_and_seven_centimetre_preferred_marg
     assert parameters["corridor_side_margin"] == 0.07
     assert parameters["stop_turn_minimum_route_side_clearance"] == 0.02
     assert "self._hard_route_side_clearance()" in compute
+    assert "self._stop_turn_planner_for_clearance(" in compute
+    assert "request_planner.plan_result(" in compute
     assert "self.corridor_side_margin" in compute
     assert '"ROUTE_CLEARANCE_INSUFFICIENT"' in compute
     assert '"ROUTE_CLEARANCE_INSUFFICIENT"' in recovery
+
+
+def test_planning_and_recovery_project_route_aligned_front_lidar_keepout() -> None:
+    helper = _method_source(
+        "_live_front_keepout_for_route", "_route_signature"
+    )
+    compute = _method_source("_compute_path", "_navigate")
+    blocker = _method_source(
+        "_observe_controller_blocker", "_schedule_execution_replan"
+    )
+
+    assert "self.corridor_samples" in helper
+    assert "recent_corridors" in helper
+    assert "key=lambda item: float(item[1].front_clearance)" in helper
+    assert "math.radians(20.0)" in helper
+    assert "self.footprint_half_length + front_clearance" in helper
+    assert "segment_length" in helper
+    assert '"PLAN_LIVE_FRONT_KEEPOUT"' in compute
+    assert 'action="APPLY_BEFORE_SEARCH"' in compute
+    assert 'action="REPLAN_BEFORE_MOTION"' in compute
+    assert "exclusions=(live_front_keepout,)" in compute
+    assert 'source="ROUTE_ALIGNED_FRONT_LIDAR"' in blocker
+    assert 'result="KEEP_OUT_CONFIRMED"' in blocker
 
 
 def test_controller_blocker_is_a_persistent_recovery_planning_keepout() -> None:
@@ -1340,7 +1410,11 @@ def test_controller_blocker_is_a_persistent_recovery_planning_keepout() -> None:
     )
 
     assert "self.dynamic_blocked_keepout" in exclusions
+    assert "return (self.dynamic_blocked_keepout,)" in exclusions
+    assert "return self._dynamic_exclusions()" in exclusions
     assert "self.alternative_route_keepout_radius" in blocker
+    assert 'result="KEEP_OUT_REUSED"' in blocker
+    assert "obstacle.radius + footprint_inflation" in blocker
     assert "force: bool = False" in blocker
     assert "self._observe_controller_blocker(force=True)" in wait
     assert "self._dynamic_planning_exclusions()" in recovery
@@ -1472,13 +1546,80 @@ def test_costmap_transform_prefers_message_timestamp_and_bounds_latest_fallback(
 
 def test_approximate_hint_discards_yaw_and_never_sets_ready() -> None:
     operator = _method_source("_set_initial_pose", "_deactivate_map")
+    fallback = _method_source("_begin_operator_pose_hint", "_set_initial_pose")
 
     assert '"yaw": 0.0' in operator
-    assert "self.global_search_untrusted = True" in operator
-    assert "self.localization_operator_hint_active = True" in operator
-    assert 'self.localization_state = "LOCALIZING_APPROXIMATE_POSE"' in operator
+    assert "self.global_search_untrusted = True" in fallback
+    assert "self.localization_operator_hint_active = True" in fallback
+    assert 'self.localization_state = "LOCALIZING_APPROXIMATE_POSE"' in fallback
     assert '"localized": False' in operator
     assert 'self.localization_state = "READY"' not in operator
+
+
+def test_operator_pose_uses_verified_odometry_as_a_bounded_prior() -> None:
+    projected = _method_source("_odometry_predicted_map_pose", "_update_pose")
+    operator = _method_source("_set_initial_pose", "_deactivate_map")
+    prior = _method_source("_begin_odometry_prior", "_begin_operator_pose_hint")
+    tick = _method_source("_localization_tick", "_load_map")
+
+    assert "self.trajectory_map_from_odom is None" in projected
+    assert "self._critical_sensor_time_healthy()" in projected
+    assert "self.localization_odometry_prior_rejected_epoch" in projected
+    assert '"odom", "base_footprint", Time()' in projected
+    assert '"covariance": 0.01' in projected
+    assert "self._odometry_predicted_map_pose()" in operator
+    assert "self._begin_odometry_prior(" in operator
+    assert "self.localization_odometry_prior_active = True" in prior
+    assert 'self.localization_state = "LOCALIZING_LAST_POSE"' in prior
+    assert "self.odometry_prior_timeout" in tick
+    assert '"ODOMETRY_PRIOR_REJECTED"' in tick
+    assert "self._begin_operator_pose_hint(" in tick
+    assert "self._start_global_localization()" in tick
+
+
+def test_operator_hint_runs_one_independent_scan_seed_before_waiting_on_amcl() -> None:
+    request = _method_source(
+        "_request_global_scan_uniqueness", "_path_callback"
+    )
+    tick = _method_source("_localization_tick", "_load_map")
+
+    assert "operator_seed: bool = False" in request
+    assert "require_candidate_match=not operator_seed" in request
+    assert "self.localization_seed_approximate = False" in request
+    assert "self.localization_operator_hint_active = True" in request
+    assert "self._publish_initial_pose(scan_seed, approximate=False)" in request
+    assert '"LOCALIZATION_OPERATOR_SCAN_SEED"' in request
+    assert "strict_verification_required=True" in request
+    assert "self._request_global_scan_uniqueness(operator_seed=True)" in tick
+
+
+def test_repeated_operator_hint_preserves_a_converging_attempt() -> None:
+    operator = _method_source("_set_initial_pose", "_deactivate_map")
+
+    assert "previous_hint = self.localization_pending_operator_hint" in operator
+    assert "<= 0.20" in operator
+    assert '"CANDIDATE", "VERIFYING"' in operator
+    assert '"LOCALIZATION_HINT_IGNORED"' in operator
+    repeated_branch = operator.split(
+        "if repeated_hint and self.localization_state in active_hint_states:", 1
+    )[1].split("odometry_pose =", 1)[0]
+    assert "self._reset_localization_evidence()" not in repeated_branch
+    assert "evidence_preserved=True" in repeated_branch
+
+
+def test_failed_localization_is_terminal_until_new_evidence_or_command() -> None:
+    tick = _method_source("_localization_tick", "_load_map")
+
+    ready_acceptance = tick.index('self.localization_state = "READY"')
+    failed_terminal = tick.index(
+        'if self.localization_state == "LOCALIZATION_FAILED":',
+        ready_acceptance,
+    )
+    generic_timeout = tick.index(
+        "now - self.localization_started_monotonic >= self.localization_timeout",
+        failed_terminal,
+    )
+    assert ready_acceptance < failed_terminal < generic_timeout
 
 
 def test_odometry_trajectory_is_unanchored_until_first_trusted_localization() -> None:

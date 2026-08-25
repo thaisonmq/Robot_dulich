@@ -2773,6 +2773,111 @@ def test_visibility_search_changes_topology_beyond_local_corner_deletion(
     assert planner._route_internal_turn_count(route) == 2
 
 
+def test_visibility_incumbent_bound_keeps_faster_equal_turn_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = _manual_map(120, 80, _free_rectangle(1, 118, 1, 78))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    nodes = [
+        {"x": 0.50, "y": 0.50},
+        {"x": 4.50, "y": 0.50},
+        {"x": 1.50, "y": 2.50},
+        {"x": 3.50, "y": 2.50},
+        {"x": 1.50, "y": 1.50},
+        {"x": 3.50, "y": 1.50},
+    ]
+    incumbent_indices = (0, 2, 3, 1)
+    faster_indices = (0, 4, 5, 1)
+    allowed = {
+        frozenset((left, right))
+        for route_indices in (incumbent_indices, faster_indices)
+        for left, right in zip(route_indices, route_indices[1:])
+    }
+    indices = {
+        (point["x"], point["y"]): index
+        for index, point in enumerate(nodes)
+    }
+
+    def edge(left: dict[str, float], right: dict[str, float]):
+        key = frozenset((
+            indices[(left["x"], left["y"])],
+            indices[(right["x"], right["y"])],
+        ))
+        return ExecutablePathValidation(
+            key in allowed,
+            "" if key in allowed else "PATH_FOOTPRINT_COLLISION",
+        )
+
+    monkeypatch.setattr(planner, "_visibility_translation_validation", edge)
+    monkeypatch.setattr(planner, "_turn_valid", lambda *args, **kwargs: True)
+    incumbent = planner._route_result(
+        [nodes[index] for index in incumbent_indices],
+        start_yaw=0.0,
+    )
+    faster = planner._route_result(
+        [nodes[index] for index in faster_indices],
+        start_yaw=0.0,
+    )
+
+    assert incumbent is not None and faster is not None
+    assert planner.ranking_key(faster) < planner.ranking_key(incumbent)
+    selected, proven = planner._minimum_turn_visibility_route(
+        {**nodes[0], "yaw": 0.0},
+        nodes[1],
+        nodes,
+        (),
+        goal_yaw=None,
+        maximum_internal_turns=2,
+        deadline_monotonic=None,
+        incumbent=incumbent,
+    )
+
+    assert proven is True
+    assert selected is not None
+    assert list(selected.points) == [nodes[index] for index in faster_indices]
+
+
+def test_static_exact_validation_results_are_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = _manual_map(40, 30, _free_rectangle(1, 38, 1, 28))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    calls = {"turn": 0, "translation": 0}
+
+    def turn_validation(*args, **kwargs):
+        calls["turn"] += 1
+        return SimpleNamespace(valid=False)
+
+    def translation_validation(*args, **kwargs):
+        calls["translation"] += 1
+        return ExecutablePathValidation(False, "PATH_FOOTPRINT_COLLISION")
+
+    monkeypatch.setattr(
+        navigation_core,
+        "validate_rotation_sweep_neighborhood",
+        turn_validation,
+    )
+    monkeypatch.setattr(
+        navigation_core,
+        "validate_executable_grid_path",
+        translation_validation,
+    )
+    left = {"x": -0.10, "y": -0.10}
+    right = {"x": 1.00, "y": 1.00}
+
+    assert not planner._turn_valid(
+        -0.10, -0.10, 0.0, math.pi / 2.0, robust=False
+    )
+    assert not planner._turn_valid(
+        -0.10, -0.10, 0.0, math.pi / 2.0, robust=False
+    )
+    first = planner._translation_validation(left, right)
+    second = planner._translation_validation(left, right)
+
+    assert calls == {"turn": 1, "translation": 1}
+    assert first is second
+
+
 def test_route_metadata_preserves_costmap_not_ready_error() -> None:
     adapter_path = Path(__file__).parents[1] / "navigation-stack" / "adapter_node.py"
     source = adapter_path.read_text()
@@ -4207,9 +4312,12 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert 12 <= localization[
         "localization_operator_hint_minimum_static_matches"
     ] <= localization["localization_operator_hint_minimum_comparable_beams"]
+    assert localization["scan_map_minimum_score"] <= localization[
+        "localization_operator_hint_minimum_scan_score"
+    ] < localization["localization_global_final_scan_map_minimum_score"]
     assert 0.65 <= localization[
-        "localization_operator_hint_minimum_static_match_ratio"
-    ] <= 0.80
+        "localization_operator_hint_minimum_explained_ratio"
+    ] <= 0.85
     assert localization["dynamic_unconfirmed_blocker_timeout_seconds"] >= (
         localization["dynamic_obstacle_persistence_seconds"]
     )
@@ -4217,6 +4325,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert 0 < localization[
         "localization_raycast_maximum_contradiction_ratio"
     ] <= 0.20
+    assert localization["localization_raycast_maximum_contradiction_ratio"] < localization[
+        "localization_tracking_maximum_contradiction_ratio"
+    ] <= 0.40
     assert localization["localization_raycast_match_tolerance"] <= 0.15
     assert localization[
         "localization_raycast_minimum_reliable_structure_span"

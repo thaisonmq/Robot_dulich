@@ -292,6 +292,16 @@ export function DashboardPage() {
       } as const;
       const next = states[normalized as keyof typeof states];
       if (next) setNavigationState(next);
+      if ([
+        "ARRIVED", "SUCCEEDED", "CANCELED", "CANCELLED", "FAILED", "FAULT",
+      ].includes(normalized)) {
+        // A Route belongs to exactly one mission. Do not let its React/store
+        // snapshot survive a terminal runtime event and appear in the next
+        // Control session or under the next destination selection.
+        setRoute(null);
+        setRouteCandidates([]);
+        setSelectedRouteId("");
+      }
       setMapState(normalized);
     },
     onVisualization: (next) => setVisualization((previous) => (

@@ -288,6 +288,17 @@ export function goalApproachYaw(
     : Math.atan2(deltaY, deltaX);
 }
 
+export function routeShouldRemainVisible(
+  navigationStatus: string,
+  mapState: string,
+): boolean {
+  return ![
+    "arrived", "cancelled", "canceled", "failed",
+  ].includes(navigationStatus) && ![
+    "SUCCEEDED", "ARRIVED", "CANCELED", "CANCELLED", "FAILED", "FAULT",
+  ].includes(mapState);
+}
+
 function MapCanvas({
   map, destinations, pose, route, routeCandidates = [], selectedRouteId, selected, dynamicObstacles,
   readOnly, showRobot, robotMoving, focus = null, zoom = 1,
@@ -547,13 +558,17 @@ export function MapPanel({
   const showRobot = ready || showRecoveringPose;
   const visualizationMatches = visualization?.map_id === map.map_id
     && visualization.map_version === map.active_version;
+  const routeTerminal = !routeShouldRemainVisible(navigationStatus, mapState);
   const sensorTimeMessage = sensorTimeFailureMessage(
     health?.sensor_time_failure_reason,
     t,
   );
-  const liveRoute = visualization?.global_path?.length && visualizationMatches
-    ? { ...(route ?? { route_id: "live-path", robot_id: "", destination_id: "CUSTOM-GOAL", distance_m: 0, estimated_seconds: 0 }), route_id: visualization.route_id ?? route?.route_id ?? "live-path", points: visualization.global_path }
-    : route;
+  const liveRoute = routeTerminal
+    ? null
+    : visualization?.global_path?.length && visualizationMatches
+      ? { ...(route ?? { route_id: "live-path", robot_id: "", destination_id: "CUSTOM-GOAL", distance_m: 0, estimated_seconds: 0 }), route_id: visualization.route_id ?? route?.route_id ?? "live-path", points: visualization.global_path }
+      : route;
+  const visibleRouteCandidates = routeTerminal ? [] : routeCandidates;
   const obstacles = visualizationMatches ? visualization?.dynamic_obstacles ?? [] : [];
   const recoveryCount = Math.max(0, Number(feedback?.recoveries ?? 0));
   // Prefer the request lifecycle supplied by Dashboard. Runtime polling can
@@ -577,7 +592,7 @@ export function MapPanel({
     <div className="map-canvas map-canvas--mini" aria-busy={routePlanning}
       onDoubleClick={() => ready && !activeMission && setExpanded(true)}>
       <MapCanvas map={map} destinations={[]} pose={pose} route={liveRoute}
-        routeCandidates={routeCandidates} selectedRouteId={selectedRouteId} selected={selected}
+        routeCandidates={visibleRouteCandidates} selectedRouteId={selectedRouteId} selected={selected}
         dynamicObstacles={obstacles} readOnly={readOnly || loading || activeMission}
         showRobot={showRobot} robotMoving={moving && ready}
         focus={followRobot || centerRobot ? pose : null} zoom={followRobot || centerRobot ? 2 : 1}
@@ -681,7 +696,7 @@ export function MapPanel({
         }}><X /></button></header></div>
         <div className="map-modal__canvas" aria-busy={routePlanning}><MapCanvas map={map}
           destinations={approximateHintMode ? [] : destinations} pose={pose}
-          route={liveRoute} routeCandidates={routeCandidates} selectedRouteId={selectedRouteId}
+          route={liveRoute} routeCandidates={visibleRouteCandidates} selectedRouteId={selectedRouteId}
           selected={approximateHintMode ? null : selected} dynamicObstacles={obstacles}
           readOnly={readOnly || loading || activeMission} showRobot={showRobot} robotMoving={moving && ready}
           onSelect={(destination) => {

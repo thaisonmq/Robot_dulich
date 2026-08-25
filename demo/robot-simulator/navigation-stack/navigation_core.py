@@ -1060,8 +1060,16 @@ def validate_executable_grid_path(
         row: int,
         center_x: float,
         center_y: float,
-        path_yaw: float,
+        robot_axis_x: tuple[float, float],
+        robot_axis_y: tuple[float, float],
+        axis_limits: tuple[float, float, float, float],
     ) -> bool:
+        """Exact rectangle/cell SAT using segment-constant projections.
+
+        A segment checks the same footprint orientation against thousands of
+        raster cells.  Trigonometry and the four projection radii therefore
+        belong to the segment, not to every candidate cell.
+        """
         local_cell_x = (column + 0.5) * resolution
         local_cell_y = (row + 0.5) * resolution
         cell_x = (
@@ -1075,24 +1083,17 @@ def validate_executable_grid_path(
             + grid_cosine * local_cell_y
         )
         delta = (cell_x - center_x, cell_y - center_y)
-        robot_axis_x = (math.cos(path_yaw), math.sin(path_yaw))
-        robot_axis_y = (-robot_axis_x[1], robot_axis_x[0])
-
-        def dot(left: tuple[float, float], right: tuple[float, float]) -> float:
-            return left[0] * right[0] + left[1] * right[1]
-
-        for axis in (robot_axis_x, robot_axis_y, grid_axis_x, grid_axis_y):
-            distance = abs(dot(delta, axis))
-            robot_projection = (
-                float(half_length) * abs(dot(robot_axis_x, axis))
-                + float(half_width) * abs(dot(robot_axis_y, axis))
-            )
-            cell_projection = cell_half * (
-                abs(dot(grid_axis_x, axis)) + abs(dot(grid_axis_y, axis))
-            )
-            if distance > robot_projection + cell_projection + 1e-9:
-                return False
-        return True
+        delta_x, delta_y = delta
+        return not (
+            abs(delta_x * robot_axis_x[0] + delta_y * robot_axis_x[1])
+            > axis_limits[0] + 1e-9
+            or abs(delta_x * robot_axis_y[0] + delta_y * robot_axis_y[1])
+            > axis_limits[1] + 1e-9
+            or abs(delta_x * grid_axis_x[0] + delta_y * grid_axis_x[1])
+            > axis_limits[2] + 1e-9
+            or abs(delta_x * grid_axis_y[0] + delta_y * grid_axis_y[1])
+            > axis_limits[3] + 1e-9
+        )
 
     for segment_index, (left, right) in enumerate(zip(route, route[1:])):
         delta_x = right["x"] - left["x"]
@@ -1101,6 +1102,34 @@ def validate_executable_grid_path(
         if distance <= 1e-9:
             continue
         yaw = math.atan2(delta_y, delta_x)
+        robot_axis_x = (math.cos(yaw), math.sin(yaw))
+        robot_axis_y = (-robot_axis_x[1], robot_axis_x[0])
+
+        def axis_dot(
+            left: tuple[float, float], right: tuple[float, float]
+        ) -> float:
+            return left[0] * right[0] + left[1] * right[1]
+
+        axis_limits = (
+            float(half_length)
+            + cell_half
+            * (
+                abs(axis_dot(grid_axis_x, robot_axis_x))
+                + abs(axis_dot(grid_axis_y, robot_axis_x))
+            ),
+            float(half_width)
+            + cell_half
+            * (
+                abs(axis_dot(grid_axis_x, robot_axis_y))
+                + abs(axis_dot(grid_axis_y, robot_axis_y))
+            ),
+            float(half_length) * abs(axis_dot(robot_axis_x, grid_axis_x))
+            + float(half_width) * abs(axis_dot(robot_axis_y, grid_axis_x))
+            + cell_half,
+            float(half_length) * abs(axis_dot(robot_axis_x, grid_axis_y))
+            + float(half_width) * abs(axis_dot(robot_axis_y, grid_axis_y))
+            + cell_half,
+        )
         sample_count = max(1, math.ceil(distance / sample_spacing))
         for sample_index in range(sample_count + 1):
             ratio = sample_index / sample_count
@@ -1182,7 +1211,13 @@ def validate_executable_grid_path(
                         cost < 0 and not allow_unknown
                     )
                     if not blocked or not cell_intersects_footprint(
-                        column, row, sample_x, sample_y, yaw
+                        column,
+                        row,
+                        sample_x,
+                        sample_y,
+                        robot_axis_x,
+                        robot_axis_y,
+                        axis_limits,
                     ):
                         continue
                     local_cell_x = (column + 0.5) * resolution
@@ -1916,6 +1951,19 @@ class StopTurnStateLatticePlanner:
         )
         self.heading_step = 2.0 * math.pi / self.HEADING_BINS
         self._last_plan_diagnostics: dict[str, Any] = {}
+        # Static-map validation is deterministic for the lifetime of this
+        # planner. Seed, support-line, visibility and lattice phases revisit
+        # many identical turns and segments; share their exact outcomes
+        # instead of repeating swept-footprint SAT work in every phase.
+        self._turn_validation_cache: dict[
+            tuple[float, float, float, float, bool, bool], bool
+        ] = {}
+        self._translation_validation_cache: dict[
+            tuple[float, float, float, float], ExecutablePathValidation
+        ] = {}
+        self._visibility_translation_cache: dict[
+            tuple[float, float, float, float], ExecutablePathValidation
+        ] = {}
 
     @staticmethod
     def _grid_seed_turn_count(seed: list[tuple[int, int]]) -> int:
@@ -2048,6 +2096,16 @@ class StopTurnStateLatticePlanner:
         robust: bool = True,
         measured_start: bool = False,
     ) -> bool:
+        cache_key = (
+            float(x),
+            float(y),
+            float(start_yaw),
+            float(end_yaw),
+            bool(robust),
+            bool(measured_start),
+        )
+        if cache_key in self._turn_validation_cache:
+            return self._turn_validation_cache[cache_key]
         # The exact rectangular sweep is expensive inside the lattice. A
         # conservatively free bounding circle is sufficient proof of validity:
         # geometry clearance is measured at the raster cell center, so subtract
@@ -2072,8 +2130,11 @@ class StopTurnStateLatticePlanner:
                 turn_half_width + self.padding,
             ) + (self.turn_robustness_radius if robust else 0.0)
             if available_clearance + 1e-9 >= required_clearance:
+                if len(self._turn_validation_cache) >= 20_000:
+                    self._turn_validation_cache.clear()
+                self._turn_validation_cache[cache_key] = True
                 return True
-        return validate_rotation_sweep_neighborhood(
+        valid = validate_rotation_sweep_neighborhood(
             self.saved_map,
             x,
             y,
@@ -2084,6 +2145,10 @@ class StopTurnStateLatticePlanner:
             padding=self.padding,
             robustness_radius=(self.turn_robustness_radius if robust else 0.0),
         ).valid
+        if len(self._turn_validation_cache) >= 20_000:
+            self._turn_validation_cache.clear()
+        self._turn_validation_cache[cache_key] = valid
+        return valid
 
     def heading_bin(self, yaw: float) -> int:
         return int(round(float(yaw) / self.heading_step)) % self.HEADING_BINS
@@ -2103,6 +2168,8 @@ class StopTurnStateLatticePlanner:
     def _excluded(
         x: float, y: float, exclusions: tuple[tuple[float, float, float], ...]
     ) -> bool:
+        if not exclusions:
+            return False
         return any(
             math.hypot(float(x) - center_x, float(y) - center_y) <= radius
             for center_x, center_y, radius in exclusions
@@ -2114,6 +2181,8 @@ class StopTurnStateLatticePlanner:
         right: dict[str, float],
         exclusions: tuple[tuple[float, float, float], ...],
     ) -> bool:
+        if not exclusions:
+            return False
         delta_x = right["x"] - left["x"]
         delta_y = right["y"] - left["y"]
         denominator = delta_x * delta_x + delta_y * delta_y
@@ -2135,7 +2204,16 @@ class StopTurnStateLatticePlanner:
     def _translation_validation(
         self, left: dict[str, float], right: dict[str, float]
     ) -> ExecutablePathValidation:
-        return validate_executable_grid_path(
+        cache_key = (
+            float(left["x"]),
+            float(left["y"]),
+            float(right["x"]),
+            float(right["y"]),
+        )
+        cached = self._translation_validation_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        validation = validate_executable_grid_path(
             (left, right),
             width=self.saved_map.width,
             height=self.saved_map.height,
@@ -2151,6 +2229,10 @@ class StopTurnStateLatticePlanner:
             allow_unknown=False,
             lethal_threshold=65,
         )
+        if len(self._translation_validation_cache) >= 12_000:
+            self._translation_validation_cache.clear()
+        self._translation_validation_cache[cache_key] = validation
+        return validation
 
     def _translation_valid(
         self, left: dict[str, float], right: dict[str, float]
@@ -2163,11 +2245,22 @@ class StopTurnStateLatticePlanner:
         right: dict[str, float],
     ) -> ExecutablePathValidation:
         """Use a conservative clearance-circle proof before exact SAT checks."""
+        cache_key = (
+            float(left["x"]),
+            float(left["y"]),
+            float(right["x"]),
+            float(right["y"]),
+        )
+        cached = self._visibility_translation_cache.get(cache_key)
+        if cached is not None:
+            return cached
         delta_x = float(right["x"]) - float(left["x"])
         delta_y = float(right["y"]) - float(left["y"])
         distance = math.hypot(delta_x, delta_y)
         if distance <= 1e-9:
-            return ExecutablePathValidation(False, "PATH_HAS_NO_LENGTH")
+            validation = ExecutablePathValidation(False, "PATH_HAS_NO_LENGTH")
+            self._visibility_translation_cache[cache_key] = validation
+            return validation
         required = math.hypot(
             self.half_length + self.padding,
             self.half_width + self.padding + self.hard_side_margin,
@@ -2193,10 +2286,15 @@ class StopTurnStateLatticePlanner:
                 circle_proves_edge = False
                 break
         if circle_proves_edge:
-            return ExecutablePathValidation(
+            validation = ExecutablePathValidation(
                 True, samples_checked=count + 1
             )
-        return self._translation_validation(left, right)
+        else:
+            validation = self._translation_validation(left, right)
+        if len(self._visibility_translation_cache) >= 12_000:
+            self._visibility_translation_cache.clear()
+        self._visibility_translation_cache[cache_key] = validation
+        return validation
 
     def _segment_has_center_clearance(
         self,
@@ -2502,9 +2600,12 @@ class StopTurnStateLatticePlanner:
                         )
                     ):
                         continue
-                world_x, world_y = self.saved_map.cell_center(next_column, next_row)
-                if self._excluded(world_x, world_y, exclusions):
-                    continue
+                if exclusions:
+                    world_x, world_y = self.saved_map.cell_center(
+                        next_column, next_row
+                    )
+                    if self._excluded(world_x, world_y, exclusions):
+                        continue
                 step = math.hypot(delta_x, delta_y)
                 next_cost = costs[index] + step
                 if next_cost + 1e-9 >= costs.get(next_index, math.inf):
@@ -2627,11 +2728,12 @@ class StopTurnStateLatticePlanner:
                         )
                     ):
                         continue
-                world_x, world_y = self.saved_map.cell_center(
-                    next_column, next_row
-                )
-                if self._excluded(world_x, world_y, exclusions):
-                    continue
+                if exclusions:
+                    world_x, world_y = self.saved_map.cell_center(
+                        next_column, next_row
+                    )
+                    if self._excluded(world_x, world_y, exclusions):
+                        continue
                 next_turns = int(turns) + int(
                     previous_direction >= 0
                     and previous_direction != direction_index
@@ -3179,6 +3281,7 @@ class StopTurnStateLatticePlanner:
         maximum_internal_turns: int | None,
         deadline_monotonic: float | None,
         maximum_expansions: int | None = None,
+        incumbent: StopTurnRoute | None = None,
     ) -> tuple[StopTurnRoute | None, bool]:
         """Lexicographic shortest path over ``(node, incoming heading)``.
 
@@ -3230,6 +3333,16 @@ class StopTurnStateLatticePlanner:
         edge_cache: dict[tuple[int, int], ExecutablePathValidation] = {}
         turn_cache: dict[tuple[int, int, int], bool] = {}
         self._last_visibility_expansions = 0
+        incumbent_turns = (
+            None
+            if incumbent is None
+            else self._route_internal_turn_count(incumbent)
+        )
+        incumbent_time = (
+            math.inf
+            if incumbent is None
+            else float(incumbent.metadata.estimated_time)
+        )
 
         while queue:
             if (
@@ -3249,6 +3362,20 @@ class StopTurnStateLatticePlanner:
             self._last_visibility_expansions += 1
             turns, estimated_time, distance, rotation = current_cost
             current_index, previous_index = state
+            optimistic_remaining = math.hypot(
+                float(goal["x"]) - nodes[current_index]["x"],
+                float(goal["y"]) - nodes[current_index]["y"],
+            ) / self.linear_speed
+            if (
+                incumbent_turns is not None
+                and turns == incumbent_turns
+                and estimated_time + optimistic_remaining
+                > incumbent_time + 1e-9
+            ):
+                # Queue order is lexicographic by turn count and optimistic
+                # time. All lower-turn states have now been exhausted and no
+                # remaining equal-turn state can beat the exact incumbent.
+                return incumbent, True
             if current_index == 1:
                 state_path: list[int] = []
                 cursor: tuple[int, int] | None = state
@@ -3299,6 +3426,37 @@ class StopTurnStateLatticePlanner:
                     and next_turns > int(maximum_internal_turns)
                 ):
                     continue
+                edge_distance = math.hypot(
+                    following["x"] - current["x"],
+                    following["y"] - current["y"],
+                )
+                optimistic_remaining = math.hypot(
+                    float(goal["x"]) - following["x"],
+                    float(goal["y"]) - following["y"],
+                )
+                turn_angle = abs(_angle_delta(
+                    outgoing_yaw,
+                    start_yaw if incoming_yaw is None else incoming_yaw,
+                ))
+                if incoming_yaw is not None and not internal_turn:
+                    turn_angle = 0.0
+                initial_turn = int(
+                    previous_index < 0
+                    and turn_angle > STOP_TURN_ANGLE_TOLERANCE
+                )
+                optimistic_time = (
+                    estimated_time
+                    + edge_distance / self.linear_speed
+                    + turn_angle / self.angular_speed
+                    + (initial_turn + internal_turn) * stop_overhead
+                    + optimistic_remaining / self.linear_speed
+                )
+                if (
+                    incumbent_turns is not None
+                    and next_turns == incumbent_turns
+                    and optimistic_time > incumbent_time + 1e-9
+                ):
+                    continue
                 if self._segment_excluded(current, following, exclusions):
                     self._record_turn_route_rejection(
                         next_turns,
@@ -3307,28 +3465,22 @@ class StopTurnStateLatticePlanner:
                     )
                     continue
                 if incoming_yaw is None:
-                    turn_angle = abs(_angle_delta(outgoing_yaw, start_yaw))
                     if turn_angle > STOP_TURN_ANGLE_TOLERANCE:
-                        initial_rotation = validate_rotation_sweep(
-                            self.saved_map,
+                        if not self._turn_valid(
                             current["x"],
                             current["y"],
                             start_yaw,
                             outgoing_yaw,
-                            half_length=self.half_length,
-                            half_width=self.half_width,
-                            padding=self.padding,
-                        )
-                        if not initial_rotation.valid:
+                            robust=False,
+                            measured_start=True,
+                        ):
                             self._record_turn_route_rejection(
                                 next_turns,
-                                initial_rotation.code
-                                or "ROTATION_SWEEP_COLLISION",
+                                "ROTATION_SWEEP_COLLISION",
                                 waypoint=current_index,
                             )
                             continue
                 else:
-                    turn_angle = abs(_angle_delta(outgoing_yaw, incoming_yaw))
                     if internal_turn:
                         turn_key = (
                             previous_index,
@@ -3352,8 +3504,6 @@ class StopTurnStateLatticePlanner:
                                 waypoint=current_index,
                             )
                             continue
-                    else:
-                        turn_angle = 0.0
 
                 edge_key = (
                     min(current_index, next_index),
@@ -3374,36 +3524,24 @@ class StopTurnStateLatticePlanner:
                     )
                     continue
 
-                edge_distance = math.hypot(
-                    following["x"] - current["x"],
-                    following["y"] - current["y"],
-                )
                 next_distance = distance + edge_distance
                 next_rotation = rotation + turn_angle
-                initial_turn = int(
-                    previous_index < 0
-                    and turn_angle > STOP_TURN_ANGLE_TOLERANCE
-                )
                 final_angle = 0.0
                 final_turn = 0
                 if next_index == 1 and goal_yaw is not None:
                     final_angle = abs(_angle_delta(goal_yaw, outgoing_yaw))
                     if final_angle > STOP_TURN_ANGLE_TOLERANCE:
-                        final_validation = validate_rotation_sweep(
-                            self.saved_map,
+                        if not self._turn_valid(
                             following["x"],
                             following["y"],
                             outgoing_yaw,
                             goal_yaw,
-                            half_length=self.half_length,
-                            half_width=self.half_width,
-                            padding=self.padding,
-                        )
-                        if not final_validation.valid:
+                            robust=False,
+                            measured_start=True,
+                        ):
                             self._record_turn_route_rejection(
                                 next_turns,
-                                final_validation.code
-                                or "ROTATION_SWEEP_COLLISION",
+                                "ROTATION_SWEEP_COLLISION",
                                 waypoint=next_index,
                             )
                             continue
@@ -3416,6 +3554,14 @@ class StopTurnStateLatticePlanner:
                     + (initial_turn + internal_turn + final_turn)
                     * stop_overhead
                 )
+                if (
+                    incumbent_turns is not None
+                    and next_turns == incumbent_turns
+                    and next_time
+                    + optimistic_remaining / self.linear_speed
+                    > incumbent_time + 1e-9
+                ):
+                    continue
                 next_state = (next_index, current_index)
                 next_cost = (
                     next_turns,
@@ -3431,20 +3577,19 @@ class StopTurnStateLatticePlanner:
                 costs[next_state] = next_cost
                 parents[next_state] = state
                 sequence += 1
-                remaining_distance = math.hypot(
-                    float(goal["x"]) - following["x"],
-                    float(goal["y"]) - following["y"],
-                )
                 heapq.heappush(queue, (
                     next_turns,
-                    next_time + remaining_distance / self.linear_speed,
-                    next_distance + remaining_distance,
+                    next_time + optimistic_remaining / self.linear_speed,
+                    next_distance + optimistic_remaining,
                     next_rotation,
                     sequence,
                     next_cost,
                     next_state,
                 ))
-        return None, True
+        # Equal-turn branches that cannot beat the exact incumbent are pruned
+        # above. Exhausting the remaining lower-bound states therefore proves
+        # the incumbent optimal within this visibility topology.
+        return (incumbent, True) if incumbent is not None else (None, True)
 
     def _single_turn_visibility_candidate(
         self,
@@ -3857,21 +4002,19 @@ class StopTurnStateLatticePlanner:
         )
         if directions[0] < 0:
             first_heading = _angle_delta(first_heading + math.pi, 0.0)
-        if start_yaw is not None and not validate_rotation_sweep(
-            self.saved_map,
+        if start_yaw is not None and not self._turn_valid(
             route[0]["x"],
             route[0]["y"],
             float(start_yaw),
             first_heading,
-            half_length=self.half_length,
             # The initial pose is measured, not selected by the planner. Match
             # the executor's exact physical-footprint turn check here; applying
             # the translation side reserve can reject a safe current pose and
             # force the lattice to exhaust its time budget. Planned internal
             # corners still retain hard_side_margin below.
-            half_width=self.half_width,
-            padding=self.padding,
-        ).valid:
+            robust=False,
+            measured_start=True,
+        ):
             return None
         last_heading = math.atan2(
             route[-1]["y"] - route[-2]["y"],
@@ -3879,17 +4022,15 @@ class StopTurnStateLatticePlanner:
         )
         if directions[-1] < 0:
             last_heading = _angle_delta(last_heading + math.pi, 0.0)
-        if goal_yaw is not None and not validate_rotation_sweep(
-            self.saved_map,
+        if goal_yaw is not None and not self._turn_valid(
             route[-1]["x"],
             route[-1]["y"],
             last_heading,
             float(goal_yaw),
-            half_length=self.half_length,
             # Final in-place execution uses the same physical sweep authority.
-            half_width=self.half_width,
-            padding=self.padding,
-        ).valid:
+            robust=False,
+            measured_start=True,
+        ):
             return None
         validation = validate_stop_turn_route(
             self.saved_map,
@@ -4279,6 +4420,34 @@ class StopTurnStateLatticePlanner:
             if simplified_result is not None:
                 candidate_pool.append(simplified_result)
 
+        # Seed canonicalization is bounded by the shorter seed deadline. On a
+        # slower CPU it can expire after finding a valid route but before the
+        # final exact shortcut pass, making the same request retain one extra
+        # stop. Re-run that inexpensive exact simplifier on the best few
+        # incumbents using the topology window so performance never degrades
+        # the selected geometry.
+        for incumbent_candidate in sorted(
+            candidate_pool, key=self.ranking_key
+        )[:4]:
+            if (
+                topology_deadline_monotonic is not None
+                and time.monotonic() >= topology_deadline_monotonic
+            ):
+                break
+            shortcut_points = self._simplify_exact_route_points(
+                list(incumbent_candidate.points),
+                start_yaw=start_yaw,
+                exclusions=forbidden,
+                deadline_monotonic=topology_deadline_monotonic,
+            )
+            shortcut_result = self._route_result(
+                shortcut_points,
+                start_yaw=start_yaw,
+                goal_yaw=goal_yaw,
+            )
+            if shortcut_result is not None:
+                candidate_pool.append(shortcut_result)
+
         initial_goal_heading = math.atan2(goal_y - start_y, goal_x - start_x)
         turn_bay_result = None
         if self._excluded(start_x, start_y, forbidden) or not self._turn_valid(
@@ -4403,6 +4572,11 @@ class StopTurnStateLatticePlanner:
                 for route in candidate_pool
             )
         )
+        incumbent_route = (
+            None
+            if not candidate_pool
+            else min(candidate_pool, key=self.ranking_key)
+        )
         visibility_result, minimum_turn_proven = (
             self._minimum_turn_visibility_route(
                 start,
@@ -4413,6 +4587,7 @@ class StopTurnStateLatticePlanner:
                 maximum_internal_turns=maximum_internal_turns,
                 deadline_monotonic=topology_deadline_monotonic,
                 maximum_expansions=expansion_limit,
+                incumbent=incumbent_route,
             )
         )
         if visibility_result is not None:
@@ -6910,21 +7085,53 @@ class SavedOccupancyMap:
 
         half_cell = self.resolution / 2.0
 
+        def axis_dot(
+            left: tuple[float, float], right: tuple[float, float]
+        ) -> float:
+            return left[0] * right[0] + left[1] * right[1]
+
+        axis_limits = (
+            length
+            + half_cell
+            * (
+                abs(axis_dot(map_x_axis, robot_x_axis))
+                + abs(axis_dot(map_y_axis, robot_x_axis))
+            ),
+            width
+            + half_cell
+            * (
+                abs(axis_dot(map_x_axis, robot_y_axis))
+                + abs(axis_dot(map_y_axis, robot_y_axis))
+            ),
+            length * abs(axis_dot(robot_x_axis, map_x_axis))
+            + width * abs(axis_dot(robot_y_axis, map_x_axis))
+            + half_cell,
+            length * abs(axis_dot(robot_x_axis, map_y_axis))
+            + width * abs(axis_dot(robot_y_axis, map_y_axis))
+            + half_cell,
+        )
+
         def rectangles_intersect(cell_x: float, cell_y: float) -> bool:
-            delta = (cell_x - x, cell_y - y)
-            for axis in (robot_x_axis, robot_y_axis, map_x_axis, map_y_axis):
-                separation = abs(delta[0] * axis[0] + delta[1] * axis[1])
-                robot_projection = (
-                    length * abs(robot_x_axis[0] * axis[0] + robot_x_axis[1] * axis[1])
-                    + width * abs(robot_y_axis[0] * axis[0] + robot_y_axis[1] * axis[1])
-                )
-                cell_projection = half_cell * (
-                    abs(map_x_axis[0] * axis[0] + map_x_axis[1] * axis[1])
-                    + abs(map_y_axis[0] * axis[0] + map_y_axis[1] * axis[1])
-                )
-                if separation > robot_projection + cell_projection:
-                    return False
-            return True
+            delta_x = cell_x - x
+            delta_y = cell_y - y
+            return not (
+                abs(
+                    delta_x * robot_x_axis[0]
+                    + delta_y * robot_x_axis[1]
+                ) > axis_limits[0]
+                or abs(
+                    delta_x * robot_y_axis[0]
+                    + delta_y * robot_y_axis[1]
+                ) > axis_limits[1]
+                or abs(
+                    delta_x * map_x_axis[0]
+                    + delta_y * map_x_axis[1]
+                ) > axis_limits[2]
+                or abs(
+                    delta_x * map_y_axis[0]
+                    + delta_y * map_y_axis[1]
+                ) > axis_limits[3]
+            )
 
         center_column, center_row = center_cell
         search_radius = math.ceil(
@@ -6938,18 +7145,19 @@ class SavedOccupancyMap:
             ):
                 if not (0 <= column < self.width and 0 <= row < self.height):
                     continue
+                value = self.value_at(column, row)
+                if value < 65 and (value >= 0 or allow_unknown):
+                    continue
                 cell_x, cell_y = self.cell_center(column, row)
                 if not rectangles_intersect(cell_x, cell_y):
                     continue
-                value = self.value_at(column, row)
-                if value >= 65 or (value < 0 and not allow_unknown):
-                    subject = "Vị trí hiện tại" if prefix == "START" else "Điểm đến"
-                    obstacle = "vùng chưa lập bản đồ" if value < 0 else "vật cản"
-                    return GoalValidation(
-                        False,
-                        f"{prefix}_FOOTPRINT_BLOCKED",
-                        f"{subject} không đủ khoảng trống cho toàn bộ thân robot ({obstacle} nằm trong footprint).",
-                    )
+                subject = "Vị trí hiện tại" if prefix == "START" else "Điểm đến"
+                obstacle = "vùng chưa lập bản đồ" if value < 0 else "vật cản"
+                return GoalValidation(
+                    False,
+                    f"{prefix}_FOOTPRINT_BLOCKED",
+                    f"{subject} không đủ khoảng trống cho toàn bộ thân robot ({obstacle} nằm trong footprint).",
+                )
 
         for obstacle_x, obstacle_y in lethal_world_cells:
             delta_x = float(obstacle_x) - x

@@ -414,6 +414,13 @@ class NavigationAdapter(Node):
         self.localization_seed_pose: dict[str, Any] | None = None
         self.localization_seed_approximate = False
         self.localization_operator_hint_active = False
+        # A verified map<-odom anchor is the best short-lived prior after a
+        # rescan. Keep the operator's approximate point as a fallback: odom
+        # still has to pass the complete LiDAR verification gate and must
+        # never replace the human hint after a rejected anchor.
+        self.localization_pending_operator_hint: dict[str, float] | None = None
+        self.localization_odometry_prior_active = False
+        self.localization_odometry_prior_rejected_epoch: int | None = None
         self.global_search_requires_rotation = False
         self.global_search_rotation_pending = False
         self.global_search_untrusted = False
@@ -472,6 +479,9 @@ class NavigationAdapter(Node):
         self.last_pose_timeout = configured(
             "localization_last_pose_timeout_seconds", 12.0,
             "LAST_POSE_TIMEOUT_SECONDS",
+        )
+        self.odometry_prior_timeout = configured(
+            "localization_odometry_prior_timeout_seconds", 4.0
         )
         self.approximate_pose_timeout = configured(
             "localization_approximate_pose_timeout_seconds", 20.0
@@ -586,11 +596,22 @@ class NavigationAdapter(Node):
                 "localization_operator_hint_minimum_static_matches", 12
             ).value)),
         )
-        self.localization_operator_hint_minimum_static_match_ratio = configured(
-            "localization_operator_hint_minimum_static_match_ratio", 0.65
+        self.localization_operator_hint_minimum_scan_score = configured(
+            "localization_operator_hint_minimum_scan_score", 0.50
+        )
+        self.localization_operator_hint_minimum_explained_ratio = configured(
+            "localization_operator_hint_minimum_explained_ratio", 0.65
         )
         self.localization_raycast_maximum_contradiction_ratio = configured(
             "localization_raycast_maximum_contradiction_ratio", 0.20
+        )
+        # Acquisition must remain strict, but a continuously tracked READY
+        # pose can end a route facing movable furniture or another transient
+        # occluder.  Navigation start uses this wider sanity ceiling together
+        # with fresh AMCL/TF/scan, confidence and residual gates; it must not
+        # silently rerun the first-acquisition contradiction test.
+        self.localization_tracking_maximum_contradiction_ratio = configured(
+            "localization_tracking_maximum_contradiction_ratio", 0.40
         )
         self.particle_cloud_freshness = configured(
             "localization_particle_cloud_freshness_seconds", 2.0
@@ -825,6 +846,9 @@ class NavigationAdapter(Node):
         )
         self.stop_turn_planning_budget = configured(
             "stop_turn_planning_budget_seconds", 12.0
+        )
+        self.stop_turn_live_obstacle_planning_budget = configured(
+            "stop_turn_live_obstacle_planning_budget_seconds", 6.0
         )
         self.stop_turn_retry_planning_budget = configured(
             "stop_turn_retry_planning_budget_seconds", 15.0
@@ -2343,18 +2367,25 @@ class NavigationAdapter(Node):
                         "current_state": self.current_state,
                         "state": self._state(),
                     }
-                # An operator-forced rescan deliberately discards the old
-                # route/mission and AMCL hypothesis. The map-coordinate goal
-                # remains owned by Center so it can be planned again after
-                # localization returns READY.
+                # The route is stale once a rescan starts, but a verified
+                # map<-odom anchor is stronger than an unbounded particle
+                # reset. Recheck that narrow prior first; only its bounded
+                # rejection may fall back to the authorized global search.
                 self.paused_goal = None
                 self.current_mission_id = ""
                 if self.latest_global_path:
                     self.latest_global_path = []
                     self.visualization_revision += 1
                 self.localization_rotation_authorized = True
-                self.localization_started_monotonic = time.monotonic()
-                self._start_global_localization()
+                odometry_pose = self._odometry_predicted_map_pose()
+                if odometry_pose is not None:
+                    self._begin_odometry_prior(
+                        odometry_pose,
+                        rotation_was_authorized=True,
+                    )
+                else:
+                    self.localization_started_monotonic = time.monotonic()
+                    self._start_global_localization()
                 return {
                     "status": "accepted",
                     "current_state": self.current_state,
@@ -2822,17 +2853,37 @@ class NavigationAdapter(Node):
         )
         self.last_particle_cloud_monotonic = time.monotonic()
 
-    def _request_global_scan_uniqueness(self) -> None:
+    def _request_global_scan_uniqueness(
+        self,
+        *,
+        operator_seed: bool = False,
+    ) -> None:
         """Run one bounded map-wide alias search outside ROS callbacks."""
         if (
             not self.global_search_untrusted
             or self.saved_map is None
-            or self.last_amcl_pose is None
             or self.latest_localization_scan_snapshot is None
             or self.global_scan_uniqueness_in_progress
+            or (
+                operator_seed
+                and (
+                    not self.localization_operator_hint_active
+                    or not self.localization_seed_approximate
+                    or self.localization_seed_pose is None
+                )
+            )
+            or (not operator_seed and self.last_amcl_pose is None)
         ):
             return
-        candidate = tuple(self.last_amcl_pose)
+        candidate = (
+            (
+                float(self.localization_seed_pose["x"]),
+                float(self.localization_seed_pose["y"]),
+                0.0,
+            )
+            if operator_seed and self.localization_seed_pose is not None
+            else tuple(self.last_amcl_pose or ())
+        )
         if self.global_scan_evaluated_candidate is not None:
             previous = self.global_scan_evaluated_candidate
             if (
@@ -2917,6 +2968,12 @@ class NavigationAdapter(Node):
                         self.global_scan_hint_radius
                         if hint_center is not None else None
                     ),
+                    # For an operator point, this independent search is used
+                    # to correct AMCL's first local basin, so requiring that
+                    # basin to already equal the best mode defeats the search.
+                    # The result is only a new seed; READY still requires all
+                    # strict multi-frame AMCL/raycast gates.
+                    require_candidate_match=not operator_seed,
                 )
             except Exception as exc:
                 result = GlobalScanUniqueness(
@@ -2958,7 +3015,66 @@ class NavigationAdapter(Node):
                     score_margin=result.score_margin,
                     score_ratio=self._finite_metric(result.score_ratio),
                     hint_center=hint_center,
+                    operator_seed=operator_seed,
                 )
+                if (
+                    operator_seed
+                    and result.accepted
+                    and result.best_x is not None
+                    and result.best_y is not None
+                    and result.best_yaw is not None
+                ):
+                    operator_pose = dict(self.localization_seed_pose or {})
+                    rotation_was_authorized = (
+                        self.localization_rotation_authorized
+                    )
+                    scan_seed = {
+                        "x": float(result.best_x),
+                        "y": float(result.best_y),
+                        "yaw": float(result.best_yaw),
+                        "covariance": 0.01,
+                    }
+                    self._reset_localization_evidence()
+                    self.localization_rotation_authorized = (
+                        rotation_was_authorized
+                    )
+                    self.localization_started_monotonic = time.monotonic()
+                    self.localization_phase_started_monotonic = (
+                        self.localization_started_monotonic
+                    )
+                    self.localization_seed_pose = scan_seed
+                    self.localization_seed_approximate = False
+                    self.localization_operator_hint_active = True
+                    self.localization_pending_operator_hint = operator_pose
+                    self.localization_odometry_prior_active = False
+                    self.global_search_requires_rotation = False
+                    self.global_search_untrusted = True
+                    self.approximate_hint_allowed = False
+                    self.localization_attempt_id = f"{attempt_id}:scan-seed"
+                    # Retain the independent result for the UI/debug status;
+                    # reset above deliberately discarded all old AMCL frames.
+                    self.global_scan_uniqueness = result
+                    self.global_scan_evaluated_candidate = (
+                        scan_seed["x"], scan_seed["y"], scan_seed["yaw"]
+                    )
+                    self.global_scan_uniqueness_in_progress = False
+                    self._publish_initial_pose(scan_seed, approximate=False)
+                    self.localization_state = "LOCALIZING_LAST_POSE"
+                    self._set_state(
+                        "LOCALIZING_LAST_POSE", "operator_scan_seed"
+                    )
+                    self._nav_debug(
+                        "LOCALIZATION_OPERATOR_SCAN_SEED",
+                        attempt_id=self.localization_attempt_id,
+                        operator_center=(
+                            operator_pose.get("x"), operator_pose.get("y")
+                        ),
+                        scan_seed=scan_seed,
+                        best_score=result.best_score,
+                        score_margin=result.score_margin,
+                        score_ratio=self._finite_metric(result.score_ratio),
+                        strict_verification_required=True,
+                    )
 
         threading.Thread(target=evaluate, daemon=True).start()
 
@@ -3308,10 +3424,95 @@ class NavigationAdapter(Node):
     def _dynamic_planning_exclusions(
         self,
     ) -> tuple[tuple[float, float, float], ...]:
-        exclusions = list(self._dynamic_exclusions())
         if self.dynamic_blocked_keepout is not None:
-            exclusions.append(self.dynamic_blocked_keepout)
-        return tuple(exclusions)
+            # Recovery has stronger evidence than the general live overlay:
+            # this keepout was located from repeated observations on the
+            # segment which actually stopped.  Do not combine it with every
+            # map-mismatch cluster in the live overlay.  Treating those noisy
+            # clusters as simultaneous hard walls can falsely disconnect a
+            # wide free route and leave the robot waiting beside the blocker.
+            return (self.dynamic_blocked_keepout,)
+        return self._dynamic_exclusions()
+
+    def _live_front_keepout_for_route(
+        self,
+        points: list[dict[str, float]],
+        segment_directions: list[int] | tuple[int, ...] = (),
+        *,
+        blocked_only: bool,
+    ) -> tuple[float, float, float] | None:
+        """Project fresh route-aligned front LiDAR evidence into map space."""
+        if self.pose is None or len(points) < 2 or not self.corridor_samples:
+            return None
+        now = time.monotonic()
+        recent_corridors = [
+            (timestamp, corridor)
+            for timestamp, corridor, _ in self.corridor_samples
+            if now - float(timestamp) <= 0.60
+            and math.isfinite(float(corridor.front_clearance))
+        ]
+        if not recent_corridors:
+            return None
+        # A thin chair leg can alternate between adjacent LiDAR beams while
+        # the chassis is stationary.  Retain the nearest fresh return inside
+        # the same 600 ms evidence window instead of letting the final beam of
+        # the window erase a real obstacle.
+        _, corridor = min(
+            recent_corridors,
+            key=lambda item: float(item[1].front_clearance),
+        )
+        if segment_directions and int(segment_directions[0]) < 0:
+            return None
+        pose_x = float(self.pose["x"])
+        pose_y = float(self.pose["y"])
+        target = next(
+            (
+                point
+                for point in points[1:]
+                if math.hypot(
+                    float(point["x"]) - pose_x,
+                    float(point["y"]) - pose_y,
+                ) >= 0.08
+            ),
+            None,
+        )
+        if target is None:
+            return None
+        delta_x = float(target["x"]) - pose_x
+        delta_y = float(target["y"]) - pose_y
+        segment_length = math.hypot(delta_x, delta_y)
+        route_heading = math.atan2(delta_y, delta_x)
+        chassis_yaw = float(self.pose.get("yaw", route_heading))
+        if abs(self._yaw_delta(route_heading, chassis_yaw)) > math.radians(20.0):
+            return None
+        front_clearance = float(corridor.front_clearance)
+        if not math.isfinite(front_clearance) or front_clearance < 0.0:
+            return None
+        physically_blocked = bool(
+            corridor.classification == "PHYSICALLY_BLOCKED"
+            or not bool(corridor.physically_passable)
+            or front_clearance
+            <= self.corridor_front_clearance + self.straight_endpoint_tolerance
+        )
+        if blocked_only:
+            if not physically_blocked:
+                return None
+        elif (
+            front_clearance > min(0.60, self.corridor_lookahead)
+            or segment_length
+            <= front_clearance + self.straight_endpoint_tolerance
+        ):
+            return None
+        obstacle_distance = self.footprint_half_length + front_clearance
+        keepout_radius = min(
+            self.alternative_route_keepout_radius,
+            max(0.05, obstacle_distance - 0.02),
+        )
+        return (
+            pose_x + obstacle_distance * math.cos(chassis_yaw),
+            pose_y + obstacle_distance * math.sin(chassis_yaw),
+            keepout_radius,
+        )
 
     @staticmethod
     def _route_signature(points: list[dict[str, float]]) -> str:
@@ -3871,7 +4072,8 @@ class NavigationAdapter(Node):
         with self.state_lock:
             self.route_selection_return_state = return_state
             self._set_state("COMPUTING_ALTERNATIVES", "operator_requested_routes")
-        planned = self.stop_turn_planner.plan_candidates(
+        request_planner = self._stop_turn_planner_for_clearance()
+        planned = request_planner.plan_candidates(
             dict(self.pose),
             dict(self.paused_goal),
             maximum_candidates=self.alternative_route_max_candidates,
@@ -5248,6 +5450,7 @@ class NavigationAdapter(Node):
         offset_x = float(self.pose["x"]) - cosine * odom_x + sine * odom_y
         offset_y = float(self.pose["y"]) - sine * odom_x - cosine * odom_y
         self.trajectory_map_from_odom = (offset_x, offset_y, offset_yaw)
+        self.localization_odometry_prior_rejected_epoch = None
         reconstructed = 0
         for point in self.odometry_trajectory:
             if (
@@ -5276,6 +5479,42 @@ class NavigationAdapter(Node):
             trusted_map_id=self.map_id,
             trusted_map_version=self.map_version,
         )
+
+    def _odometry_predicted_map_pose(self) -> dict[str, float] | None:
+        """Project the current measured odometry through a trusted map anchor."""
+        if (
+            self.trajectory_map_from_odom is None
+            or self.saved_map is None
+            or not self.map_id
+            or not self._critical_sensor_time_healthy()
+            or self.localization_odometry_prior_rejected_epoch
+            == self.trajectory_odom_epoch
+        ):
+            return None
+        try:
+            odom = self.tf_buffer.lookup_transform(
+                "odom", "base_footprint", Time()
+            )
+        except TransformException:
+            return None
+        odom_x = float(odom.transform.translation.x)
+        odom_y = float(odom.transform.translation.y)
+        odom_yaw = self._yaw_from_quaternion(odom.transform.rotation)
+        offset_x, offset_y, offset_yaw = self.trajectory_map_from_odom
+        cosine, sine = math.cos(offset_yaw), math.sin(offset_yaw)
+        predicted = {
+            "x": offset_x + cosine * odom_x - sine * odom_y,
+            "y": offset_y + sine * odom_x + cosine * odom_y,
+            "yaw": self._yaw_delta(odom_yaw + offset_yaw, 0.0),
+            # The anchor was created only after READY. Keep enough uncertainty
+            # for AMCL correction without broadening into another corridor.
+            "covariance": 0.01,
+        }
+        if not all(math.isfinite(value) for value in predicted.values()):
+            return None
+        if self.saved_map.world_to_cell(predicted["x"], predicted["y"]) is None:
+            return None
+        return predicted
 
     def _update_pose(self) -> None:
         if (
@@ -5462,6 +5701,8 @@ class NavigationAdapter(Node):
         self.global_search_untrusted = False
         self.stationary_global_candidate_ambiguous = False
         self.localization_operator_hint_active = False
+        self.localization_pending_operator_hint = None
+        self.localization_odometry_prior_active = False
         self.approximate_hint_allowed = False
         self.last_particle_cloud_monotonic = 0.0
         self.particle_uniqueness = ParticleCloudUniqueness(
@@ -6023,6 +6264,7 @@ class NavigationAdapter(Node):
         self.localization_state = "LOCALIZATION_LOST"
         self._set_state("LOCALIZATION_LOST", "localization_evidence_lost")
         handle = self.current_goal_handle
+        completed_route_id = self.execution_route_id
         self.current_goal_handle = None
         self.navigation_goal_generation += 1
         self.execution_segment_token += 1
@@ -6066,6 +6308,13 @@ class NavigationAdapter(Node):
 
     def _required_localization_scan_score(self) -> float:
         """Keep global-origin candidates on global criteria through READY."""
+        if self.localization_operator_hint_active:
+            # A bounded position hint plus strict residual, contradiction,
+            # covariance, consensus and particle-uniqueness gates supplies
+            # stronger local evidence than this occlusion-sensitive coarse
+            # endpoint score. Keep a substantial floor without applying the
+            # blind global-search score to a cluttered route endpoint.
+            return self.localization_operator_hint_minimum_scan_score
         if not self.global_search_untrusted:
             return self.scan_map_threshold
         if (
@@ -6083,6 +6332,20 @@ class NavigationAdapter(Node):
         require_heading: bool,
     ) -> LocalizationVerification:
         hinted_candidate = bool(self.localization_operator_hint_active)
+        trusted_continuity_candidate = bool(
+            not self.global_search_untrusted
+            and not self.localization_seed_approximate
+            and (
+                self.localization_odometry_prior_active
+                or self.localization_state
+                in {"LOCALIZING_LAST_POSE", "VERIFYING"}
+            )
+        )
+        maximum_raycast_contradiction_ratio = (
+            self.localization_tracking_maximum_contradiction_ratio
+            if trusted_continuity_candidate
+            else self.localization_raycast_maximum_contradiction_ratio
+        )
         minimum_raycast_beams = (
             self.localization_operator_hint_minimum_raycast_beams
             if hinted_candidate
@@ -6109,7 +6372,7 @@ class NavigationAdapter(Node):
             minimum_raycast_beams=minimum_raycast_beams,
             minimum_raycast_static_matches=minimum_raycast_static_matches,
             maximum_raycast_contradiction_ratio=(
-                self.localization_raycast_maximum_contradiction_ratio
+                maximum_raycast_contradiction_ratio
             ),
         )
         self.localization_consensus = consensus
@@ -6117,11 +6380,13 @@ class NavigationAdapter(Node):
             return LocalizationVerification(False, consensus.reason)
         if (
             hinted_candidate
-            and consensus.raycast_static_match_ratio
-            < self.localization_operator_hint_minimum_static_match_ratio
+            and (
+                consensus.raycast_static_match_ratio
+                + consensus.raycast_dynamic_occlusion_ratio
+            ) < self.localization_operator_hint_minimum_explained_ratio
         ):
             return LocalizationVerification(
-                False, "OPERATOR_HINT_STATIC_MATCH_RATIO_TOO_LOW"
+                False, "OPERATOR_HINT_EXPLAINED_RATIO_TOO_LOW"
             )
         self.scan_map_score = round(consensus.scan_score, 4)
         self.scan_map_valid_beams = consensus.valid_beams
@@ -6179,7 +6444,7 @@ class NavigationAdapter(Node):
             minimum_raycast_static_matches=minimum_raycast_static_matches,
             raycast_contradiction_ratio=self.raycast_contradiction_ratio,
             maximum_raycast_contradiction_ratio=(
-                self.localization_raycast_maximum_contradiction_ratio
+                maximum_raycast_contradiction_ratio
             ),
             heading_required=require_heading,
             heading_ready=self._global_heading_diversity_ready(),
@@ -6355,7 +6620,7 @@ class NavigationAdapter(Node):
             and self.raycast_comparable_beams > 0
             and self.raycast_static_matches > 0
             and self.raycast_contradiction_ratio
-            <= self.localization_raycast_maximum_contradiction_ratio
+            <= self.localization_tracking_maximum_contradiction_ratio
         )
 
     def _wait_for_localization_start_evidence(self) -> bool:
@@ -6625,6 +6890,14 @@ class NavigationAdapter(Node):
         ):
             self.last_nomotion_request_monotonic = now
             self.nomotion_update_client.call_async(Empty.Request())
+        if (
+            self.localization_operator_hint_active
+            and self.localization_seed_approximate
+        ):
+            # A fresh single-scan map search can pull AMCL out of a wrong local
+            # basin near the click. It runs once in a worker and only supplies
+            # a seed; it never grants localization authority by itself.
+            self._request_global_scan_uniqueness(operator_seed=True)
         localization_ready = self._localization_evidence_ready(now)
         if localization_ready and self.localization_state in {
             "PASSIVE_LOCALIZING", "AMBIGUOUS",
@@ -6850,6 +7123,8 @@ class NavigationAdapter(Node):
             self.low_confidence_since = None
             self.localization_seed_pose = None
             self.localization_operator_hint_active = False
+            self.localization_pending_operator_hint = None
+            self.localization_odometry_prior_active = False
             self.localization_rotation_authorized = False
             self.global_search_requires_rotation = False
             self.global_search_rotation_pending = False
@@ -6862,6 +7137,12 @@ class NavigationAdapter(Node):
             # localization timer callback that owns AMCL service responses.
             self._resume_sensor_time_navigation_if_ready()
             self._resume_localization_navigation_if_ready()
+            return
+        if self.localization_state == "LOCALIZATION_FAILED":
+            # A failed active scan is terminal until fresh evidence actually
+            # reaches READY above or the operator starts another attempt. Do
+            # not let the generic session timeout rewrite it to AMBIGUOUS and
+            # leave the UI waiting forever on a scan that already ended.
             return
         if (
             self.localization_state == "LOCALIZING_SETTLING"
@@ -6949,7 +7230,12 @@ class NavigationAdapter(Node):
             )
         )
         seed_timeout = (
-            self.approximate_pose_timeout if broad_seed else self.last_pose_timeout
+            self.odometry_prior_timeout
+            if self.localization_odometry_prior_active
+            else (
+                self.approximate_pose_timeout
+                if broad_seed else self.last_pose_timeout
+            )
         )
         if (
             self.localization_state in {
@@ -6957,6 +7243,41 @@ class NavigationAdapter(Node):
             }
             and now - self.localization_phase_started_monotonic >= seed_timeout
         ):
+            if (
+                self.localization_state == "LOCALIZING_LAST_POSE"
+                and self.localization_odometry_prior_active
+            ):
+                rejected_pose = dict(self.localization_seed_pose or {})
+                operator_pose = (
+                    None
+                    if self.localization_pending_operator_hint is None
+                    else dict(self.localization_pending_operator_hint)
+                )
+                self.localization_odometry_prior_active = False
+                self.localization_odometry_prior_rejected_epoch = (
+                    self.trajectory_odom_epoch
+                )
+                self._nav_debug(
+                    "ODOMETRY_PRIOR_REJECTED",
+                    attempt_id=self.localization_attempt_id,
+                    predicted_pose=rejected_pose,
+                    rejection_reason=self._localization_rejection_reason(now),
+                    fallback=(
+                        "GLOBAL_SEARCH"
+                        if operator_pose is None
+                        else "OPERATOR_POSE_HINT"
+                    ),
+                )
+                if operator_pose is None:
+                    self._start_global_localization()
+                else:
+                    self._begin_operator_pose_hint(
+                        operator_pose,
+                        rotation_was_authorized=(
+                            self.localization_rotation_authorized
+                        ),
+                    )
+                return
             if broad_seed:
                 # A broad operator/legacy hint is already a global hypothesis
                 # with a useful spatial prior.  Keep AMCL particles and all
@@ -7337,17 +7658,67 @@ class NavigationAdapter(Node):
             "state": self._state(),
         }
 
-    @localization_serialized
-    def _set_initial_pose(self, payload: dict[str, Any]) -> dict[str, Any]:
-        pose = dict(payload["pose"])
-        self._validate_command_map(payload)
-        if self.saved_map is None or self.saved_map.world_to_cell(float(pose["x"]), float(pose["y"])) is None:
-            raise AdapterError("POSE_OUTSIDE_MAP", "Vị trí gần đúng nằm ngoài bản đồ")
-        # A pose hint may be supplied while an explicitly authorized global
-        # rescan is already in progress. Reset the old localization evidence,
-        # but do not revoke that operator-granted rotation permission. A hint
-        # submitted without prior authorization remains passive.
-        rotation_was_authorized = self.localization_rotation_authorized
+    def _begin_odometry_prior(
+        self,
+        odometry_pose: dict[str, float],
+        *,
+        rotation_was_authorized: bool,
+        fallback_operator_hint: dict[str, float] | None = None,
+    ) -> None:
+        """Verify the current pose through the last trusted map<-odom anchor."""
+        self._reset_localization_evidence()
+        self.localization_rotation_authorized = rotation_was_authorized
+        self.localization_started_monotonic = time.monotonic()
+        self.localization_phase_started_monotonic = (
+            self.localization_started_monotonic
+        )
+        self.localization_seed_pose = dict(odometry_pose)
+        self.localization_seed_approximate = False
+        self.localization_operator_hint_active = False
+        self.localization_pending_operator_hint = (
+            None
+            if fallback_operator_hint is None
+            else dict(fallback_operator_hint)
+        )
+        self.localization_odometry_prior_active = True
+        self.global_search_requires_rotation = False
+        self.global_search_untrusted = False
+        self.approximate_hint_allowed = False
+        self.localization_attempt_sequence += 1
+        self.localization_attempt_id = (
+            f"{self.map_id}:{self.map_version}:odom-"
+            f"{self.localization_attempt_sequence}"
+        )
+        self._publish_initial_pose(odometry_pose, approximate=False)
+        self.localization_state = "LOCALIZING_LAST_POSE"
+        self._set_state("LOCALIZING_LAST_POSE", "trusted_odometry_prior")
+        self._nav_debug(
+            "LOCALIZATION_ODOMETRY_PRIOR",
+            attempt_id=self.localization_attempt_id,
+            predicted_pose=odometry_pose,
+            fallback=(
+                "GLOBAL_SEARCH"
+                if fallback_operator_hint is None
+                else "OPERATOR_POSE_HINT"
+            ),
+            fallback_center=(
+                None
+                if fallback_operator_hint is None
+                else (
+                    fallback_operator_hint["x"],
+                    fallback_operator_hint["y"],
+                )
+            ),
+            strict_verification_required=True,
+        )
+
+    def _begin_operator_pose_hint(
+        self,
+        operator_pose: dict[str, float],
+        *,
+        rotation_was_authorized: bool,
+    ) -> None:
+        """Start the broad click-based fallback with completely fresh evidence."""
         # Never let confidence accumulated around a false, locally stable AMCL
         # hypothesis immediately validate an operator-supplied correction.
         # Require fresh AMCL samples around the new pose before returning READY.
@@ -7355,20 +7726,11 @@ class NavigationAdapter(Node):
         self.localization_rotation_authorized = rotation_was_authorized
         self.localization_started_monotonic = time.monotonic()
         self.localization_phase_started_monotonic = self.localization_started_monotonic
-        # This is deliberately a broad search hint, not the robot pose. AMCL
-        # must move/refine the estimate using current LiDAR data. If the hint is
-        # wrong it falls back to global localization after the bounded hint
-        # phase instead of pinning the marker to the operator's click.
-        # The operator supplies a search region only. Deliberately discard yaw
-        # so a click can never masquerade as a complete robot pose.
-        operator_pose = {
-            "x": float(pose["x"]),
-            "y": float(pose["y"]),
-            "yaw": 0.0,
-        }
         self.localization_seed_pose = operator_pose
         self.localization_seed_approximate = True
         self.localization_operator_hint_active = True
+        self.localization_pending_operator_hint = dict(operator_pose)
+        self.localization_odometry_prior_active = False
         self.global_search_requires_rotation = False
         self.global_search_untrusted = True
         self.approximate_hint_allowed = False
@@ -7387,6 +7749,71 @@ class NavigationAdapter(Node):
             yaw_trusted=False,
             localized=False,
             strict_verification_required=True,
+        )
+
+    @localization_serialized
+    def _set_initial_pose(self, payload: dict[str, Any]) -> dict[str, Any]:
+        pose = dict(payload["pose"])
+        self._validate_command_map(payload)
+        if self.saved_map is None or self.saved_map.world_to_cell(float(pose["x"]), float(pose["y"])) is None:
+            raise AdapterError("POSE_OUTSIDE_MAP", "Vị trí gần đúng nằm ngoài bản đồ")
+        # The operator supplies a search region only. Deliberately discard yaw
+        # so a click can never masquerade as a complete robot pose.
+        operator_pose = {
+            "x": float(pose["x"]),
+            "y": float(pose["y"]),
+            "yaw": 0.0,
+        }
+        # A pose hint may be supplied while an explicitly authorized global
+        # rescan is already in progress. Preserve that explicit permission;
+        # submitting the same hint again must not erase a converging cloud.
+        rotation_was_authorized = self.localization_rotation_authorized
+        active_hint_states = {
+            "LOCALIZING_LAST_POSE", "LOCALIZING_APPROXIMATE_POSE",
+            "CANDIDATE", "VERIFYING", "AMBIGUOUS", "LOCALIZING_GLOBAL",
+            "LOCALIZING_ROTATING", "LOCALIZING_SETTLING",
+        }
+        previous_hint = self.localization_pending_operator_hint
+        repeated_hint = bool(
+            previous_hint is not None
+            and math.hypot(
+                operator_pose["x"] - float(previous_hint["x"]),
+                operator_pose["y"] - float(previous_hint["y"]),
+            ) <= 0.20
+        )
+        if repeated_hint and self.localization_state in active_hint_states:
+            self.localization_rotation_authorized = rotation_was_authorized
+            self._nav_debug(
+                "LOCALIZATION_HINT_IGNORED",
+                attempt_id=self.localization_attempt_id,
+                reason="SAME_HINT_ATTEMPT_IN_PROGRESS",
+                state=self.localization_state,
+                evidence_preserved=True,
+            )
+            return {
+                "status": "accepted",
+                "current_state": self.current_state,
+                "localized": False,
+                "state": self._state(),
+            }
+
+        odometry_pose = self._odometry_predicted_map_pose()
+        if odometry_pose is not None:
+            self._begin_odometry_prior(
+                odometry_pose,
+                rotation_was_authorized=rotation_was_authorized,
+                fallback_operator_hint=operator_pose,
+            )
+            return {
+                "status": "accepted",
+                "current_state": "LOCALIZING_LAST_POSE",
+                "localized": False,
+                "state": self._state(),
+            }
+
+        self._begin_operator_pose_hint(
+            operator_pose,
+            rotation_was_authorized=rotation_was_authorized,
         )
         return {
             "status": "accepted",
@@ -7750,6 +8177,51 @@ class NavigationAdapter(Node):
             + map_resolution_allowance
         )
 
+    def _stop_turn_planner_for_clearance(
+        self, required_side_clearance: float | None = None
+    ) -> StopTurnStateLatticePlanner:
+        """Create a request-local planner with the complete hard reserve.
+
+        The map-level planner owns the configured 2 cm reserve.  A live route
+        additionally needs localization and raster allowances.  Applying
+        those only after planning can reject a perfectly routable wide aisle:
+        the search has never been allowed to move its candidate farther from
+        the wall.  Keep the shared geometry, but put the full hard requirement
+        into every exact segment and turn check from the start.
+        """
+        base = self.stop_turn_planner
+        if base is None:
+            raise AdapterError(
+                "PLANNER_NOT_READY", "Static stop-turn planner is unavailable"
+            )
+        requested = (
+            self._hard_route_side_clearance()
+            if required_side_clearance is None
+            else max(0.0, float(required_side_clearance))
+        )
+        # Round upward, never downward, so tiny covariance jitter neither
+        # weakens safety nor changes the search bands for sub-millimetre noise.
+        hard_margin = math.ceil(requested * 1000.0 - 1e-9) / 1000.0
+        if abs(hard_margin - base.hard_side_margin) <= 1e-9:
+            return base
+        return StopTurnStateLatticePlanner(
+            base.saved_map,
+            base.geometry,
+            half_length=base.half_length,
+            half_width=base.half_width,
+            padding=base.padding,
+            primitive_length=base.primitive_length,
+            linear_speed=base.linear_speed,
+            angular_speed=base.angular_speed,
+            max_expansions=base.max_expansions,
+            turn_robustness_radius=base.turn_robustness_radius,
+            turn_bay_max_distance=base.turn_bay_max_distance,
+            hard_side_margin=hard_margin,
+            preferred_side_margin=max(
+                hard_margin, base.preferred_side_margin
+            ),
+        )
+
     def _compute_path(self, payload: dict[str, Any]) -> dict[str, Any]:
         planning_started = time.monotonic()
         self._validate_command_map(payload)
@@ -7807,21 +8279,69 @@ class NavigationAdapter(Node):
             and not (self.safety_direction_mask & 1)
             and not self.estop_active
         )
-        dynamic_exclusions = self._dynamic_exclusions()
-        planner_result = self.stop_turn_planner.plan_result(
+        chassis_yaw = float(start_pose.get("yaw", 0.0))
+        front_probe_distance = max(
+            0.80,
+            self.corridor_lookahead + self.footprint_half_length,
+        )
+        live_front_keepout = self._live_front_keepout_for_route(
+            [
+                dict(start_pose),
+                {
+                    "x": float(start_pose["x"])
+                    + front_probe_distance * math.cos(chassis_yaw),
+                    "y": float(start_pose["y"])
+                    + front_probe_distance * math.sin(chassis_yaw),
+                },
+            ],
+            (1,),
+            blocked_only=False,
+        )
+        dynamic_exclusions = (
+            (live_front_keepout,)
+            if live_front_keepout is not None
+            else self._dynamic_exclusions()
+        )
+        if live_front_keepout is not None:
+            self._nav_debug(
+                "PLAN_LIVE_FRONT_KEEPOUT",
+                center=(
+                    round(live_front_keepout[0], 3),
+                    round(live_front_keepout[1], 3),
+                ),
+                radius=round(live_front_keepout[2], 3),
+                front_clearance=self._finite_metric(
+                    float(self.latest_corridor.front_clearance)
+                ),
+                action="APPLY_BEFORE_SEARCH",
+            )
+        live_obstacle_search = live_front_keepout is not None
+        planning_time_budget = (
+            min(
+                self.stop_turn_planning_budget,
+                self.stop_turn_live_obstacle_planning_budget,
+            )
+            if live_obstacle_search
+            else self.stop_turn_planning_budget
+        )
+        hard_side_clearance = self._hard_route_side_clearance()
+        request_planner = self._stop_turn_planner_for_clearance(
+            hard_side_clearance
+        )
+        planner_result = request_planner.plan_result(
             start_pose,
             resolved_goal,
             exclusions=dynamic_exclusions,
-            planning_time_budget=self.stop_turn_planning_budget,
+            planning_time_budget=planning_time_budget,
             allow_start_escape=True,
             maximum_start_escape_distance=self.start_escape_max_distance,
             live_start_clear=live_start_clear,
         )
         if planner_result.status in {
             "SEARCH_EXPANSION_LIMIT", "SEARCH_TIME_BUDGET_EXCEEDED"
-        }:
+        } and not live_obstacle_search:
             retry_expansion_limit = (
-                self.stop_turn_planner.max_expansions
+                request_planner.max_expansions
                 * self.stop_turn_retry_expansion_multiplier
             )
             self._nav_debug(
@@ -7834,7 +8354,7 @@ class NavigationAdapter(Node):
                 planning_time_budget=self.stop_turn_retry_planning_budget,
                 expansion_limit=retry_expansion_limit,
             )
-            planner_result = self.stop_turn_planner.plan_result(
+            planner_result = request_planner.plan_result(
                 start_pose,
                 resolved_goal,
                 exclusions=dynamic_exclusions,
@@ -7844,7 +8364,45 @@ class NavigationAdapter(Node):
                 maximum_start_escape_distance=self.start_escape_max_distance,
                 live_start_clear=live_start_clear,
             )
-        hard_side_clearance = self._hard_route_side_clearance()
+        if planner_result.route is not None:
+            live_front_keepout = self._live_front_keepout_for_route(
+                [dict(point) for point in planner_result.route.points],
+                tuple(planner_result.route.segment_directions),
+                blocked_only=False,
+            )
+            if live_front_keepout is not None:
+                # The Saved Map can be stale around a chair, trolley or wall
+                # edge.  If the selected first straight points directly into
+                # fresh LiDAR evidence, replan before moving and use only that
+                # precise local keepout; the broad live overlay contains many
+                # map-mismatch clusters and is not a hard-wall authority.
+                self._nav_debug(
+                    "PLAN_LIVE_FRONT_KEEPOUT",
+                    first_route=[
+                        dict(point) for point in planner_result.route.points
+                    ],
+                    center=(
+                        round(live_front_keepout[0], 3),
+                        round(live_front_keepout[1], 3),
+                    ),
+                    radius=round(live_front_keepout[2], 3),
+                    front_clearance=self._finite_metric(
+                        float(self.latest_corridor.front_clearance)
+                    ),
+                    action="REPLAN_BEFORE_MOTION",
+                )
+                planner_result = request_planner.plan_result(
+                    start_pose,
+                    resolved_goal,
+                    exclusions=(live_front_keepout,),
+                    planning_time_budget=min(
+                        self.stop_turn_planning_budget,
+                        self.stop_turn_live_obstacle_planning_budget,
+                    ),
+                    allow_start_escape=True,
+                    maximum_start_escape_distance=self.start_escape_max_distance,
+                    live_start_clear=live_start_clear,
+                )
         turn_diagnostics = dict(planner_result.diagnostics)
         if turn_diagnostics:
             rejections = list(
@@ -7879,7 +8437,7 @@ class NavigationAdapter(Node):
         planned = (
             []
             if planner_result.route is None
-            else self.stop_turn_planner.plan_candidates(
+            else request_planner.plan_candidates(
                 start_pose,
                 resolved_goal,
                 # Preview stays latency-sensitive; explicit alternatives are
@@ -8613,7 +9171,11 @@ class NavigationAdapter(Node):
     def _find_and_start_turn_bay(
         self, pose: dict[str, float], goal_generation: int
     ) -> None:
-        planner = self.stop_turn_planner
+        planner = (
+            None
+            if self.stop_turn_planner is None
+            else self._stop_turn_planner_for_clearance()
+        )
         saved_map = self.saved_map
         goal = dict(self.execution_goal or self.paused_goal or {})
         if planner is None or saved_map is None or not goal:
@@ -9386,6 +9948,16 @@ class NavigationAdapter(Node):
             handle.cancel_goal_async()
         self._set_state("SUCCEEDED", "goal_reached_by_stop_turn_segments")
         self.paused_goal = None
+        self.execution_goal = None
+        self.execution_route_id = ""
+        self.execution_points = []
+        self.execution_segment_directions = []
+        self.execution_segment_index = 0
+        self.execution_narrow_segments = set()
+        self.route_candidates = {}
+        self.selected_route_id = ""
+        self.current_mission_id = ""
+        self.route_selection_return_state = "READY"
         self.latest_global_path = []
         self.visualization_revision += 1
         if physical_final_turn:
@@ -9393,21 +9965,21 @@ class NavigationAdapter(Node):
                 "EXECUTION_PHASE",
                 phase="FINAL_TURN_END",
                 heading_error=heading_error,
-                route_id=self.execution_route_id,
+                route_id=completed_route_id,
             )
         elif self.stop_turn_require_final_yaw and self.execution_goal is not None:
             self._nav_debug(
                 "GOAL_REACHED",
                 mode="POSITION_AND_YAW",
                 distance=position_distance,
-                route_id=self.execution_route_id,
+                route_id=completed_route_id,
             )
         else:
             self._nav_debug(
                 "GOAL_REACHED",
                 mode="POSITION_ONLY",
                 distance=position_distance,
-                route_id=self.execution_route_id,
+                route_id=completed_route_id,
             )
 
     def _restart_segment_from_current(
@@ -9599,11 +10171,55 @@ class NavigationAdapter(Node):
         does not weaken the observation requirement.
         """
         now = time.monotonic()
+        if self.dynamic_blocked_keepout is not None:
+            # A short occlusion or an expiring overlay track must not erase a
+            # blocker whose position was already confirmed.  Keep using the
+            # latched map position until a replacement route is accepted or
+            # the recovery state is explicitly reset.
+            self._nav_debug(
+                "DYNAMIC_BLOCKER",
+                source="LATCHED_MULTI_OBSERVATION_SENSOR",
+                result="KEEP_OUT_REUSED",
+                blocker_id=self.dynamic_blocker_id or None,
+                center=(
+                    round(self.dynamic_blocked_keepout[0], 3),
+                    round(self.dynamic_blocked_keepout[1], 3),
+                ),
+                radius=round(self.dynamic_blocked_keepout[2], 3),
+                destination_preserved=bool(
+                    self.execution_goal or self.paused_goal
+                ),
+            )
+            return True
         corridor_blocked, front_clearance = self._fresh_corridor_blockage(now)
         candidates = self._dynamic_route_obstacles(
             minimum_observations=self.dynamic_planning_minimum_observations
         )
         if self.pose is None or not candidates:
+            projected_keepout = self._live_front_keepout_for_route(
+                self.dynamic_blocked_route,
+                self.dynamic_blocked_segment_directions,
+                blocked_only=True,
+            )
+            if projected_keepout is not None:
+                self.dynamic_blocked_keepout = projected_keepout
+                self.dynamic_blocker_id = "corridor-front-projection"
+                self._nav_debug(
+                    "DYNAMIC_BLOCKER",
+                    source="ROUTE_ALIGNED_FRONT_LIDAR",
+                    result="KEEP_OUT_CONFIRMED",
+                    blocker_id=self.dynamic_blocker_id,
+                    center=(
+                        round(projected_keepout[0], 3),
+                        round(projected_keepout[1], 3),
+                    ),
+                    radius=round(projected_keepout[2], 3),
+                    front_clearance=self._finite_metric(front_clearance),
+                    destination_preserved=bool(
+                        self.execution_goal or self.paused_goal
+                    ),
+                )
+                return True
             if (
                 force
                 or now - self.dynamic_last_unconfirmed_log_monotonic
@@ -9630,10 +10246,18 @@ class NavigationAdapter(Node):
                 item.center_y - float(self.pose["y"]),
             ),
         )
+        footprint_inflation = (
+            self.footprint_half_width
+            + self.planning_footprint_padding
+            + self.corridor_hard_side_margin
+        )
         self.dynamic_blocked_keepout = (
             obstacle.center_x,
             obstacle.center_y,
-            max(obstacle.radius, self.alternative_route_keepout_radius),
+            max(
+                obstacle.radius + footprint_inflation,
+                self.alternative_route_keepout_radius,
+            ),
         )
         self.dynamic_blocker_id = f"dynamic-{obstacle.id}"
         self._nav_debug(
@@ -10045,7 +10669,8 @@ class NavigationAdapter(Node):
                 # The primary solver is deterministic. Search its bounded set
                 # of exact-valid, geometrically distinct candidates now instead
                 # of feeding the same rejected route to the controller again.
-                alternatives = self.stop_turn_planner.plan_candidates(
+                recovery_planner = self._stop_turn_planner_for_clearance()
+                alternatives = recovery_planner.plan_candidates(
                     dict(self.pose),
                     goal,
                     maximum_candidates=self.alternative_route_max_candidates,
@@ -10802,7 +11427,11 @@ class NavigationAdapter(Node):
             raise AdapterError("PLANNER_NOT_READY", "Stop-turn planner is unavailable")
         self.pending_start_escape = None
         self.pending_segment_directions = []
-        result = self.stop_turn_planner.plan_result(
+        hard_side_clearance = self._hard_route_side_clearance()
+        request_planner = self._stop_turn_planner_for_clearance(
+            hard_side_clearance
+        )
+        result = request_planner.plan_result(
             dict(self.pose),
             goal,
             exclusions=self._dynamic_planning_exclusions(),
@@ -10825,7 +11454,6 @@ class NavigationAdapter(Node):
                 ),
                 result.message or "No exact footprint-valid stop-turn path remains",
             )
-        hard_side_clearance = self._hard_route_side_clearance()
         if (
             result.route.metadata.minimum_side_clearance + 1e-9
             < hard_side_clearance

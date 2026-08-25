@@ -47,6 +47,9 @@ rovera_navigation_adapter:
     # AMCL updates plus the evidence hold in under five seconds. If it cannot
     # agree in eight seconds, expose global/assisted localization promptly.
     localization_last_pose_timeout_seconds: 8.0
+    # A continuous verified map<-odom anchor is tried first after a rescan.
+    # Reject it quickly if strict LiDAR evidence disagrees, then use the click.
+    localization_odometry_prior_timeout_seconds: 4.0
     # An operator supplies only a nearby position and AMCL must search every
     # heading. Do not discard a converging local cloud at the shorter timeout
     # used for a persisted pose with a known heading.
@@ -103,13 +106,19 @@ rovera_navigation_adapter:
     localization_raycast_minimum_reliable_structure_span: 0.75
     localization_raycast_minimum_static_matches: 20
     localization_raycast_maximum_contradiction_ratio: 0.20
+    # READY tracking is already anchored by AMCL/map->odom continuity. Allow
+    # transient endpoint occlusion without weakening the strict 20% initial
+    # acquisition cap above or accepting stale AMCL/TF/scan evidence.
+    localization_tracking_maximum_contradiction_ratio: 0.40
     # A user-provided nearby hint constrains the search region. Sparse endpoint
     # headings may expose only 12-19 comparable static rays; retain 12 exact
-    # hits plus a 65% multi-frame static ratio, strict residual/covariance and
-    # unique-particle gates. Blind global localization remains at 25/20.
+    # hits plus 65% explained rays (static match or nearer dynamic occlusion),
+    # strict 20% contradiction, residual/covariance and unique-particle gates.
+    # Blind global localization remains at its 0.70 score and 25/20 samples.
     localization_operator_hint_minimum_comparable_beams: 12
     localization_operator_hint_minimum_static_matches: 12
-    localization_operator_hint_minimum_static_match_ratio: 0.65
+    localization_operator_hint_minimum_scan_score: 0.50
+    localization_operator_hint_minimum_explained_ratio: 0.65
     # Acquisition uses a strict 5-of-7 consensus around one pose. Two transient
     # scans may be occluded, while three contradictory/bad frames still reject.
     localization_consensus_window_size: 7
@@ -225,6 +234,10 @@ rovera_navigation_adapter:
     # alternatives.  Center waits longer than this, so a slow alternative
     # search cannot produce a false command-ACK timeout.
     stop_turn_planning_budget_seconds: 12.0
+    # A fresh route-aligned LiDAR obstacle already removes the unsafe direct
+    # topology. Keep this replan bounded so the robot does not wait 12--15 s
+    # beside the obstacle before presenting the safe route around it.
+    stop_turn_live_obstacle_planning_budget_seconds: 6.0
     # A point-selection preview retries once only when the first exact search
     # exhausts its bound.  12s + 15s stays below Center's 30s command timeout.
     stop_turn_retry_planning_budget_seconds: 15.0
@@ -248,11 +261,11 @@ rovera_navigation_adapter:
     stop_turn_stable_dwell_seconds: 0.40
     stop_turn_safety_block_timeout_seconds: 5.0
     stop_turn_heading_kp: 1.8
-    stop_turn_max_angular_speed: 0.60
+    stop_turn_max_angular_speed: 0.50
     # Brake a pivot before the settle band so smoother/chassis momentum does
     # not carry it past the target and cause a reverse correction.
     stop_turn_angular_deceleration: 2.0
-    stop_turn_angular_reaction_seconds: 0.12
+    stop_turn_angular_reaction_seconds: 0.30
     straight_max_angular_correction: 0.18
     straight_path_pose_spacing: 0.05
     execution_pose_freshness_seconds: 0.30

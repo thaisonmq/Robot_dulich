@@ -1,7 +1,8 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import {
-  drawRobotMapMarker, goalApproachYaw, MapPanel, worldYawToCanvas,
+  drawRobotMapMarker, goalApproachYaw, MapPanel, routeShouldRemainVisible,
+  worldYawToCanvas,
 } from "../src/components/MapPanel";
 import { I18nProvider } from "../src/i18n/I18nProvider";
 import type { Destination, Health, MapData } from "../src/types";
@@ -83,6 +84,14 @@ describe("MapPanel navigation controls", () => {
       .toBeCloseTo(Math.atan2(0.55, -1.36));
     expect(goalApproachYaw({ x: 1, y: 2, yaw: -0.7 }, { x: 1.005, y: 2.005 }))
       .toBeCloseTo(-0.7);
+  });
+
+  it("never reuses a completed or canceled mission route", () => {
+    expect(routeShouldRemainVisible("moving", "NAVIGATING")).toBe(true);
+    expect(routeShouldRemainVisible("route_ready", "READY")).toBe(true);
+    expect(routeShouldRemainVisible("arrived", "SUCCEEDED")).toBe(false);
+    expect(routeShouldRemainVisible("cancelled", "CANCELED")).toBe(false);
+    expect(routeShouldRemainVisible("moving", "FAULT")).toBe(false);
   });
 
   it("changes candidate without loading it until Activate is confirmed", () => {
