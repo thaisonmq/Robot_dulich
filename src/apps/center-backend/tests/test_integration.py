@@ -11,7 +11,7 @@ from starlette.websockets import WebSocketDisconnect
 from app.main import app
 from app.api import maps as maps_api
 from app.models.database import SessionLocal
-from app.models.entities import ControlSession, MapRecord, Robot
+from app.models.entities import ControlSession, MapRecord, MapVersion, POI, Robot
 from app.services.hub import hub
 
 
@@ -80,6 +80,152 @@ def test_draft_map_metadata_can_be_edited_and_deleted() -> None:
             assert robot.active_map_version is None
             database.delete(robot)
             database.commit()
+
+
+def test_operator_can_save_active_map_destination_and_guest_cannot() -> None:
+    map_id = f"MAP-SAVED-POINT-{uuid4().hex[:8]}"
+    checksum = hashlib.sha256(map_id.encode()).hexdigest()
+    # Start the application once so its test database schema and demo operator
+    # are ready before this test inserts a versioned active map directly.
+    with TestClient(app):
+        pass
+    with SessionLocal.begin() as database:
+        database.add(MapRecord(
+            map_id=map_id,
+            name="Saved point permissions",
+            image_url="",
+            width_pixels=200,
+            height_pixels=200,
+            resolution_m_per_pixel=0.05,
+            origin={"x": -5.0, "y": -5.0, "yaw": 0.0},
+            status="ACTIVE",
+            active_version=1,
+        ))
+        database.add(MapVersion(
+            map_id=map_id,
+            version=1,
+            status="ACTIVE",
+            checksum=checksum,
+            storage_path=f"/tmp/{map_id}.tar.gz",
+            resolution=0.05,
+            origin={"x": -5.0, "y": -5.0, "yaw": 0.0},
+            width=200,
+            height=200,
+            metadata_json={},
+            created_by_robot="ROBOT-TEST",
+        ))
+    try:
+        with TestClient(app) as client:
+            operator = client.post(
+                "/api/auth/login",
+                json={"email": "demo@rovera.local", "password": "demo123"},
+            ).json()
+            operator_headers = {"Authorization": f"Bearer {operator['access_token']}"}
+            guest_name = f"saved.point.{uuid4().hex[:8]}"
+            guest = client.post(
+                "/api/auth/register",
+                json={
+                    "username": guest_name,
+                    "email": f"{guest_name}@example.com",
+                    "full_name": "Khách điểm đã lưu",
+                    "password": "saved-point-guest-password",
+                },
+            ).json()
+            guest_headers = {"Authorization": f"Bearer {guest['access_token']}"}
+            payload = {
+                "name": "Trạm sạc",
+                "version": 1,
+                "x": 1.25,
+                "y": -0.5,
+                "yaw": 1.57,
+            }
+
+            created = client.post(
+                f"/api/maps/{map_id}/destinations",
+                headers=operator_headers,
+                json=payload,
+            )
+            assert created.status_code == 201
+            assert created.json()["name"] == "Trạm sạc"
+            assert created.json()["map_id"] == map_id
+
+            listed = client.get(
+                f"/api/maps/{map_id}/destinations",
+                headers=guest_headers,
+            )
+            assert listed.status_code == 200
+            assert [item["name"] for item in listed.json()] == ["Trạm sạc"]
+
+            forbidden = client.post(
+                f"/api/maps/{map_id}/destinations",
+                headers=guest_headers,
+                json={**payload, "name": "Điểm của khách"},
+            )
+            assert forbidden.status_code == 403
+            assert client.post(
+                f"/api/maps/{map_id}/destinations",
+                headers=operator_headers,
+                json=payload,
+            ).status_code == 409
+            assert client.post(
+                f"/api/maps/{map_id}/destinations",
+                headers=operator_headers,
+                json={**payload, "name": "Sai phiên bản", "version": 2},
+            ).status_code == 409
+            assert client.post(
+                f"/api/maps/{map_id}/destinations",
+                headers=operator_headers,
+                json={**payload, "name": "Ngoài bản đồ", "x": 6.0},
+            ).status_code == 422
+
+            destination_id = created.json()["destination_id"]
+            assert client.patch(
+                f"/api/maps/{map_id}/destinations/{destination_id}",
+                headers=guest_headers,
+                json={"name": "Khách đổi tên", "version": 1},
+            ).status_code == 403
+            assert client.delete(
+                f"/api/maps/{map_id}/destinations/{destination_id}?version=1",
+                headers=guest_headers,
+            ).status_code == 403
+            assert client.patch(
+                f"/api/maps/{map_id}/destinations/{destination_id}",
+                headers=operator_headers,
+                json={"name": "Sai phiên bản", "version": 2},
+            ).status_code == 409
+
+            updated = client.patch(
+                f"/api/maps/{map_id}/destinations/{destination_id}",
+                headers=operator_headers,
+                json={"name": "Sảnh chính", "version": 1},
+            )
+            assert updated.status_code == 200
+            assert updated.json()["name"] == "Sảnh chính"
+            assert updated.json()["x"] == payload["x"]
+            assert [item["name"] for item in client.get(
+                f"/api/maps/{map_id}/destinations",
+                headers=guest_headers,
+            ).json()] == ["Sảnh chính"]
+
+            removed = client.delete(
+                f"/api/maps/{map_id}/destinations/{destination_id}?version=1",
+                headers=operator_headers,
+            )
+            assert removed.status_code == 204
+            assert client.get(
+                f"/api/maps/{map_id}/destinations",
+                headers=guest_headers,
+            ).json() == []
+    finally:
+        with SessionLocal.begin() as database:
+            for item in database.scalars(select(POI).where(POI.map_id == map_id)):
+                database.delete(item)
+            version = database.scalar(select(MapVersion).where(MapVersion.map_id == map_id))
+            if version is not None:
+                database.delete(version)
+            record = database.get(MapRecord, map_id)
+            if record is not None:
+                database.delete(record)
 
 
 def test_online_active_map_delete_waits_for_runtime_deactivation(monkeypatch) -> None:

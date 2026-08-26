@@ -316,6 +316,27 @@ export const api = {
   archiveMap: (mapId: string) => request<MapData>(`/api/maps/${mapId}/archive`, { method: "POST" }),
   destinations: (mapId: string) =>
     request<Destination[]>(`/api/maps/${mapId}/destinations`),
+  createDestination: (mapId: string, input: {
+    name: string;
+    version: number;
+    x: number;
+    y: number;
+    yaw: number;
+  }) => request<Destination>(`/api/maps/${mapId}/destinations`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  }),
+  updateDestination: (mapId: string, destinationId: string, input: {
+    name: string;
+    version: number;
+  }) => request<Destination>(`/api/maps/${mapId}/destinations/${destinationId}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  }),
+  deleteDestination: (mapId: string, destinationId: string, version: number) =>
+    request<void>(`/api/maps/${mapId}/destinations/${destinationId}?version=${version}`, {
+      method: "DELETE",
+    }),
   previewRoute: (robotId: string, destinationId: string) =>
     request<Route>("/api/navigation/preview", {
       method: "POST",

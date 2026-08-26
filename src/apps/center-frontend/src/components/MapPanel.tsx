@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle, Crosshair, Flag, LocateFixed, Maximize2, Navigation, Pause, Play,
-  Route as RouteIcon, RotateCcw, X,
+  AlertTriangle, Check, Crosshair, Flag, LocateFixed, MapPinPlus, Maximize2,
+  Navigation, Pause, Pencil, Play, Route as RouteIcon, RotateCcw, Search, Trash2, X,
 } from "lucide-react";
 import { authenticatedAsset } from "../api/client";
 import { useI18n } from "../i18n/I18nProvider";
@@ -158,19 +158,26 @@ interface Props {
   visualization?: NavigationVisualization | null;
   feedback?: NavigationFeedback;
   footprint?: Point[];
-  canStart?: boolean;
   preflightFailures?: string[];
   errorMessage?: string;
   noticeMessage?: string;
   mapActivationError?: string;
   localized?: boolean;
   readOnly?: boolean;
+  allowCustomDestination?: boolean;
+  canSaveCurrentLocation?: boolean;
+  canManageDestinations?: boolean;
+  savingCurrentLocation?: boolean;
+  destinationMutationPending?: boolean;
   onMapChange?: (mapId: string) => void;
+  onSaveCurrentLocation?: (name: string) => Promise<void>;
+  onUpdateDestination?: (destinationId: string, name: string) => Promise<Destination>;
+  onDeleteDestination?: (destinationId: string) => Promise<void>;
   onRetryLocalization?: () => void;
   approximateHintAllowed?: boolean;
   onApproximateHint?: (point: Point) => void;
   onSelect: (destination: Destination) => void;
-  onGo: () => void;
+  onGo: () => void | Promise<unknown>;
   onPause?: () => void;
   onResume?: () => void;
   onManualHandoff?: () => void;
@@ -191,6 +198,7 @@ interface CanvasProps {
   selected: Destination | null;
   dynamicObstacles: Point[];
   readOnly: boolean;
+  allowCustomDestination?: boolean;
   showRobot: boolean;
   robotMoving: boolean;
   focus?: Point | null;
@@ -288,6 +296,16 @@ export function goalApproachYaw(
     : Math.atan2(deltaY, deltaX);
 }
 
+export function destinationOverlapsRobot(
+  destination: Pick<Destination, "map_id" | "x" | "y">,
+  pose: Pick<Pose, "map_id" | "x" | "y">,
+  resolution: number,
+): boolean {
+  if (destination.map_id !== pose.map_id) return false;
+  const tolerance = Math.max(0.12, resolution * 2.5);
+  return Math.hypot(destination.x - pose.x, destination.y - pose.y) <= tolerance;
+}
+
 export function routeShouldRemainVisible(
   navigationStatus: string,
   mapState: string,
@@ -301,7 +319,7 @@ export function routeShouldRemainVisible(
 
 function MapCanvas({
   map, destinations, pose, route, routeCandidates = [], selectedRouteId, selected, dynamicObstacles,
-  readOnly, showRobot, robotMoving, focus = null, zoom = 1,
+  readOnly, allowCustomDestination = true, showRobot, robotMoving, focus = null, zoom = 1,
   onSelect, onSelectRoute,
 }: CanvasProps) {
   const { t } = useI18n();
@@ -367,6 +385,10 @@ function MapCanvas({
     const pixel = worldToPixel(point, map);
     return { x: fitted.x + pixel.px * fitted.scale, y: fitted.y + pixel.py * fitted.scale };
   };
+  const selectedOverlapsRobot = Boolean(
+    showRobot && selected
+    && destinationOverlapsRobot(selected, pose, map.resolution_m_per_pixel),
+  );
 
   useEffect(() => {
     const context = canvasRef.current?.getContext("2d");
@@ -412,7 +434,7 @@ function MapCanvas({
     } else if (route?.points.length) {
       drawPath(route.points, "#1759d6", Math.max(2, viewport.width / 500));
     }
-    if (selected) {
+    if (selected && !selectedOverlapsRobot) {
       const goal = pointOnCanvas(selected);
       context.save(); context.translate(goal.x, goal.y);
       context.rotate(worldYawToCanvas(selected.yaw, map.origin.yaw));
@@ -431,7 +453,7 @@ function MapCanvas({
         markerRadius,
       );
     }
-  }, [dynamicObstacles, fitted, imageRevision, imageState, map, pose, robotMoving, route, routeCandidates, selected, selectedRouteId, showRobot, viewport]);
+  }, [dynamicObstacles, fitted, imageRevision, imageState, map, pose, robotMoving, route, routeCandidates, selected, selectedOverlapsRobot, selectedRouteId, showRobot, viewport]);
 
   const eventWorld = (clientX: number, clientY: number): Point | null => {
     const canvas = canvasRef.current;
@@ -447,7 +469,7 @@ function MapCanvas({
     <canvas ref={canvasRef} className="map-render-canvas" width={viewport.width} height={viewport.height}
       aria-label={t("Bản đồ đã lưu với robot, lộ trình và điểm đến")} aria-busy={imageState === "loading"}
       onPointerDown={(event) => {
-        if (readOnly || imageState !== "ready") return;
+        if (readOnly || !allowCustomDestination || imageState !== "ready") return;
         const point = eventWorld(event.clientX, event.clientY);
         if (!point) return;
         event.currentTarget.setPointerCapture(event.pointerId);
@@ -456,7 +478,7 @@ function MapCanvas({
       onPointerUp={(event) => {
         const start = dragRef.current;
         dragRef.current = null;
-        if (!start || readOnly) return;
+        if (!start || readOnly || !allowCustomDestination) return;
         const end = eventWorld(event.clientX, event.clientY) ?? start.point;
         const dragged = Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) > 6;
         if (!dragged && routeCandidates.length && onSelectRoute) {
@@ -486,11 +508,17 @@ function MapCanvas({
             : goalApproachYaw(pose, start.point),
           enabled: true });
       }} />
-    {destinations.map((destination) => {
+    {destinations.filter((destination) => !(
+      showRobot && destinationOverlapsRobot(destination, pose, map.resolution_m_per_pixel)
+    )).map((destination) => {
       const marker = pointOnCanvas(destination);
-      return <button type="button" key={destination.destination_id} className="destination-marker"
+      return <button type="button" key={destination.destination_id}
+        className={`destination-marker${selected?.destination_id === destination.destination_id ? " is-selected" : ""}`}
         style={{ left: marker.x, top: marker.y }} disabled={readOnly || imageState !== "ready"}
-        onClick={() => onSelect(destination)} aria-label={t("Chọn {name}", { name: t(destination.name) })}><Flag size={13} /></button>;
+        title={t(destination.name)} onClick={() => onSelect(destination)}
+        aria-label={t("Chọn {name}", { name: t(destination.name) })}>
+        <Flag size={13} /><span>{t(destination.name)}</span>
+      </button>;
     })}
     {imageState !== "ready" && <div className={`map-image-state map-image-state--${imageState}`} role={imageState === "error" ? "alert" : "status"}>
       <strong>{t(imageState === "loading" ? "Đang tải Saved Map…" : "Không tải được Saved Map")}</strong>
@@ -504,10 +532,13 @@ export function MapPanel({
   planningRoute,
   navigationStatus, mapState = "READY", localizationState = mapState,
   localizationConfidence = 0, health, visualization, feedback,
-  canStart = true, preflightFailures = [], errorMessage = "", noticeMessage = "", localized = false,
+  preflightFailures = [], errorMessage = "", noticeMessage = "", localized = false,
   mapActivationError = "",
   approximateHintAllowed = false,
+  allowCustomDestination = true, canSaveCurrentLocation = false, canManageDestinations = false,
+  savingCurrentLocation = false, destinationMutationPending = false,
   onMapChange, onSelect, onRetryLocalization, onApproximateHint, onGo, onPause,
+  onSaveCurrentLocation, onUpdateDestination, onDeleteDestination,
   onResume, onManualHandoff, onFindAlternatives, onSelectRoute,
   onConfirmRoute, onBackRouteSelection, onCancel, readOnly = false,
 }: Props) {
@@ -517,6 +548,14 @@ export function MapPanel({
   const [followRobot, setFollowRobot] = useState(false);
   const [centerRobot, setCenterRobot] = useState(false);
   const [approximateHintMode, setApproximateHintMode] = useState(false);
+  const [saveLocationOpen, setSaveLocationOpen] = useState(false);
+  const [savedLocationName, setSavedLocationName] = useState("");
+  const [saveLocationError, setSaveLocationError] = useState("");
+  const [destinationSearch, setDestinationSearch] = useState("");
+  const [editingDestinationId, setEditingDestinationId] = useState("");
+  const [editingDestinationName, setEditingDestinationName] = useState("");
+  const [deletingDestinationId, setDeletingDestinationId] = useState("");
+  const [destinationManageError, setDestinationManageError] = useState("");
   useEffect(() => setCandidateMapId(selectedMapId ?? map.map_id), [map.map_id, selectedMapId]);
   const moving = navigationStatus === "moving";
   const recovering = navigationStatus === "recovery" || [
@@ -578,10 +617,56 @@ export function MapPanel({
   const routePlanning = planningRoute ?? (loading && [
     "previewing", "planning", "sending_goal",
   ].includes(navigationStatus));
+  const filteredDestinations = useMemo(() => {
+    const query = destinationSearch.trim().toLocaleLowerCase();
+    return query
+      ? destinations.filter((destination) => destination.name.toLocaleLowerCase().includes(query))
+      : destinations;
+  }, [destinationSearch, destinations]);
+  const pickerLocked = readOnly || loading || activeMission;
+  const openDestinationPicker = () => {
+    setApproximateHintMode(false);
+    setDestinationSearch("");
+    setEditingDestinationId("");
+    setDeletingDestinationId("");
+    setDestinationManageError("");
+    setExpanded(true);
+  };
+  const closeDestinationPicker = () => {
+    setExpanded(false);
+    setEditingDestinationId("");
+    setDeletingDestinationId("");
+    setDestinationManageError("");
+  };
+  const submitDestinationName = async (destination: Destination) => {
+    const name = editingDestinationName.trim();
+    if (name.length < 2 || !onUpdateDestination) return;
+    setDestinationManageError("");
+    try {
+      await onUpdateDestination(destination.destination_id, name);
+      setEditingDestinationId("");
+    } catch (reason) {
+      setDestinationManageError(reason instanceof Error
+        ? reason.message
+        : t("Không thể sửa điểm đến"));
+    }
+  };
+  const removeDestination = async (destination: Destination) => {
+    if (!onDeleteDestination) return;
+    setDestinationManageError("");
+    try {
+      await onDeleteDestination(destination.destination_id);
+      setDeletingDestinationId("");
+    } catch (reason) {
+      setDestinationManageError(reason instanceof Error
+        ? reason.message
+        : t("Không thể xóa điểm đến"));
+    }
+  };
 
   return <section className="map-section map-section--mini" aria-labelledby="map-title">
     <div className="section-heading"><div><p className="eyebrow">NAV2 · {navigationStateLabel(mapState, t)}</p><h2 id="map-title">{t("Bản đồ hành trình")}</h2></div>
-      <button type="button" className="map-expand-button" onClick={() => setExpanded(true)}><Maximize2 size={16} /> {t("Mở rộng")}</button></div>
+      <button type="button" className="map-expand-button" onClick={openDestinationPicker}><Maximize2 size={16} /> {t("Mở rộng")}</button></div>
     {maps.length > 0 && <div className="map-activation-row"><label><span>{t("Bản đồ")} <small>{maps.length}</small></span><select aria-label={t("Map")}
       disabled={readOnly || loading} value={candidateMapId} onChange={(event) => setCandidateMapId(event.target.value)}>
       {maps.map((item) => <option key={item.map_id} value={item.map_id}>{item.name} · v{item.active_version}</option>)}</select></label>
@@ -592,10 +677,11 @@ export function MapPanel({
       <button type="button" disabled={!ready} onClick={() => { setFollowRobot(false); setCenterRobot(true); }}><LocateFixed size={13} /> {t("Tới robot")}</button>
       <button type="button" disabled={!ready} className={followRobot ? "is-active" : ""} onClick={() => { setCenterRobot(false); setFollowRobot((value) => !value); }}><Crosshair size={13} /> {t("Theo robot")}</button></div>
     <div className="map-canvas map-canvas--mini" aria-busy={routePlanning}
-      onDoubleClick={() => ready && !activeMission && setExpanded(true)}>
-      <MapCanvas map={map} destinations={[]} pose={pose} route={liveRoute}
+      onDoubleClick={() => ready && !activeMission && openDestinationPicker()}>
+      <MapCanvas map={map} destinations={destinations} pose={pose} route={liveRoute}
         routeCandidates={visibleRouteCandidates} selectedRouteId={selectedRouteId} selected={selected}
         dynamicObstacles={obstacles} readOnly={readOnly || loading || activeMission}
+        allowCustomDestination={allowCustomDestination}
         showRobot={showRobot} robotMoving={moving && ready}
         focus={followRobot || centerRobot ? pose : null} zoom={followRobot || centerRobot ? 2 : 1}
         onSelect={onSelect} onSelectRoute={onSelectRoute} />
@@ -616,6 +702,16 @@ export function MapPanel({
         <span>{t("Đang kiểm tra độ rộng, vật cản và quỹ đạo của robot.")}</span>
       </div>}
     </div>
+    <button type="button" className="saved-destination-button" onClick={openDestinationPicker}>
+      <Flag />
+      <span><strong>{t("Điểm đến đã lưu")}</strong>
+        <small>{destinations.length
+          ? selected && destinations.some((item) => item.destination_id === selected.destination_id)
+            ? t("Đang chọn: {name}", { name: t(selected.name) })
+            : t("{count} điểm · Mở bản đồ để chọn", { count: destinations.length })
+          : t("Chưa có điểm nào được lưu")}</small></span>
+      <Maximize2 />
+    </button>
     <div className="navigation-health-row">
       <span>{t("LiDAR")} <i className={health?.scan_fresh ? "is-ok" : "is-fault"} /></span>
       <span>{t("Đồng hồ sensor")} <i className={health?.sensor_time_healthy ? "is-ok" : "is-fault"} /></span>
@@ -691,7 +787,14 @@ export function MapPanel({
             title={rescanBlocked ? t("Không thể quét lại khi robot đang di chuyển hoặc định vị.") : undefined}
             onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button></>
         : <><button type="button" className="button button--primary" disabled={readOnly || loading}
-          onClick={() => setExpanded(true)}><Flag /> {t("Chọn điểm đến")}</button>
+          onClick={openDestinationPicker}><Flag /> {t("Chọn điểm đến")}</button>
+          {canSaveCurrentLocation && <button type="button"
+            disabled={readOnly || loading || !ready || activeMission}
+            onClick={() => {
+              setSavedLocationName("");
+              setSaveLocationError("");
+              setSaveLocationOpen(true);
+            }}><MapPinPlus /> {t("Lưu vị trí")}</button>}
           {(route?.points?.length ?? 0) >= 2 && onFindAlternatives && <button type="button"
             disabled={readOnly || loading} onClick={onFindAlternatives}>
             <RouteIcon /> {t("Tìm đường khác")}</button>}
@@ -699,42 +802,210 @@ export function MapPanel({
             title={rescanBlocked ? t("Không thể quét lại khi robot đang di chuyển hoặc định vị.") : undefined}
             onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button></>}
     </div>
-    {expanded && <div className="map-modal" role="dialog" aria-modal="true"
-      aria-label={t(approximateHintMode ? "Chỉ vị trí robot gần đúng" : "Chọn điểm đến")}>
-      <div className="map-modal__panel"><div className="map-modal__heading"><header><div><small>{map.name} · v{map.active_version}</small>
-        <strong>{t(approximateHintMode ? "Chỉ vị trí robot gần đúng" : "Chọn điểm đến")}</strong></div>
+    {expanded && approximateHintMode && <div className="map-modal" role="dialog" aria-modal="true"
+      aria-label={t("Chỉ vị trí robot gần đúng")}>
+      <div className="map-modal__panel"><div className="map-modal__heading"><header><div>
+        <small>{map.name} · v{map.active_version}</small>
+        <strong>{t("Chỉ vị trí robot gần đúng")}</strong></div>
         <button type="button" aria-label={t("Đóng bản đồ mở rộng")} onClick={() => {
           setApproximateHintMode(false); setExpanded(false);
         }}><X /></button></header></div>
-        <div className="map-modal__canvas" aria-busy={routePlanning}><MapCanvas map={map}
-          destinations={approximateHintMode ? [] : destinations} pose={pose}
-          route={liveRoute} routeCandidates={visibleRouteCandidates} selectedRouteId={selectedRouteId}
-          selected={approximateHintMode ? null : selected} dynamicObstacles={obstacles}
-          readOnly={readOnly || loading || activeMission} showRobot={showRobot} robotMoving={moving && ready}
+        <div className="map-modal__canvas"><MapCanvas map={map} destinations={[]} pose={pose}
+          route={liveRoute} selected={null} dynamicObstacles={obstacles} readOnly={readOnly || loading}
+          allowCustomDestination showRobot={showRobot} robotMoving={false}
           onSelect={(destination) => {
-            if (approximateHintMode) {
-              onApproximateHint?.({ x: destination.x, y: destination.y });
-              setApproximateHintMode(false);
-              setExpanded(false);
-              return;
-            }
-            onSelect(destination);
-          }} onSelectRoute={approximateHintMode ? undefined : onSelectRoute} />
-          {routePlanning && <div className="route-planning-overlay" role="status" aria-live="polite">
-            <i aria-hidden="true" />
-            <strong>{t("Đang tính tuyến đường an toàn…")}</strong>
-            <span>{t("Đang kiểm tra độ rộng, vật cản và quỹ đạo của robot.")}</span>
-          </div>}
+            onApproximateHint?.({ x: destination.x, y: destination.y });
+            setApproximateHintMode(false);
+            setExpanded(false);
+          }} />
         </div>
-        {approximateHintMode && <p className="navigation-inline-notice" role="status">
+        <p className="navigation-inline-notice" role="status">
           {t("Bấm vào khu vực gần robot. Đây chỉ là gợi ý tìm kiếm; LiDAR vẫn phải xác minh trước khi READY.")}
-        </p>}
+        </p>
         <footer><button type="button" onClick={() => {
           setApproximateHintMode(false); setExpanded(false);
-        }}>{t("Hủy")}</button>
-          {!approximateHintMode && <button type="button" className="button button--primary" disabled={!selected || !canStart || loading}
-            title={preflightFailures.join(", ")} onClick={() => { onGo(); setExpanded(false); }}><RouteIcon /> {t("Đi đến đây")}</button>}
+        }}>{t("Hủy")}</button></footer>
+      </div>
+    </div>}
+    {expanded && !approximateHintMode && <div className="map-modal destination-picker" role="dialog"
+      aria-modal="true" aria-labelledby="destination-picker-title">
+      <div className="map-modal__panel destination-picker__panel">
+        <header className="destination-picker__header">
+          <div className="destination-picker__title"><Flag /><span>
+            <strong id="destination-picker-title">{t("Chọn điểm đến")}</strong>
+            <small>{t("Chọn một điểm trên bản đồ hoặc trong danh sách")}</small>
+          </span></div>
+          <div className="destination-picker__meta"><span>{map.name} · v{map.active_version}</span>
+            <button type="button" aria-label={t("Đóng danh sách điểm đến")}
+              onClick={closeDestinationPicker}><X /></button></div>
+        </header>
+        <div className="destination-picker__body">
+          <div className="map-modal__canvas destination-picker__map" aria-busy={routePlanning}>
+            <MapCanvas map={map} destinations={destinations} pose={pose}
+              route={liveRoute} routeCandidates={visibleRouteCandidates}
+              selectedRouteId={selectedRouteId} selected={selected} dynamicObstacles={obstacles}
+              readOnly={pickerLocked} allowCustomDestination={allowCustomDestination}
+              showRobot={showRobot} robotMoving={moving && ready}
+              onSelect={onSelect} onSelectRoute={onSelectRoute} />
+            {routePlanning && <div className="route-planning-overlay" role="status" aria-live="polite">
+              <i aria-hidden="true" />
+              <strong>{t("Đang tính tuyến đường an toàn…")}</strong>
+              <span>{t("Đang kiểm tra độ rộng, vật cản và quỹ đạo của robot.")}</span>
+            </div>}
+          </div>
+          <aside className="destination-picker__sidebar">
+            <div className="destination-picker__sidebar-heading">
+              <div><strong>{t("Điểm đã lưu")}</strong><small>{destinations.length}</small></div>
+              <label><Search /><input type="search" value={destinationSearch}
+                onChange={(event) => setDestinationSearch(event.target.value)}
+                placeholder={t("Tìm kiếm điểm đến")}
+                aria-label={t("Tìm kiếm điểm đến")} /></label>
+            </div>
+            <div className="destination-picker__list" role="list">
+              {filteredDestinations.length === 0 && <div className="destination-picker__empty">
+                <Flag /><strong>{t(destinationSearch ? "Không tìm thấy điểm đến" : "Chưa có điểm nào được lưu")}</strong>
+              </div>}
+              {filteredDestinations.map((destination) => {
+                const isSelected = selected?.destination_id === destination.destination_id;
+                const isEditing = editingDestinationId === destination.destination_id;
+                const isDeleting = deletingDestinationId === destination.destination_id;
+                return <article key={destination.destination_id} role="listitem"
+                  className={`destination-picker__row${isSelected ? " is-selected" : ""}`}>
+                  {isEditing ? <form className="destination-picker__edit" onSubmit={(event) => {
+                    event.preventDefault();
+                    void submitDestinationName(destination);
+                  }}><input autoFocus minLength={2} maxLength={120}
+                      aria-label={t("Tên điểm đến {name}", { name: t(destination.name) })}
+                      value={editingDestinationName}
+                      onChange={(event) => setEditingDestinationName(event.target.value)} />
+                    <button type="submit" disabled={destinationMutationPending || editingDestinationName.trim().length < 2}
+                      aria-label={t("Lưu thay đổi {name}", { name: t(destination.name) })}><Check /></button>
+                    <button type="button" disabled={destinationMutationPending}
+                      aria-label={t("Hủy sửa {name}", { name: t(destination.name) })}
+                      onClick={() => setEditingDestinationId("")}><X /></button>
+                  </form> : <><button type="button" className="destination-picker__select"
+                    disabled={pickerLocked || isDeleting} onClick={() => onSelect(destination)}>
+                    <Flag /><span><strong>{t(destination.name)}</strong>
+                      <small>X: {destination.x.toFixed(2)} · Y: {destination.y.toFixed(2)}</small></span>
+                  </button>
+                  {canManageDestinations && <div className="destination-picker__manage">
+                    <button type="button" disabled={pickerLocked || destinationMutationPending || isDeleting}
+                      aria-label={t("Sửa {name}", { name: t(destination.name) })}
+                      onClick={() => {
+                        setDeletingDestinationId("");
+                        setEditingDestinationId(destination.destination_id);
+                        setEditingDestinationName(destination.name);
+                        setDestinationManageError("");
+                      }}><Pencil /></button>
+                    <button type="button" className="is-danger"
+                      disabled={pickerLocked || destinationMutationPending || isDeleting}
+                      aria-label={t("Xóa {name}", { name: t(destination.name) })}
+                      onClick={() => {
+                        setEditingDestinationId("");
+                        setDeletingDestinationId(destination.destination_id);
+                        setDestinationManageError("");
+                      }}><Trash2 /></button>
+                  </div>}</>}
+                  {isDeleting && <div className="destination-picker__delete-confirm" role="alert">
+                    <span>{t("Xóa điểm “{name}”?", { name: t(destination.name) })}</span>
+                    <button type="button" disabled={destinationMutationPending}
+                      onClick={() => setDeletingDestinationId("")}>{t("Không")}</button>
+                    <button type="button" className="is-danger" disabled={destinationMutationPending}
+                      onClick={() => void removeDestination(destination)}>{t("Xóa")}</button>
+                  </div>}
+                </article>;
+              })}
+            </div>
+            {destinationManageError && <div className="destination-picker__error" role="alert">
+              <AlertTriangle /><span>{t(destinationManageError)}</span>
+            </div>}
+            {errorMessage && <div className="destination-picker__error" role="alert">
+              <AlertTriangle /><span>{t(errorMessage)}</span>
+            </div>}
+            <footer className="destination-picker__actions">
+              <div>{selected ? <><Flag /><span><small>{t("Điểm đã chọn")}</small>
+                <strong>{t(selected.name)}</strong>
+                <em>X: {selected.x.toFixed(2)} · Y: {selected.y.toFixed(2)}</em></span></>
+                : <span><strong>{t("Chưa chọn điểm đến")}</strong>
+                  <em>{t("Chọn một điểm trong danh sách hoặc trên bản đồ.")}</em></span>}</div>
+              <span className="destination-picker__action-buttons">
+                <button type="button" onClick={closeDestinationPicker}>{t("Hủy")}</button>
+                <button type="button" className="button button--primary"
+                  disabled={!selected || loading || activeMission || readOnly}
+                  title={preflightFailures.join(", ")} onClick={() => {
+                    void Promise.resolve(onGo())
+                      .then(closeDestinationPicker)
+                      .catch(() => undefined);
+                  }}><RouteIcon /> {t("Đi đến đây")}</button>
+              </span>
+            </footer>
+          </aside>
+        </div>
+      </div>
+    </div>}
+    {saveLocationOpen && <div className="map-modal map-save-dialog" role="dialog" aria-modal="true"
+      aria-labelledby="save-location-title">
+      <form className="map-modal__panel map-save-dialog__panel" onSubmit={async (event) => {
+        event.preventDefault();
+        const name = savedLocationName.trim();
+        if (name.length < 2) {
+          setSaveLocationError(t("Tên vị trí phải có ít nhất 2 ký tự"));
+          return;
+        }
+        if (!onSaveCurrentLocation) return;
+        setSaveLocationError("");
+        try {
+          await onSaveCurrentLocation(name);
+          setSaveLocationOpen(false);
+          setSavedLocationName("");
+        } catch (reason) {
+          setSaveLocationError(reason instanceof Error
+            ? reason.message
+            : t("Không thể lưu vị trí hiện tại"));
+        }
+      }}>
+        <header><div><small>{map.name} · v{map.active_version}</small>
+          <strong id="save-location-title">{t("Lưu vị trí hiện tại")}</strong></div>
+          <button type="button" aria-label={t("Đóng hộp thoại lưu vị trí")}
+            disabled={savingCurrentLocation} onClick={() => setSaveLocationOpen(false)}><X /></button>
+        </header>
+        <div className="map-save-dialog__body">
+          <div className="map-modal__canvas map-save-dialog__map">
+            <MapCanvas map={map} destinations={destinations} pose={pose} route={null}
+              selected={null} dynamicObstacles={[]} readOnly allowCustomDestination={false}
+              showRobot robotMoving={false} focus={pose} onSelect={() => undefined} />
+            <div className="map-save-dialog__current-label">{t("Vị trí hiện tại")}</div>
+          </div>
+          <aside className="map-save-dialog__form">
+            <div className="map-save-dialog__intro"><MapPinPlus />
+              <div><strong>{t("Tạo điểm đến mới")}</strong>
+                <span>{t("Điểm được lưu riêng cho bản đồ hiện tại và có thể chọn để robot tự động đi đến.")}</span></div>
+            </div>
+            <label><span>{t("Tên vị trí")}</span>
+              <input autoFocus required minLength={2} maxLength={120}
+                placeholder={t("Ví dụ: Trạm sạc")}
+                value={savedLocationName}
+                onChange={(event) => setSavedLocationName(event.target.value)} /></label>
+            <div className="map-save-dialog__coordinates" aria-label={t("Tọa độ vị trí hiện tại")}>
+              <span><small>X</small><strong>{pose.x.toFixed(2)} m</strong></span>
+              <span><small>Y</small><strong>{pose.y.toFixed(2)} m</strong></span>
+              <span><small>{t("Hướng")}</small><strong>{(pose.yaw * 180 / Math.PI).toFixed(1)}°</strong></span>
+            </div>
+            <p>{t("Tọa độ được lấy từ vị trí robot đã xác nhận trên phiên bản bản đồ đang hoạt động.")}</p>
+            {saveLocationError && <div className="map-save-dialog__error" role="alert">
+              <AlertTriangle /> <span>{t(saveLocationError)}</span>
+            </div>}
+          </aside>
+        </div>
+        <footer><span>{t("Điểm mới sẽ xuất hiện ngay trên bản đồ và danh sách điểm đã lưu.")}</span>
+          <button type="button" disabled={savingCurrentLocation}
+            onClick={() => setSaveLocationOpen(false)}>{t("Hủy")}</button>
+          <button type="submit" className="button button--primary"
+            disabled={savingCurrentLocation || savedLocationName.trim().length < 2}>
+            <MapPinPlus /> {t(savingCurrentLocation ? "Đang lưu…" : "Lưu vị trí")}
+          </button>
         </footer>
-      </div></div>}
+      </form>
+    </div>}
   </section>;
 }

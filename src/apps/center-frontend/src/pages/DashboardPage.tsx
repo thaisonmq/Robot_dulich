@@ -403,10 +403,69 @@ export function DashboardPage() {
     enabled: Boolean(selectedMapId),
   });
   const map = mapQuery.data;
-  const { data: destinations = [] } = useQuery({
+  const destinationsQuery = useQuery({
     queryKey: ["destinations", selectedMapId],
     queryFn: () => api.destinations(selectedMapId),
     enabled: Boolean(selectedMapId),
+  });
+  const destinations = destinationsQuery.data ?? [];
+  const saveCurrentDestination = useMutation({
+    mutationFn: (name: string) => {
+      if (!map?.active_version || !poseVerified || pose.map_id !== map.map_id) {
+        return Promise.reject(new Error(t("Vị trí robot chưa được xác nhận trên bản đồ hiện tại.")));
+      }
+      return api.createDestination(map.map_id, {
+        name,
+        version: map.active_version,
+        x: pose.x,
+        y: pose.y,
+        yaw: pose.yaw,
+      });
+    },
+    onMutate: () => {
+      setNavigationError("");
+      setNavigationNotice("");
+    },
+    onSuccess: async () => {
+      await destinationsQuery.refetch();
+      setNavigationNotice(t("Đã lưu vị trí hiện tại thành điểm đến."));
+    },
+  });
+  const updateSavedDestination = useMutation({
+    mutationFn: ({ destinationId, name }: { destinationId: string; name: string }) => {
+      if (!map?.active_version) {
+        return Promise.reject(new Error(t("Bản đồ hiện tại chưa sẵn sàng.")));
+      }
+      return api.updateDestination(map.map_id, destinationId, {
+        name,
+        version: map.active_version,
+      });
+    },
+    onSuccess: async (updated) => {
+      if (selectedDestination?.destination_id === updated.destination_id) {
+        setSelectedDestination(updated);
+      }
+      await destinationsQuery.refetch();
+      setNavigationNotice(t("Đã cập nhật điểm đến."));
+    },
+  });
+  const deleteSavedDestination = useMutation({
+    mutationFn: (destinationId: string) => {
+      if (!map?.active_version) {
+        return Promise.reject(new Error(t("Bản đồ hiện tại chưa sẵn sàng.")));
+      }
+      return api.deleteDestination(map.map_id, destinationId, map.active_version);
+    },
+    onSuccess: async (_result, destinationId) => {
+      if (selectedDestination?.destination_id === destinationId) {
+        setSelectedDestination(null);
+        setRoute(null);
+        setRouteCandidates([]);
+        setSelectedRouteId("");
+      }
+      await destinationsQuery.refetch();
+      setNavigationNotice(t("Đã xóa điểm đến."));
+    },
   });
   const camerasQuery = useQuery({
     queryKey: ["session-cameras", session?.session_id],
@@ -1562,13 +1621,6 @@ export function DashboardPage() {
                 visualization={visualization}
                 feedback={navigationFeedback}
                 footprint={health.footprint}
-                canStart={Boolean(
-                  selectedDestination
-                  && (!route?.mission_id || (
-                    route.status?.toUpperCase() === "READY" && route.points.length > 0
-                  ))
-                  && autoStartPreflightFailures.length === 0
-                )}
                 preflightFailures={autoStartPreflightFailures}
                 errorMessage={navigationError}
                 noticeMessage={navigationNotice}
@@ -1576,6 +1628,16 @@ export function DashboardPage() {
                 localized={poseVerified}
                 approximateHintAllowed={approximateHintAllowed}
                 readOnly={isSpectator}
+                allowCustomDestination={user?.role !== "guest"}
+                canSaveCurrentLocation={user?.role === "admin" || user?.role === "operator"}
+                canManageDestinations={user?.role === "admin" || user?.role === "operator"}
+                savingCurrentLocation={saveCurrentDestination.isPending}
+                destinationMutationPending={updateSavedDestination.isPending || deleteSavedDestination.isPending}
+                onSaveCurrentLocation={(name) => saveCurrentDestination.mutateAsync(name).then(() => undefined)}
+                onUpdateDestination={(destinationId, name) => updateSavedDestination.mutateAsync({
+                  destinationId, name,
+                })}
+                onDeleteDestination={(destinationId) => deleteSavedDestination.mutateAsync(destinationId)}
                 onMapChange={(mapId) => {
                   if (navigationRequestInFlightRef.current) return;
                   const nextMap = activeMaps.find((item) => item.map_id === mapId);
@@ -1601,7 +1663,7 @@ export function DashboardPage() {
                   forceGlobal: true,
                 })}
                 onApproximateHint={(point) => approximatePose.mutate(point)}
-                onGo={() => sendGoal.mutate()}
+                onGo={() => sendGoal.mutateAsync()}
                 onPause={() => {
                   if (route?.mission_id) missionAction.mutate({ action: "pause" });
                 }}

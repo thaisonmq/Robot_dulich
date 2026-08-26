@@ -1,7 +1,7 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import {
-  drawRobotMapMarker, goalApproachYaw, MapPanel, routeShouldRemainVisible,
+  destinationOverlapsRobot, drawRobotMapMarker, goalApproachYaw, MapPanel, routeShouldRemainVisible,
   worldYawToCanvas,
 } from "../src/components/MapPanel";
 import { I18nProvider } from "../src/i18n/I18nProvider";
@@ -262,8 +262,8 @@ describe("MapPanel navigation controls", () => {
     expect(screen.getByText("Định vị")).toBeInTheDocument();
   });
 
-  it("previews in a modal and only sends the goal after confirmation", () => {
-    const onGo = vi.fn();
+  it("previews in a modal and only sends the goal after confirmation", async () => {
+    const onGo = vi.fn().mockResolvedValue(undefined);
     panel({
       localized: true,
       localizationState: "READY",
@@ -272,14 +272,31 @@ describe("MapPanel navigation controls", () => {
         route_id: "mission-1", robot_id: "ROBOT-1", destination_id: poi.destination_id,
         points: [{ x: 0, y: 0 }, poi], distance_m: 1.4, estimated_seconds: 14,
       },
-      canStart: true,
       onGo,
     });
     fireEvent.click(screen.getByRole("button", { name: "Chọn điểm đến" }));
     expect(onGo).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Đi đến đây" }));
     expect(onGo).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("keeps Go here clickable when the browser preflight is stale", async () => {
+    const onGo = vi.fn().mockRejectedValue(new Error("Robot chưa đủ điều kiện an toàn"));
+    panel({
+      selected: poi,
+      preflightFailures: ["SCAN_STALE"],
+      onGo,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Chọn điểm đến" }));
+    const dialog = screen.getByRole("dialog", { name: "Chọn điểm đến" });
+    const go = within(dialog).getByRole("button", { name: "Đi đến đây" });
+    expect(go).toBeEnabled();
+    fireEvent.click(go);
+
+    await waitFor(() => expect(onGo).toHaveBeenCalledOnce());
+    expect(dialog).toBeInTheDocument();
   });
 
   it("blocks destination changes while a Nav2 request is pending", () => {
@@ -289,6 +306,114 @@ describe("MapPanel navigation controls", () => {
 
     expect(screen.getByLabelText("Map")).toBeDisabled();
     expect(screen.getByRole("alert")).toHaveTextContent("Nav2 chưa sẵn sàng");
+  });
+
+  it("opens saved destinations in a map-and-list dialog and selects one", () => {
+    const onSelect = vi.fn();
+    panel({ onSelect, allowCustomDestination: false });
+
+    fireEvent.click(screen.getByRole("button", { name: /Điểm đến đã lưu/ }));
+    const dialog = screen.getByRole("dialog", { name: "Chọn điểm đến" });
+    expect(within(dialog).getByText("Điểm đã lưu")).toBeInTheDocument();
+    fireEvent.click(within(within(dialog).getByRole("list"))
+      .getByRole("button", { name: /Lobby/ }));
+
+    expect(onSelect).toHaveBeenCalledWith(poi);
+  });
+
+  it("shows only the current-position icon when a saved point overlaps the robot", () => {
+    expect(destinationOverlapsRobot(poi, {
+      map_id: map.map_id, x: 1.05, y: 1.04,
+    }, map.resolution_m_per_pixel)).toBe(true);
+    expect(destinationOverlapsRobot(poi, {
+      map_id: map.map_id, x: 1.5, y: 1.5,
+    }, map.resolution_m_per_pixel)).toBe(false);
+
+    panel({
+      localized: true,
+      localizationState: "READY",
+      mapState: "READY",
+      pose: {
+        map_id: map.map_id, map_version: 1, x: poi.x, y: poi.y, yaw: 0,
+        linear_velocity: 0, angular_velocity: 0,
+      },
+    });
+    expect(screen.queryByRole("button", { name: "Chọn Lobby" })).not.toBeInTheDocument();
+  });
+
+  it("lets operators rename and delete a saved destination from the side list", async () => {
+    const onUpdateDestination = vi.fn().mockResolvedValue({ ...poi, name: "Sảnh chính" });
+    const onDeleteDestination = vi.fn().mockResolvedValue(undefined);
+    panel({
+      canManageDestinations: true,
+      onUpdateDestination,
+      onDeleteDestination,
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Điểm đến đã lưu/ }));
+    const dialog = screen.getByRole("dialog", { name: "Chọn điểm đến" });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Sửa Lobby" }));
+    const name = within(dialog).getByLabelText("Tên điểm đến Lobby");
+    fireEvent.change(name, { target: { value: "Sảnh chính" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Lưu thay đổi Lobby" }));
+    await waitFor(() => expect(onUpdateDestination).toHaveBeenCalledWith(poi.destination_id, "Sảnh chính"));
+    await waitFor(() => expect(within(dialog).queryByLabelText("Tên điểm đến Lobby")).not.toBeInTheDocument());
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Xóa Lobby" }));
+    const confirmation = within(dialog).getByRole("alert");
+    expect(confirmation).toHaveTextContent("Xóa điểm “Lobby”?");
+    fireEvent.click(within(confirmation).getByRole("button", { name: "Xóa" }));
+    await waitFor(() => expect(onDeleteDestination).toHaveBeenCalledWith(poi.destination_id));
+    await waitFor(() => expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument());
+  });
+
+  it("does not expose destination management actions to guests", () => {
+    panel({ canManageDestinations: false, allowCustomDestination: false });
+    fireEvent.click(screen.getByRole("button", { name: /Điểm đến đã lưu/ }));
+
+    expect(screen.queryByRole("button", { name: "Sửa Lobby" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Xóa Lobby" })).not.toBeInTheDocument();
+    expect(within(screen.getByRole("list")).getByRole("button", { name: /Lobby/ }))
+      .toBeInTheDocument();
+  });
+
+  it("only exposes saving when authorized and saves the verified current pose", async () => {
+    const onSaveCurrentLocation = vi.fn().mockResolvedValue(undefined);
+    const rendered = panel({
+      localized: true,
+      localizationState: "READY",
+      mapState: "READY",
+      canSaveCurrentLocation: false,
+      onSaveCurrentLocation,
+    });
+    expect(screen.queryByRole("button", { name: "Lưu vị trí" })).not.toBeInTheDocument();
+
+    rendered.unmount();
+    panel({
+      localized: true,
+      localizationState: "READY",
+      mapState: "READY",
+      canSaveCurrentLocation: true,
+      pose: {
+        map_id: map.map_id, map_version: 1, x: 1.25, y: -0.5, yaw: Math.PI / 2,
+        linear_velocity: 0, angular_velocity: 0,
+      },
+      onSaveCurrentLocation,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Lưu vị trí" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Lưu vị trí hiện tại" });
+    expect(within(dialog).getByText("1.25 m")).toBeInTheDocument();
+    expect(within(dialog).getByText("-0.50 m")).toBeInTheDocument();
+    expect(within(dialog).getByText("90.0°")).toBeInTheDocument();
+    fireEvent.change(within(dialog).getByLabelText("Tên vị trí"), {
+      target: { value: "Trạm sạc" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Lưu vị trí" }));
+
+    await waitFor(() => expect(onSaveCurrentLocation).toHaveBeenCalledWith("Trạm sạc"));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Lưu vị trí hiện tại" }))
+      .not.toBeInTheDocument());
   });
 
   it("does not claim both sensors are lost without a specific backend reason", () => {

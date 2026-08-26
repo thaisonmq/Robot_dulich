@@ -100,6 +100,16 @@ class MapLifecycleRequest(BaseModel):
     version: int = Field(ge=1)
 
 
+class SavedDestinationCreateRequest(MappingInitialPose):
+    name: str = Field(min_length=2, max_length=120)
+    version: int = Field(ge=1)
+
+
+class SavedDestinationUpdateRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    version: int = Field(ge=1)
+
+
 class TombstoneAckRequest(BaseModel):
     robot_id: str = Field(min_length=3, max_length=64)
 
@@ -236,7 +246,11 @@ def _map_view(database: Session, map_record: MapRecord, *, details: bool = False
                 "enabled": item.enabled,
             }
             for item in database.scalars(
-                select(POI).where(POI.map_id == map_record.map_id, POI.enabled.is_(True))
+                select(POI).where(
+                    POI.map_id == map_record.map_id,
+                    POI.version == map_record.active_version,
+                    POI.enabled.is_(True),
+                )
             )
         ]
         value["keepout_zones"] = [
@@ -1267,7 +1281,222 @@ async def get_destinations(
             "enabled": item.enabled,
         }
         for item in database.scalars(
-            select(POI).where(POI.map_id == map_id, POI.enabled.is_(True))
+            select(POI).where(
+                POI.map_id == map_id,
+                POI.version == record.active_version,
+                POI.enabled.is_(True),
+            )
         )
     )
-    return destinations
+    return sorted(destinations, key=lambda item: item["name"].casefold())
+
+
+@router.post("/{map_id}/destinations", status_code=201)
+async def create_saved_destination(
+    map_id: str,
+    payload: SavedDestinationCreateRequest,
+    _: str = Depends(operator_user_id),
+    database: Session = Depends(get_db),
+) -> dict:
+    record = database.get(MapRecord, map_id)
+    if record is None or record.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bản đồ")
+    if record.status != "ACTIVE" or record.active_version is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Chỉ có thể lưu điểm đến trên phiên bản bản đồ đang hoạt động",
+        )
+    if payload.version != record.active_version:
+        raise HTTPException(
+            status_code=409,
+            detail="Phiên bản bản đồ đã thay đổi; hãy tải lại trước khi lưu vị trí",
+        )
+    version = database.scalar(
+        select(MapVersion).where(
+            MapVersion.map_id == map_id,
+            MapVersion.version == payload.version,
+        )
+    )
+    if version is None:
+        raise HTTPException(status_code=409, detail="Không tìm thấy phiên bản bản đồ đang hoạt động")
+
+    pose = MappingInitialPose(x=payload.x, y=payload.y, yaw=payload.yaw)
+    if not _mapping_pose_in_version(version, pose):
+        raise HTTPException(status_code=422, detail="Vị trí robot nằm ngoài phạm vi bản đồ")
+
+    name = payload.name.strip()
+    if len(name) < 2:
+        raise HTTPException(status_code=422, detail="Tên vị trí phải có ít nhất 2 ký tự")
+    duplicate_poi = database.scalar(
+        select(POI.poi_id).where(
+            POI.map_id == map_id,
+            POI.version == payload.version,
+            POI.enabled.is_(True),
+            func.lower(POI.name) == name.lower(),
+        )
+    )
+    duplicate_destination = database.scalar(
+        select(Destination.destination_id).where(
+            Destination.map_id == map_id,
+            Destination.enabled.is_(True),
+            func.lower(Destination.name) == name.lower(),
+        )
+    )
+    if duplicate_poi is not None or duplicate_destination is not None:
+        raise HTTPException(status_code=409, detail="Tên vị trí đã tồn tại trên bản đồ này")
+
+    item = POI(
+        map_id=map_id,
+        version=payload.version,
+        name=name,
+        x=payload.x,
+        y=payload.y,
+        yaw=payload.yaw,
+        enabled=True,
+    )
+    database.add(item)
+    database.commit()
+    database.refresh(item)
+    return {
+        "destination_id": item.poi_id,
+        "map_id": item.map_id,
+        "name": item.name,
+        "x": item.x,
+        "y": item.y,
+        "yaw": item.yaw,
+        "enabled": item.enabled,
+    }
+
+
+def _saved_destination_item(
+    database: Session,
+    *,
+    map_id: str,
+    version: int,
+    destination_id: str,
+) -> POI | Destination | None:
+    poi = database.get(POI, destination_id)
+    if (
+        poi is not None
+        and poi.map_id == map_id
+        and poi.version == version
+        and poi.enabled
+    ):
+        return poi
+    destination = database.get(Destination, destination_id)
+    if destination is not None and destination.map_id == map_id and destination.enabled:
+        return destination
+    return None
+
+
+def _saved_destination_name_exists(
+    database: Session,
+    *,
+    map_id: str,
+    version: int,
+    name: str,
+    exclude_id: str,
+) -> bool:
+    poi = database.scalar(
+        select(POI.poi_id).where(
+            POI.map_id == map_id,
+            POI.version == version,
+            POI.poi_id != exclude_id,
+            POI.enabled.is_(True),
+            func.lower(POI.name) == name.lower(),
+        )
+    )
+    destination = database.scalar(
+        select(Destination.destination_id).where(
+            Destination.map_id == map_id,
+            Destination.destination_id != exclude_id,
+            Destination.enabled.is_(True),
+            func.lower(Destination.name) == name.lower(),
+        )
+    )
+    return poi is not None or destination is not None
+
+
+def _require_active_destination_version(
+    database: Session,
+    *,
+    map_id: str,
+    version: int,
+) -> MapRecord:
+    record = database.get(MapRecord, map_id)
+    if record is None or record.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bản đồ")
+    if record.status != "ACTIVE" or record.active_version != version:
+        raise HTTPException(
+            status_code=409,
+            detail="Phiên bản bản đồ đã thay đổi; hãy tải lại trước khi sửa điểm đến",
+        )
+    return record
+
+
+@router.patch("/{map_id}/destinations/{destination_id}")
+async def update_saved_destination(
+    map_id: str,
+    destination_id: str,
+    payload: SavedDestinationUpdateRequest,
+    _: str = Depends(operator_user_id),
+    database: Session = Depends(get_db),
+) -> dict:
+    _require_active_destination_version(
+        database,
+        map_id=map_id,
+        version=payload.version,
+    )
+    item = _saved_destination_item(
+        database,
+        map_id=map_id,
+        version=payload.version,
+        destination_id=destination_id,
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy điểm đến")
+    name = payload.name.strip()
+    if len(name) < 2:
+        raise HTTPException(status_code=422, detail="Tên vị trí phải có ít nhất 2 ký tự")
+    if _saved_destination_name_exists(
+        database,
+        map_id=map_id,
+        version=payload.version,
+        name=name,
+        exclude_id=destination_id,
+    ):
+        raise HTTPException(status_code=409, detail="Tên vị trí đã tồn tại trên bản đồ này")
+    item.name = name
+    database.commit()
+    database.refresh(item)
+    return {
+        "destination_id": item.poi_id if isinstance(item, POI) else item.destination_id,
+        "map_id": item.map_id,
+        "name": item.name,
+        "x": item.x,
+        "y": item.y,
+        "yaw": item.yaw,
+        "enabled": item.enabled,
+    }
+
+
+@router.delete("/{map_id}/destinations/{destination_id}", status_code=204)
+async def delete_saved_destination(
+    map_id: str,
+    destination_id: str,
+    version: int = Query(ge=1),
+    _: str = Depends(operator_user_id),
+    database: Session = Depends(get_db),
+) -> Response:
+    _require_active_destination_version(database, map_id=map_id, version=version)
+    item = _saved_destination_item(
+        database,
+        map_id=map_id,
+        version=version,
+        destination_id=destination_id,
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy điểm đến")
+    item.enabled = False
+    database.commit()
+    return Response(status_code=204)
