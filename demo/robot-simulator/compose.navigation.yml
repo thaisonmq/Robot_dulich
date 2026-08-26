@@ -31,6 +31,10 @@ services:
         target: /opt/rovera/config/velocity_smoother.yaml
         read_only: true
       - type: bind
+        source: ./motion-safety/config/twist_mux.yaml
+        target: /opt/rovera/config/twist_mux.yaml
+        read_only: true
+      - type: bind
         source: ./micro_ros_fastdds.xml
         target: /etc/rovera/micro_ros_fastdds.xml
         read_only: true

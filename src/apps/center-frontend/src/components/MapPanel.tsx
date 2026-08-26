@@ -529,6 +529,8 @@ export function MapPanel({
   const manualBypass = mapState === "MANUAL_BYPASS";
   const computingAlternatives = mapState === "COMPUTING_ALTERNATIVES";
   const routeSelection = mapState === "ROUTE_SELECTION";
+  const dynamicRouteSelection = routeSelection
+    && feedback?.recovery_reason === "USER_ROUTE_CONFIRMATION_REQUIRED";
   const showRouteChoices = routeSelection || (
     !activeMission && routeCandidates.length > 1
   );
@@ -644,6 +646,14 @@ export function MapPanel({
       <strong>{t("Đang tìm các tuyến đường khác tới cùng điểm đến…")}</strong>
       <span>{t("Robot vẫn dừng an toàn trong khi kiểm tra độ rộng và vật cản của từng tuyến.")}</span>
     </div>}
+    {routeSelection && <div className="narrow-path-decision" role="alert">
+      <strong>{dynamicRouteSelection
+        ? t("Đường cũ không còn khoảng trống đủ an toàn để đi tiếp.")
+        : t("Hãy chọn tuyến đường bạn muốn robot thực hiện.")}</strong>
+      <span>{dynamicRouteSelection
+        ? t("Robot đang dừng và vẫn giữ điểm đến. Chọn một đường thay thế; robot chỉ bắt đầu sau khi bạn nhấn “Đi theo tuyến này”.")
+        : t("Robot chỉ bắt đầu di chuyển sau khi bạn xác nhận tuyến đã chọn.")}</span>
+    </div>}
     {showRouteChoices && <div className="route-candidate-list" role="list">
       {routeCandidates.map((candidate, index) => <button type="button" role="listitem"
         key={candidate.route_id} className={candidate.route_id === selectedRouteId ? "is-selected" : ""}
@@ -665,7 +675,9 @@ export function MapPanel({
         : routeSelection ? <><button type="button" className="button button--primary"
           disabled={readOnly || loading || !selectedRouteId} onClick={onConfirmRoute}>
           <RouteIcon /> {t("Đi theo tuyến này")}</button>
-          <button type="button" onClick={onBackRouteSelection}>{t("Quay lại")}</button></>
+          <button type="button" onClick={onBackRouteSelection}>{dynamicRouteSelection
+            ? t("Tiếp tục chờ đường cũ")
+            : t("Quay lại")}</button></>
         : localizationNeedsAssistance ? <>{approximateHintAllowed && onApproximateHint && <button
           type="button" className="button button--primary" disabled={readOnly || loading}
           onClick={() => { setApproximateHintMode(true); setExpanded(true); }}>

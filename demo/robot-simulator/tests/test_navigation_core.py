@@ -56,6 +56,7 @@ from navigation_core import (  # noqa: E402
     mapping_pose_match_quality,
     mask_scan_self_returns,
     normalize_trinary_unknown_metadata,
+    path_maximum_deviation,
     path_overlap_ratio,
     particle_cloud_uniqueness,
     position_within_tolerance,
@@ -1721,6 +1722,31 @@ def test_route_overlap_rejects_near_duplicates_but_keeps_distinct_corridors() ->
     ]
     assert path_overlap_ratio(original, near_duplicate) > 0.85
     assert path_overlap_ratio(original, distinct) < 0.85
+
+
+def test_path_maximum_deviation_separates_local_bypass_from_global_route() -> None:
+    original = [{"x": 0.0, "y": 0.0}, {"x": 2.0, "y": 0.0}]
+    local_bypass = [
+        {"x": 0.0, "y": 0.0},
+        {"x": 0.7, "y": 0.0},
+        {"x": 0.9, "y": 0.25},
+        {"x": 1.1, "y": 0.25},
+        {"x": 1.3, "y": 0.0},
+        {"x": 2.0, "y": 0.0},
+    ]
+    global_route = [
+        {"x": 0.0, "y": 0.0},
+        {"x": 0.5, "y": 0.8},
+        {"x": 1.5, "y": 0.8},
+        {"x": 2.0, "y": 0.0},
+    ]
+
+    assert path_maximum_deviation(local_bypass, original) == pytest.approx(
+        0.25, abs=0.01
+    )
+    assert path_maximum_deviation(global_route, original) == pytest.approx(
+        0.8, abs=0.01
+    )
 
 
 def test_dynamic_obstacle_payload_is_metric_and_bounded() -> None:
@@ -3400,12 +3426,17 @@ def test_dynamic_overlay_tracks_person_without_growing_historical_trail() -> Non
 
     first = overlay.observe(((0.00, 0.00),), now=20.0)[0]
     overlay.observe(((0.12, 0.00),), now=20.3)
-    moving = overlay.observe(((0.24, 0.00),), now=20.6)[0]
+    one_window = overlay.observe(((0.24, 0.00),), now=20.6)[0]
+    overlay.observe(((0.36, 0.00),), now=20.9)
+    moving = overlay.observe(((0.48, 0.00),), now=21.2)[0]
 
+    # One rolling-costmap/TF jump cannot receive mission-level MOVING stop
+    # authority. Sustained displacement over a second independent window can.
+    assert one_window.motion_state == "UNCONFIRMED"
     assert moving.id == first.id
     assert moving.motion_state == "MOVING"
     assert moving.speed == pytest.approx(0.40)
-    assert moving.bounds == pytest.approx((0.24, 0.0, 0.24, 0.0))
+    assert moving.bounds == pytest.approx((0.48, 0.0, 0.48, 0.0))
     assert moving.radius == pytest.approx(overlay.observation_radius)
 
 
@@ -3571,6 +3602,13 @@ def test_turn_braking_speed_limit_reduces_before_completion_band() -> None:
         completion_tolerance=tolerance,
         angular_deceleration=2.0,
         reaction_time=0.12,
+    ) == 0.0
+    assert turn_braking_speed_limit(
+        math.radians(8.0),
+        completion_tolerance=tolerance,
+        angular_deceleration=2.0,
+        reaction_time=0.12,
+        current_angular_speed=0.50,
     ) == 0.0
 
 
@@ -4151,7 +4189,8 @@ def test_motion_safety_startup_recovers_inactive_velocity_smoother() -> None:
     compose = yaml.safe_load(
         (project / "compose.navigation.yml").read_text()
     )
-    healthcheck = compose["services"]["motion-safety"]["healthcheck"]["test"][1]
+    motion_service = compose["services"]["motion-safety"]
+    healthcheck = motion_service["healthcheck"]["test"][1]
 
     assert "TimerAction(" in launch
     assert "ensure_velocity_smoother_active.py" in launch
@@ -4160,6 +4199,11 @@ def test_motion_safety_startup_recovers_inactive_velocity_smoother() -> None:
     assert "Transition.TRANSITION_CONFIGURE" in recovery
     assert "Transition.TRANSITION_ACTIVATE" in recovery
     assert "velocity-smoother-active" in healthcheck
+    assert any(
+        volume.get("target") == "/opt/rovera/config/twist_mux.yaml"
+        for volume in motion_service["volumes"]
+        if isinstance(volume, dict)
+    )
 
 
 def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:

@@ -10,4 +10,7 @@ velocity_smoother:
     odom_topic: /odometry/filtered
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
-    velocity_timeout: 0.30
+    # Nav2 runs at 10 Hz and can miss one or two cycles while a Pi costmap is
+    # serialized. Explicit cancel/safety zero commands remain immediate; this
+    # bound only prevents a harmless scheduling gap from braking then surging.
+    velocity_timeout: 0.50

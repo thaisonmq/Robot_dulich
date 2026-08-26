@@ -477,6 +477,10 @@ export interface RouteCandidate {
   overlap_with_original: number;
   valid: boolean;
   recommended: boolean;
+  requires_user_confirmation?: boolean;
+  recovery_route_kind?: "LOCAL_BYPASS" | "GLOBAL_ALTERNATIVE";
+  overlap_with_blocked_route?: number;
+  maximum_deviation_from_blocked_route?: number;
 }
 
 export interface CorridorStatus {
@@ -496,6 +500,8 @@ export interface NavigationFeedback {
   distance_remaining?: number;
   navigation_time_seconds?: number;
   recoveries?: number;
+  recovery_reason?: string;
+  destination_preserved?: boolean;
 }
 
 export interface NavigationVisualization {

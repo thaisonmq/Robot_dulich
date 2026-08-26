@@ -11,7 +11,10 @@ twist_mux:
         priority: 50
       nav2:
         topic: /cmd_vel_nav
-        timeout: 0.30
+        # Tolerate a bounded missed 10 Hz controller cycle. Manual and e-stop
+        # priorities still preempt immediately and explicit Auto stops publish
+        # zero instead of relying on this timeout.
+        timeout: 0.50
         priority: 10
     locks:
       emergency_stop:

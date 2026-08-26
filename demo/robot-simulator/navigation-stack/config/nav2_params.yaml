@@ -119,6 +119,9 @@ rovera_navigation_adapter:
     localization_operator_hint_minimum_static_matches: 12
     localization_operator_hint_minimum_scan_score: 0.50
     localization_operator_hint_minimum_explained_ratio: 0.65
+    # An explicit click is a local spatial prior. A wider radius admitted the
+    # repeated corridor 1.22 m away and let AMCL leave the selected region.
+    localization_operator_hint_search_radius: 0.60
     # Acquisition uses a strict 5-of-7 consensus around one pose. Two transient
     # scans may be occluded, while three contradictory/bad frames still reject.
     localization_consensus_window_size: 7
@@ -154,6 +157,9 @@ rovera_navigation_adapter:
     # Moving people keep right-of-way; a stable chair becomes replanable.
     dynamic_obstacle_motion_threshold: 0.12
     dynamic_obstacle_stationary_confirmation_seconds: 1.0
+    # Two independent 500 ms velocity windows are required before a rolling
+    # costmap cluster may stop the whole mission as a moving object.
+    dynamic_obstacle_moving_confirmation_windows: 2
     # Mission-level stop authority requires a confirmed moving track whose
     # predicted footprint meets the driven route inside this TTC horizon.
     dynamic_obstacle_conflict_ttc_seconds: 3.0
@@ -169,6 +175,15 @@ rovera_navigation_adapter:
     # logging forever.
     dynamic_unconfirmed_blocker_timeout_seconds: 8.0
     dynamic_unconfirmed_blocker_log_interval_seconds: 1.0
+    # Never leave a preserved destination in an invisible moving-object wait
+    # forever. A still-confirmed person becomes an explicit retriable BLOCKED
+    # state; a cleared track resumes normally before this bound.
+    dynamic_moving_obstacle_max_wait_seconds: 12.0
+    # When map/TF disagreement makes most scan endpoints look dynamic, retain
+    # raw motion safety but revoke mission-level costmap tracking authority.
+    dynamic_tracking_maximum_point_ratio: 0.40
+    dynamic_tracking_minimum_static_matches: 20
+    dynamic_tracking_evidence_freshness_seconds: 0.75
     # Require sustained route-aligned clearance before resuming. A single
     # sideways scan while waiting must never restart the blocked segment.
     dynamic_obstacle_clear_dwell_seconds: 1.00
@@ -230,6 +245,11 @@ rovera_navigation_adapter:
     alternative_route_max_candidates: 3
     alternative_route_overlap_threshold: 0.85
     alternative_route_keepout_radius: 0.18
+    # A footprint-valid detour may run automatically only while it remains in
+    # the accepted route's local corridor and rejoins it. Anything farther
+    # away is a new global route and requires explicit operator selection.
+    dynamic_local_bypass_minimum_overlap: 0.35
+    dynamic_local_bypass_maximum_deviation_m: 0.50
     # One shared wall-clock budget covers the primary route and all optional
     # alternatives.  Center waits longer than this, so a slow alternative
     # search cannot produce a false command-ACK timeout.
@@ -254,11 +274,13 @@ rovera_navigation_adapter:
     stop_turn_final_position_tolerance: 0.12
     stop_turn_max_reanchors_per_segment: 1
     stop_turn_settle_seconds: 0.20
+    stop_turn_velocity_settle_timeout_seconds: 0.80
     stop_turn_heading_tolerance_degrees: 3.0
     # Separate completion/re-entry bands plus a stable dwell prevent the
     # TURN_END/TURN_BEGIN chatter seen around one shared threshold.
     stop_turn_heading_reentry_tolerance_degrees: 6.0
     stop_turn_stable_dwell_seconds: 0.40
+    stop_turn_reentry_dwell_seconds: 0.20
     stop_turn_safety_block_timeout_seconds: 5.0
     stop_turn_heading_kp: 1.8
     stop_turn_max_angular_speed: 0.50
@@ -435,7 +457,10 @@ local_costmap:
   local_costmap:
     ros__parameters:
       update_frequency: 10.0
-      publish_frequency: 5.0
+      # The controller still updates its private grid at 10 Hz. Publishing the
+      # full grid at 3 Hz is enough for the Python tracker and avoids starving
+      # the 10 Hz controller/velocity pipeline on the Pi.
+      publish_frequency: 3.0
       global_frame: odom
       robot_base_frame: base_footprint
       rolling_window: true

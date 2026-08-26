@@ -52,8 +52,9 @@ def test_only_trusted_pose_sources_get_fast_local_verification() -> None:
     assert '"recent_navigation_pose"' in automatic
     assert "self.localization_seed_approximate = not recent_verified_pose" in automatic
     assert "self.global_search_requires_rotation = False" in automatic
-    assert "self._odometry_predicted_map_pose()" in operator
-    assert "self._begin_odometry_prior(" in operator
+    assert "self._odometry_predicted_map_pose()" not in operator
+    assert "self._begin_odometry_prior(" not in operator
+    assert "self._begin_operator_pose_hint(" in operator
     assert "approximate=False" in odometry
     assert "approximate=True" in fallback
 
@@ -134,6 +135,26 @@ def test_continue_mapping_checks_deserialize_result_and_never_trusts_hint_direct
     assert "not bool(response.result)" in load
     assert "_verify_mapping_continuation_pose(" in command
     assert 'self.current_state = "MAPPING_RUNNING"' in command
+
+
+def test_continued_mapping_clears_only_repeatedly_disproven_old_obstacles() -> None:
+    record = _method_source(
+        "_record_mapping_change_evidence", "_apply_mapping_change_evidence"
+    )
+    apply = _method_source(
+        "_apply_mapping_change_evidence", "_amcl_pose_callback"
+    )
+    save = _method_source("_save_mapping_bundle", "_schedule_autosave")
+
+    assert 'self._scan_transform("map", message)' in record
+    assert "source_map.value_at(*cell) >= 65" in record
+    assert "free_cells: set[tuple[int, int]]" in record
+    assert "hit_cells: set[tuple[int, int]]" in record
+    assert "self.mapping_change_minimum_free_observations" in apply
+    assert "free_count < (3 * hit_count + minimum)" in apply
+    assert "pixels[column, image_row] = 254" in apply
+    assert "self._apply_mapping_change_evidence(" in save
+    assert '"MAPPING_STALE_CELLS_CLEARED"' in save
 
 
 def test_each_localization_phase_discards_old_evidence_and_uses_full_threshold() -> None:
@@ -223,7 +244,8 @@ def test_operator_hint_resolves_without_unsafe_rotation_only_with_strict_local_e
     )[1].split("self._request_global_scan_uniqueness()", 1)[0]
     assert "self.localization_operator_hint_active = True" in operator
     assert "self.localization_seed_pose" in operator_branch
-    assert "self.global_scan_hint_radius" in operator_branch
+    assert "self.operator_hint_search_radius" in operator_branch
+    assert "self.localization_pending_operator_hint" in operator_branch
     assert "self._global_heading_diversity_ready()" not in operator_branch
     assert '"INSUFFICIENT_HEADING_DIVERSITY"' not in operator_branch
     assert "return verdict" in operator_branch
@@ -363,6 +385,12 @@ def test_cancel_discards_transaction_local_route_and_destination_state() -> None
 def test_success_discards_transaction_local_route_and_destination_state() -> None:
     finish = _method_source("_finish_execution_success", "_restart_segment_from_current")
 
+    assert finish.index(
+        "completed_route_id = self.execution_route_id"
+    ) < finish.index('self.execution_route_id = ""')
+    assert "completed_goal" in finish
+    assert "route_id=completed_route_id" in finish
+
     for required in (
         "self.paused_goal = None",
         "self.execution_goal = None",
@@ -375,6 +403,16 @@ def test_success_discards_transaction_local_route_and_destination_state() -> Non
         "self.latest_global_path = []",
     ):
         assert required in finish
+
+    # Completing a route is not a localization boundary. Keep the verified
+    # map/odometry anchor so the next destination can start immediately.
+    for forbidden in (
+        "self.localized = False",
+        "self.localization_state =",
+        "self.trajectory_map_from_odom = None",
+        "self._reset_localization_evidence()",
+    ):
+        assert forbidden not in finish
 
 
 def test_ready_requires_scan_map_pose_window_and_synchronized_time() -> None:
@@ -1128,6 +1166,19 @@ def test_turn_reentry_reselects_direction_after_target_overshoot() -> None:
     assert '"TURN" if direction else "WAIT_FOR_TURN_CLEAR"' in reentry
     assert "previous_direction=previous_direction" in reentry
     assert "direction=self.execution_turn_direction" in reentry
+    assert "self.execution_turn_reentry_since" in settling
+    assert "self.execution_turn_reentry_dwell" in reentry
+
+
+def test_segment_transitions_wait_for_measured_zero_and_turn_momentum_brakes() -> None:
+    tick = _method_source("_segment_execution_tick", "_fresh_execution_pose")
+
+    prepare = tick.split('if self.execution_phase == "STRAIGHT_PREPARE":', 1)[1]
+    assert 'self.pipeline_samples.get("motion_safety")' in prepare
+    assert "final_velocity_settled" in prepare
+    assert "self.execution_velocity_settle_timeout" in prepare
+    assert "current_angular_speed=measured_angular" in tick
+    assert "direction * measured[1] <= 0.0" in tick
 
 
 def test_navigation_debug_events_cover_new_geometry_and_recovery_sources() -> None:
@@ -1315,6 +1366,11 @@ def test_dynamic_recovery_waits_for_moving_people_and_replans_fixed_obstacles() 
     assert "self.dynamic_planning_minimum_observations" in tick
     assert 'action="PROACTIVE_TRAJECTORY_CONFLICT"' in tick
     assert "dynamic_trajectory_conflict_ttc" in tick
+    assert 'self.execution_phase in {"STRAIGHT", "NARROW_STRAIGHT"}' in tick
+    assert "self.active_segment is not None" in tick
+    assert "self.current_goal_handle is not None" in tick
+    assert "self._dynamic_tracking_evidence_trusted(now)" in tick
+    assert "ttc > 0.0 or immediate_physical_block" in tick
     assert 'item.motion_state in {"MOVING", "STATIONARY"}' not in tick
     assert 'item.motion_state == "MOVING"' in tick
     assert 'item.motion_state == "STATIONARY"' in tick
@@ -1328,6 +1384,8 @@ def test_dynamic_recovery_waits_for_moving_people_and_replans_fixed_obstacles() 
     assert "unconfirmed_replan_due" not in tick
     assert 'result="RESUME_ORIGINAL_ROUTE"' in attempt
     assert '"segment_directions": resume_directions' in attempt
+    assert "self.dynamic_moving_obstacle_max_wait" in tick
+    assert "self._stop_persistent_moving_dynamic_recovery()" in tick
 
 
 def test_dynamic_wait_evaluates_clearance_along_the_blocked_route() -> None:
@@ -1395,6 +1453,11 @@ def test_planning_and_recovery_project_route_aligned_front_lidar_keepout() -> No
     assert "exclusions=(live_front_keepout,)" in compute
     assert 'source="ROUTE_ALIGNED_FRONT_LIDAR"' in blocker
     assert 'result="KEEP_OUT_CONFIRMED"' in blocker
+
+    presearch = compute.split("live_front_keepout =", 1)[1].split(
+        "planner_result =", 1
+    )[0]
+    assert "blocked_only=True" in presearch
 
 
 def test_controller_blocker_is_a_persistent_recovery_planning_keepout() -> None:
@@ -1464,6 +1527,14 @@ def test_dynamic_replan_pause_invalidates_inflight_route_restart() -> None:
 def test_dynamic_recovery_rejects_same_blocked_geometry_without_retry_burn() -> None:
     attempt = _method_source("_attempt_dynamic_replan", "_replan_execution_from_current")
 
+    confirmation_gate = attempt.index("if requires_alternative:")
+    ordinary_replan = attempt.index("self._plan_stop_turn_from_current(goal)")
+    assert confirmation_gate < ordinary_replan
+    assert "self._attempt_dynamic_local_bypass_or_selection(" in attempt[
+        confirmation_gate:ordinary_replan
+    ]
+    assert "return" in attempt[confirmation_gate:ordinary_replan]
+
     assert "path_overlap_ratio" in attempt
     assert "self.dynamic_blocked_route" in attempt
     assert 'self._set_state("WAITING_FOR_DYNAMIC_CLEAR"' in attempt
@@ -1471,6 +1542,68 @@ def test_dynamic_recovery_rejects_same_blocked_geometry_without_retry_burn() -> 
     assert '"STILL_INTERSECTS_BLOCKER"' in attempt
     assert "self.dynamic_failed_route_signatures" in attempt
     assert "self.execution_replan_attempts += 1" not in attempt
+
+
+def test_dynamic_blockage_only_auto_starts_a_same_corridor_bypass() -> None:
+    classify = _method_source(
+        "_dynamic_route_relation", "_present_dynamic_route_selection"
+    )
+    recover = _method_source(
+        "_attempt_dynamic_local_bypass_or_selection", "_attempt_dynamic_replan"
+    )
+
+    assert "path_overlap_ratio(self.dynamic_blocked_route, points)" in classify
+    assert "path_maximum_deviation(" in classify
+    assert "self.dynamic_local_bypass_minimum_overlap" in classify
+    assert "self.dynamic_local_bypass_maximum_deviation" in classify
+    assert "plan_candidates(" in recover
+    assert "exclusions=self._dynamic_planning_exclusions()" in recover
+    assert "self._serialize_stop_turn_candidates(planned)" in recover
+    local_branch = recover.split("if local_candidates:", 1)[1].split(
+        "if global_candidates:", 1
+    )[0]
+    global_branch = recover.split("if global_candidates:", 1)[1].split(
+        'self.dynamic_recovery_state = "WAITING"', 1
+    )[0]
+    assert "self._navigate(" in local_branch
+    assert 'result="AUTO_RESUME_IN_OLD_CORRIDOR"' in local_branch
+    assert "global_route_started=False" in local_branch
+    assert "self._present_dynamic_route_selection(" in global_branch
+    assert "self._navigate(" not in global_branch
+
+
+def test_global_dynamic_alternative_requires_an_explicit_route_selection() -> None:
+    present = _method_source(
+        "_present_dynamic_route_selection",
+        "_attempt_dynamic_local_bypass_or_selection",
+    )
+    dispatch = _method_source("_dispatch", "_mapping_command")
+    tick = _method_source("_dynamic_recovery_tick", "_dynamic_route_relation")
+
+    assert 'candidate["requires_user_confirmation"] = True' in present
+    assert 'candidate["recovery_route_kind"] = "GLOBAL_ALTERNATIVE"' in present
+    assert '"USER_ROUTE_CONFIRMATION_REQUIRED"' in present
+    assert 'self._set_state(\n                "ROUTE_SELECTION"' in present
+    assert "self.navigation_velocity.publish(Twist())" in present
+    assert "resume_automatically=False" in present
+    assert "autonomous_global_route_started=False" in present
+    assert "self._navigate(" not in present
+    assert 'command == "navigation.select_route"' in dispatch
+    assert "self._start_selected_route(" in dispatch
+    assert 'command == "navigation.route_selection_back"' in dispatch
+    assert 'self.dynamic_recovery_state = "WAITING_OLD_ROUTE_ONLY"' in dispatch
+    assert 'self.current_state == "ROUTE_SELECTION"' in tick
+    assert '"AWAITING_USER_ROUTE_CONFIRMATION"' in tick
+
+
+def test_dynamic_local_bypass_thresholds_are_explicit_configuration() -> None:
+    project = Path(__file__).parents[1]
+    parameters = yaml.safe_load(
+        (project / "navigation-stack/config/nav2_params.yaml").read_text()
+    )["rovera_navigation_adapter"]["ros__parameters"]
+
+    assert parameters["dynamic_local_bypass_minimum_overlap"] == 0.35
+    assert parameters["dynamic_local_bypass_maximum_deviation_m"] == 0.50
 
 
 def test_true_static_disconnect_remains_terminal_during_runtime_recovery() -> None:
@@ -1534,6 +1667,26 @@ def test_untrusted_pose_cannot_create_map_relative_dynamic_planning_authority() 
     assert "ClearEntireCostmap.Request()" in ready_reset
 
 
+def test_map_disagreement_revokes_only_costmap_tracking_stop_authority() -> None:
+    costmap = _method_source("_costmap_callback", "_refresh_dynamic_obstacle_view")
+    trust = _method_source(
+        "_dynamic_tracking_evidence_trusted", "_refresh_dynamic_obstacle_view"
+    )
+    exclusions = _method_source(
+        "_dynamic_exclusions", "_dynamic_affects_remaining_route"
+    )
+
+    assert "if not self._dynamic_tracking_evidence_trusted():" in costmap
+    assert '"DYNAMIC_TRACKING_SUPPRESSED"' in costmap
+    assert 'stats.get("reason") == "EXPECTED_RANGE_MATCH"' in trust
+    assert 'stats.get("dynamic_points_kept"' in trust
+    assert "self.dynamic_tracking_maximum_point_ratio" in trust
+    assert "self.dynamic_tracking_minimum_static_matches" in trust
+    assert "if not self._dynamic_tracking_evidence_trusted():" in exclusions
+    # Raw Motion Safety remains the independent physical stop authority.
+    assert "self._atomic_dynamic_blockage" not in costmap
+
+
 def test_costmap_transform_prefers_message_timestamp_and_bounds_latest_fallback() -> None:
     callback = _method_source("_costmap_callback", "_refresh_dynamic_obstacle_view")
 
@@ -1556,7 +1709,7 @@ def test_approximate_hint_discards_yaw_and_never_sets_ready() -> None:
     assert 'self.localization_state = "READY"' not in operator
 
 
-def test_operator_pose_uses_verified_odometry_as_a_bounded_prior() -> None:
+def test_explicit_operator_pose_overrides_the_old_odometry_prior() -> None:
     projected = _method_source("_odometry_predicted_map_pose", "_update_pose")
     operator = _method_source("_set_initial_pose", "_deactivate_map")
     prior = _method_source("_begin_odometry_prior", "_begin_operator_pose_hint")
@@ -1567,8 +1720,9 @@ def test_operator_pose_uses_verified_odometry_as_a_bounded_prior() -> None:
     assert "self.localization_odometry_prior_rejected_epoch" in projected
     assert '"odom", "base_footprint", Time()' in projected
     assert '"covariance": 0.01' in projected
-    assert "self._odometry_predicted_map_pose()" in operator
-    assert "self._begin_odometry_prior(" in operator
+    assert "self._odometry_predicted_map_pose()" not in operator
+    assert "self._begin_odometry_prior(" not in operator
+    assert "self._begin_operator_pose_hint(" in operator
     assert "self.localization_odometry_prior_active = True" in prior
     assert 'self.localization_state = "LOCALIZING_LAST_POSE"' in prior
     assert "self.odometry_prior_timeout" in tick
@@ -1585,6 +1739,8 @@ def test_operator_hint_runs_one_independent_scan_seed_before_waiting_on_amcl() -
 
     assert "operator_seed: bool = False" in request
     assert "require_candidate_match=not operator_seed" in request
+    assert "self.operator_hint_search_radius" in request
+    assert "math.radians(45.0) if operator_seed else None" in request
     assert "self.localization_seed_approximate = False" in request
     assert "self.localization_operator_hint_active = True" in request
     assert "self._publish_initial_pose(scan_seed, approximate=False)" in request
@@ -1602,7 +1758,7 @@ def test_repeated_operator_hint_preserves_a_converging_attempt() -> None:
     assert '"LOCALIZATION_HINT_IGNORED"' in operator
     repeated_branch = operator.split(
         "if repeated_hint and self.localization_state in active_hint_states:", 1
-    )[1].split("odometry_pose =", 1)[0]
+    )[1].split("self._begin_operator_pose_hint(", 1)[0]
     assert "self._reset_localization_evidence()" not in repeated_branch
     assert "evidence_preserved=True" in repeated_branch
 
@@ -1657,6 +1813,30 @@ def test_localization_loss_preserves_revalidates_and_resumes_mission() -> None:
     assert "self._plan_stop_turn_from_current(goal)" in resume
     assert 'action="WAIT_AND_RETRY"' in resume
     assert "destination_preserved=True" in resume
+
+
+def test_restart_recovery_persists_destination_but_never_publishes_stale_route() -> None:
+    persist = _method_source(
+        "_persist_active_navigation_mission", "_clear_active_navigation_mission"
+    )
+    load = _method_source("_load_map", "_begin_odometry_prior")
+    navigate = _method_source("_navigate", "_start_escape_execution")
+    finish = _method_source("_finish_execution_success", "_restart_segment_from_current")
+    cancel = _method_source("_cancel_navigation", "_pause_navigation")
+
+    assert '"/var/lib/rovera/navigation/active-mission.json"' in ADAPTER_SOURCE
+    assert "output.flush()" in persist
+    assert "os.fsync(output.fileno())" in persist
+    assert "os.replace(temporary, target)" in persist
+    assert '"resume_automatically": bool(resume_automatically)' in persist
+    assert "self.localization_resume_context = {" in load
+    assert '"path": []' in load
+    assert 'stale_route_published=False' in load
+    assert 'stored_mission.get("path")' not in load
+    assert "self._persist_active_navigation_mission(resume_automatically=True)" in navigate
+    assert 'self._clear_active_navigation_mission("goal_succeeded")' in finish
+    assert "resume_automatically=False" in cancel
+    assert "elif target != \"PAUSED\":" in cancel
 
 
 def test_final_position_short_circuit_is_before_turn_and_endpoint_replan() -> None:

@@ -358,6 +358,67 @@ describe("MapPanel navigation controls", () => {
     expect(screen.queryByRole("button", { name: "Chọn điểm đến" })).not.toBeInTheDocument();
   });
 
+  it("requires confirmation before using a different obstacle-recovery route", () => {
+    const onSelectRoute = vi.fn();
+    const onConfirmRoute = vi.fn();
+    const onBackRouteSelection = vi.fn();
+    panel({
+      localized: true,
+      localizationState: "READY",
+      mapState: "ROUTE_SELECTION",
+      navigationStatus: "route_selection",
+      feedback: {
+        recovery_reason: "USER_ROUTE_CONFIRMATION_REQUIRED",
+        destination_preserved: true,
+      },
+      routeCandidates: [
+        {
+          route_id: "alternative-a",
+          points: [{ x: 0, y: 0 }, { x: 0.5, y: 0.8 }, { x: 1, y: 1 }],
+          total_length: 1.6,
+          estimated_time: 20,
+          minimum_clearance: 0.09,
+          narrow_segments: 0,
+          overlap_with_original: 0.2,
+          valid: true,
+          recommended: true,
+          requires_user_confirmation: true,
+          recovery_route_kind: "GLOBAL_ALTERNATIVE",
+        },
+        {
+          route_id: "alternative-b",
+          points: [{ x: 0, y: 0 }, { x: -0.4, y: 0.7 }, { x: 1, y: 1 }],
+          total_length: 1.8,
+          estimated_time: 24,
+          minimum_clearance: 0.08,
+          narrow_segments: 0,
+          overlap_with_original: 0.1,
+          valid: true,
+          recommended: false,
+          requires_user_confirmation: true,
+          recovery_route_kind: "GLOBAL_ALTERNATIVE",
+        },
+      ],
+      selectedRouteId: "alternative-a",
+      onSelectRoute,
+      onConfirmRoute,
+      onBackRouteSelection,
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Đường cũ không còn khoảng trống đủ an toàn để đi tiếp.",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "robot chỉ bắt đầu sau khi bạn nhấn “Đi theo tuyến này”",
+    );
+    fireEvent.click(screen.getByText("Tuyến 2"));
+    expect(onSelectRoute).toHaveBeenCalledWith("alternative-b");
+    fireEvent.click(screen.getByRole("button", { name: "Đi theo tuyến này" }));
+    expect(onConfirmRoute).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Tiếp tục chờ đường cũ" }));
+    expect(onBackRouteSelection).toHaveBeenCalledOnce();
+  });
+
   it("shows a blocking progress state while a safe route is being computed", () => {
     panel({
       localized: true,

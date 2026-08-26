@@ -173,6 +173,7 @@ class DynamicObstacle:
     motion_anchor_x: float | None = None
     motion_anchor_y: float | None = None
     motion_anchor_time: float | None = None
+    moving_confirmation_windows: int = 0
 
 
 class DynamicObstacleOverlay:
@@ -187,6 +188,7 @@ class DynamicObstacleOverlay:
         observation_radius: float = 0.025,
         motion_threshold: float = 0.12,
         stationary_confirmation_seconds: float = 1.0,
+        moving_confirmation_windows: int = 2,
     ) -> None:
         self.ttl_seconds = max(0.05, float(ttl_seconds))
         self.cluster_distance = max(0.001, float(cluster_distance))
@@ -197,6 +199,12 @@ class DynamicObstacleOverlay:
         self.motion_threshold = max(0.01, float(motion_threshold))
         self.stationary_confirmation_seconds = max(
             0.10, float(stationary_confirmation_seconds)
+        )
+        # Motion is estimated over 500 ms anchors. Requiring more than one
+        # independent window prevents a single TF/rolling-costmap jump from
+        # turning a saved wall into a person with mission-level STOP authority.
+        self.moving_confirmation_windows = max(
+            1, int(moving_confirmation_windows)
         )
         self._next_id = 1
         self._obstacles: dict[int, DynamicObstacle] = {}
@@ -341,6 +349,7 @@ class DynamicObstacleOverlay:
                 motion_anchor_x = center_x
                 motion_anchor_y = center_y
                 motion_anchor_time = timestamp
+                moving_confirmation_windows = 0
             else:
                 obstacle_id = associated.id
                 first_seen = associated.first_seen
@@ -362,6 +371,9 @@ class DynamicObstacleOverlay:
                 )
                 velocity_x = associated.velocity_x
                 velocity_y = associated.velocity_y
+                moving_confirmation_windows = (
+                    associated.moving_confirmation_windows
+                )
                 elapsed = timestamp - motion_anchor_time
                 # Costmap endpoints can jump one 2.5 cm cell each frame even
                 # for a fixed chair leg. Estimate motion over a longer window
@@ -372,8 +384,17 @@ class DynamicObstacleOverlay:
                     motion_anchor_x = center_x
                     motion_anchor_y = center_y
                     motion_anchor_time = timestamp
+                    if math.hypot(velocity_x, velocity_y) >= self.motion_threshold:
+                        moving_confirmation_windows += 1
+                    else:
+                        moving_confirmation_windows = 0
                 speed = math.hypot(velocity_x, velocity_y)
-                if count >= 3 and speed >= self.motion_threshold:
+                if (
+                    count >= 3
+                    and speed >= self.motion_threshold
+                    and moving_confirmation_windows
+                    >= self.moving_confirmation_windows
+                ):
                     motion_state = "MOVING"
                     stationary_since = None
                 else:
@@ -415,6 +436,7 @@ class DynamicObstacleOverlay:
                 motion_anchor_x,
                 motion_anchor_y,
                 motion_anchor_time,
+                moving_confirmation_windows,
             )
         return self.snapshot(timestamp)
 
@@ -5939,6 +5961,32 @@ def path_overlap_ratio(
     return round(min(covered(left_points, right_points), covered(right_points, left_points)), 4)
 
 
+def path_maximum_deviation(
+    path: Iterable[dict[str, float]],
+    reference: Iterable[dict[str, float]],
+    *,
+    spacing: float = 0.05,
+) -> float:
+    """Largest centerline departure of ``path`` from a reference corridor.
+
+    Dynamic recovery uses this one-way distance to distinguish a short local
+    bypass which rejoins the accepted route from a genuinely different global
+    route. Collision/footprint validation remains authoritative; this metric
+    decides only whether operator confirmation is required.
+    """
+    candidate_points = _resample_path(path, spacing=spacing)
+    reference_points = _resample_path(reference, spacing=spacing)
+    if not candidate_points or not reference_points:
+        return math.inf
+    return max(
+        min(
+            math.hypot(x - reference_x, y - reference_y)
+            for reference_x, reference_y in reference_points
+        )
+        for x, y in candidate_points
+    )
+
+
 def dynamic_exclusions_intersect_route(
     points: Iterable[dict[str, float]],
     exclusions: Iterable[tuple[float, float, float]],
@@ -6062,6 +6110,7 @@ def turn_braking_speed_limit(
     completion_tolerance: float,
     angular_deceleration: float,
     reaction_time: float,
+    current_angular_speed: float = 0.0,
 ) -> float:
     """Maximum angular speed that can settle without crossing the target."""
     remaining = max(
@@ -6071,6 +6120,17 @@ def turn_braking_speed_limit(
         return 0.0
     deceleration = max(0.01, abs(float(angular_deceleration)))
     reaction = max(0.0, float(reaction_time))
+    current_speed = abs(float(current_angular_speed))
+    current_stopping_distance = (
+        current_speed * reaction
+        + current_speed * current_speed / (2.0 * deceleration)
+    )
+    if current_speed > 1e-3 and current_stopping_distance >= remaining:
+        # Command zero now and let the downstream smoother perform the proven
+        # deceleration. Solving only for the desired future speed ignored the
+        # chassis' current 0.5 rad/s momentum and caused a 6-7 degree overshoot
+        # followed by a visible reverse correction.
+        return 0.0
     # Solve v * reaction + v^2 / (2a) <= remaining angle.
     return max(
         0.0,
