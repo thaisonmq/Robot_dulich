@@ -994,7 +994,7 @@ def test_executable_validator_combines_live_master_and_saved_static_walls() -> N
     assert 'validation_source = "GLOBAL_MASTER_COSTMAP"' in validate
     assert "self.saved_map.occupancy" in validate
     assert "lethal_threshold=100" in validate
-    assert "inscribed_threshold=99" in validate
+    assert "None if allow_monotonic_initial_overlap else 99" in validate
     assert "lethal_threshold=65" in validate
     assert 'validation_source = "SAVED_STATIC_MAP"' in validate
     assert "self._path_after_initial_distance" in validate
@@ -1010,10 +1010,24 @@ def test_compute_path_never_fabricates_or_mutates_a_failed_candidate() -> None:
     assert 'self._set_state("BLOCKED"' not in compute_path
 
 
+def test_started_compute_failure_becomes_nonterminal_automatic_recovery() -> None:
+    compute = _method_source("_compute_path", "_navigate")
+
+    assert "def begin_automatic_plan_recovery(" in compute
+    assert 'payload.get("auto_recover")' in compute
+    assert '"recovery_pending": True' in compute
+    assert 'status="RECOVERY_PENDING"' in compute
+    assert "self.execution_goal = dict(resolved_goal)" in compute
+    assert "self.paused_goal = dict(resolved_goal)" in compute
+    assert "self._enter_dynamic_wait(" in compute
+    assert "resume_automatically=True" in compute
+    assert 'self.latest_feedback.pop("terminal_reason", None)' in compute
+
+
 def test_invalid_preview_never_falls_back_to_a_curved_planner() -> None:
     ensure = _method_source("_ensure_executable_path", "_global_cost_at")
 
-    assert "validate_stop_turn_route" in ensure
+    assert "self._validate_static_stop_turn_route(" in ensure
     assert "canonicalize_stop_turn_path" in ensure
     assert "_request_path_once" not in ensure
     assert "FOOTPRINT_AWARE_PLANNER" not in ensure
@@ -1046,7 +1060,9 @@ def test_navigation_abort_uses_confirmed_corridor_then_preserves_user_choice() -
     assert "self.corridor_confirmation_samples" in evidence
     assert "self.corridor_confirmation_duration" in evidence
     assert "localization_reliable" in result
-    assert '"LOCALIZATION_UNRELIABLE"' in result
+    assert 'self._localization_lost(' in result
+    assert '"SEGMENT_CONTROLLER_UNRELIABLE_POSE"' in result
+    assert '"SEGMENT_CONTROLLER_FAILURE", goal_generation' in result
 
 
 def test_manual_handoff_preserves_goal_and_resume_replans_from_current_pose() -> None:
@@ -1133,6 +1149,39 @@ def test_segment_result_callbacks_require_generation_token_and_index() -> None:
     assert "self._segment_callback_current" in result
     assert 'evidence_reason == "UNCONFIRMED"' in result
     assert 'self._set_state("NAVIGATING", "automatic_segment_retry")' in result
+
+
+def test_segment_completion_is_atomic_idempotent_and_cannot_skip_final_leg() -> None:
+    tick = _method_source("_segment_execution_tick", "_fresh_execution_pose")
+    complete = _method_source(
+        "_complete_active_segment", "_finish_execution_success"
+    )
+    finish = _method_source(
+        "_finish_execution_success", "_restart_segment_from_current"
+    )
+    result = _method_source("_navigation_result", "_set_recovery_terminal")
+
+    assert "with self.state_lock:" in complete
+    for authority in (
+        "goal_generation == self.navigation_goal_generation",
+        "self.execution_segment_token == segment_token",
+        "self.execution_segment_index == segment_index",
+        'self.current_state == "NAVIGATING"',
+    ):
+        assert authority in complete
+    assert '"SEGMENT_COMPLETION_IGNORED"' in complete
+    assert "segment_token=active.segment_token" in tick
+    assert "segment_index=active.segment_index" in tick
+    assert "segment_token=segment_token" in result
+    assert "segment_index=segment_index" in result
+
+    # Even if a future regression corrupts the segment index, terminal success
+    # remains impossible while the measured chassis is outside goal tolerance.
+    assert "authoritative_distance" in finish
+    assert "self.stop_turn_final_position_tolerance" in finish
+    assert 'rejection_reason = "FINAL_POSITION_NOT_REACHED"' in finish
+    assert '"GOAL_COMPLETION_REJECTED"' in finish
+    assert "self.navigation_goal_generation += 1" in finish
 
 
 def test_turn_hysteresis_and_persistent_safety_block_are_bounded() -> None:
@@ -1253,15 +1302,20 @@ def test_rotation_sweep_stop_and_start_escape_remain_runtime_recoverable() -> No
     escape = _method_source(
         "_start_escape_execution", "_final_position_distance"
     )
+    validation = _method_source(
+        "_validate_executable_path", "_path_after_initial_distance"
+    )
 
     assert '"ROTATION_SWEEP_COLLISION"' in safety
     assert '"ROTATION_SWEEP_COLLISION"' in atomic
     assert "allow_monotonic_initial_overlap=start_escape" in prepare
+    assert "endpoint = dict(refreshed_escape.end)" in prepare
     assert 'status="ALREADY_CLEAR"' in prepare
     assert "START_ESCAPE_ALREADY_CLEAR" in prepare
     assert "self._live_start_escape_directions(" in escape
     assert "directions=escape_directions" in escape
     assert "escape.motion_direction" in escape
+    assert "None if allow_monotonic_initial_overlap else 99" in validation
     direction_gate = _method_source(
         "_live_start_escape_directions", "_compute_path"
     )
@@ -1336,13 +1390,15 @@ def test_dynamic_wait_periodically_replans_and_success_resumes_same_goal() -> No
     assert "observe_confirmed_blocker" not in blocker
     assert "self.dynamic_unconfirmed_blocker_timeout" in tick
     assert "self._stop_unconfirmed_dynamic_recovery()" in tick
-    terminal = _method_source(
+    retry_wait = _method_source(
         "_stop_unconfirmed_dynamic_recovery", "_schedule_execution_replan"
     )
-    assert 'self._set_state("BLOCKED"' in terminal
-    assert "self.paused_goal = goal" in terminal
-    assert "destination_preserved" in terminal
-    assert "keepout_created=False" in terminal
+    assert 'self._set_state("WAITING_FOR_DYNAMIC_CLEAR"' in retry_wait
+    assert "self.paused_goal = goal" in retry_wait
+    assert 'self.latest_feedback.pop("terminal_reason", None)' in retry_wait
+    assert "resume_automatically=True" in retry_wait
+    assert "destination_preserved" in retry_wait
+    assert "keepout_created=False" in retry_wait
     assert "corridor_blocked" in tick
     assert 'self.dynamic_block_reason.startswith("CONTROLLER_ABORT")' not in tick
     enter = _method_source("_enter_dynamic_wait", "_dynamic_recovery_tick")
@@ -1429,6 +1485,9 @@ def test_auto_route_uses_two_centimetre_hard_and_seven_centimetre_preferred_marg
     recovery = _method_source(
         "_plan_stop_turn_from_current", "_resume_auto_from_current_pose"
     )
+    static_validation = _method_source(
+        "_validate_static_stop_turn_route", "_decision_keepout"
+    )
 
     assert parameters["corridor_side_margin"] == 0.07
     assert parameters["stop_turn_minimum_route_side_clearance"] == 0.02
@@ -1438,6 +1497,13 @@ def test_auto_route_uses_two_centimetre_hard_and_seven_centimetre_preferred_marg
     assert "self.corridor_side_margin" in compute
     assert '"ROUTE_CLEARANCE_INSUFFICIENT"' in compute
     assert '"ROUTE_CLEARANCE_INSUFFICIENT"' in recovery
+    assert "initial_reverse_clearance_recovery" in compute
+    assert "initial_reverse_clearance_recovery" in recovery
+    assert "directions[0] >= 0" in static_validation
+    assert "any(direction < 0 for direction in directions[1:])" in static_validation
+    assert "self.turn_bay_max_distance" in static_validation
+    assert "half_width=self.footprint_half_width" in static_validation
+    assert "half_width=reserved_half_width" in static_validation
 
 
 def test_planning_and_recovery_project_route_aligned_front_lidar_keepout() -> None:
@@ -1614,14 +1680,66 @@ def test_dynamic_local_bypass_thresholds_are_explicit_configuration() -> None:
     assert parameters["dynamic_local_bypass_maximum_deviation_m"] == 0.50
 
 
-def test_true_static_disconnect_remains_terminal_during_runtime_recovery() -> None:
+def test_static_disconnect_remains_retryable_and_preserves_runtime_mission() -> None:
     dynamic = _method_source("_attempt_dynamic_replan", "_replan_execution_from_current")
     ordinary = _method_source("_replan_execution_from_current", "_send_current_straight_segment")
+    recovery = _method_source("_set_recovery_terminal", "_recover_navigation")
 
     assert 'exc.code == "GOAL_PHYSICALLY_UNREACHABLE"' in dynamic
     assert "self._set_recovery_terminal" in dynamic
-    assert 'exc.code == "GOAL_PHYSICALLY_UNREACHABLE"' in ordinary
-    assert "self._set_recovery_terminal" in ordinary
+    assert "self._enter_dynamic_wait(" in ordinary
+    assert 'self.latest_feedback["destination_preserved"] = True' in ordinary
+    assert 'self.latest_feedback.pop("terminal_reason", None)' in recovery
+    assert "self._enter_dynamic_wait(" in recovery
+    assert "resume_automatically=True" in recovery
+
+
+def test_runtime_detects_lost_steering_and_turn_hard_stop_as_recovery() -> None:
+    safety = _method_source("_safety_status_callback", "_safety_source_callback")
+    turn = _method_source("_segment_execution_tick", "_start_turn_bay_recovery")
+
+    assert 'reason="STEERING_AUTHORITY_LOST"' in safety
+    assert '"STEERING_AUTHORITY_LOST", self.navigation_goal_generation' in safety
+    assert 'action="RELOCATE_AFTER_HARD_STOP"' in safety
+    assert "self._start_turn_bay_recovery(" in safety
+    assert 'action="REJECT_ERROR_INCREASING_DIRECTION"' in turn
+    assert 'self.execution_phase = "WAIT_FOR_TURN_CLEAR"' in turn
+
+
+def test_sustained_scan_map_mismatch_pauses_then_automatically_relocalizes() -> None:
+    tick = _method_source("_localization_tick", "_load_map")
+    lost = _method_source("_localization_lost", "_global_heading_requirement")
+
+    assert "self.execution_scan_map_mismatch_confirmation" in tick
+    assert 'action="HOLD_FOR_SCAN_MAP_CONFIRMATION"' in tick
+    assert 'self._localization_lost("SUSTAINED_SCAN_MAP_MISMATCH")' in tick
+    assert '"goal": dict(self.paused_goal)' in lost
+    assert "self.localization_resume_context" in lost
+    assert "self._start_global_localization()" in lost
+
+
+def test_sensor_and_localization_recovery_never_clear_goal_on_replan_failure() -> None:
+    sensor = _method_source(
+        "_resume_sensor_time_navigation_if_ready",
+        "_resume_localization_navigation_if_ready",
+    )
+    localization = _method_source(
+        "_resume_localization_navigation_if_ready", "_localization_lost"
+    )
+    wait = _method_source("_enter_dynamic_wait", "_dynamic_recovery_tick")
+
+    assert 'self._set_state("PAUSED"' not in sensor
+    assert "self.sensor_time_resume_context = None" in sensor
+    sensor_failure = sensor.split("except AdapterError as exc:", 1)[1].split(
+        "                return", 1
+    )[0]
+    assert "self.sensor_time_resume_context = None" not in sensor_failure
+    assert 'action="REPLAN_WAIT_AND_RETRY"' in sensor
+    assert 'self._set_state("PAUSED"' not in localization
+    assert '"WAITING_FOR_DYNAMIC_CLEAR"' in localization
+    assert 'self.latest_feedback.pop("terminal_reason", None)' in sensor
+    assert 'self.latest_feedback.pop("terminal_reason", None)' in localization
+    assert 'self.latest_feedback.pop("terminal_reason", None)' in wait
 
 
 def test_no_last_pose_starts_passive_localization_without_velocity_ownership() -> None:
@@ -1850,6 +1968,9 @@ def test_restart_recovery_persists_destination_but_never_publishes_stale_route()
 def test_final_position_short_circuit_is_before_turn_and_endpoint_replan() -> None:
     tick = _method_source("_segment_execution_tick", "_start_turn_bay_recovery")
     prepare = _method_source("_prepare_active_segment", "_begin_turn_or_settling")
+    complete = _method_source(
+        "_complete_final_position_if_reached", "_segment_execution_tick"
+    )
     finish = _method_source("_finish_execution_success", "_restart_segment_from_current")
 
     first_final_check = tick.index("_complete_final_position_if_reached")
@@ -1864,6 +1985,12 @@ def test_final_position_short_circuit_is_before_turn_and_endpoint_replan() -> No
     assert prepare.index("_complete_final_position_if_reached") < prepare.index(
         "_begin_turn_or_settling"
     )
+    assert "straight_segment_progress" in complete
+    assert "self.straight_endpoint_tolerance" in complete
+    assert "self.saved_map.validate_footprint" in complete
+    assert '"GOAL_COMPLETION_DEFERRED"' in complete
+    assert '"FINAL_CROSS_TRACK_OUTSIDE_ENDPOINT_BAND"' in complete
+    assert '"FINAL_FOOTPRINT_NOT_STATIC_VALID"' in complete
     assert '"GOAL_REACHED"' in finish
     assert 'mode="POSITION_ONLY"' in finish
     assert 'phase="FINAL_TURN_END"' in finish

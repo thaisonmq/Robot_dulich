@@ -65,6 +65,7 @@ from navigation_core import (  # noqa: E402
     post_turn_reanchor_requires_turn,
     pose_stability,
     rotation_swept_clearance,
+    reverse_stop_turn_path,
     route_geometry_metadata,
     scan_raycast_consistency,
     scan_to_map_match,
@@ -417,6 +418,52 @@ def test_start_escape_live_validation_allows_only_shrinking_initial_overlap() ->
     )
     assert not new_collision.valid
     assert new_collision.code == "PATH_FOOTPRINT_COLLISION"
+
+
+def test_start_escape_can_cross_static_inscribed_inflation_without_a_lethal_cell() -> None:
+    """Cost 99 is an inflated warning, not new physical obstacle geometry."""
+    width, height, resolution = 50, 30, 0.05
+    costs = [0] * (width * height)
+    for column in range(20, 29):
+        costs[10 * width + column] = 99
+    escape = [{"x": 1.025, "y": 0.525}, {"x": 1.50, "y": 0.525}]
+
+    center_inscribed = validate_executable_grid_path(
+        escape,
+        width=width,
+        height=height,
+        resolution=resolution,
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+        data=costs,
+        half_length=0.15,
+        half_width=0.10,
+        lethal_threshold=100,
+        inscribed_threshold=99,
+        allow_monotonic_initial_overlap=True,
+        maximum_new_initial_overlap_cells=1,
+    )
+    physical_lethal_only = validate_executable_grid_path(
+        escape,
+        width=width,
+        height=height,
+        resolution=resolution,
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+        data=costs,
+        half_length=0.15,
+        half_width=0.10,
+        lethal_threshold=100,
+        inscribed_threshold=None,
+        allow_monotonic_initial_overlap=True,
+        maximum_new_initial_overlap_cells=1,
+    )
+
+    assert not center_inscribed.valid
+    assert center_inscribed.cell_cost == 99
+    assert physical_lethal_only.valid
 
 
 def test_exact_saved_grid_negative_rotated_origin_and_y_axis(tmp_path: Path) -> None:
@@ -2089,6 +2136,33 @@ def test_turn_direction_tracks_overshoot_error_sign_on_reentry() -> None:
     assert choose_turn_direction(math.radians(6.2), **safety) == 1
 
 
+def test_turn_direction_never_takes_long_way_when_shortest_side_is_blocked() -> None:
+    assert choose_turn_direction(
+        math.radians(-18.4),
+        left_static_safe=True,
+        right_static_safe=True,
+        left_live_safe=True,
+        right_live_safe=False,
+    ) == 0
+    assert choose_turn_direction(
+        math.radians(18.4),
+        left_static_safe=True,
+        right_static_safe=True,
+        left_live_safe=False,
+        right_live_safe=True,
+    ) == 0
+
+
+def test_exact_half_turn_may_use_either_equally_short_safe_direction() -> None:
+    assert choose_turn_direction(
+        math.pi,
+        left_static_safe=True,
+        right_static_safe=True,
+        left_live_safe=False,
+        right_live_safe=True,
+    ) == -1
+
+
 def test_rotation_sweep_rejects_collision_missed_at_both_endpoint_headings() -> None:
     resolution = 0.01
     width = height = 80
@@ -3034,6 +3108,153 @@ def test_small_initial_turn_keeps_short_direct_candidate() -> None:
     assert route.metadata.initial_turn_angle < math.radians(2.0)
 
 
+def test_direct_route_behind_robot_turns_and_drives_forward_in_open_space() -> None:
+    saved = _manual_map(80, 80, _free_rectangle(1, 78, 1, 78))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    start = {"x": 2.0, "y": 2.0, "yaw": 0.0}
+    goal = {"x": 1.0, "y": 2.0}
+
+    route = planner.plan(start, goal)
+
+    assert route is not None
+    assert route.segment_directions == (1,)
+    assert route.metadata.initial_turn_angle == pytest.approx(math.pi)
+    assert validate_stop_turn_route(
+        saved,
+        route.points,
+        half_length=0.15,
+        half_width=0.10,
+        segment_directions=route.segment_directions,
+    ).valid
+
+
+def test_every_exact_route_has_an_exact_valid_inverse_on_same_static_map() -> None:
+    """Geometry-level invariant; this is independent of terrain topology."""
+    free = _free_rectangle(1, 98, 1, 78)
+    # A solid island makes the test route use three sides of real obstacle
+    # topology instead of proving the property only in an empty room.
+    for column in range(39, 62):
+        for row in range(24, 55):
+            free.discard((column, row))
+    saved = _manual_map(100, 80, free)
+    points = (
+        {"x": 1.20, "y": 1.00},
+        {"x": 1.20, "y": 3.20},
+        {"x": 3.80, "y": 3.20},
+        {"x": 3.80, "y": 1.00},
+    )
+    directions = (1, -1, 1)
+
+    forward = validate_stop_turn_route(
+        saved,
+        points,
+        half_length=0.15,
+        half_width=0.10,
+        padding=0.02,
+        turn_robustness_radius=0.01,
+        segment_directions=directions,
+    )
+    inverse_points, inverse_directions = reverse_stop_turn_path(
+        points, directions
+    )
+    inverse = validate_stop_turn_route(
+        saved,
+        inverse_points,
+        half_length=0.15,
+        half_width=0.10,
+        padding=0.02,
+        turn_robustness_radius=0.01,
+        segment_directions=inverse_directions,
+    )
+
+    assert forward.valid
+    assert inverse.valid
+    assert inverse_points == list(reversed(points))
+    assert inverse_directions == (-1, 1, -1)
+
+    forward_metadata = route_geometry_metadata(
+        saved,
+        saved.navigation_geometry,
+        points,
+        half_length=0.15,
+        half_width=0.10,
+        padding=0.02,
+        start_yaw=math.pi / 2.0,
+        goal_yaw=-math.pi / 2.0,
+        segment_directions=directions,
+    )
+    inverse_metadata = route_geometry_metadata(
+        saved,
+        saved.navigation_geometry,
+        inverse_points,
+        half_length=0.15,
+        half_width=0.10,
+        padding=0.02,
+        start_yaw=-math.pi / 2.0,
+        goal_yaw=math.pi / 2.0,
+        segment_directions=inverse_directions,
+    )
+    assert inverse_metadata.total_length == pytest.approx(
+        forward_metadata.total_length
+    )
+    assert inverse_metadata.execution_total_turn_angle == pytest.approx(
+        forward_metadata.execution_total_turn_angle
+    )
+    assert inverse_metadata.estimated_time == pytest.approx(
+        forward_metadata.estimated_time
+    )
+
+
+def test_dead_end_escape_reverses_to_a_bay_then_drives_forward() -> None:
+    free: set[tuple[int, int]] = set()
+    free.update(_free_rectangle(5, 55, 17, 23))  # Narrow horizontal stem.
+    free.update(_free_rectangle(25, 40, 8, 30))  # Turn bay behind start.
+    free.update(_free_rectangle(29, 35, 17, 60))  # Narrow vertical exit.
+    saved = _manual_map(70, 70, free)
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        primitive_length=0.10,
+        turn_robustness_radius=0.0,
+        turn_bay_max_distance=0.80,
+    )
+    start = {"x": 2.55, "y": 1.025, "yaw": 0.0}
+    goal = {"x": 1.625, "y": 2.70, "yaw": math.pi / 2.0}
+
+    result = planner.plan_result(start, goal, planning_time_budget=8.0)
+
+    assert result.success
+    assert planner._initial_reverse_escape_authorized(start, ())
+    assert result.route is not None
+    directions = result.route.segment_directions
+    assert directions[0] == -1
+    assert all(direction > 0 for direction in directions[1:])
+    reverse_distance = math.hypot(
+        result.route.points[1]["x"] - result.route.points[0]["x"],
+        result.route.points[1]["y"] - result.route.points[0]["y"],
+    )
+    assert reverse_distance <= planner.turn_bay_max_distance
+    assert planner._route_result(
+        list(result.route.points),
+        start_yaw=start["yaw"],
+        goal_yaw=goal["yaw"],
+        segment_directions=tuple(1 for _ in directions),
+    ) is None
+    assert planner._route_result(
+        list(result.route.points),
+        start_yaw=start["yaw"],
+        goal_yaw=goal["yaw"],
+        segment_directions=tuple(-1 for _ in directions),
+    ) is None
+    assert validate_stop_turn_route(
+        saved,
+        result.route.points,
+        half_length=0.15,
+        half_width=0.10,
+        segment_directions=directions,
+    ).valid
+
+
 def test_post_turn_reanchor_uses_straight_band_for_small_drift() -> None:
     assert not post_turn_reanchor_requires_turn(
         math.radians(5.0),
@@ -3170,7 +3391,7 @@ def test_actual_runtime_start_overlap_is_classified_and_escapes_forward() -> Non
     assert recovered.route.points[-1] == goal
 
 
-def test_actual_runtime_pose_prefers_goal_aligned_turn_bay_direction() -> None:
+def test_actual_runtime_pose_stays_forward_even_when_goal_is_behind() -> None:
     project = Path(__file__).parents[3]
     saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")
     planner = StopTurnStateLatticePlanner(
@@ -3186,9 +3407,9 @@ def test_actual_runtime_pose_prefers_goal_aligned_turn_bay_direction() -> None:
         "yaw": -1.4428476156244743,
     }
 
-    for goal, expected_direction in (
-        ({"x": 0.585, "y": 1.565}, -1),
-        ({"x": -0.003265306122449, "y": 0.330816326530613}, 1),
+    for goal in (
+        {"x": 0.585, "y": 1.565},
+        {"x": -0.003265306122449, "y": 0.330816326530613},
     ):
         result = planner.plan_result(
             start,
@@ -3201,13 +3422,9 @@ def test_actual_runtime_pose_prefers_goal_aligned_turn_bay_direction() -> None:
         assert result.route is not None
         assert result.route.points[0] == {"x": start["x"], "y": start["y"]}
         assert result.route.points[-1] == goal
-        # Relocate without changing chassis yaw, preferring whichever of
-        # forward/reverse lies in the destination half-plane, then turn.
-        assert result.route.segment_directions[0] == expected_direction
-        if expected_direction < 0:
-            assert result.route.points[1]["y"] > start["y"] + 0.05
-        else:
-            assert result.route.points[1]["y"] < start["y"] - 0.20
+        assert all(
+            direction > 0 for direction in result.route.segment_directions
+        )
         assert validate_stop_turn_route(
             saved,
             result.route.points,
@@ -3260,6 +3477,32 @@ def test_turn_bay_direction_order_tracks_goal_projection() -> None:
     ) == (-1, 1)
 
 
+def test_logged_final_pose_is_inside_radius_but_outside_endpoint_band() -> None:
+    """Regression for arrival beside the line that blocked reverse escape."""
+    final_segment_start = {
+        "x": 1.962532829783426,
+        "y": 1.4750000000000005,
+    }
+    final_endpoint = {
+        "x": 1.72080932621125,
+        "y": 0.7551736637656288,
+    }
+    logged_pose = {
+        "x": 1.691470914231122,
+        "y": 0.8682839980525292,
+    }
+
+    assert position_within_tolerance(logged_pose, final_endpoint, 0.12)
+    progress = straight_segment_progress(
+        final_segment_start,
+        final_endpoint,
+        logged_pose,
+    )
+    assert progress.endpoint_distance == pytest.approx(0.1168532847)
+    assert abs(progress.signed_cross_track) == pytest.approx(0.0638195058)
+    assert abs(progress.signed_cross_track) > 0.03
+
+
 def test_turn_bay_does_not_reverse_when_the_required_turn_is_already_clear() -> None:
     saved = _manual_map(80, 80, _free_rectangle(1, 78, 1, 78))
     planner = StopTurnStateLatticePlanner(
@@ -3276,7 +3519,7 @@ def test_turn_bay_does_not_reverse_when_the_required_turn_is_already_clear() -> 
     assert candidate.segment_directions[0] == 1
 
 
-def test_reverse_turn_bay_sheds_request_local_clearance_allowance() -> None:
+def test_near_wall_turn_bay_stays_forward_when_forward_is_clear() -> None:
     free = _free_rectangle(1, 78, 1, 78)
     for column in range(34, 51):
         free.discard((column, 17))
@@ -3295,36 +3538,12 @@ def test_reverse_turn_bay_sheds_request_local_clearance_allowance() -> None:
     candidate = planner._turn_bay_candidate(start, goal, (), None)
 
     assert candidate is not None
-    assert candidate.segment_directions == (-1, 1)
-    assert candidate.points[1]["x"] < start["x"] - 0.30
-    # The ordinary full-margin validator still rejects the initial raster
-    # contact; this exemption is local to the reverse turn-bay recovery.
-    assert not validate_stop_turn_route(
-        saved,
-        candidate.points,
-        half_length=0.15,
-        half_width=0.135,
-        segment_directions=candidate.segment_directions,
-    ).valid
-    assert validate_stop_turn_route(
-        saved,
-        candidate.points[:2],
-        half_length=0.15,
-        half_width=0.1225,
-        segment_directions=(-1,),
-    ).valid
-    # The bay and all normal motion after it retain the complete 3.5 cm
-    # request-local reserve.
-    assert validate_stop_turn_route(
-        saved,
-        candidate.points[1:],
-        half_length=0.15,
-        half_width=0.135,
-        segment_directions=(1,),
-    ).valid
+    assert all(direction > 0 for direction in candidate.segment_directions)
+    assert not candidate.initial_reverse_clearance_recovery
+    assert not planner._initial_reverse_escape_authorized(start, ())
 
 
-def test_reverse_turn_bay_can_shed_all_reserve_but_not_physical_clearance() -> None:
+def test_near_wall_turn_bay_does_not_reverse_merely_to_shed_reserve() -> None:
     free = _free_rectangle(1, 78, 1, 78)
     for column in range(34, 51):
         free.discard((column, 17))
@@ -3345,29 +3564,9 @@ def test_reverse_turn_bay_can_shed_all_reserve_but_not_physical_clearance() -> N
     candidate = planner._turn_bay_candidate(start, goal, (), None)
 
     assert candidate is not None
-    assert candidate.segment_directions == (-1, 1)
-    assert candidate.points[1]["x"] < 1.65
-    assert validate_stop_turn_route(
-        saved,
-        candidate.points[:2],
-        half_length=0.15,
-        half_width=0.10,
-        segment_directions=(-1,),
-    ).valid
-    assert not validate_stop_turn_route(
-        saved,
-        candidate.points[:2],
-        half_length=0.15,
-        half_width=0.11,
-        segment_directions=(-1,),
-    ).valid
-    assert validate_stop_turn_route(
-        saved,
-        candidate.points[1:],
-        half_length=0.15,
-        half_width=0.135,
-        segment_directions=(1,),
-    ).valid
+    assert all(direction > 0 for direction in candidate.segment_directions)
+    assert not candidate.initial_reverse_clearance_recovery
+    assert not planner._initial_reverse_escape_authorized(start, ())
 
 
 def test_start_escape_rejects_a_new_static_overlap_cell() -> None:
@@ -3456,6 +3655,54 @@ def test_start_escape_rejects_a_new_static_overlap_cell() -> None:
     assert blocked.status == "START_ESCAPE_UNAVAILABLE"
     assert blocked.reason == "DYNAMICALLY_BLOCKED"
     assert blocked.start_escape is None
+
+
+def test_live_authorized_start_escape_can_bridge_one_isolated_raster_cell() -> None:
+    free = _free_rectangle(1, 38, 1, 18)
+    free.remove((10, 8))
+    free.remove((14, 10))
+    saved = _manual_map(40, 20, free)
+    start = {"x": 0.525, "y": 0.525, "yaw": 0.0}
+
+    escape = find_start_escape(
+        saved,
+        start,
+        half_length=0.15,
+        half_width=0.10,
+        maximum_distance=0.50,
+        directions=(1,),
+        maximum_new_overlap_cells=1,
+    )
+
+    assert escape is not None
+    assert escape.motion_direction == 1
+    assert saved.validate_footprint(
+        escape.end["x"],
+        escape.end["y"],
+        escape.yaw,
+        half_length=0.15,
+        half_width=0.10,
+        code_prefix="ESCAPE",
+    ).valid
+
+
+def test_raster_disagreement_allowance_never_crosses_a_multi_cell_wall() -> None:
+    free = _free_rectangle(1, 38, 1, 18)
+    free.remove((10, 8))
+    for row in (9, 10, 11):
+        free.remove((14, row))
+    saved = _manual_map(40, 20, free)
+    start = {"x": 0.525, "y": 0.525, "yaw": 0.0}
+
+    assert find_start_escape(
+        saved,
+        start,
+        half_length=0.15,
+        half_width=0.10,
+        maximum_distance=0.50,
+        directions=(1,),
+        maximum_new_overlap_cells=1,
+    ) is None
 
 
 def test_latest_runtime_overlap_does_not_reverse_as_start_escape() -> None:
@@ -4081,6 +4328,102 @@ def test_adequate_clearance_ranking_does_not_reward_many_extra_turns() -> None:
     long = route(5.4, 7, 45.0)
 
     assert planner.ranking_key(short) < planner.ranking_key(long)
+
+
+def test_route_ranking_uses_reverse_only_as_the_shortest_escape() -> None:
+    saved = _manual_map(20, 20, _free_rectangle(1, 18, 1, 18))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+
+    def route(
+        points: tuple[dict[str, float], ...],
+        directions: tuple[int, ...],
+        *,
+        turns: int,
+        estimated_time: float,
+    ) -> StopTurnRoute:
+        length = sum(
+            math.hypot(
+                right["x"] - left["x"], right["y"] - left["y"]
+            )
+            for left, right in zip(points, points[1:])
+        )
+        return StopTurnRoute(
+            points=points,
+            metadata=RouteMetadata(
+                total_length=length,
+                minimum_passage_width=0.50,
+                minimum_static_clearance=0.25,
+                minimum_turn_clearance=0.05,
+                turn_count=turns,
+                total_turn_angle=turns * math.pi / 2,
+                initial_turn_angle=0.0,
+                internal_turn_angle=turns * math.pi / 2,
+                final_turn_angle=0.0,
+                execution_total_turn_angle=turns * math.pi / 2,
+                narrow_segments=(),
+                estimated_time=estimated_time,
+                turn_safe=True,
+            ),
+            heading_bins=tuple(0 for _ in directions),
+            segment_directions=directions,
+        )
+
+    whole_route_reverse = route(
+        ({"x": 0.0, "y": 0.0}, {"x": 3.0, "y": 0.0}),
+        (-1,),
+        turns=0,
+        estimated_time=3.0,
+    )
+    short_reverse_then_forward = route(
+        (
+            {"x": 0.0, "y": 0.0},
+            {"x": -0.4, "y": 0.0},
+            {"x": 3.0, "y": 1.0},
+        ),
+        (-1, 1),
+        turns=1,
+        estimated_time=20.0,
+    )
+    all_forward = route(
+        (
+            {"x": 0.0, "y": 0.0},
+            {"x": 0.0, "y": 1.0},
+            {"x": 3.0, "y": 1.0},
+        ),
+        (1, 1),
+        turns=1,
+        estimated_time=30.0,
+    )
+
+    assert (
+        planner.ranking_key(short_reverse_then_forward)
+        < planner.ranking_key(whole_route_reverse)
+    )
+    assert (
+        planner.ranking_key(all_forward)
+        < planner.ranking_key(short_reverse_then_forward)
+    )
+
+
+def test_planner_never_returns_whole_route_reverse_as_final_policy() -> None:
+    free = _free_rectangle(2, 47, 6, 11)
+    saved = _manual_map(50, 20, free)
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    start = {"x": 1.80, "y": 0.45, "yaw": 0.0}
+    goal = {"x": 0.40, "y": 0.45}
+
+    # The geometry itself permits backing down the whole corridor. That old
+    # fallback must not leak out as an executable result. There is no bay in
+    # which to turn, and forward is initially clear, so reverse is forbidden.
+    reverse_only = planner._route_result(
+        (start, goal),
+        start_yaw=0.0,
+        segment_directions=(-1,),
+    )
+    assert reverse_only is not None
+    assert planner._route_unsupported_reverse_distance(reverse_only) > 0.0
+    planned = planner.plan(start, goal, maximum_expansions=3000)
+    assert planned is None
 
 
 def test_equal_routes_use_dominant_map_axis_as_a_bounded_tie_breaker() -> None:

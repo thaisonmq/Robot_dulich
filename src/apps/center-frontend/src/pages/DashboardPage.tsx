@@ -814,7 +814,11 @@ export function DashboardPage() {
               y: selectedDestination.y,
               yaw: selectedDestination.yaw,
             },
+            auto_recover: true,
           });
+        }
+        if (preparedRoute.status?.toUpperCase() === "RECOVERY") {
+          return preparedRoute;
         }
         if (
           !preparedRoute.mission_id
@@ -860,7 +864,11 @@ export function DashboardPage() {
         setMapLocalized(true);
       }
       setRoute(preparedRoute);
-      setNavigationState("moving");
+      setNavigationState(
+        preparedRoute.status?.toUpperCase() === "RECOVERY"
+          ? "recovery"
+          : "moving",
+      );
     },
     onError: (reason) => {
       setNavigationState("failed");

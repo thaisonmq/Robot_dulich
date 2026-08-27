@@ -384,6 +384,7 @@ export const api = {
   computePath: (input: {
     request_id: string; robot_id: string; session_id: string; expected_state: string;
     map_id: string; version: number; goal: { x: number; y: number; yaw: number };
+    auto_recover?: boolean;
   }) => request<Route>("/api/navigation/compute-path", {
     method: "POST", body: JSON.stringify(input),
   }),

@@ -93,6 +93,7 @@ class ComputePathRequest(NavigationCommandBase):
     map_id: str = Field(min_length=2, max_length=64)
     version: int = Field(ge=1)
     goal: GoalPose
+    auto_recover: bool = False
 
 
 class MissionCommandRequest(NavigationCommandBase):
@@ -598,6 +599,7 @@ async def compute_path(
             existing,
             candidates=_mission_route_candidates(database, existing),
         )
+    runtime_mission_id = str(uuid4())
     result = await _command(
         database,
         settings,
@@ -609,20 +611,23 @@ async def compute_path(
             "map_id": body.map_id,
             "version": body.version,
             "goal": body.goal.model_dump(),
+            "auto_recover": body.auto_recover,
+            "mission_id": runtime_mission_id,
         },
         timeout_seconds=settings.navigation_planning_timeout_seconds,
     )
     points = list(result.get("points") or result.get("path") or [])
-    # Planning happens before the chassis moves. A failed route is mission
-    # status PLAN_FAILED while the robot runtime remains READY; BLOCKED is
-    # reserved for an active navigation that exhausted recovery.
+    recovery_pending = bool(result.get("recovery_pending"))
     status = (
-        "READY"
+        "RECOVERY"
+        if recovery_pending
+        else "READY"
         if result.get("status") in {"accepted", "completed"} and points
         else "PLAN_FAILED"
     )
     resolved_goal = dict(result.get("goal") or body.goal.model_dump())
     mission = NavigationMission(
+        mission_id=runtime_mission_id,
         request_id=body.request_id,
         robot_id=body.robot_id,
         control_session_id=body.session_id,
@@ -634,8 +639,8 @@ async def compute_path(
         goal=resolved_goal,
         path=points,
         distance_m=float(result.get("distance_m", 0)),
-        error_code=result.get("error_code"),
-        error_message=result.get("error_message"),
+        error_code=(None if recovery_pending else result.get("error_code")),
+        error_message=(None if recovery_pending else result.get("error_message")),
     )
     database.add(mission)
     database.commit()

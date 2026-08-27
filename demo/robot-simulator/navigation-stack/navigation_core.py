@@ -108,6 +108,10 @@ class StopTurnRoute:
     metadata: RouteMetadata
     heading_bins: tuple[int, ...]
     segment_directions: tuple[int, ...] = ()
+    # True only when _route_result() has proved that the first, bounded
+    # reverse segment is physically clear and reaches a bay where the full
+    # configured side reserve is recovered before turning and driving on.
+    initial_reverse_clearance_recovery: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1073,6 +1077,43 @@ def canonicalize_stop_turn_path(
     return output
 
 
+def reverse_stop_turn_path(
+    points: Iterable[dict[str, float]],
+    segment_directions: Iterable[int] | None = None,
+) -> tuple[list[dict[str, float]], tuple[int, ...]]:
+    """Return the exact executable inverse of a canonical stop/turn path.
+
+    Reversing only the points is insufficient: a segment travelled forward
+    from A to B must be travelled in reverse from B to A so that the chassis
+    keeps the same orientation and sweeps the same rectangle.  Direction
+    order is therefore reversed and every sign is negated.
+
+    The input must already be canonical when explicit directions are supplied
+    because deleting a collinear point could otherwise delete a real
+    forward/reverse stop boundary.
+    """
+    raw_route = [
+        {"x": float(point["x"]), "y": float(point["y"])}
+        for point in points
+    ]
+    route = canonicalize_stop_turn_path(raw_route)
+    directions = (
+        tuple(1 for _ in range(max(0, len(route) - 1)))
+        if segment_directions is None
+        else tuple(-1 if int(value) < 0 else 1 for value in segment_directions)
+    )
+    if segment_directions is not None and len(route) != len(raw_route):
+        raise ValueError(
+            "explicit segment_directions require a canonical stop/turn path"
+        )
+    if len(directions) != max(0, len(route) - 1):
+        raise ValueError("segment_directions must match the canonical route")
+    return (
+        list(reversed(route)),
+        tuple(-direction for direction in reversed(directions)),
+    )
+
+
 def densify_straight_segment(
     start: dict[str, float],
     end: dict[str, float],
@@ -1117,6 +1158,7 @@ def validate_executable_grid_path(
     lethal_threshold: int = 99,
     inscribed_threshold: int | None = None,
     allow_monotonic_initial_overlap: bool = False,
+    maximum_new_initial_overlap_cells: int = 0,
 ) -> ExecutablePathValidation:
     """Validate the oriented physical footprint over every path segment.
 
@@ -1154,6 +1196,7 @@ def validate_executable_grid_path(
     first_collision: tuple[str, int, float, float, float, int, float, float] | None = None
     collision_cells: dict[tuple[int, int], tuple[float, float, int]] = {}
     permitted_initial_overlap: set[tuple[int, int]] | None = None
+    permitted_raster_disagreement: set[tuple[int, int]] = set()
     previous_overlap_count = 0
     last_overlap: tuple[
         tuple[str, int, float, float, float, int, float, float],
@@ -1371,15 +1414,31 @@ def validate_executable_grid_path(
                 if permitted_initial_overlap is None:
                     permitted_initial_overlap = sample_cells
                     previous_overlap_count = len(sample_cells)
-                elif (
-                    not sample_cells.issubset(permitted_initial_overlap)
-                    or len(sample_cells) > previous_overlap_count
-                ):
-                    assert sample_first_collision is not None
-                    first_collision = sample_first_collision
-                    collision_cells = sample_collision_cells
-                    break
                 else:
+                    newly_seen = (
+                        sample_cells
+                        - permitted_initial_overlap
+                        - permitted_raster_disagreement
+                    )
+                    maximum_new = max(
+                        0, int(maximum_new_initial_overlap_cells)
+                    )
+                    new_unknown = any(
+                        sample_collision_cells[cell][2] < 0
+                        for cell in newly_seen
+                    )
+                    if (
+                        new_unknown
+                        or len(permitted_raster_disagreement | newly_seen)
+                        > maximum_new
+                        or len(sample_cells)
+                        > previous_overlap_count + len(newly_seen)
+                    ):
+                        assert sample_first_collision is not None
+                        first_collision = sample_first_collision
+                        collision_cells = sample_collision_cells
+                        break
+                    permitted_raster_disagreement.update(newly_seen)
                     previous_overlap_count = len(sample_cells)
                 if sample_first_collision is not None:
                     last_overlap = (
@@ -1666,7 +1725,13 @@ def choose_turn_direction(
     left_live_safe: bool,
     right_live_safe: bool,
 ) -> int:
-    """Choose shortest safe direction, then the statically/live-safe opposite."""
+    """Choose a safe shortest turn without ever increasing heading error.
+
+    The opposite direction is not a fallback: except at the exact pi
+    ambiguity it is the long way around and therefore moves the chassis away
+    from its target heading. A blocked shortest turn must be handled by
+    translating to another turn bay instead.
+    """
     preferred = 1 if float(angular_error) >= 0.0 else -1
     safe = {
         1: bool(left_static_safe and left_live_safe),
@@ -1674,7 +1739,10 @@ def choose_turn_direction(
     }
     if safe[preferred]:
         return preferred
-    if safe[-preferred]:
+    if (
+        math.isclose(abs(float(angular_error)), math.pi, abs_tol=1e-6)
+        and safe[-preferred]
+    ):
         return -preferred
     return 0
 
@@ -2022,7 +2090,13 @@ def route_geometry_metadata(
 
 
 class StopTurnStateLatticePlanner:
-    """24-heading lattice containing only forward and in-place primitives."""
+    """24-heading lattice with forward motion and in-place turns.
+
+    Reverse is exposed only as a bounded initial dead-end escape: the robot
+    must be unable to advance or begin a turn, the reverse sweep must be
+    exact-valid, and reversing stops permanently after the first turn or
+    forward motion.
+    """
 
     HEADING_BINS = 24
 
@@ -2116,6 +2190,52 @@ class StopTurnStateLatticePlanner:
                 count += 1
         return count
 
+    @staticmethod
+    def _route_reverse_distance(route: StopTurnRoute) -> float:
+        """Return how far this route asks the chassis to drive backwards."""
+        points = list(route.points)
+        directions = tuple(
+            route.segment_directions
+            or (1 for _ in range(max(0, len(points) - 1)))
+        )
+        return sum(
+            math.hypot(
+                float(right["x"]) - float(left["x"]),
+                float(right["y"]) - float(left["y"]),
+            )
+            for direction, (left, right) in zip(
+                directions, zip(points, points[1:])
+            )
+            if direction < 0
+        )
+
+    def _route_unsupported_reverse_distance(
+        self, route: StopTurnRoute
+    ) -> float:
+        """Allow reverse only as one initial escape ending at a turn bay.
+
+        The escape length is terrain-derived: a long narrow stem may require
+        more than the interactive bay-probe radius before the first physical
+        rotation is possible. What is forbidden is reversing the whole trip
+        or returning to reverse after the chassis has turned forward.
+        """
+        reverse_distance = self._route_reverse_distance(route)
+        if reverse_distance <= 1e-9:
+            return 0.0
+        points = list(route.points)
+        directions = tuple(
+            route.segment_directions
+            or (1 for _ in range(max(0, len(points) - 1)))
+        )
+        if (
+            len(points) >= 3
+            and len(directions) == len(points) - 1
+            and directions[0] < 0
+            and all(direction > 0 for direction in directions[1:])
+        ):
+            return 0.0
+        return reverse_distance
+
     def _record_turn_route_rejection(
         self,
         turn_count: int,
@@ -2191,6 +2311,12 @@ class StopTurnStateLatticePlanner:
             "initial_alignment_turn": initial_turn,
             "total_execution_turns": normal_turns + initial_turn + final_turn,
             "route_length": round(selected.metadata.total_length, 4),
+            "reverse_distance": round(
+                self._route_reverse_distance(selected), 4
+            ),
+            "initial_reverse_clearance_recovery": bool(
+                selected.initial_reverse_clearance_recovery
+            ),
             "total_rotation_deg": round(
                 math.degrees(selected.metadata.total_turn_angle), 3
             ),
@@ -2352,6 +2478,25 @@ class StopTurnStateLatticePlanner:
     ) -> bool:
         return self._translation_validation(left, right).valid
 
+    def _translation_physically_valid(
+        self, left: dict[str, float], right: dict[str, float]
+    ) -> bool:
+        """Validate the chassis body without the planner's extra side reserve."""
+        return validate_executable_grid_path(
+            (left, right),
+            width=self.saved_map.width,
+            height=self.saved_map.height,
+            resolution=self.saved_map.resolution,
+            origin_x=self.saved_map.origin_x,
+            origin_y=self.saved_map.origin_y,
+            origin_yaw=self.saved_map.origin_yaw,
+            data=self.saved_map.occupancy,
+            half_length=self.half_length + self.padding,
+            half_width=self.half_width + self.padding,
+            allow_unknown=False,
+            lethal_threshold=65,
+        ).valid
+
     def _visibility_translation_validation(
         self,
         left: dict[str, float],
@@ -2501,6 +2646,82 @@ class StopTurnStateLatticePlanner:
                 return False
         return True
 
+    def _initial_reverse_escape_authorized(
+        self,
+        start: dict[str, float],
+        exclusions: tuple[tuple[float, float, float], ...],
+    ) -> bool:
+        """Allow reverse only as a bounded escape from a static dead end.
+
+        Reverse is not an ordinary lattice primitive.  It becomes available
+        only when the measured pose cannot advance far enough to escape or
+        make a meaningful turn-based forward departure, and the first reverse
+        primitive is itself exact-valid. The lattice additionally bounds that
+        initial reverse phase by ``turn_bay_max_distance`` and disables reverse
+        after the first forward motion or rotation.
+        """
+        if self.turn_bay_max_distance + 1e-9 < self.primitive_length:
+            return False
+        start_yaw = float(start.get("yaw", 0.0))
+        # A short clear patch directly ahead is not a usable exit when it ends
+        # at a wall before the chassis can turn. Probe the full bounded escape
+        # distance: reverse stays locked if the robot can keep advancing to the
+        # limit or reaches any earlier pose from which it can turn and depart
+        # forward. This distinguishes a real dead end from a goal merely lying
+        # behind the robot.
+        attempts = max(
+            1,
+            math.floor(self.turn_bay_max_distance / self.primitive_length),
+        )
+        for index in range(0, attempts + 1):
+            distance = index * self.primitive_length
+            pose = {
+                "x": float(start["x"]) + distance * math.cos(start_yaw),
+                "y": float(start["y"]) + distance * math.sin(start_yaw),
+            }
+            if index > 0 and (
+                self._segment_excluded(start, pose, exclusions)
+                or not self._translation_physically_valid(start, pose)
+            ):
+                break
+            # One 15-degree nudge that immediately faces another wall is not
+            # enough manoeuvring room. Require at least two heading bins so a
+            # turn-based departure is materially different from continuing
+            # down the blocked stem.
+            for offset in range(2, self.HEADING_BINS - 1):
+                departure_yaw = start_yaw + offset * self.heading_step
+                departure = {
+                    "x": float(pose["x"])
+                    + self.primitive_length * math.cos(departure_yaw),
+                    "y": float(pose["y"])
+                    + self.primitive_length * math.sin(departure_yaw),
+                }
+                if (
+                    self._turn_valid(
+                        float(pose["x"]),
+                        float(pose["y"]),
+                        start_yaw,
+                        departure_yaw,
+                        robust=False,
+                        measured_start=(index == 0),
+                    )
+                    and not self._segment_excluded(
+                        pose, departure, exclusions
+                    )
+                    and self._translation_physically_valid(pose, departure)
+                ):
+                    return False
+            if index == attempts:
+                return False
+        reverse = {
+            "x": float(start["x"]) - self.primitive_length * math.cos(start_yaw),
+            "y": float(start["y"]) - self.primitive_length * math.sin(start_yaw),
+        }
+        return bool(
+            not self._segment_excluded(start, reverse, exclusions)
+            and self._translation_physically_valid(start, reverse)
+        )
+
     def _turn_bay_candidate(
         self,
         start: dict[str, float],
@@ -2552,7 +2773,75 @@ class StopTurnStateLatticePlanner:
                 for turn_direction in (1, -1)
             )
 
-        for direction in preferred_turn_bay_directions(start, goal):
+        reverse_escape_authorized = self._initial_reverse_escape_authorized(
+            start, exclusions
+        )
+
+        def complete_forward_suffix(
+            bay: dict[str, float], direction: int
+        ) -> StopTurnRoute | None:
+            """Plan from a recovered bay without exposing reverse again."""
+            bay_clear = self.saved_map.validate_footprint(
+                float(bay["x"]),
+                float(bay["y"]),
+                start_yaw,
+                half_length=self.half_length,
+                half_width=self.half_width + self.hard_side_margin,
+                padding=self.padding,
+                allow_unknown=False,
+                code_prefix="BAY",
+            ).valid
+            initial_translation_clear = (
+                self._translation_valid(start, bay)
+                or self._translation_physically_valid(start, bay)
+            )
+            if not bay_clear or not initial_translation_clear:
+                return None
+            continuation_planner = StopTurnStateLatticePlanner(
+                self.saved_map,
+                self.geometry,
+                half_length=self.half_length,
+                half_width=self.half_width,
+                padding=self.padding,
+                primitive_length=self.primitive_length,
+                linear_speed=self.linear_speed,
+                angular_speed=self.angular_speed,
+                max_expansions=self.max_expansions,
+                turn_robustness_radius=self.turn_robustness_radius,
+                turn_bay_max_distance=0.0,
+                hard_side_margin=self.hard_side_margin,
+                preferred_side_margin=self.preferred_side_margin,
+            )
+            suffix = continuation_planner.plan(
+                bay,
+                goal,
+                exclusions=exclusions,
+                deadline_monotonic=deadline_monotonic,
+            )
+            if suffix is None or any(
+                suffix_direction < 0
+                for suffix_direction in suffix.segment_directions
+            ):
+                return None
+            combined = [
+                {"x": float(start["x"]), "y": float(start["y"])},
+                *map(dict, suffix.points),
+            ]
+            return self._route_result(
+                combined,
+                start_yaw=start_yaw,
+                goal_yaw=goal_yaw,
+                segment_directions=(direction, *suffix.segment_directions),
+                allow_initial_reverse_clearance_recovery=(direction < 0),
+                allow_initial_translation_clearance_recovery=True,
+            )
+
+        # Forward relocation is always preferred. Reverse is a last-resort
+        # escape from a pose that cannot advance or rotate, never a shortcut
+        # merely because the destination lies behind the chassis.
+        for direction in (1, -1):
+            if direction < 0 and not reverse_escape_authorized:
+                continue
             for index in range(1, attempts + 1):
                 if (
                     deadline_monotonic is not None
@@ -2566,6 +2855,24 @@ class StopTurnStateLatticePlanner:
                     "yaw": start_yaw,
                 }
                 if self._segment_excluded(start, bay, exclusions):
+                    continue
+                # A straight relocation may not jump across the first body
+                # collision. Once the swept body is blocked, every farther
+                # sample on this ray is unreachable. Also defer all expensive
+                # continuation searches until the endpoint has recovered the
+                # complete configured side reserve needed for its first turn.
+                if not self._translation_physically_valid(start, bay):
+                    break
+                if not self.saved_map.validate_footprint(
+                    float(bay["x"]),
+                    float(bay["y"]),
+                    start_yaw,
+                    half_length=self.half_length,
+                    half_width=self.half_width + self.hard_side_margin,
+                    padding=self.padding,
+                    allow_unknown=False,
+                    code_prefix="BAY",
+                ).valid:
                     continue
 
                 simple_continuations = (
@@ -2605,7 +2912,16 @@ class StopTurnStateLatticePlanner:
                         allow_initial_reverse_clearance_recovery=(
                             direction < 0
                         ),
+                        allow_initial_translation_clearance_recovery=True,
                     )
+                    if result is not None:
+                        return result
+
+                # For an authorized reverse escape, reach the complete
+                # forward-only planner before spending the remaining recovery
+                # budget on multiple seed rewrites for this same bay.
+                if direction < 0:
+                    result = complete_forward_suffix(bay, direction)
                     if result is not None:
                         return result
 
@@ -2652,6 +2968,13 @@ class StopTurnStateLatticePlanner:
                     )
                     if result is not None:
                         return result
+
+                # The destination may require more than the three cheap
+                # straight/L-shaped continuations above. Once this relocation
+                # reaches a full-clearance bay, run the complete planner from
+                # that bay with reverse disabled, then prepend exactly one
+                # bounded escape segment. This preserves the policy that the
+                # robot can never return to reverse later in the route.
         return None
 
     def _grid_seed(
@@ -4103,6 +4426,7 @@ class StopTurnStateLatticePlanner:
         goal_yaw: float | None = None,
         segment_directions: Iterable[int] | None = None,
         allow_initial_reverse_clearance_recovery: bool = False,
+        allow_initial_translation_clearance_recovery: bool = False,
     ) -> StopTurnRoute | None:
         if len(route) < 2:
             return None
@@ -4152,14 +4476,24 @@ class StopTurnStateLatticePlanner:
             measured_start=True,
         ):
             return None
-        if allow_initial_reverse_clearance_recovery:
+        initial_clearance_recovery = bool(
+            allow_initial_reverse_clearance_recovery
+            or allow_initial_translation_clearance_recovery
+        )
+        if initial_clearance_recovery:
             # A measured pose beside a wall can be physically valid while any
-            # request-local reserve overlaps one raster cell. Permit only the
-            # bounded reverse turn-bay segment to shed that reserve. The exact
-            # physical body must remain collision-free throughout, and the bay
-            # plus every following segment must recover the complete hard
-            # margin before the first turn can execute.
-            if directions[0] >= 0 or len(route) < 3:
+            # request-local reserve overlaps one raster cell. Permit the first
+            # bounded turn-bay relocation to shed that reserve. Forward uses
+            # this recovery preferentially; reverse additionally requires the
+            # dead-end authorization enforced by _turn_bay_candidate(). The
+            # exact body remains collision-free and the bay plus every later
+            # segment must recover the full margin before turning.
+            if len(route) < 3:
+                return None
+            if (
+                allow_initial_reverse_clearance_recovery
+                and directions[0] >= 0
+            ):
                 return None
             recovery_validation = validate_executable_grid_path(
                 route[:2],
@@ -4192,7 +4526,8 @@ class StopTurnStateLatticePlanner:
                 bay["y"] - route[0]["y"],
                 bay["x"] - route[0]["x"],
             )
-            incoming = _angle_delta(incoming + math.pi, 0.0)
+            if directions[0] < 0:
+                incoming = _angle_delta(incoming + math.pi, 0.0)
             outgoing = math.atan2(
                 route[2]["y"] - bay["y"],
                 route[2]["x"] - bay["x"],
@@ -4246,7 +4581,13 @@ class StopTurnStateLatticePlanner:
                 directions, zip(route, route[1:])
             )
         )
-        return StopTurnRoute(tuple(route), metadata, headings, directions)
+        return StopTurnRoute(
+            tuple(route),
+            metadata,
+            headings,
+            directions,
+            bool(allow_initial_reverse_clearance_recovery),
+        )
 
     def _widen_route_with_one_waypoint(
         self,
@@ -4426,17 +4767,21 @@ class StopTurnStateLatticePlanner:
         turn_bay_deadline_monotonic = deadline_monotonic
         if deadline_monotonic is not None:
             remaining = max(0.0, deadline_monotonic - planning_started)
+            # Interactive planning must reach the complete heading lattice
+            # early enough to answer before the edge RPC timeout. Seed and
+            # visibility passes improve turn count, but they must not consume
+            # most of the request while an exact forward route already exists.
             seed_deadline_monotonic = min(
                 deadline_monotonic,
-                planning_started + remaining * 0.25,
+                planning_started + remaining * 0.12,
             )
             topology_deadline_monotonic = min(
                 deadline_monotonic,
-                planning_started + remaining * 0.72,
+                planning_started + remaining * 0.25,
             )
             turn_bay_deadline_monotonic = min(
                 deadline_monotonic,
-                planning_started + remaining * 0.72,
+                planning_started + remaining * 0.55,
             )
         start_x, start_y = float(start["x"]), float(start["y"])
         goal_x, goal_y = float(goal["x"]), float(goal["y"])
@@ -4468,20 +4813,43 @@ class StopTurnStateLatticePlanner:
             {"x": goal_x, "y": goal_y},
         ]
         candidate_pool: list[StopTurnRoute] = []
+
+        def best_executable_policy_candidate() -> StopTurnRoute | None:
+            compliant = [
+                route
+                for route in candidate_pool
+                if self._route_unsupported_reverse_distance(route) <= 1e-9
+            ]
+            return None if not compliant else min(compliant, key=self.ranking_key)
+
         if not self._segment_excluded(direct_points[0], direct_points[1], forbidden):
-            direct = self._route_result(
-                direct_points, start_yaw=start_yaw, goal_yaw=goal_yaw
-            )
-            if direct is not None:
-                candidate_pool.append(direct)
-                # Zero normal direction changes is the global lower bound;
-                # no seed, clearance band or lattice search can improve it.
-                self._complete_plan_diagnostics(
-                    direct,
-                    candidate_count=1,
-                    minimum_turn_proven=True,
-                )
-                return direct
+            direct_candidates = [
+                result
+                for direction in (1,)
+                if (
+                    result := self._route_result(
+                        direct_points,
+                        start_yaw=start_yaw,
+                        goal_yaw=goal_yaw,
+                        segment_directions=(direction,),
+                    )
+                ) is not None
+            ]
+            if direct_candidates:
+                direct = min(direct_candidates, key=self.ranking_key)
+                candidate_pool.extend(direct_candidates)
+                # A direct forward route is the global lower bound. A direct
+                # reverse route is only a fallback: keep searching for a
+                # nearby bay where the vehicle can turn and drive forward.
+                # Returning here used to make the robot reverse all the way
+                # to a goal behind it even when such a bay existed.
+                if self._route_reverse_distance(direct) <= 1e-9:
+                    self._complete_plan_diagnostics(
+                        direct,
+                        candidate_count=len(direct_candidates),
+                        minimum_turn_proven=True,
+                    )
+                    return direct
 
         for simple in (
             [
@@ -4501,11 +4869,17 @@ class StopTurnStateLatticePlanner:
                 for left, right in zip(canonical_simple, canonical_simple[1:])
             ):
                 continue
-            result = self._route_result(
-                canonical_simple, start_yaw=start_yaw, goal_yaw=goal_yaw
-            )
-            if result is not None:
-                candidate_pool.append(result)
+            for direction in (1,):
+                result = self._route_result(
+                    canonical_simple,
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                    segment_directions=tuple(
+                        direction for _ in range(len(canonical_simple) - 1)
+                    ),
+                )
+                if result is not None:
+                    candidate_pool.append(result)
         visibility_seeds: list[list[tuple[int, int]]] = []
         visibility_seed_routes: list[list[dict[str, float]]] = []
         seen_seed_routes: set[tuple[tuple[float, float], ...]] = set()
@@ -4630,14 +5004,21 @@ class StopTurnStateLatticePlanner:
                 candidate_pool.append(shortcut_result)
 
         initial_goal_heading = math.atan2(goal_y - start_y, goal_x - start_x)
+        reverse_escape_required = self._initial_reverse_escape_authorized(
+            start, forbidden
+        )
         turn_bay_result = None
-        if self._excluded(start_x, start_y, forbidden) or not self._turn_valid(
-            start_x,
-            start_y,
-            start_yaw,
-            initial_goal_heading,
-            robust=False,
-            measured_start=True,
+        if (
+            reverse_escape_required
+            or self._excluded(start_x, start_y, forbidden)
+            or not self._turn_valid(
+                start_x,
+                start_y,
+                start_yaw,
+                initial_goal_heading,
+                robust=False,
+                measured_start=True,
+            )
         ):
             turn_bay_result = self._turn_bay_candidate(
                 start,
@@ -4700,12 +5081,16 @@ class StopTurnStateLatticePlanner:
         ]
         if one_turn_candidates:
             selected = min(one_turn_candidates, key=self.ranking_key)
-            self._complete_plan_diagnostics(
-                selected,
-                candidate_count=len(candidate_pool),
-                minimum_turn_proven=True,
-            )
-            return selected
+            # A one-turn route is a proven optimum only when it either drives
+            # wholly forward or uses one initial reverse-to-bay escape.
+            # Full-route reverse must not terminate the search early.
+            if self._route_unsupported_reverse_distance(selected) <= 1e-9:
+                self._complete_plan_diagnostics(
+                    selected,
+                    candidate_count=len(candidate_pool),
+                    minimum_turn_proven=True,
+                )
+                return selected
 
         # Candidate routes and grid seeds only bound the search. The sparse
         # graph can connect landmarks across unrelated seeds, so it can replace
@@ -4745,18 +5130,23 @@ class StopTurnStateLatticePlanner:
             visibility_seed_routes,
             deadline_monotonic=topology_deadline_monotonic,
         )
+        policy_compliant_candidates = [
+            route
+            for route in candidate_pool
+            if self._route_unsupported_reverse_distance(route) <= 1e-9
+        ]
         maximum_internal_turns = (
             None
-            if not candidate_pool
+            if not policy_compliant_candidates
             else min(
                 self._route_internal_turn_count(route)
-                for route in candidate_pool
+                for route in policy_compliant_candidates
             )
         )
         incumbent_route = (
             None
-            if not candidate_pool
-            else min(candidate_pool, key=self.ranking_key)
+            if not policy_compliant_candidates
+            else min(policy_compliant_candidates, key=self.ranking_key)
         )
         visibility_result, minimum_turn_proven = (
             self._minimum_turn_visibility_route(
@@ -4773,24 +5163,27 @@ class StopTurnStateLatticePlanner:
         )
         if visibility_result is not None:
             candidate_pool.append(visibility_result)
-            selected = min(candidate_pool, key=self.ranking_key)
-            self._last_plan_expansions = int(
-                getattr(self, "_last_visibility_expansions", 0)
-            )
-            self._complete_plan_diagnostics(
-                selected,
-                candidate_count=len(candidate_pool),
-                minimum_turn_proven=minimum_turn_proven,
-            )
-            return selected
+            selected = best_executable_policy_candidate()
+            if selected is not None:
+                self._last_plan_expansions = int(
+                    getattr(self, "_last_visibility_expansions", 0)
+                )
+                self._complete_plan_diagnostics(
+                    selected,
+                    candidate_count=len(candidate_pool),
+                    minimum_turn_proven=minimum_turn_proven,
+                )
+                return selected
         if turn_bay_result is None and (
-            self._excluded(start_x, start_y, forbidden) or not self._turn_valid(
-            start_x,
-            start_y,
-            start_yaw,
-            initial_goal_heading,
-            robust=False,
-            measured_start=True,
+            reverse_escape_required
+            or self._excluded(start_x, start_y, forbidden)
+            or not self._turn_valid(
+                start_x,
+                start_y,
+                start_yaw,
+                initial_goal_heading,
+                robust=False,
+                measured_start=True,
             )
         ):
             turn_bay_result = self._turn_bay_candidate(
@@ -4801,24 +5194,21 @@ class StopTurnStateLatticePlanner:
             )
         if turn_bay_result is not None:
             candidate_pool.append(turn_bay_result)
-            selected = min(candidate_pool, key=self.ranking_key)
-            self._complete_plan_diagnostics(
-                selected,
-                candidate_count=len(candidate_pool),
-                minimum_turn_proven=False,
-            )
-            return selected
+            selected = best_executable_policy_candidate()
+            if selected is not None:
+                self._complete_plan_diagnostics(
+                    selected,
+                    candidate_count=len(candidate_pool),
+                    minimum_turn_proven=False,
+                )
+                return selected
         if (
             deadline_monotonic is not None
             and time.monotonic() >= deadline_monotonic
         ):
             if not candidate_pool:
                 self._last_plan_limit = "SEARCH_TIME_BUDGET_EXCEEDED"
-            selected = (
-                min(candidate_pool, key=self.ranking_key)
-                if candidate_pool
-                else None
-            )
+            selected = best_executable_policy_candidate()
             self._complete_plan_diagnostics(
                 selected,
                 candidate_count=len(candidate_pool),
@@ -4830,7 +5220,7 @@ class StopTurnStateLatticePlanner:
         # over proving the globally least-time lattice route. A modest weighted
         # A* heuristic sharply reduces open-room heading permutations; every
         # returned route still passes the same footprint and rotation sweeps.
-        lattice_heuristic_weight = 1.25 if deadline_monotonic is not None else 1.0
+        lattice_heuristic_weight = 1.50 if deadline_monotonic is not None else 1.0
 
         # Reverse 8-connected grid costs add obstacle topology to the lattice
         # heuristic. Euclidean distance alone expands thousands of headings on
@@ -4906,7 +5296,16 @@ class StopTurnStateLatticePlanner:
         parents: dict[
             tuple[int, int, int], tuple[int, int, int] | None
         ] = {start_key: None}
+        # 0 is an in-place rotation; +/-1 are forward/reverse translations.
+        # Keeping the action separate from the pose parent is essential when
+        # reconstructing an executable route: the same chassis heading can
+        # traverse a geometric segment in either direction.
+        parent_actions: dict[tuple[int, int, int], int] = {start_key: 0}
         costs = {start_key: 0.0}
+        initial_reverse_distances: dict[
+            tuple[int, int, int], float | None
+        ] = {start_key: 0.0}
+        initial_reverse_authorized = reverse_escape_required
         queue: list[tuple[float, int, tuple[int, int, int]]] = []
         sequence = 0
         heapq.heappush(
@@ -4919,6 +5318,102 @@ class StopTurnStateLatticePlanner:
         )
         edge_cache: dict[tuple[tuple[int, int, int], tuple[int, int, int]], bool] = {}
         rotation_cache: dict[tuple[tuple[int, int, int], int], bool] = {}
+
+        def lattice_route(
+            terminal_state: tuple[int, int, int],
+            direct: dict[str, float],
+            direct_direction: int,
+            direct_chassis_yaw: float,
+        ) -> StopTurnRoute | None:
+            states: list[tuple[int, int, int]] = []
+            cursor: tuple[int, int, int] | None = terminal_state
+            while cursor is not None:
+                states.append(cursor)
+                cursor = parents[cursor]
+            states.reverse()
+
+            # Compact primitive translations only while chassis heading and
+            # motion direction remain unchanged and no in-place rotation
+            # occurred between them.  This preserves every real stop/turn and
+            # every forward/reverse boundary without making the executor stop
+            # at each lattice cell.
+            motion_segments: list[
+                list[tuple[float, float] | float | int]
+            ] = []
+            rotation_since_motion = False
+            for left_state, right_state in zip(states, states[1:]):
+                action = int(parent_actions[right_state])
+                if action == 0:
+                    rotation_since_motion = True
+                    continue
+                segment_start = positions[left_state]
+                segment_end = positions[right_state]
+                chassis_yaw = self.heading(left_state[2])
+                if (
+                    motion_segments
+                    and not rotation_since_motion
+                    and int(motion_segments[-1][2]) == action
+                    and abs(_angle_delta(
+                        chassis_yaw, float(motion_segments[-1][3])
+                    )) <= STOP_TURN_ANGLE_TOLERANCE
+                ):
+                    motion_segments[-1][1] = segment_end
+                else:
+                    motion_segments.append([
+                        segment_start,
+                        segment_end,
+                        action,
+                        chassis_yaw,
+                    ])
+                rotation_since_motion = False
+
+            terminal_xy = positions[terminal_state]
+            direct_end = (float(direct["x"]), float(direct["y"]))
+            direct_requires_rotation = abs(_angle_delta(
+                direct_chassis_yaw,
+                self.heading(terminal_state[2]),
+            )) > STOP_TURN_ANGLE_TOLERANCE
+            if (
+                motion_segments
+                and not rotation_since_motion
+                and not direct_requires_rotation
+                and int(motion_segments[-1][2]) == int(direct_direction)
+                and abs(_angle_delta(
+                    direct_chassis_yaw, float(motion_segments[-1][3])
+                )) <= STOP_TURN_ANGLE_TOLERANCE
+            ):
+                motion_segments[-1][1] = direct_end
+            else:
+                motion_segments.append([
+                    terminal_xy,
+                    direct_end,
+                    int(direct_direction),
+                    float(direct_chassis_yaw),
+                ])
+
+            route_points = [
+                {
+                    "x": float(motion_segments[0][0][0]),
+                    "y": float(motion_segments[0][0][1]),
+                }
+            ]
+            route_points.extend(
+                {
+                    "x": float(segment[1][0]),
+                    "y": float(segment[1][1]),
+                }
+                for segment in motion_segments
+            )
+            route_directions = tuple(
+                int(segment[2]) for segment in motion_segments
+            )
+            return self._route_result(
+                route_points,
+                start_yaw=start_yaw,
+                goal_yaw=goal_yaw,
+                segment_directions=route_directions,
+            )
+
         expansions = 0
         while (
             queue
@@ -4938,68 +5433,84 @@ class StopTurnStateLatticePlanner:
             goal_distance = math.hypot(goal_x - x, goal_y - y)
             if goal_distance <= self.primitive_length * 2.5:
                 goal_heading = math.atan2(goal_y - y, goal_x - x)
-                rotation_valid = self._turn_valid(
-                    x,
-                    y,
-                    yaw,
-                    goal_heading,
-                    robust=True,
-                )
                 direct = {"x": goal_x, "y": goal_y}
                 if (
-                    rotation_valid
-                    and not self._excluded(goal_x, goal_y, forbidden)
+                    not self._excluded(goal_x, goal_y, forbidden)
                     and not self._segment_excluded(
                         {"x": x, "y": y}, direct, forbidden
                     )
                     and self._translation_valid({"x": x, "y": y}, direct)
                 ):
-                    states: list[tuple[int, int, int]] = []
-                    cursor: tuple[int, int, int] | None = state
-                    while cursor is not None:
-                        states.append(cursor)
-                        cursor = parents[cursor]
-                    states.reverse()
-                    candidate = canonicalize_stop_turn_path([
-                        *(
-                            {"x": positions[item][0], "y": positions[item][1]}
-                            for item in states
-                        ),
-                        direct,
-                    ])
-                    candidate = self._simplify_exact_route_points(
-                        candidate,
-                        start_yaw=start_yaw,
-                        exclusions=forbidden,
-                        deadline_monotonic=deadline_monotonic,
-                    )
-                    lattice_result = self._route_result(
-                        candidate,
-                        start_yaw=start_yaw,
-                        goal_yaw=goal_yaw,
-                    )
-                    if lattice_result is not None:
-                        candidate_pool.append(lattice_result)
-                        selected = min(candidate_pool, key=self.ranking_key)
-                        self._complete_plan_diagnostics(
-                            selected,
-                            candidate_count=len(candidate_pool),
-                            minimum_turn_proven=False,
+                    lattice_results: list[StopTurnRoute] = []
+                    # A terminal reverse edge would make reverse an ordinary
+                    # route choice again. Once the initial escape phase has
+                    # ended, every translation edge is forward-only.
+                    for direct_direction in (1,):
+                        direct_chassis_yaw = _angle_delta(
+                            goal_heading
+                            + (math.pi if direct_direction < 0 else 0.0),
+                            0.0,
                         )
-                        return selected
+                        if not self._turn_valid(
+                            x,
+                            y,
+                            yaw,
+                            direct_chassis_yaw,
+                            robust=True,
+                        ):
+                            continue
+                        lattice_result = lattice_route(
+                            state,
+                            direct,
+                            direct_direction,
+                            direct_chassis_yaw,
+                        )
+                        if lattice_result is not None:
+                            lattice_results.append(lattice_result)
+                    if lattice_results:
+                        candidate_pool.extend(lattice_results)
+                        selected = best_executable_policy_candidate()
+                        if selected is not None:
+                            self._complete_plan_diagnostics(
+                                selected,
+                                candidate_count=len(candidate_pool),
+                                minimum_turn_proven=False,
+                            )
+                            return selected
 
-            next_x = x + self.primitive_length * math.cos(yaw)
-            next_y = y + self.primitive_length * math.sin(yaw)
-            next_cell = self.saved_map.world_to_cell(next_x, next_y)
+            reverse_distance = initial_reverse_distances.get(state)
+            motion_directions = [1]
             if (
-                next_cell is not None
-                and not self._excluded(next_x, next_y, forbidden)
-                and not self._segment_excluded(
-                    {"x": x, "y": y},
-                    {"x": next_x, "y": next_y},
-                    forbidden,
-                )
+                initial_reverse_authorized
+                and reverse_distance is not None
+                and reverse_distance + self.primitive_length
+                <= self.turn_bay_max_distance + 1e-9
             ):
+                motion_directions.append(-1)
+            for motion_direction in motion_directions:
+                next_x = (
+                    x
+                    + motion_direction
+                    * self.primitive_length
+                    * math.cos(yaw)
+                )
+                next_y = (
+                    y
+                    + motion_direction
+                    * self.primitive_length
+                    * math.sin(yaw)
+                )
+                next_cell = self.saved_map.world_to_cell(next_x, next_y)
+                if (
+                    next_cell is None
+                    or self._excluded(next_x, next_y, forbidden)
+                    or self._segment_excluded(
+                        {"x": x, "y": y},
+                        {"x": next_x, "y": next_y},
+                        forbidden,
+                    )
+                ):
+                    continue
                 next_key = self._pose_key(next_x, next_y, heading_bin)
                 edge = (state, next_key)
                 valid = edge_cache.get(edge)
@@ -5008,17 +5519,27 @@ class StopTurnStateLatticePlanner:
                         {"x": x, "y": y}, {"x": next_x, "y": next_y}
                     )
                     edge_cache[edge] = valid
-                if valid:
-                    next_cost = state_cost + self.primitive_length / self.linear_speed
-                    if next_cost + 1e-9 < costs.get(next_key, math.inf):
-                        costs[next_key] = next_cost
-                        parents[next_key] = state
-                        positions[next_key] = (next_x, next_y)
-                        sequence += 1
-                        heuristic = lattice_heuristic(next_x, next_y)
-                        heapq.heappush(
-                            queue, (next_cost + heuristic, sequence, next_key)
-                        )
+                if not valid:
+                    continue
+                next_cost = (
+                    state_cost + self.primitive_length / self.linear_speed
+                )
+                if next_cost + 1e-9 >= costs.get(next_key, math.inf):
+                    continue
+                costs[next_key] = next_cost
+                parents[next_key] = state
+                parent_actions[next_key] = motion_direction
+                positions[next_key] = (next_x, next_y)
+                initial_reverse_distances[next_key] = (
+                    reverse_distance + self.primitive_length
+                    if motion_direction < 0 and reverse_distance is not None
+                    else None
+                )
+                sequence += 1
+                heuristic = lattice_heuristic(next_x, next_y)
+                heapq.heappush(
+                    queue, (next_cost + heuristic, sequence, next_key)
+                )
 
             for direction in (-1, 1):
                 if self._excluded(x, y, forbidden):
@@ -5047,7 +5568,9 @@ class StopTurnStateLatticePlanner:
                     continue
                 costs[next_key] = next_cost
                 parents[next_key] = state
+                parent_actions[next_key] = 0
                 positions[next_key] = (x, y)
+                initial_reverse_distances[next_key] = None
                 sequence += 1
                 heuristic = lattice_heuristic(x, y)
                 heapq.heappush(queue, (next_cost + heuristic, sequence, next_key))
@@ -5058,11 +5581,7 @@ class StopTurnStateLatticePlanner:
             and time.monotonic() >= deadline_monotonic
         ):
             self._last_plan_limit = "SEARCH_TIME_BUDGET_EXCEEDED"
-        selected = (
-            min(candidate_pool, key=self.ranking_key)
-            if candidate_pool
-            else None
-        )
+        selected = best_executable_policy_candidate()
         self._complete_plan_diagnostics(
             selected,
             candidate_count=len(candidate_pool),
@@ -5080,6 +5599,7 @@ class StopTurnStateLatticePlanner:
         search_expansion_limit: int | None = None,
         allow_start_escape: bool = False,
         maximum_start_escape_distance: float = 0.60,
+        maximum_start_escape_new_overlap_cells: int = 0,
         live_start_clear: bool = True,
         live_start_directions: Iterable[int] | None = None,
     ) -> PlannerResult:
@@ -5159,6 +5679,9 @@ class StopTurnStateLatticePlanner:
                 # and forbids touching any new occupied/unknown cell.
                 directions=start_escape_directions,
                 endpoint_lateral_margin=self.hard_side_margin,
+                maximum_new_overlap_cells=(
+                    maximum_start_escape_new_overlap_cells
+                ),
             )
             escape_cell = (
                 None
@@ -5358,7 +5881,7 @@ class StopTurnStateLatticePlanner:
 
     def ranking_key(
         self, route: StopTurnRoute
-    ) -> tuple[int, float, float, float, float, float, float, float]:
+    ) -> tuple[float, int, float, float, float, float, float, float, float, float]:
         metadata = route.metadata
         # Footprint, hard side margin and rotation sweep are hard filters in
         # _route_result(). Ranking is deliberately lexicographic: no amount of
@@ -5386,7 +5909,13 @@ class StopTurnStateLatticePlanner:
             ) / len(route.heading_bins) * self.heading_step
         )
         return (
+            # Reverse is legal only as one initial escape to a turn bay. Any
+            # full-route or later reverse loses to both an all-forward
+            # route and a compliant reverse-then-forward escape.
+            self._route_unsupported_reverse_distance(route),
             internal_turn_count,
+            # For equally simple compliant routes, turn at the nearest bay.
+            self._route_reverse_distance(route),
             metadata.estimated_time,
             metadata.total_length,
             metadata.total_turn_angle,
@@ -7575,12 +8104,15 @@ def find_start_escape(
     live_inflation: float = 0.0,
     directions: Iterable[int] = (1,),
     endpoint_lateral_margin: float = 0.0,
+    maximum_new_overlap_cells: int = 0,
 ) -> StartEscape | None:
     """Find the nearest exact-valid pose in the requested straight directions.
 
-    Every intermediate footprint may retain only cells already overlapped at
-    the initial pose.  Encountering any new occupied/unknown cell terminates
-    the search, so this cannot become permission to cross a wall.
+    Every intermediate footprint normally retains only cells already
+    overlapped at the initial pose.  A caller backed by fresh directional
+    safety may permit a tiny, cumulative number of new *known occupied* raster
+    cells to bridge one quantization disagreement; unknown cells are never
+    exempt, and the endpoint must still regain full exact clearance.
     """
     start_x = float(start["x"])
     start_y = float(start["y"])
@@ -7623,6 +8155,7 @@ def find_start_escape(
     ))
     for direction in normalized_directions:
         previous_count = len(initial_set)
+        raster_disagreement: set[tuple[int, int]] = set()
         for index in range(1, samples + 1):
             distance = min(limit, index * step)
             x = start_x + direction * distance * math.cos(yaw)
@@ -7636,11 +8169,20 @@ def find_start_escape(
                 padding=padding,
             )
             overlap_set = {(column, row) for column, row, _ in overlap}
+            overlap_costs = {
+                (column, row): cost for column, row, cost in overlap
+            }
+            newly_seen = (
+                overlap_set - initial_set - raster_disagreement
+            )
             if (
-                not overlap_set.issubset(initial_set)
-                or len(overlap_set) > previous_count
+                any(overlap_costs[cell] < 0 for cell in newly_seen)
+                or len(raster_disagreement | newly_seen)
+                > max(0, int(maximum_new_overlap_cells))
+                or len(overlap_set) > previous_count + len(newly_seen)
             ):
                 break
+            raster_disagreement.update(newly_seen)
             previous_count = len(overlap_set)
             lateral = half_width + padding + max(
                 0.0, float(live_inflation)

@@ -3,6 +3,7 @@ import io
 import json
 import math
 import tarfile
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from app.api import maps as maps_api
 from app.api import navigation as navigation_api
 from app.core.config import Settings
 from app.api.navigation import (
+    ComputePathRequest,
     InitialPoseRequest,
     RelocalizeRequest,
     _mission_start_rejection,
@@ -60,6 +62,100 @@ def test_navigation_resolves_robot_by_public_robot_id() -> None:
         assert robot is not None
         assert robot.robot_id == "ROBOT-001"
         assert robot.id == "internal-robot-uuid"
+
+
+def test_compute_path_auto_recovery_is_explicit_and_opt_in() -> None:
+    common = {
+        "request_id": "request-auto-recovery",
+        "robot_id": "ROBOT-001",
+        "session_id": "session-auto-recovery",
+        "expected_state": "READY",
+        "map_id": "MAP-TEST",
+        "version": 1,
+        "goal": {"x": 1.0, "y": 2.0, "yaw": 0.0},
+    }
+
+    assert ComputePathRequest(**common).auto_recover is False
+    assert ComputePathRequest(**common, auto_recover=True).auto_recover is True
+
+
+@pytest.mark.asyncio
+async def test_compute_path_persists_recovery_instead_of_plan_failed(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_command(database, settings, **kwargs):
+        del database, settings
+        captured.update(kwargs)
+        return {
+            "status": "accepted",
+            "current_state": "WAITING_FOR_DYNAMIC_CLEAR",
+            "points": [],
+            "goal": {"x": 1.0, "y": 2.0, "yaw": 0.0},
+            "recovery_pending": True,
+            "recovery_reason": "NO_EXACT_STOP_TURN_ROUTE",
+        }
+
+    class FakeDatabase:
+        mission = None
+
+        def scalar(self, _query):
+            return None
+
+        def add(self, mission):
+            self.mission = mission
+
+        def commit(self):
+            return None
+
+        def refresh(self, mission):
+            now = datetime.now(timezone.utc)
+            mission.created_at = now
+            mission.updated_at = now
+
+    database = FakeDatabase()
+    monkeypatch.setattr(navigation_api, "_valid_lease", lambda *args: None)
+    monkeypatch.setattr(
+        navigation_api,
+        "_active_version",
+        lambda *args: SimpleNamespace(
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            width=100,
+            height=100,
+            resolution=0.05,
+        ),
+    )
+    monkeypatch.setattr(
+        navigation_api,
+        "_robot_by_public_id",
+        lambda *args: SimpleNamespace(
+            map_id="MAP-TEST", active_map_version=1
+        ),
+    )
+    monkeypatch.setattr(navigation_api, "_command", fake_command)
+    request = ComputePathRequest(
+        request_id="request-recovery-mission",
+        robot_id="ROBOT-001",
+        session_id="session-recovery-mission",
+        expected_state="READY",
+        map_id="MAP-TEST",
+        version=1,
+        goal={"x": 1.0, "y": 2.0, "yaw": 0.0},
+        auto_recover=True,
+    )
+
+    result = await navigation_api.compute_path(
+        request,
+        user_id="operator-1",
+        database=database,
+        settings=Settings(),
+    )
+
+    assert captured["payload"]["auto_recover"] is True
+    assert captured["payload"]["mission_id"] == result["mission_id"]
+    assert database.mission.status == "RECOVERY"
+    assert database.mission.path == []
+    assert database.mission.error_code is None
+    assert result["status"] == "RECOVERY"
 
 
 def test_navigation_route_id_is_deterministic_from_executable_geometry() -> None:
