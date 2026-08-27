@@ -284,6 +284,13 @@ rovera_navigation_adapter:
     stop_turn_safety_block_timeout_seconds: 5.0
     stop_turn_heading_kp: 1.8
     stop_turn_max_angular_speed: 0.50
+    # The Pi chassis did not move reliably below ~0.13 rad/s. If wheel odom
+    # shows no useful yaw progress for a bounded dwell, apply one effective
+    # pivot command; normal braking and every safety gate remain authoritative.
+    stop_turn_stall_timeout_seconds: 0.75
+    stop_turn_stall_progress_degrees: 0.35
+    stop_turn_min_effective_angular_speed: 0.18
+    stop_turn_rate_window_seconds: 0.10
     # Brake a pivot before the settle band so smoother/chassis momentum does
     # not carry it past the target and cause a reverse correction.
     stop_turn_angular_deceleration: 2.0

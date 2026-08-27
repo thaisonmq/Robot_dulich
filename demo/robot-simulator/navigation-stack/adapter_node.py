@@ -62,6 +62,7 @@ from navigation_core import (
     SavedOccupancyMap,
     StopTurnStateLatticePlanner,
     TurnBlockTracker,
+    TurnMotionTracker,
     UnwrappedYawProgress,
     bounded_heading_evidence,
     canonicalize_stop_turn_path,
@@ -1015,6 +1016,21 @@ class NavigationAdapter(Node):
         self.execution_turn_blocked_since: float | None = None
         self.execution_turn_direction = 0
         self.turn_block_tracker = TurnBlockTracker(clear_dwell_seconds=0.30)
+        self.execution_turn_stall_timeout = configured(
+            "stop_turn_stall_timeout_seconds", 0.75
+        )
+        self.execution_turn_stall_progress = math.radians(configured(
+            "stop_turn_stall_progress_degrees", 0.35
+        ))
+        self.execution_turn_min_effective_speed = configured(
+            "stop_turn_min_effective_angular_speed", 0.18
+        )
+        self.turn_motion_tracker = TurnMotionTracker(
+            progress_timeout=self.execution_turn_stall_timeout,
+            minimum_progress=self.execution_turn_stall_progress,
+            rate_window=configured("stop_turn_rate_window_seconds", 0.10),
+        )
+        self.execution_turn_stall_active = False
         self.execution_reanchor_after_turn = False
         self.execution_segment_reanchors = 0
         self.execution_final_turn = False
@@ -8687,6 +8703,25 @@ class NavigationAdapter(Node):
             ),
         )
 
+    def _live_start_escape_directions(
+        self,
+        pose: dict[str, float],
+        goal: dict[str, float],
+    ) -> tuple[int, ...]:
+        """Return only translation directions authorized by fresh safety."""
+        if not self._atomic_safety_fresh() or self.estop_active:
+            return ()
+        permitted = {
+            direction
+            for direction, mask in ((1, 1), (-1, 2))
+            if not (self.safety_direction_mask & mask)
+        }
+        return tuple(
+            direction
+            for direction in preferred_turn_bay_directions(pose, goal)
+            if direction in permitted
+        )
+
     def _compute_path(self, payload: dict[str, Any]) -> dict[str, Any]:
         planning_started = time.monotonic()
         self._validate_command_map(payload)
@@ -8739,11 +8774,10 @@ class NavigationAdapter(Node):
             retry=0,
         )
         start_pose = dict(self.pose)
-        live_start_clear = bool(
-            self._atomic_safety_fresh()
-            and not (self.safety_direction_mask & 1)
-            and not self.estop_active
+        live_start_directions = self._live_start_escape_directions(
+            start_pose, resolved_goal
         )
+        live_start_clear = bool(live_start_directions)
         chassis_yaw = float(start_pose.get("yaw", 0.0))
         front_probe_distance = max(
             0.80,
@@ -8807,6 +8841,7 @@ class NavigationAdapter(Node):
             allow_start_escape=True,
             maximum_start_escape_distance=self.start_escape_max_distance,
             live_start_clear=live_start_clear,
+            live_start_directions=live_start_directions,
         )
         if planner_result.status in {
             "SEARCH_EXPANSION_LIMIT", "SEARCH_TIME_BUDGET_EXCEEDED"
@@ -8834,6 +8869,7 @@ class NavigationAdapter(Node):
                 allow_start_escape=True,
                 maximum_start_escape_distance=self.start_escape_max_distance,
                 live_start_clear=live_start_clear,
+                live_start_directions=live_start_directions,
             )
         if planner_result.route is not None:
             live_front_keepout = self._live_front_keepout_for_route(
@@ -8873,6 +8909,7 @@ class NavigationAdapter(Node):
                     allow_start_escape=True,
                     maximum_start_escape_distance=self.start_escape_max_distance,
                     live_start_clear=live_start_clear,
+                    live_start_directions=live_start_directions,
                 )
         turn_diagnostics = dict(planner_result.diagnostics)
         if turn_diagnostics:
@@ -9208,17 +9245,14 @@ class NavigationAdapter(Node):
     ) -> dict[str, Any]:
         if self.saved_map is None or self.pose is None:
             raise AdapterError("PLANNER_NOT_READY", "Saved Map or current pose is unavailable")
-        if not self._atomic_safety_fresh() or self.estop_active:
+        escape_directions = self._live_start_escape_directions(
+            dict(self.pose), goal
+        )
+        if not escape_directions:
             self.navigation_velocity.publish(Twist())
             raise AdapterError(
                 "START_ESCAPE_UNAVAILABLE",
-                "Start escape safety data is unavailable",
-            )
-        if self.safety_direction_mask & 1:
-            self.navigation_velocity.publish(Twist())
-            raise AdapterError(
-                "START_ESCAPE_UNAVAILABLE",
-                "The forward start-escape direction is blocked by live safety",
+                "No start-escape direction is allowed by fresh live safety",
             )
         escape = find_start_escape(
             self.saved_map,
@@ -9227,7 +9261,8 @@ class NavigationAdapter(Node):
             half_width=self.footprint_half_width,
             padding=self.planning_footprint_padding,
             maximum_distance=self.start_escape_max_distance,
-            directions=(1,),
+            directions=escape_directions,
+            endpoint_lateral_margin=self._hard_route_side_clearance(),
         )
         if escape is None:
             raise AdapterError(
@@ -9449,6 +9484,8 @@ class NavigationAdapter(Node):
             self.motion_owner = "NONE"
             self.last_turn_command = (0.0, 0.0)
             self.navigation_velocity.publish(Twist())
+            self.turn_motion_tracker.reset()
+            self.execution_turn_stall_active = False
             # TURN_SETTLING is a Schmitt-trigger band.  The tighter tolerance
             # admitted us here; only leaving the wider re-entry band resets
             # the zero-command dwell.  Resetting at the tight threshold left
@@ -9511,6 +9548,13 @@ class NavigationAdapter(Node):
                 self.turn_block_tracker = TurnBlockTracker(
                     clear_dwell_seconds=0.30
                 )
+                observed_yaw = self._actual_odom_yaw()
+                self.turn_motion_tracker.reset(
+                    current_yaw if observed_yaw is None else observed_yaw,
+                    direction=self.execution_turn_direction,
+                    now=now,
+                )
+                self.execution_turn_stall_active = False
                 self.latest_feedback["execution_phase"] = self.execution_phase
                 self._nav_debug(
                     "EXECUTION_PHASE",
@@ -9575,6 +9619,13 @@ class NavigationAdapter(Node):
             self.motion_owner = "NONE"
             self.last_turn_command = (0.0, 0.0)
             self.navigation_velocity.publish(Twist())
+            observed_yaw = self._actual_odom_yaw()
+            self.turn_motion_tracker.reset(
+                current_yaw if observed_yaw is None else observed_yaw,
+                direction=direction,
+                now=now,
+            )
+            self.execution_turn_stall_active = False
             if self.execution_turn_blocked_since is None:
                 self.execution_turn_blocked_since = now
             elif (
@@ -9625,27 +9676,47 @@ class NavigationAdapter(Node):
         command = Twist()
         command.linear.x = 0.0
         measured = self.pipeline_samples.get("motion_safety")
-        measured_angular = (
-            0.0
-            if (
-                measured is None
-                or now - measured[2] > 0.25
-                or direction * measured[1] <= 0.0
-            )
-            else abs(measured[1])
+        observed_yaw = self._actual_odom_yaw()
+        turn_motion = self.turn_motion_tracker.observe(
+            current_yaw if observed_yaw is None else observed_yaw,
+            direction=direction,
+            now=now,
         )
         braking_limit = turn_braking_speed_limit(
             error,
             completion_tolerance=self.execution_turn_tolerance,
             angular_deceleration=self.execution_turn_angular_deceleration,
             reaction_time=self.execution_turn_reaction_time,
-            current_angular_speed=measured_angular,
+            current_angular_speed=turn_motion.angular_speed,
         )
-        command.angular.z = direction * min(
-            self.execution_turn_max_speed,
-            braking_limit,
-            max(0.08, self.execution_turn_kp * abs(error)),
+        proportional_speed = max(0.08, self.execution_turn_kp * abs(error))
+        commanded_speed = (
+            min(
+                self.execution_turn_max_speed,
+                max(self.execution_turn_min_effective_speed, proportional_speed),
+            )
+            if turn_motion.stalled
+            else min(
+                self.execution_turn_max_speed,
+                braking_limit,
+                proportional_speed,
+            )
         )
+        command.angular.z = direction * commanded_speed
+        if turn_motion.stalled and not self.execution_turn_stall_active:
+            self._nav_debug(
+                "TURN_STALL_BOOST",
+                segment_index=self.execution_segment_index,
+                target_heading=target,
+                current_heading=current_yaw,
+                heading_error=error,
+                elapsed_without_progress=(
+                    turn_motion.elapsed_without_progress
+                ),
+                observed_angular_speed=turn_motion.angular_speed,
+                boost_angular_speed=command.angular.z,
+            )
+        self.execution_turn_stall_active = turn_motion.stalled
         self.motion_owner = "NAVIGATION"
         self.last_turn_command = (0.0, float(command.angular.z))
         self.navigation_velocity.publish(command)
@@ -9659,6 +9730,8 @@ class NavigationAdapter(Node):
                 requested_angular=command.angular.z,
                 published_angular=command.angular.z,
                 final_output_angular=(None if measured is None else measured[1]),
+                observed_angular_speed=turn_motion.angular_speed,
+                stall_boost=turn_motion.stalled,
             )
             self.last_turn_command_log_monotonic = now
 
@@ -10080,6 +10153,7 @@ class NavigationAdapter(Node):
                 padding=self.planning_footprint_padding,
                 maximum_distance=self.start_escape_max_distance,
                 directions=(motion_direction,),
+                endpoint_lateral_margin=self._hard_route_side_clearance(),
             )
             if refreshed_escape is None:
                 current_footprint = self.saved_map.validate_footprint(
@@ -10305,6 +10379,13 @@ class NavigationAdapter(Node):
             self.execution_turn_reentry_since = None
             self.execution_turn_blocked_since = None if direction else now
             self.turn_block_tracker = TurnBlockTracker(clear_dwell_seconds=0.30)
+            observed_yaw = self._actual_odom_yaw()
+            self.turn_motion_tracker.reset(
+                current_yaw if observed_yaw is None else observed_yaw,
+                direction=self.execution_turn_direction,
+                now=now,
+            )
+            self.execution_turn_stall_active = False
             self.execution_reanchor_after_turn = (
                 self.execution_segment_reanchors
                 < self.stop_turn_max_reanchors_per_segment
@@ -12348,6 +12429,9 @@ class NavigationAdapter(Node):
         request_planner = self._stop_turn_planner_for_clearance(
             hard_side_clearance
         )
+        live_start_directions = self._live_start_escape_directions(
+            dict(self.pose), goal
+        )
         result = request_planner.plan_result(
             dict(self.pose),
             goal,
@@ -12355,11 +12439,8 @@ class NavigationAdapter(Node):
             planning_time_budget=self.stop_turn_planning_budget,
             allow_start_escape=True,
             maximum_start_escape_distance=self.start_escape_max_distance,
-            live_start_clear=bool(
-                self._atomic_safety_fresh()
-                and not (self.safety_direction_mask & 1)
-                and not self.estop_active
-            ),
+            live_start_clear=bool(live_start_directions),
+            live_start_directions=live_start_directions,
         )
         if result.route is None:
             code = result.reason or result.status

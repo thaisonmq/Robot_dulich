@@ -509,6 +509,97 @@ class TurnBlockTracker:
 
 
 @dataclass(frozen=True, slots=True)
+class TurnMotionObservation:
+    """Measured pivot progress used to distinguish braking from a stall."""
+
+    angular_speed: float
+    progress: float
+    elapsed_without_progress: float
+    stalled: bool
+
+
+@dataclass(slots=True)
+class TurnMotionTracker:
+    """Track real yaw motion and bound how long an ineffective pivot can wait."""
+
+    progress_timeout: float
+    minimum_progress: float
+    rate_window: float = 0.10
+    direction: int = 0
+    progress_yaw: float | None = None
+    progress_monotonic: float | None = None
+    rate_yaw: float | None = None
+    rate_monotonic: float | None = None
+    angular_speed: float = 0.0
+
+    def reset(
+        self,
+        yaw: float | None = None,
+        *,
+        direction: int = 0,
+        now: float | None = None,
+    ) -> None:
+        timestamp = None if now is None else float(now)
+        value = None if yaw is None else float(yaw)
+        self.direction = 1 if direction > 0 else (-1 if direction < 0 else 0)
+        self.progress_yaw = value
+        self.progress_monotonic = timestamp
+        self.rate_yaw = value
+        self.rate_monotonic = timestamp
+        self.angular_speed = 0.0
+
+    def observe(
+        self,
+        yaw: float,
+        *,
+        direction: int,
+        now: float,
+    ) -> TurnMotionObservation:
+        value = float(yaw)
+        timestamp = float(now)
+        normalized_direction = 1 if direction > 0 else -1
+        if (
+            self.direction != normalized_direction
+            or self.progress_yaw is None
+            or self.progress_monotonic is None
+            or self.rate_yaw is None
+            or self.rate_monotonic is None
+            or timestamp < self.progress_monotonic
+        ):
+            self.reset(
+                value,
+                direction=normalized_direction,
+                now=timestamp,
+            )
+            return TurnMotionObservation(0.0, 0.0, 0.0, False)
+
+        rate_elapsed = timestamp - self.rate_monotonic
+        if rate_elapsed >= max(0.02, float(self.rate_window)):
+            signed_motion = normalized_direction * _angle_delta(
+                value, self.rate_yaw
+            )
+            self.angular_speed = max(0.0, signed_motion / rate_elapsed)
+            self.rate_yaw = value
+            self.rate_monotonic = timestamp
+
+        progress = max(
+            0.0,
+            normalized_direction * _angle_delta(value, self.progress_yaw),
+        )
+        if progress >= max(1e-4, abs(float(self.minimum_progress))):
+            self.progress_yaw = value
+            self.progress_monotonic = timestamp
+            progress = 0.0
+        elapsed = max(0.0, timestamp - self.progress_monotonic)
+        return TurnMotionObservation(
+            angular_speed=self.angular_speed,
+            progress=progress,
+            elapsed_without_progress=elapsed,
+            stalled=elapsed >= max(0.05, float(self.progress_timeout)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveSegment:
     """Immutable control geometry for one stop-turn straight segment.
 
@@ -2511,6 +2602,9 @@ class StopTurnStateLatticePlanner:
                             direction,
                             *(1 for _ in range(len(combined) - 2)),
                         ),
+                        allow_initial_reverse_clearance_recovery=(
+                            direction < 0
+                        ),
                     )
                     if result is not None:
                         return result
@@ -2551,6 +2645,9 @@ class StopTurnStateLatticePlanner:
                         segment_directions=(
                             direction,
                             *(1 for _ in range(len(combined) - 2)),
+                        ),
+                        allow_initial_reverse_clearance_recovery=(
+                            direction < 0
                         ),
                     )
                     if result is not None:
@@ -4005,6 +4102,7 @@ class StopTurnStateLatticePlanner:
         start_yaw: float | None = None,
         goal_yaw: float | None = None,
         segment_directions: Iterable[int] | None = None,
+        allow_initial_reverse_clearance_recovery: bool = False,
     ) -> StopTurnRoute | None:
         if len(route) < 2:
             return None
@@ -4054,16 +4152,77 @@ class StopTurnStateLatticePlanner:
             measured_start=True,
         ):
             return None
-        validation = validate_stop_turn_route(
-            self.saved_map,
-            route,
-            half_length=self.half_length,
-            half_width=self.half_width + self.hard_side_margin,
-            padding=self.padding,
-            segment_directions=directions,
-        )
-        if not validation.valid:
-            return None
+        if allow_initial_reverse_clearance_recovery:
+            # A measured pose beside a wall can be physically valid while any
+            # request-local reserve overlaps one raster cell. Permit only the
+            # bounded reverse turn-bay segment to shed that reserve. The exact
+            # physical body must remain collision-free throughout, and the bay
+            # plus every following segment must recover the complete hard
+            # margin before the first turn can execute.
+            if directions[0] >= 0 or len(route) < 3:
+                return None
+            recovery_validation = validate_executable_grid_path(
+                route[:2],
+                width=self.saved_map.width,
+                height=self.saved_map.height,
+                resolution=self.saved_map.resolution,
+                origin_x=self.saved_map.origin_x,
+                origin_y=self.saved_map.origin_y,
+                origin_yaw=self.saved_map.origin_yaw,
+                data=self.saved_map.occupancy,
+                half_length=self.half_length + self.padding,
+                half_width=self.half_width + self.padding,
+                allow_unknown=False,
+                lethal_threshold=65,
+            )
+            if not recovery_validation.valid:
+                return None
+            validation = validate_stop_turn_route(
+                self.saved_map,
+                route[1:],
+                half_length=self.half_length,
+                half_width=self.half_width + self.hard_side_margin,
+                padding=self.padding,
+                segment_directions=directions[1:],
+            )
+            if not validation.valid:
+                return None
+            bay = route[1]
+            incoming = math.atan2(
+                bay["y"] - route[0]["y"],
+                bay["x"] - route[0]["x"],
+            )
+            incoming = _angle_delta(incoming + math.pi, 0.0)
+            outgoing = math.atan2(
+                route[2]["y"] - bay["y"],
+                route[2]["x"] - bay["x"],
+            )
+            if directions[1] < 0:
+                outgoing = _angle_delta(outgoing + math.pi, 0.0)
+            bay_turn = validate_rotation_sweep_neighborhood(
+                self.saved_map,
+                bay["x"],
+                bay["y"],
+                incoming,
+                outgoing,
+                half_length=self.half_length,
+                half_width=self.half_width + self.hard_side_margin,
+                padding=self.padding,
+                robustness_radius=0.0,
+            )
+            if not bay_turn.valid:
+                return None
+        else:
+            validation = validate_stop_turn_route(
+                self.saved_map,
+                route,
+                half_length=self.half_length,
+                half_width=self.half_width + self.hard_side_margin,
+                padding=self.padding,
+                segment_directions=directions,
+            )
+            if not validation.valid:
+                return None
         metadata = route_geometry_metadata(
             self.saved_map,
             self.geometry,
@@ -4922,9 +5081,22 @@ class StopTurnStateLatticePlanner:
         allow_start_escape: bool = False,
         maximum_start_escape_distance: float = 0.60,
         live_start_clear: bool = True,
+        live_start_directions: Iterable[int] | None = None,
     ) -> PlannerResult:
         """Plan with explicit start/goal/search/dynamic failure semantics."""
         started = time.monotonic()
+        start_escape_directions = (
+            ()
+            if not live_start_clear
+            else (
+                (1,)
+                if live_start_directions is None
+                else tuple(dict.fromkeys(
+                    -1 if int(direction) < 0 else 1
+                    for direction in live_start_directions
+                ))
+            )
+        )
         deadline = (
             None
             if planning_time_budget is None
@@ -4981,10 +5153,12 @@ class StopTurnStateLatticePlanner:
                 half_width=self.half_width,
                 padding=self.padding,
                 maximum_distance=maximum_start_escape_distance,
-                # Start-overlap recovery is forward-only. Reverse motion is
-                # reserved for turn-bay recovery after a turn is proven
-                # blocked and the destination lies behind the chassis.
-                directions=(1,),
+                # The caller supplies only directions backed by a fresh
+                # directional-safety snapshot. Geometry below additionally
+                # requires the initial raster overlap to shrink monotonically
+                # and forbids touching any new occupied/unknown cell.
+                directions=start_escape_directions,
+                endpoint_lateral_margin=self.hard_side_margin,
             )
             escape_cell = (
                 None
@@ -5001,12 +5175,12 @@ class StopTurnStateLatticePlanner:
                     start_escape=escape,
                     elapsed_seconds=time.monotonic() - started,
                 )
-            if not live_start_clear or escape is None:
+            if not start_escape_directions or escape is None:
                 return PlannerResult(
                     "START_ESCAPE_UNAVAILABLE",
                     reason=(
                         "DYNAMICALLY_BLOCKED"
-                        if not live_start_clear
+                        if not start_escape_directions
                         else "START_ESCAPE_UNAVAILABLE"
                     ),
                     message="No bounded straight start escape is executable",
@@ -7400,6 +7574,7 @@ def find_start_escape(
     live_blocked_points: Iterable[tuple[float, float]] = (),
     live_inflation: float = 0.0,
     directions: Iterable[int] = (1,),
+    endpoint_lateral_margin: float = 0.0,
 ) -> StartEscape | None:
     """Find the nearest exact-valid pose in the requested straight directions.
 
@@ -7496,7 +7671,23 @@ def find_start_escape(
                 allow_unknown=False,
                 code_prefix="START",
             )
-            if validation.valid:
+            endpoint_validation = (
+                validation
+                if endpoint_lateral_margin <= 0.0
+                else saved_map.validate_footprint(
+                    x,
+                    y,
+                    yaw,
+                    half_length=half_length,
+                    half_width=(
+                        half_width + max(0.0, endpoint_lateral_margin)
+                    ),
+                    padding=padding,
+                    allow_unknown=False,
+                    code_prefix="START_ESCAPE_END",
+                )
+            )
+            if validation.valid and endpoint_validation.valid:
                 return StartEscape(
                     start={"x": start_x, "y": start_y},
                     end={"x": x, "y": y},

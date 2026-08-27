@@ -1177,8 +1177,11 @@ def test_segment_transitions_wait_for_measured_zero_and_turn_momentum_brakes() -
     assert 'self.pipeline_samples.get("motion_safety")' in prepare
     assert "final_velocity_settled" in prepare
     assert "self.execution_velocity_settle_timeout" in prepare
-    assert "current_angular_speed=measured_angular" in tick
-    assert "direction * measured[1] <= 0.0" in tick
+    assert "self._actual_odom_yaw()" in tick
+    assert "self.turn_motion_tracker.observe(" in tick
+    assert "current_angular_speed=turn_motion.angular_speed" in tick
+    assert "self.execution_turn_min_effective_speed" in tick
+    assert '"TURN_STALL_BOOST"' in tick
 
 
 def test_navigation_debug_events_cover_new_geometry_and_recovery_sources() -> None:
@@ -1256,9 +1259,14 @@ def test_rotation_sweep_stop_and_start_escape_remain_runtime_recoverable() -> No
     assert "allow_monotonic_initial_overlap=start_escape" in prepare
     assert 'status="ALREADY_CLEAR"' in prepare
     assert "START_ESCAPE_ALREADY_CLEAR" in prepare
-    assert "preferred_turn_bay_directions" not in escape
-    assert "directions=(1,)" in escape
+    assert "self._live_start_escape_directions(" in escape
+    assert "directions=escape_directions" in escape
     assert "escape.motion_direction" in escape
+    direction_gate = _method_source(
+        "_live_start_escape_directions", "_compute_path"
+    )
+    assert "preferred_turn_bay_directions(pose, goal)" in direction_gate
+    assert "((1, 1), (-1, 2))" in direction_gate
 
 
 def test_navigation_pose_jump_stops_before_replan_and_preserves_destination() -> None:

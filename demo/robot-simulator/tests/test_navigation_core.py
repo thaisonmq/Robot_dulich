@@ -27,6 +27,7 @@ from navigation_core import (  # noqa: E402
     StopTurnStateLatticePlanner,
     StopTurnRoute,
     TurnBlockTracker,
+    TurnMotionTracker,
     UnwrappedYawProgress,
     bounded_heading_evidence,
     canonicalize_stop_turn_path,
@@ -3275,6 +3276,100 @@ def test_turn_bay_does_not_reverse_when_the_required_turn_is_already_clear() -> 
     assert candidate.segment_directions[0] == 1
 
 
+def test_reverse_turn_bay_sheds_request_local_clearance_allowance() -> None:
+    free = _free_rectangle(1, 78, 1, 78)
+    for column in range(34, 51):
+        free.discard((column, 17))
+    saved = _manual_map(80, 80, free)
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        turn_bay_max_distance=0.80,
+        hard_side_margin=0.035,
+        preferred_side_margin=0.07,
+        turn_robustness_radius=0.0,
+    )
+    start = {"x": 2.10, "y": 1.035, "yaw": 0.0}
+    goal = {"x": 1.00, "y": 2.00}
+
+    candidate = planner._turn_bay_candidate(start, goal, (), None)
+
+    assert candidate is not None
+    assert candidate.segment_directions == (-1, 1)
+    assert candidate.points[1]["x"] < start["x"] - 0.30
+    # The ordinary full-margin validator still rejects the initial raster
+    # contact; this exemption is local to the reverse turn-bay recovery.
+    assert not validate_stop_turn_route(
+        saved,
+        candidate.points,
+        half_length=0.15,
+        half_width=0.135,
+        segment_directions=candidate.segment_directions,
+    ).valid
+    assert validate_stop_turn_route(
+        saved,
+        candidate.points[:2],
+        half_length=0.15,
+        half_width=0.1225,
+        segment_directions=(-1,),
+    ).valid
+    # The bay and all normal motion after it retain the complete 3.5 cm
+    # request-local reserve.
+    assert validate_stop_turn_route(
+        saved,
+        candidate.points[1:],
+        half_length=0.15,
+        half_width=0.135,
+        segment_directions=(1,),
+    ).valid
+
+
+def test_reverse_turn_bay_can_shed_all_reserve_but_not_physical_clearance() -> None:
+    free = _free_rectangle(1, 78, 1, 78)
+    for column in range(34, 51):
+        free.discard((column, 17))
+    saved = _manual_map(80, 80, free)
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        turn_bay_max_distance=0.80,
+        hard_side_margin=0.035,
+        preferred_side_margin=0.07,
+        turn_robustness_radius=0.0,
+    )
+    # The body has 5 mm of real clearance beside the wall. Any additional
+    # reserve overlaps the raster until the chassis reverses beyond its end.
+    start = {"x": 2.10, "y": 1.005, "yaw": 0.0}
+    goal = {"x": 1.00, "y": 2.00}
+
+    candidate = planner._turn_bay_candidate(start, goal, (), None)
+
+    assert candidate is not None
+    assert candidate.segment_directions == (-1, 1)
+    assert candidate.points[1]["x"] < 1.65
+    assert validate_stop_turn_route(
+        saved,
+        candidate.points[:2],
+        half_length=0.15,
+        half_width=0.10,
+        segment_directions=(-1,),
+    ).valid
+    assert not validate_stop_turn_route(
+        saved,
+        candidate.points[:2],
+        half_length=0.15,
+        half_width=0.11,
+        segment_directions=(-1,),
+    ).valid
+    assert validate_stop_turn_route(
+        saved,
+        candidate.points[1:],
+        half_length=0.15,
+        half_width=0.135,
+        segment_directions=(1,),
+    ).valid
+
+
 def test_start_escape_rejects_a_new_static_overlap_cell() -> None:
     free = _free_rectangle(1, 38, 1, 18)
     free.remove((10, 8))   # Initial side overlap that persists while moving.
@@ -3305,6 +3400,26 @@ def test_start_escape_rejects_a_new_static_overlap_cell() -> None:
     assert reverse_escape.motion_direction == -1
     assert reverse_escape.end["x"] < start["x"]
 
+    reserve_recovered = find_start_escape(
+        saved,
+        start,
+        half_length=0.15,
+        half_width=0.10,
+        maximum_distance=0.50,
+        directions=(-1,),
+        endpoint_lateral_margin=0.02,
+    )
+    assert reserve_recovered is not None
+    assert reserve_recovered.distance >= reverse_escape.distance
+    assert saved.validate_footprint(
+        reserve_recovered.end["x"],
+        reserve_recovered.end["y"],
+        start["yaw"],
+        half_length=0.15,
+        half_width=0.12,
+        code_prefix="ESCAPE_END",
+    ).valid
+
     result = StopTurnStateLatticePlanner(
         saved, saved.navigation_geometry
     ).plan_result(
@@ -3315,6 +3430,32 @@ def test_start_escape_rejects_a_new_static_overlap_cell() -> None:
     )
     assert result.status == "START_ESCAPE_UNAVAILABLE"
     assert result.start_escape is None
+
+    authorized_reverse = StopTurnStateLatticePlanner(
+        saved, saved.navigation_geometry
+    ).plan_result(
+        start,
+        {"x": 1.50, "y": 0.525},
+        allow_start_escape=True,
+        maximum_start_escape_distance=0.50,
+        live_start_directions=(-1,),
+    )
+    assert authorized_reverse.start_escape is not None
+    assert authorized_reverse.start_escape.motion_direction == -1
+    assert authorized_reverse.status != "START_ESCAPE_UNAVAILABLE"
+
+    blocked = StopTurnStateLatticePlanner(
+        saved, saved.navigation_geometry
+    ).plan_result(
+        start,
+        {"x": 1.50, "y": 0.525},
+        allow_start_escape=True,
+        maximum_start_escape_distance=0.50,
+        live_start_directions=(),
+    )
+    assert blocked.status == "START_ESCAPE_UNAVAILABLE"
+    assert blocked.reason == "DYNAMICALLY_BLOCKED"
+    assert blocked.start_escape is None
 
 
 def test_latest_runtime_overlap_does_not_reverse_as_start_escape() -> None:
@@ -3838,6 +3979,45 @@ def test_turn_block_tracker_requires_atomic_clear_dwell() -> None:
     assert tracker.blocked_since == original
     assert tracker.update(sequence=13, blocked=False, now=1.7)
     assert not tracker.update(sequence=14, blocked=False, now=2.01)
+
+
+def test_turn_motion_tracker_detects_and_clears_a_stationary_pivot() -> None:
+    tracker = TurnMotionTracker(
+        progress_timeout=0.75,
+        minimum_progress=math.radians(0.35),
+        rate_window=0.10,
+    )
+
+    first = tracker.observe(0.0, direction=1, now=1.0)
+    waiting = tracker.observe(0.0, direction=1, now=1.70)
+    stalled = tracker.observe(0.0, direction=1, now=1.76)
+    moving = tracker.observe(math.radians(0.40), direction=1, now=1.86)
+
+    assert not first.stalled
+    assert not waiting.stalled
+    assert stalled.stalled
+    assert not moving.stalled
+    assert moving.elapsed_without_progress == 0.0
+    assert moving.angular_speed > 0.04
+
+
+def test_turn_motion_tracker_uses_real_motion_and_resets_on_direction_change() -> None:
+    tracker = TurnMotionTracker(
+        progress_timeout=0.50,
+        minimum_progress=math.radians(0.25),
+        rate_window=0.10,
+    )
+    tracker.reset(math.radians(179.8), direction=1, now=2.0)
+
+    wrapped = tracker.observe(math.radians(-179.8), direction=1, now=2.1)
+    changed = tracker.observe(math.radians(-179.8), direction=-1, now=3.0)
+
+    assert wrapped.angular_speed == pytest.approx(
+        math.radians(0.4) / 0.1, rel=0.05
+    )
+    assert not wrapped.stalled
+    assert changed.angular_speed == 0.0
+    assert not changed.stalled
 
 
 def test_equally_safe_oblique_detour_beats_longer_right_angle_route() -> None:
