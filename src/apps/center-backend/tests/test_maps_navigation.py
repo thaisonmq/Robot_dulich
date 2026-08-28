@@ -490,6 +490,11 @@ def test_mapping_and_navigation_state_machines_are_idempotent_and_strict() -> No
     assert navigation_transition("LOCALIZING_GLOBAL", "LOCALIZING_ROTATING") == "LOCALIZING_ROTATING"
     assert navigation_transition("LOCALIZING_ROTATING", "READY") == "READY"
     assert navigation_transition("NAVIGATING", "PAUSED") == "PAUSED"
+    assert navigation_transition("RECOVERY", "PAUSED") == "PAUSED"
+    assert navigation_transition("RECOVERY", "ROUTE_SELECTION") == "ROUTE_SELECTION"
+    assert navigation_transition("ROUTE_SELECTION", "BLOCKED") == "BLOCKED"
+    assert navigation_transition("BLOCKED", "COMPUTING_ALTERNATIVES") == "COMPUTING_ALTERNATIVES"
+    assert navigation_transition("COMPUTING_ALTERNATIVES", "READY") == "READY"
     with pytest.raises(InvalidTransition):
         navigation_transition("ARRIVED", "NAVIGATING")
 
@@ -847,6 +852,50 @@ def test_navigation_runtime_preserves_failed_and_ignores_map_only_states() -> No
     with SessionLocal() as database:
         assert database.get(NavigationMission, mission_id).status == "FAILED"
 
+
+def test_robot_health_reconciles_a_succeeded_navigation_mission() -> None:
+    map_id = "MAP-MISSION-HEALTH"
+    mission_id = "mission-health-succeeded"
+    robot_id = "ROBOT-MISSION-HEALTH"
+    with SessionLocal.begin() as database:
+        database.add(MapRecord(
+            map_id=map_id,
+            name="Mission health map",
+            image_url="",
+            width_pixels=1,
+            height_pixels=1,
+            resolution_m_per_pixel=0.05,
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            status="ACTIVE",
+        ))
+        database.add(NavigationMission(
+            mission_id=mission_id,
+            request_id="request-health-succeeded",
+            robot_id=robot_id,
+            control_session_id="session-health-succeeded",
+            map_id=map_id,
+            map_version=1,
+            status="NAVIGATING",
+            goal={"x": 0.5, "y": 0.5, "yaw": 0.0},
+            path=[],
+        ))
+
+    persist_robot_runtime_event(
+        robot_id,
+        "robot.health",
+        {
+            "mode": "NAVIGATION",
+            "map_state": "SUCCEEDED",
+            "navigation": "idle",
+            "mission_id": mission_id,
+        },
+    )
+
+    with SessionLocal() as database:
+        mission = database.get(NavigationMission, mission_id)
+        assert mission.status == "SUCCEEDED"
+        assert mission.error_code is None
+        assert mission.error_message is None
 
 @pytest.mark.parametrize(
     ("runtime_state", "expected_status"),

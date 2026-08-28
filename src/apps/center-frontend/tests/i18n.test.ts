@@ -1,9 +1,62 @@
-import { translate } from "../src/i18n/translations";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { resolve } from "node:path";
+import * as ts from "typescript";
+import { SUPPORTED_LANGUAGE_CODES } from "../src/data/languages";
+import { hasTranslation, translate } from "../src/i18n/translations";
 import {
   MAP_LOCALES, MAP_TRANSLATION_KEYS, MAP_TRANSLATIONS,
 } from "../src/i18n/mapTranslations";
 
 describe("interface translations", () => {
+  it("has a native translation for every literal passed to t()", () => {
+    const sourceRoot = resolve(process.cwd(), "src");
+    const files: string[] = [];
+    const visit = (directory: string) => {
+      for (const name of readdirSync(directory)) {
+        const path = resolve(directory, name);
+        if (statSync(path).isDirectory()) visit(path);
+        else if (/\.(?:ts|tsx)$/.test(name)) files.push(path);
+      }
+    };
+    visit(sourceRoot);
+    const keys = new Set<string>();
+    const untranslatedJsx: string[] = [];
+    for (const file of files) {
+      const source = readFileSync(file, "utf8");
+      for (const match of source.matchAll(/\bt\(\s*["`]([^"`]+)["`]/g)) {
+        if (!match[1].includes("${")) keys.add(match[1]);
+      }
+      const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, false, ts.ScriptKind.TSX);
+      const inspect = (node: ts.Node) => {
+        if (ts.isJsxText(node)
+          && /[ăâđêôơưĂÂĐÊÔƠƯáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]/iu.test(node.text)) {
+          untranslatedJsx.push(`${file.replace(`${sourceRoot}/`, "")}: ${node.text.trim()}`);
+        }
+        ts.forEachChild(node, inspect);
+      };
+      inspect(ast);
+    }
+    const missing = [...keys].flatMap((key) => {
+      const locales = SUPPORTED_LANGUAGE_CODES
+        .filter((locale) => locale !== "vi" && !hasTranslation(locale, key));
+      return locales.length > 0 ? [`${key} [${locales.join(", ")}]`] : [];
+    });
+    expect(missing).toEqual([]);
+    expect(untranslatedJsx).toEqual([]);
+
+    for (const locale of SUPPORTED_LANGUAGE_CODES.filter((code) => code !== "vi")) {
+      for (const key of keys) {
+        if (/[ăâđêôơưĂÂĐÊÔƠƯáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]/iu.test(key)) {
+          expect(translate(locale, key), `${locale}: ${key}`).not.toBe(key);
+        }
+        const sourceVariables = [...key.matchAll(/\{([^}]+)\}/g)].map((match) => match[1]).sort();
+        const translatedVariables = [...translate(locale, key).matchAll(/\{([^}]+)\}/g)]
+          .map((match) => match[1]).sort();
+        expect(translatedVariables, `${locale}: ${key}`).toEqual(sourceVariables);
+      }
+    }
+  });
+
   it("renders the Japanese interface catalogue", () => {
     expect(translate("ja", "Đăng nhập")).toBe("ログイン");
     expect(translate("ja", "Điều khiển")).toBe("操作");
@@ -20,6 +73,9 @@ describe("interface translations", () => {
     expect(translate("th", "Điều khiển robot")).not.toBe("Robot controls");
     expect(translate("zh", "Quản trị hệ thống")).toBe("系统管理员");
     expect(translate("zh", "Chưa phân khu")).toBe("未分区");
+    expect(translate("ko", "Hành trình")).toBe("경로 안내");
+    expect(translate("ko", "Điểm đến đã lưu")).toBe("저장된 목적지");
+    expect(translate("ko", "Đồng hồ sensor")).toBe("센서 시간");
   });
 
   it("interpolates translated values", () => {

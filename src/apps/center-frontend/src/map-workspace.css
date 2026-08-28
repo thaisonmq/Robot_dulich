@@ -412,8 +412,8 @@
 .navigation-inline-notice { padding: 7px 8px; background: #edf9f3; border: 1px solid #c9ead9; border-radius: 6px; font-size: 9px; }
 .navigation-inline-recovery { padding: 7px 8px; background: #fff8e8; border: 1px solid #f0d69a; border-radius: 6px; font-size: 9px; }
 .narrow-path-decision { display: grid; gap: 3px; padding: 8px 9px; color: #674510; background: #fff8e8; border: 1px solid #f0d69a; border-radius: 7px; font-size: 9px; line-height: 1.4; }
-.route-candidate-list { display: flex; gap: 6px; overflow-x: auto; padding: 1px; }
-.route-candidate-list > button { min-width: 128px; padding: 7px 8px; display: grid; gap: 2px; text-align: left; color: var(--ink); background: #f4f6f9; border: 1px solid var(--line); border-radius: 7px; cursor: pointer; }
+.route-candidate-list { min-height: 49px; display: flex; flex: 0 0 auto; gap: 6px; overflow-x: auto; overflow-y: hidden; padding: 1px 1px 4px; }
+.route-candidate-list > button { min-width: 128px; min-height: 43px; padding: 7px 8px; display: grid; gap: 2px; text-align: left; color: var(--ink); background: #f4f6f9; border: 1px solid var(--line); border-radius: 7px; cursor: pointer; }
 .route-candidate-list > button.is-selected { color: #174da8; background: #edf4ff; border-color: #5d8bd7; box-shadow: 0 0 0 1px rgba(23,89,214,.12); }
 .route-candidate-list span { font-size: 9px; font-weight: 700; }
 .route-candidate-list small { color: var(--muted); font-size: 8px; }

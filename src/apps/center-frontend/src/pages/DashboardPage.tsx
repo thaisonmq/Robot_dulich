@@ -138,6 +138,7 @@ export function DashboardPage() {
   const activePtzRef = useRef<PtzCommand | null>(null);
   const ptzRepeatRef = useRef<number | null>(null);
   const navigationRequestInFlightRef = useRef(false);
+  const routeSelectionMissionIdRef = useRef("");
   const poseVerificationRef = useRef<PoseVerificationState>("required");
   const poseVerificationSawLocalizingRef = useRef(false);
   const poseVerificationKeyRef = useRef("");
@@ -210,6 +211,9 @@ export function DashboardPage() {
         setAutoSpeedMode(nextHealth.auto_speed_mode as AutoNavigationSpeedMode);
       }
       const runtimeMapState = String(nextHealth.map_state ?? "").toUpperCase();
+      if (nextHealth.mission_id) {
+        routeSelectionMissionIdRef.current = nextHealth.mission_id;
+      }
       if (runtimeMapState) setMapState(runtimeMapState);
       const activeNavigationState = ACTIVE_RUNTIME_NAVIGATION_STATES[runtimeMapState];
       if (activeNavigationState) setNavigationState(activeNavigationState);
@@ -299,6 +303,7 @@ export function DashboardPage() {
         // snapshot survive a terminal runtime event and appear in the next
         // Control session or under the next destination selection.
         setRoute(null);
+        routeSelectionMissionIdRef.current = "";
         setRouteCandidates([]);
         setSelectedRouteId("");
       }
@@ -635,6 +640,7 @@ export function DashboardPage() {
         return;
       }
       setRoute(newRoute);
+      routeSelectionMissionIdRef.current = newRoute.mission_id ?? "";
       const candidates = newRoute.candidates ?? [];
       setRouteCandidates(candidates);
       setSelectedRouteId(
@@ -878,12 +884,13 @@ export function DashboardPage() {
   });
 
   const missionAction = useMutation({
-    mutationFn: ({ action, routeId }: {
+    mutationFn: ({ action, missionId, routeId }: {
       action: "pause" | "resume" | "cancel" | "manual" | "alternatives" | "select-route" | "back";
+      missionId: string;
       routeId?: string;
     }) => api.missionAction(action, {
       request_id: createUuid(), robot_id: robotId, session_id: session!.session_id,
-      expected_state: mapState, mission_id: route!.mission_id!, route_id: routeId,
+      expected_state: mapState, mission_id: missionId, route_id: routeId,
     }),
     onSuccess: (mission, variables) => {
       setRoute(mission);
@@ -903,6 +910,7 @@ export function DashboardPage() {
         setNavigationNotice("");
       }
       const state = mission.status?.toUpperCase();
+      if (mission.mission_id) routeSelectionMissionIdRef.current = mission.mission_id;
       if (state === "PAUSED") setNavigationState("paused");
       else if (state === "NAVIGATING") setNavigationState("moving");
       else if (state === "CANCELED") setNavigationState("cancelled");
@@ -911,7 +919,11 @@ export function DashboardPage() {
       else if (state === "ROUTE_SELECTION") setNavigationState("route_selection");
       if (state) setMapState(state);
     },
-    onError: () => setNavigationState("failed"),
+    onError: (reason) => {
+      setNavigationError(
+        reason instanceof Error ? reason.message : t("Không thể cập nhật lựa chọn tuyến đường"),
+      );
+    },
   });
 
   const preflightFailures = [
@@ -1659,6 +1671,7 @@ export function DashboardPage() {
                 }}
                 onSelect={(destination) => {
                   if (navigationRequestInFlightRef.current) return;
+                  routeSelectionMissionIdRef.current = "";
                   setSelectedDestination(destination);
                   setRoute(null);
                   setRouteCandidates([]);
@@ -1673,28 +1686,38 @@ export function DashboardPage() {
                 onApproximateHint={(point) => approximatePose.mutate(point)}
                 onGo={() => sendGoal.mutateAsync()}
                 onPause={() => {
-                  if (route?.mission_id) missionAction.mutate({ action: "pause" });
+                  if (route?.mission_id) missionAction.mutate({ action: "pause", missionId: route.mission_id });
                 }}
                 onResume={() => {
-                  if (route?.mission_id) missionAction.mutate({ action: "resume" });
+                  if (route?.mission_id) missionAction.mutate({ action: "resume", missionId: route.mission_id });
                 }}
                 onManualHandoff={() => {
-                  if (route?.mission_id) missionAction.mutate({ action: "manual" });
+                  if (route?.mission_id) missionAction.mutate({ action: "manual", missionId: route.mission_id });
                 }}
                 onFindAlternatives={() => {
-                  if (route?.mission_id) missionAction.mutate({ action: "alternatives" });
+                  if (route?.mission_id) {
+                    routeSelectionMissionIdRef.current = route.mission_id;
+                    missionAction.mutate({ action: "alternatives", missionId: route.mission_id });
+                  }
                 }}
                 onSelectRoute={setSelectedRouteId}
                 onConfirmRoute={() => {
-                  if (route?.mission_id && selectedRouteId) {
-                    missionAction.mutate({ action: "select-route", routeId: selectedRouteId });
+                  const missionId = route?.mission_id || routeSelectionMissionIdRef.current;
+                  if (missionId && selectedRouteId) {
+                    missionAction.mutate({ action: "select-route", missionId, routeId: selectedRouteId });
+                  } else {
+                    setNavigationError(t("Không thể xác định hành trình đang chọn. Hãy nhấn Quay lại và chọn lại điểm đến."));
                   }
                 }}
                 onBackRouteSelection={() => {
-                  if (route?.mission_id) missionAction.mutate({ action: "back" });
+                  const missionId = route?.mission_id || routeSelectionMissionIdRef.current;
+                  if (missionId) return missionAction.mutateAsync({ action: "back", missionId });
+                  const reason = new Error(t("Không thể xác định hành trình đang chọn. Vui lòng tải lại màn hình điều khiển."));
+                  setNavigationError(reason.message);
+                  return Promise.reject(reason);
                 }}
                 onCancel={() => {
-                  if (route?.mission_id) missionAction.mutate({ action: "cancel" });
+                  if (route?.mission_id) missionAction.mutate({ action: "cancel", missionId: route.mission_id });
                   else {
                     void api.cancelNavigation(robotId, session.session_id);
                     setNavigationState("cancelled");

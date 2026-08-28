@@ -45,6 +45,7 @@ from navigation_core import (  # noqa: E402
     execution_pose_continuity,
     filter_static_map_scan,
     find_start_escape,
+    front_keepout_can_precede_route_search,
     global_scan_candidate_uniqueness,
     global_scan_alternative_is_competitive,
     heading_diversity,
@@ -69,6 +70,7 @@ from navigation_core import (  # noqa: E402
     route_geometry_metadata,
     scan_raycast_consistency,
     scan_to_map_match,
+    segment_departs_exclusions,
     segment_travel_watchdog,
     straight_heading_lock,
     straight_segment_progress,
@@ -2770,6 +2772,54 @@ def test_minimum_turn_ranking_beats_preferred_clearance_and_time() -> None:
     assert planner.ranking_key(three_turn) < planner.ranking_key(six_turn)
 
 
+def test_repeated_primary_route_keeps_topology_until_turn_count_improves() -> None:
+    saved = _manual_map(80, 60, _free_rectangle(1, 78, 1, 58))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    start = {"x": 0.50, "y": 0.50, "yaw": 0.0}
+    goal = {"x": 2.00, "y": 1.00}
+    first = planner._route_result(
+        [
+            start,
+            {"x": 1.00, "y": 0.50},
+            {"x": 1.00, "y": 1.00},
+            goal,
+        ],
+        start_yaw=0.0,
+    )
+    equal_turn_alternative = planner._route_result(
+        [
+            start,
+            {"x": 1.20, "y": 0.50},
+            {"x": 1.20, "y": 1.00},
+            goal,
+        ],
+        start_yaw=0.0,
+    )
+    fewer_turns = planner._route_result(
+        [start, goal],
+        start_yaw=0.0,
+    )
+
+    assert first is not None
+    assert equal_turn_alternative is not None
+    assert fewer_turns is not None
+    selected, reused = planner._stable_primary_route(
+        start, goal, (), first
+    )
+    assert selected is first
+    assert reused is False
+    selected, reused = planner._stable_primary_route(
+        start, goal, (), equal_turn_alternative
+    )
+    assert selected is first
+    assert reused is True
+    selected, reused = planner._stable_primary_route(
+        start, goal, (), fewer_turns
+    )
+    assert selected is fewer_turns
+    assert reused is False
+
+
 def test_visibility_search_rejects_unrotatable_lower_turn_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3157,6 +3207,55 @@ def test_axis_straightening_replaces_heading_lattice_staircase() -> None:
     )
     assert straightened.metadata.total_length <= baseline.metadata.total_length + 0.30
     assert all(direction > 0 for direction in straightened.segment_directions)
+
+
+def test_minimum_turn_seed_stitch_replaces_heading_lattice_staircase() -> None:
+    saved = _manual_map(90, 80, _free_rectangle(2, 87, 2, 77))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    points = [
+        {"x": 0.50, "y": 0.50},
+        {"x": 0.50, "y": 0.70},
+        {"x": 0.70, "y": 0.90},
+        {"x": 0.85, "y": 1.16},
+        {"x": 1.10, "y": 1.31},
+        {"x": 1.40, "y": 1.39},
+        {"x": 1.70, "y": 1.39},
+        {"x": 1.95, "y": 1.25},
+        {"x": 2.10, "y": 0.95},
+        {"x": 2.10, "y": 0.50},
+        {"x": 2.50, "y": 0.50},
+    ]
+    start_yaw = math.pi / 2.0
+    baseline = planner._route_result(points, start_yaw=start_yaw)
+    seed = [
+        (10, 10),
+        (11, 10),
+        (12, 10),
+        (12, 11),
+        (12, 12),
+        (13, 12),
+        (14, 12),
+        (14, 11),
+        (14, 10),
+    ]
+
+    assert baseline is not None
+    stitched = planner._minimum_turn_seed_stitch_candidate(
+        baseline,
+        seed,
+        (),
+        start_yaw=start_yaw,
+        goal_yaw=None,
+        deadline_monotonic=None,
+    )
+
+    assert stitched is not None
+    assert planner._route_internal_turn_count(stitched) < (
+        planner._route_internal_turn_count(baseline)
+    )
+    assert stitched.points[0] == baseline.points[0]
+    assert stitched.points[-1] == baseline.points[-1]
+    assert all(direction > 0 for direction in stitched.segment_directions)
 
 
 def test_equally_safe_direct_candidate_wins_by_using_fewer_turns(
@@ -3656,6 +3755,310 @@ def test_near_wall_turn_bay_stays_forward_when_forward_is_clear() -> None:
     assert all(direction > 0 for direction in candidate.segment_directions)
     assert not candidate.initial_reverse_clearance_recovery
     assert not planner._initial_reverse_escape_authorized(start, ())
+
+
+def test_forward_turn_bay_uses_complete_planner_after_cheap_routes_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = _manual_map(100, 80, _free_rectangle(1, 98, 1, 78))
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        turn_bay_max_distance=0.60,
+    )
+    start = {"x": 1.00, "y": 1.00, "yaw": 0.0}
+    goal = {"x": 3.00, "y": 2.50}
+    original_route_result = planner._route_result
+
+    # Force the three direct/L-shaped probes and the cheap grid suffix to miss.
+    # The only remaining valid result must come through the complete forward
+    # suffix planner after the chassis has translated to its turn bay.
+    monkeypatch.setattr(planner, "_grid_seed", lambda *args, **kwargs: [])
+
+    def reject_cheap_routes(route, **kwargs):
+        if len(route) <= 4:
+            return None
+        return original_route_result(route, **kwargs)
+
+    monkeypatch.setattr(planner, "_route_result", reject_cheap_routes)
+
+    def complete_suffix(
+        continuation_planner,
+        bay,
+        requested_goal,
+        **kwargs,
+    ):
+        del kwargs
+        return continuation_planner._route_result(
+                [
+                    dict(bay),
+                    {"x": 1.60, "y": 1.40},
+                    {"x": 1.60, "y": float(requested_goal["y"])},
+                dict(requested_goal),
+            ],
+            start_yaw=float(bay["yaw"]),
+        )
+
+    monkeypatch.setattr(StopTurnStateLatticePlanner, "plan", complete_suffix)
+
+    candidate = planner._turn_bay_candidate(start, goal, (), None)
+
+    assert candidate is not None
+    assert len(candidate.points) == 5
+    assert candidate.points[0] == {"x": start["x"], "y": start["y"]}
+    assert candidate.points[-1] == goal
+    assert all(direction > 0 for direction in candidate.segment_directions)
+    assert candidate.initial_reverse_clearance_recovery is False
+
+
+def test_failed_forward_clearance_escape_falls_back_to_live_safe_reverse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = _manual_map(100, 80, _free_rectangle(1, 98, 1, 78))
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.02,
+    )
+    start = {"x": 1.00, "y": 1.00, "yaw": 0.0}
+    goal = {"x": 3.00, "y": 2.00}
+    reverse_end = {"x": 0.50, "y": 1.00}
+    suffix = planner._route_result(
+        [reverse_end, {"x": 0.50, "y": 2.00}, goal],
+        start_yaw=0.0,
+    )
+    assert suffix is not None
+
+    original_validate = SavedOccupancyMap.validate_footprint
+
+    def reserve_constrained(saved_map, x, y, yaw, **kwargs):
+        if (
+            saved_map is saved
+            and kwargs.get("code_prefix") == "START_CLEARANCE"
+        ):
+            return navigation_core.GoalValidation(
+                False,
+                "START_CLEARANCE_FOOTPRINT_BLOCKED",
+                "request-local reserve touches the raster",
+            )
+        return original_validate(saved_map, x, y, yaw, **kwargs)
+
+    monkeypatch.setattr(
+        SavedOccupancyMap, "validate_footprint", reserve_constrained
+    )
+
+    def fake_escape(saved_map, pose, **kwargs):
+        del saved_map
+        direction = int(tuple(kwargs["directions"])[0])
+        end = (
+            {"x": 1.20, "y": 1.00}
+            if direction > 0
+            else dict(reverse_end)
+        )
+        return navigation_core.StartEscape(
+            start={"x": pose["x"], "y": pose["y"]},
+            end=end,
+            yaw=float(pose["yaw"]),
+            distance=0.20 if direction > 0 else 0.50,
+            initial_overlap_cells=(),
+            samples_checked=1,
+            motion_direction=direction,
+        )
+
+    monkeypatch.setattr(navigation_core, "find_start_escape", fake_escape)
+    monkeypatch.setattr(
+        planner,
+        "_turn_valid",
+        lambda x, y, *args, **kwargs: float(x) < 0.75,
+    )
+    monkeypatch.setattr(
+        planner,
+        "plan",
+        lambda planning_start, *args, **kwargs: (
+            suffix if math.isclose(float(planning_start["x"]), 0.50) else None
+        ),
+    )
+
+    result = planner.plan_result(
+        start,
+        goal,
+        planning_time_budget=2.0,
+        allow_start_escape=True,
+        maximum_start_escape_new_overlap_cells=1,
+        live_start_directions=(1, -1),
+    )
+
+    assert result.success
+    assert result.start_escape is not None
+    assert result.start_escape.motion_direction == -1
+    assert result.route is suffix
+    assert result.diagnostics["clearance_start_escape"] is True
+    assert result.diagnostics["clearance_start_escape_direction"] == -1
+
+
+def test_overlapping_start_tries_reverse_when_forward_escape_is_dead_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = _manual_map(100, 80, _free_rectangle(1, 98, 1, 78))
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.02,
+    )
+    start = {"x": 1.00, "y": 1.00, "yaw": 0.0}
+    goal = {"x": 3.00, "y": 2.00}
+    reverse_end = {"x": 0.50, "y": 1.00}
+    suffix = planner._route_result(
+        [reverse_end, {"x": 0.50, "y": 2.00}, goal],
+        start_yaw=0.0,
+    )
+    assert suffix is not None
+
+    original_validate = SavedOccupancyMap.validate_footprint
+
+    def overlap_at_measured_start(saved_map, x, y, yaw, **kwargs):
+        if (
+            saved_map is saved
+            and kwargs.get("code_prefix") == "START"
+            and math.isclose(float(x), float(start["x"]))
+            and math.isclose(float(y), float(start["y"]))
+        ):
+            return navigation_core.GoalValidation(
+                False,
+                "START_FOOTPRINT_BLOCKED",
+                "one Saved Map raster cell overlaps the measured footprint",
+            )
+        return original_validate(saved_map, x, y, yaw, **kwargs)
+
+    monkeypatch.setattr(
+        SavedOccupancyMap, "validate_footprint", overlap_at_measured_start
+    )
+
+    def fake_escape(saved_map, pose, **kwargs):
+        del saved_map
+        direction = int(tuple(kwargs["directions"])[0])
+        end = (
+            {"x": 1.20, "y": 1.00}
+            if direction > 0
+            else dict(reverse_end)
+        )
+        return navigation_core.StartEscape(
+            start={"x": pose["x"], "y": pose["y"]},
+            end=end,
+            yaw=float(pose["yaw"]),
+            distance=0.20 if direction > 0 else 0.50,
+            initial_overlap_cells=((20, 20),),
+            samples_checked=1,
+            motion_direction=direction,
+        )
+
+    monkeypatch.setattr(navigation_core, "find_start_escape", fake_escape)
+    monkeypatch.setattr(
+        planner,
+        "plan",
+        lambda planning_start, *args, **kwargs: (
+            suffix if math.isclose(float(planning_start["x"]), 0.50) else None
+        ),
+    )
+
+    result = planner.plan_result(
+        start,
+        goal,
+        planning_time_budget=2.0,
+        allow_start_escape=True,
+        maximum_start_escape_new_overlap_cells=1,
+        live_start_directions=(1, -1),
+    )
+
+    assert result.success
+    assert result.start_escape is not None
+    assert result.start_escape.motion_direction == -1
+    assert result.route is suffix
+    assert result.diagnostics["overlap_start_escape_candidates"] == 2
+    assert result.diagnostics["overlap_start_escape_direction"] == -1
+
+
+def test_live_safe_reverse_goal_approach_runs_before_full_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = _manual_map(100, 80, _free_rectangle(1, 98, 1, 78))
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.02,
+    )
+    start = {"x": 1.00, "y": 1.00, "yaw": 0.0}
+    goal = {"x": 3.00, "y": 2.00}
+    route = planner._route_result(
+        [start, {"x": 0.50, "y": 1.00}, {"x": 0.50, "y": 2.00}, goal],
+        start_yaw=0.0,
+        segment_directions=(-1, 1, 1),
+        allow_initial_reverse_clearance_recovery=True,
+        allow_initial_translation_clearance_recovery=True,
+    )
+    assert route is not None
+
+    normal_plan_calls = []
+
+    def no_normal_route(*args, **kwargs):
+        normal_plan_calls.append(kwargs.get("deadline_monotonic"))
+        planner._last_plan_diagnostics = {
+            "candidate_count": 0,
+            "turn_route_rejections": [],
+        }
+        return None
+
+    fallback_calls = []
+
+    def live_reverse_candidate(*args, **kwargs):
+        fallback_calls.append(kwargs.get("deadline_monotonic"))
+        planner._last_plan_diagnostics["live_reverse_goal_approach"] = True
+        return route
+
+    monkeypatch.setattr(planner, "plan", no_normal_route)
+    monkeypatch.setattr(
+        planner,
+        "_live_reverse_goal_approach_candidate",
+        live_reverse_candidate,
+    )
+
+    result = planner.plan_result(
+        start,
+        goal,
+        planning_time_budget=12.0,
+        allow_start_escape=True,
+        live_start_directions=(1, -1),
+    )
+
+    assert result.success
+    assert result.route is route
+    assert result.route.segment_directions[0] == -1
+    assert len(normal_plan_calls) == 1
+    assert len(fallback_calls) == 1
+    assert result.diagnostics["live_reverse_goal_approach"] is True
+
+
+def test_goal_approach_waypoints_are_sparse_and_exact_valid() -> None:
+    saved = _manual_map(100, 80, _free_rectangle(1, 98, 1, 78))
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.02,
+    )
+    goal = {"x": 2.50, "y": 2.00}
+
+    approaches = planner._goal_approach_visibility_waypoints(
+        goal,
+        (),
+        maximum_distance=0.20,
+        deadline_monotonic=None,
+    )
+
+    assert len(approaches) == 2 * planner.HEADING_BINS
+    assert all(
+        planner._translation_valid(approach, goal)
+        for approach in approaches
+    )
 
 
 def test_near_wall_turn_bay_does_not_reverse_merely_to_shed_reserve() -> None:
@@ -4176,11 +4579,40 @@ def test_hard_controller_block_requires_a_distinct_route() -> None:
         "MOTION_SAFETY_DYNAMIC_BLOCK",
         "CONFIRMED_DYNAMIC_ROUTE_BLOCK",
         "LIVE_ROUTE_CLEARANCE_INSUFFICIENT",
+        "TURN_BLOCKED_NO_SAFE_RELOCATION",
     ):
         assert dynamic_block_requires_alternative(reason)
 
     assert not dynamic_block_requires_alternative(
         "PREDICTED_DYNAMIC_ROUTE_BLOCK"
+    )
+
+
+def test_keepout_allows_only_a_complete_monotonic_departure() -> None:
+    keepout = ((0.0, 0.0, 0.20),)
+    start_inside = {"x": 0.10, "y": 0.0}
+
+    assert segment_departs_exclusions(
+        start_inside,
+        {"x": 0.30, "y": 0.0},
+        keepout,
+        endpoint_clearance=0.02,
+    )
+    assert not segment_departs_exclusions(
+        start_inside,
+        {"x": 0.15, "y": 0.0},
+        keepout,
+        endpoint_clearance=0.02,
+    )
+    assert not segment_departs_exclusions(
+        start_inside,
+        {"x": -0.30, "y": 0.0},
+        keepout,
+    )
+    assert not segment_departs_exclusions(
+        {"x": -0.30, "y": 0.0},
+        {"x": 0.30, "y": 0.0},
+        keepout,
     )
 
 
@@ -4327,6 +4759,17 @@ def test_reverse_clear_start_is_not_misclassified_as_statically_trapped(
     result = planner.plan_result(start, {"x": 1.8, "y": 1.0})
 
     assert result.status == "NO_EXACT_STOP_TURN_ROUTE"
+
+
+def test_front_obstacle_does_not_preempt_an_authorized_reverse_return() -> None:
+    start = {"x": 0.154, "y": 1.915, "yaw": 2.271}
+    return_goal = {"x": 1.721, "y": 0.755}
+
+    directions = preferred_turn_bay_directions(start, return_goal)
+
+    assert directions[0] == -1
+    assert not front_keepout_can_precede_route_search(directions)
+    assert front_keepout_can_precede_route_search((1,))
 
 
 def test_turn_block_tracker_requires_atomic_clear_dwell() -> None:

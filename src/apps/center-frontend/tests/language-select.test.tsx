@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { GlobalLanguageSelect } from "../src/components/GlobalLanguageSelect";
 import { LanguageSelect } from "../src/components/LanguageSelect";
 import { LANGUAGE_OPTIONS } from "../src/data/languages";
@@ -31,9 +31,22 @@ describe("LanguageSelect", () => {
     fireEvent.change(screen.getByRole("searchbox", { name: "Search languages" }), {
       target: { value: "japan" },
     });
-    fireEvent.click(screen.getByRole("option", { name: /Japanese/ }));
+    const japaneseOption = screen.getByRole("option", { name: /Japanese/ });
+    expect(within(japaneseOption).getByText("🇯🇵")).toBeInTheDocument();
+    fireEvent.click(japaneseOption);
 
     expect(onChange).toHaveBeenCalledWith("ja");
+  });
+
+  it("shows the selected language flag in the compact trigger", () => {
+    render(
+      <I18nProvider>
+        <GlobalLanguageSelect />
+      </I18nProvider>,
+    );
+
+    const trigger = screen.getByRole("button", { name: /English/ });
+    expect(within(trigger).getByText("🇬🇧")).toBeInTheDocument();
   });
 
   it("updates the interface when another supported language is selected", () => {
@@ -52,5 +65,17 @@ describe("LanguageSelect", () => {
 
     expect(screen.getByText("Se connecter")).toBeInTheDocument();
     expect(document.documentElement).toHaveAttribute("lang", "fr");
+  });
+
+  it("shows the language name in the currently selected interface language", () => {
+    localStorage.setItem("rovera:interface-language:guest", "ko");
+    render(
+      <I18nProvider>
+        <GlobalLanguageSelect />
+      </I18nProvider>,
+    );
+
+    expect(screen.getByRole("button", { name: /한국어/ })).toBeInTheDocument();
+    expect(screen.queryByText("Korean")).not.toBeInTheDocument();
   });
 });

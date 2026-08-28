@@ -1,5 +1,7 @@
 export interface LanguageOption {
   code: string;
+  /** Compact country flag used to identify the language in selectors. */
+  flag: string;
   /** International ISO language name, displayed as the primary label. */
   label: string;
   /** Name written in the language itself, when available. */
@@ -12,7 +14,20 @@ export const SUPPORTED_LANGUAGE_CODES = [
   "vi", "en", "zh", "ko", "ja", "th", "fr", "de", "es", "ru",
 ] as const;
 
-function languageName(code: string, locale: string): string {
+const LANGUAGE_FLAGS: Record<(typeof SUPPORTED_LANGUAGE_CODES)[number], string> = {
+  vi: "🇻🇳",
+  en: "🇬🇧",
+  zh: "🇨🇳",
+  ko: "🇰🇷",
+  ja: "🇯🇵",
+  th: "🇹🇭",
+  fr: "🇫🇷",
+  de: "🇩🇪",
+  es: "🇪🇸",
+  ru: "🇷🇺",
+};
+
+export function getLanguageDisplayName(code: string, locale: string): string {
   try {
     const localizedName = new Intl.DisplayNames([locale], { type: "language" }).of(code);
     if (localizedName && localizedName.toLocaleLowerCase() !== code) {
@@ -30,8 +45,9 @@ function languageName(code: string, locale: string): string {
 
 export const LANGUAGE_OPTIONS: LanguageOption[] = SUPPORTED_LANGUAGE_CODES.map((code) => ({
   code,
-  label: languageName(code, "en"),
-  nativeLabel: languageName(code, code),
+  flag: LANGUAGE_FLAGS[code],
+  label: getLanguageDisplayName(code, "en"),
+  nativeLabel: getLanguageDisplayName(code, code),
 }));
 
 export function getLanguage(code: string): LanguageOption {

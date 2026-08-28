@@ -332,6 +332,7 @@ export interface Health {
   mode?: "IDLE" | "MAPPING" | "NAVIGATION";
   footprint?: Point[];
   corridor?: CorridorStatus;
+  mission_id?: string;
   route_candidates?: RouteCandidate[];
   selected_route_id?: string;
   manual_handoff_reason?: string;
@@ -502,6 +503,9 @@ export interface NavigationFeedback {
   recoveries?: number;
   recovery_reason?: string;
   destination_preserved?: boolean;
+  route_selection_timeout_seconds?: number;
+  route_selection_seconds_remaining?: number;
+  route_selection_deadline_unix_ms?: number;
 }
 
 export interface NavigationVisualization {

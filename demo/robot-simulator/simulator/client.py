@@ -2154,6 +2154,10 @@ class RobotConnectionClient:
                             "map_registry": registry_health,
                             "footprint": backend_state.get("footprint"),
                             "corridor": backend_state.get("corridor"),
+                            # Keep the browser bound to the authoritative edge
+                            # mission even if its local route preview is replaced
+                            # by a telemetry refresh while choosing alternatives.
+                            "mission_id": backend_state.get("mission_id", ""),
                             "route_candidates": backend_state.get("route_candidates", []),
                             "selected_route_id": backend_state.get("selected_route_id", ""),
                             "manual_handoff_reason": backend_state.get("manual_handoff_reason", ""),

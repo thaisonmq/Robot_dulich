@@ -184,7 +184,7 @@ interface Props {
   onFindAlternatives?: () => void;
   onSelectRoute?: (routeId: string) => void;
   onConfirmRoute?: () => void;
-  onBackRouteSelection?: () => void;
+  onBackRouteSelection?: () => void | Promise<unknown>;
   onCancel: () => void;
 }
 
@@ -556,6 +556,7 @@ export function MapPanel({
   const [editingDestinationName, setEditingDestinationName] = useState("");
   const [deletingDestinationId, setDeletingDestinationId] = useState("");
   const [destinationManageError, setDestinationManageError] = useState("");
+  const [countdownNow, setCountdownNow] = useState(() => Date.now());
   useEffect(() => setCandidateMapId(selectedMapId ?? map.map_id), [map.map_id, selectedMapId]);
   const moving = navigationStatus === "moving";
   const recovering = navigationStatus === "recovery" || [
@@ -569,7 +570,23 @@ export function MapPanel({
   const computingAlternatives = mapState === "COMPUTING_ALTERNATIVES";
   const routeSelection = mapState === "ROUTE_SELECTION";
   const dynamicRouteSelection = routeSelection
-    && feedback?.recovery_reason === "USER_ROUTE_CONFIRMATION_REQUIRED";
+    && [
+      "USER_ROUTE_CONFIRMATION_REQUIRED",
+      "ALTERNATIVE_ROUTE_SELECTION_COUNTDOWN",
+      "AUTO_SELECTING_SHORTEST_ROUTE",
+    ].includes(String(feedback?.recovery_reason ?? ""));
+  const routeSelectionDeadline = Number(
+    feedback?.route_selection_deadline_unix_ms ?? 0,
+  );
+  const routeSelectionSeconds = routeSelectionDeadline > 0
+    ? Math.max(0, Math.ceil((routeSelectionDeadline - countdownNow) / 1000))
+    : Math.max(0, Number(feedback?.route_selection_seconds_remaining ?? 0));
+  useEffect(() => {
+    if (!dynamicRouteSelection || routeSelectionDeadline <= 0) return undefined;
+    setCountdownNow(Date.now());
+    const timer = window.setInterval(() => setCountdownNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [dynamicRouteSelection, routeSelectionDeadline]);
   const showRouteChoices = routeSelection || (
     !activeMission && routeCandidates.length > 1
   );
@@ -644,6 +661,17 @@ export function MapPanel({
     setDeletingDestinationId("");
     setDestinationManageError("");
   };
+  const backFromRouteSelection = async () => {
+    try {
+      await onBackRouteSelection?.();
+      // An explicit alternative search starts from READY. Returning from it
+      // means the operator wants to pick another goal, so reopen the picker.
+      // Dynamic recovery has different semantics: keep waiting on the old path.
+      if (!dynamicRouteSelection) openDestinationPicker();
+    } catch {
+      // Dashboard renders the mutation error and keeps this selection intact.
+    }
+  };
   const submitDestinationName = async (destination: Destination) => {
     const name = editingDestinationName.trim();
     if (name.length < 2 || !onUpdateDestination) return;
@@ -684,7 +712,7 @@ export function MapPanel({
       <button type="button" disabled={!ready} className={followRobot ? "is-active" : ""} onClick={() => { setCenterRobot(false); setFollowRobot((value) => !value); }}><Crosshair size={13} /> {t("Theo robot")}</button></div>
     <div className="map-canvas map-canvas--mini" aria-busy={routePlanning}
       onDoubleClick={() => ready && !activeMission && openDestinationPicker()}>
-      <MapCanvas map={map} destinations={destinations} pose={pose} route={liveRoute}
+      <MapCanvas map={map} destinations={[]} pose={pose} route={liveRoute}
         routeCandidates={visibleRouteCandidates} selectedRouteId={selectedRouteId} selected={selected}
         dynamicObstacles={obstacles} readOnly={readOnly || loading || activeMission}
         allowCustomDestination={allowCustomDestination}
@@ -731,7 +759,9 @@ export function MapPanel({
       {t("Robot đang cập nhật đường tránh vật cản · {count} lần phục hồi", { count: recoveryCount })}
     </p>}
     {recovering && <p className="navigation-inline-recovery" role="status">
-      {t("Điểm đến vẫn được giữ. Robot đang dừng an toàn và tìm đường tránh vật cản.")}
+      {feedback?.recovery_reason === "SEARCHING_ALTERNATIVE_ROUTES"
+        ? t("Đường cũ đã bị chặn. Robot đang tính các tuyến đường khác đến đích.")
+        : t("Điểm đến vẫn được giữ. Robot đang dừng an toàn và tìm đường tránh vật cản.")}
     </p>}
     {mapState === "BLOCKED" && !errorMessage && <p className="navigation-inline-recovery" role="status">
       {t("Đường đi đang bị chặn. Robot đã dừng an toàn; hãy dời vật cản hoặc chọn điểm khác.")}
@@ -753,7 +783,7 @@ export function MapPanel({
         ? t("Đường cũ không còn khoảng trống đủ an toàn để đi tiếp.")
         : t("Hãy chọn tuyến đường bạn muốn robot thực hiện.")}</strong>
       <span>{dynamicRouteSelection
-        ? t("Robot đang dừng và vẫn giữ điểm đến. Chọn một đường thay thế; robot chỉ bắt đầu sau khi bạn nhấn “Đi theo tuyến này”.")
+        ? t("Chọn một tuyến hoặc hủy điều hướng. Nếu bạn không thao tác, robot sẽ tự đi tuyến ngắn nhất sau {seconds} giây.", { seconds: routeSelectionSeconds })
         : t("Robot chỉ bắt đầu di chuyển sau khi bạn xác nhận tuyến đã chọn.")}</span>
     </div>}
     {showRouteChoices && <div className="route-candidate-list" role="list">
@@ -762,7 +792,7 @@ export function MapPanel({
         disabled={readOnly || loading || moving}
         onClick={() => onSelectRoute?.(candidate.route_id)}>
         <span>{t("Tuyến {number}", { number: index + 1 })}{candidate.recommended ? ` · ${t("Đề xuất")}` : ""}</span>
-        <small>{Math.round(candidate.total_length)}m · {Math.max(1, Math.round(candidate.estimated_time / 60))} phút
+        <small>{Math.round(candidate.total_length)}m · {Math.max(1, Math.round(candidate.estimated_time / 60))} {t("phút")}
           {candidate.minimum_clearance != null ? ` · ${Math.round(candidate.minimum_clearance * 100)}cm` : ""}</small>
       </button>)}
     </div>}
@@ -777,9 +807,11 @@ export function MapPanel({
         : routeSelection ? <><button type="button" className="button button--primary"
           disabled={readOnly || loading || !selectedRouteId} onClick={onConfirmRoute}>
           <RouteIcon /> {t("Đi theo tuyến này")}</button>
-          <button type="button" onClick={onBackRouteSelection}>{dynamicRouteSelection
-            ? t("Tiếp tục chờ đường cũ")
-            : t("Quay lại")}</button></>
+          {dynamicRouteSelection
+            ? <button type="button" className="is-danger" disabled={readOnly || loading}
+              onClick={onCancel}><X /> {t("Hủy, không đi")}</button>
+            : <button type="button" disabled={readOnly || loading || !onBackRouteSelection}
+              onClick={() => { void backFromRouteSelection(); }}>{t("Quay lại")}</button>}</>
         : localizationNeedsAssistance ? <>{approximateHintAllowed && onApproximateHint && <button
           type="button" className="button button--primary" disabled={readOnly || loading}
           onClick={() => { setApproximateHintMode(true); setExpanded(true); }}>

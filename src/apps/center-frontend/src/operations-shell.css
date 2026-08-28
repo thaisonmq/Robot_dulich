@@ -219,8 +219,8 @@
   border-radius: 11px;
 }
 .robot-map-assignment__copy { display: grid; gap: 3px; }
-.robot-map-assignment__copy strong { color: #172b46; font-size: 12px; }
-.robot-map-assignment__copy small { color: #66788f; font-size: 10px; line-height: 1.45; }
+.robot-map-assignment__copy strong { color: #172b46; font-size: 10px; }
+.robot-map-assignment__copy small { color: #66788f; font-size: 8px; line-height: 1.45; }
 .robot-map-assignment select { min-width: 0; min-height: 40px; }
 .robot-map-assignment .button { min-height: 40px; white-space: nowrap; }
 .robot-map-assignment__error {

@@ -33,4 +33,15 @@ describe("robot editor and configuration UX", () => {
     expect(toast).toContain("2600");
     expect(toast).toContain('aria-live="polite"');
   });
+
+  it("keeps configuration typography and buttons aligned with the robot editor", () => {
+    const styles = readFileSync(resolve("src/styles.css"), "utf8");
+    const operationsStyles = readFileSync(resolve("src/operations-shell.css"), "utf8");
+
+    expect(styles).toMatch(/\.configuration-tabs button \{[\s\S]*?min-height: 40px;[\s\S]*?font-size: 9px;/);
+    expect(styles).toMatch(/\.configuration-form \.button \{[\s\S]*?min-height: 40px;[\s\S]*?font-size: 9px;/);
+    expect(styles).toMatch(/\.source-scan-button \{[\s\S]*?font-size: 9px;/);
+    expect(operationsStyles).toContain(".robot-map-assignment__copy strong { color: #172b46; font-size: 10px; }");
+    expect(operationsStyles).toContain(".robot-map-assignment__copy small { color: #66788f; font-size: 8px;");
+  });
 });

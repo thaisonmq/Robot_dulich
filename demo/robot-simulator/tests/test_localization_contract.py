@@ -953,7 +953,11 @@ def test_compute_path_uses_cached_stop_turn_geometry_and_live_validation() -> No
 def test_compute_path_retries_only_bounded_stop_turn_search_failures() -> None:
     compute_path = _method_source("_compute_path", "_navigate")
 
-    assert '"SEARCH_EXPANSION_LIMIT", "SEARCH_TIME_BUDGET_EXCEEDED"' in compute_path
+    assert 'planner_result.status == "SEARCH_EXPANSION_LIMIT"' in compute_path
+    assert (
+        'planner_result.status == "SEARCH_TIME_BUDGET_EXCEEDED"'
+        not in compute_path
+    )
     assert '"PLAN_SEARCH_RETRY"' in compute_path
     assert "search_expansion_limit=retry_expansion_limit" in compute_path
     assert "self.stop_turn_retry_planning_budget" in compute_path
@@ -1186,6 +1190,12 @@ def test_segment_completion_is_atomic_idempotent_and_cannot_skip_final_leg() -> 
 
 def test_turn_hysteresis_and_persistent_safety_block_are_bounded() -> None:
     tick = _method_source("_segment_execution_tick", "_fresh_execution_pose")
+    turn_start = _method_source(
+        "_begin_turn_or_settling", "_dispatch_prepared_segment"
+    )
+    sweep = _method_source(
+        "_live_rotation_sweep_clear", "_manual_takeover_callback"
+    )
 
     assert "turn_hysteresis_transition" in tick
     assert '"TURN_SETTLING"' in tick
@@ -1198,6 +1208,15 @@ def test_turn_hysteresis_and_persistent_safety_block_are_bounded() -> None:
     assert 'action="ALTERNATIVE_DIRECTION"' not in tick
     assert "self._schedule_execution_replan" in tick
     assert '"TURN_CMD"' in tick
+    assert "self.latest_corridor.can_rotate" in sweep
+    assert "self._live_rotation_sweep_clear(now)" in tick
+    assert "self._live_rotation_sweep_clear(now)" in turn_start
+
+    project = Path(__file__).parents[1]
+    parameters = yaml.safe_load(
+        (project / "navigation-stack/config/nav2_params.yaml").read_text()
+    )["rovera_navigation_adapter"]["ros__parameters"]
+    assert parameters["stop_turn_safety_block_timeout_seconds"] == 1.0
 
 
 def test_turn_reentry_reselects_direction_after_target_overshoot() -> None:
@@ -1271,6 +1290,17 @@ def test_initial_preview_produces_candidates_without_persistent_scratch_state() 
     assert "request_planner.plan_candidates" in alternatives
 
 
+def test_preview_and_alternative_search_preserve_center_mission_identity() -> None:
+    compute = _method_source("_compute_path", "_navigate")
+    dispatch = _method_source("_dispatch", "_foreign_mapping_authorities")
+
+    assert 'payload.get("mission_id")' in compute
+    alternatives = dispatch.split('if command == "navigation.alternatives":', 1)[1]
+    alternatives = alternatives.split('if command == "navigation.select_route":', 1)[0]
+    assert "self.current_mission_id" in alternatives
+    assert 'payload.get("mission_id")' in alternatives
+
+
 def test_live_narrow_uncertainty_does_not_cancel_prevalidated_auto_route() -> None:
     callback = _method_source("_scan_callback", "_sensor_time_callback")
     decision = callback.split("self._corridor_failure_evidence()", 1)[1]
@@ -1308,7 +1338,8 @@ def test_rotation_sweep_stop_and_start_escape_remain_runtime_recoverable() -> No
 
     assert '"ROTATION_SWEEP_COLLISION"' in safety
     assert '"ROTATION_SWEEP_COLLISION"' in atomic
-    assert "allow_monotonic_initial_overlap=start_escape" in prepare
+    assert '"START_ESCAPE", "TURN_BAY"' in prepare
+    assert "allow_monotonic_initial_overlap=active_relocation" in prepare
     assert "endpoint = dict(refreshed_escape.end)" in prepare
     assert 'status="ALREADY_CLEAR"' in prepare
     assert "START_ESCAPE_ALREADY_CLEAR" in prepare
@@ -1388,17 +1419,11 @@ def test_dynamic_wait_periodically_replans_and_success_resumes_same_goal() -> No
     assert "minimum_observations=self.dynamic_planning_minimum_observations" in blocker
     assert 'result="POSITION_UNCONFIRMED"' in blocker
     assert "observe_confirmed_blocker" not in blocker
-    assert "self.dynamic_unconfirmed_blocker_timeout" in tick
-    assert "self._stop_unconfirmed_dynamic_recovery()" in tick
-    retry_wait = _method_source(
-        "_stop_unconfirmed_dynamic_recovery", "_schedule_execution_replan"
-    )
-    assert 'self._set_state("WAITING_FOR_DYNAMIC_CLEAR"' in retry_wait
-    assert "self.paused_goal = goal" in retry_wait
-    assert 'self.latest_feedback.pop("terminal_reason", None)' in retry_wait
-    assert "resume_automatically=True" in retry_wait
-    assert "destination_preserved" in retry_wait
-    assert "keepout_created=False" in retry_wait
+    # Missing scan classification must not renew another wait window. Every
+    # generated route is still constrained by the live costmap and footprint.
+    assert "self.dynamic_unconfirmed_blocker_timeout" not in tick
+    assert "self._stop_unconfirmed_dynamic_recovery()" not in tick
+    assert "self._observe_controller_blocker()" in tick
     assert "corridor_blocked" in tick
     assert 'self.dynamic_block_reason.startswith("CONTROLLER_ABORT")' not in tick
     enter = _method_source("_enter_dynamic_wait", "_dynamic_recovery_tick")
@@ -1423,7 +1448,7 @@ def test_live_costmap_filters_static_cells_before_bounding_dynamic_overlay() -> 
     assert "saved_map=None" in callback
 
 
-def test_dynamic_recovery_waits_for_moving_people_and_replans_fixed_obstacles() -> None:
+def test_dynamic_recovery_quickly_replans_around_any_persistent_obstacle() -> None:
     tick = _method_source("_dynamic_recovery_tick", "_attempt_dynamic_replan")
     attempt = _method_source("_attempt_dynamic_replan", "_replan_execution_from_current")
 
@@ -1440,7 +1465,10 @@ def test_dynamic_recovery_waits_for_moving_people_and_replans_fixed_obstacles() 
     assert 'item.motion_state == "STATIONARY"' in tick
     assert '"MOVING_OBSTACLE_HAS_PRIORITY"' in tick
     assert "corridor_evidence_fresh" in tick
-    assert "stationary_route_blocked or controller_corridor_blocked" in tick
+    assert "moving_route_blocked" in tick
+    assert "stationary_route_blocked" in tick
+    assert "controller_corridor_blocked" in tick
+    assert "bool(self.dynamic_block_reason)" in tick
     for state in ("CLASSIFYING", "REPLAN_PENDING", "REPLAN_RUNNING", "WAITING"):
         assert f'self.dynamic_recovery_state = "{state}"' in tick
     assert "not requires_alternative" in attempt
@@ -1448,8 +1476,9 @@ def test_dynamic_recovery_waits_for_moving_people_and_replans_fixed_obstacles() 
     assert "unconfirmed_replan_due" not in tick
     assert 'result="RESUME_ORIGINAL_ROUTE"' in attempt
     assert '"segment_directions": resume_directions' in attempt
-    assert "self.dynamic_moving_obstacle_max_wait" in tick
-    assert "self._stop_persistent_moving_dynamic_recovery()" in tick
+    assert '"SEARCHING_ALTERNATIVE_ROUTES"' in tick
+    assert "self.dynamic_moving_obstacle_max_wait" not in tick
+    assert "self._stop_persistent_moving_dynamic_recovery()" not in tick
 
 
 def test_dynamic_wait_evaluates_clearance_along_the_blocked_route() -> None:
@@ -1523,12 +1552,16 @@ def test_planning_and_recovery_project_route_aligned_front_lidar_keepout() -> No
     assert "segment_length" in helper
     assert '"PLAN_LIVE_FRONT_KEEPOUT"' in compute
     assert 'action="APPLY_BEFORE_SEARCH"' in compute
+    assert 'action="DEFER_UNTIL_FIRST_SEGMENT"' in compute
+    assert "front_keepout_can_precede_route_search(" in compute
     assert 'action="REPLAN_BEFORE_MOTION"' in compute
     assert "exclusions=(live_front_keepout,)" in compute
+    assert "planning_exclusions = (live_front_keepout,)" in compute
+    assert "exclusions=planning_exclusions" in compute
     assert 'source="ROUTE_ALIGNED_FRONT_LIDAR"' in blocker
     assert 'result="KEEP_OUT_CONFIRMED"' in blocker
 
-    presearch = compute.split("live_front_keepout =", 1)[1].split(
+    presearch = compute.split("observed_front_keepout =", 1)[1].split(
         "planner_result =", 1
     )[0]
     assert "blocked_only=True" in presearch
@@ -1637,7 +1670,7 @@ def test_dynamic_blockage_only_auto_starts_a_same_corridor_bypass() -> None:
         "if global_candidates:", 1
     )[0]
     global_branch = recover.split("if global_candidates:", 1)[1].split(
-        'self.dynamic_recovery_state = "WAITING"', 1
+        "self._set_dynamic_blocked_no_route(", 1
     )[0]
     assert "self._navigate(" in local_branch
     assert 'result="AUTO_RESUME_IN_OLD_CORRIDOR"' in local_branch
@@ -1646,7 +1679,7 @@ def test_dynamic_blockage_only_auto_starts_a_same_corridor_bypass() -> None:
     assert "self._navigate(" not in global_branch
 
 
-def test_global_dynamic_alternative_requires_an_explicit_route_selection() -> None:
+def test_global_dynamic_alternative_auto_selects_shortest_after_countdown() -> None:
     present = _method_source(
         "_present_dynamic_route_selection",
         "_attempt_dynamic_local_bypass_or_selection",
@@ -1656,7 +1689,14 @@ def test_global_dynamic_alternative_requires_an_explicit_route_selection() -> No
 
     assert 'candidate["requires_user_confirmation"] = True' in present
     assert 'candidate["recovery_route_kind"] = "GLOBAL_ALTERNATIVE"' in present
-    assert '"USER_ROUTE_CONFIRMATION_REQUIRED"' in present
+    auto_select = _method_source(
+        "_auto_start_shortest_dynamic_route",
+        "_attempt_dynamic_local_bypass_or_selection",
+    )
+
+    assert '"ALTERNATIVE_ROUTE_SELECTION_COUNTDOWN"' in present
+    assert "self.dynamic_route_selection_timeout" in present
+    assert 'self.latest_feedback["route_selection_deadline_unix_ms"]' in present
     assert 'self._set_state(\n                "ROUTE_SELECTION"' in present
     assert "self.navigation_velocity.publish(Twist())" in present
     assert "resume_automatically=False" in present
@@ -1665,9 +1705,39 @@ def test_global_dynamic_alternative_requires_an_explicit_route_selection() -> No
     assert 'command == "navigation.select_route"' in dispatch
     assert "self._start_selected_route(" in dispatch
     assert 'command == "navigation.route_selection_back"' in dispatch
-    assert 'self.dynamic_recovery_state = "WAITING_OLD_ROUTE_ONLY"' in dispatch
+    assert 'return self._cancel_navigation("CANCELED")' in dispatch
+    assert 'self.dynamic_recovery_state = "WAITING_OLD_ROUTE_ONLY"' not in dispatch
     assert 'self.current_state == "ROUTE_SELECTION"' in tick
     assert '"AWAITING_USER_ROUTE_CONFIRMATION"' in tick
+    assert 'self.dynamic_recovery_state = "AUTO_SELECT_RUNNING"' in tick
+    assert '"AUTO_SELECTING_SHORTEST_ROUTE"' in tick
+    assert "self._auto_start_shortest_dynamic_route" in tick
+    assert "self.route_candidates.values()" in auto_select
+    assert 'choice="AUTO_TIMEOUT"' in auto_select
+    assert "self._set_dynamic_blocked_no_route(" in auto_select
+
+
+def test_exhausted_dynamic_search_relocates_before_becoming_blocked() -> None:
+    recover = _method_source(
+        "_attempt_dynamic_local_bypass_or_selection", "_attempt_dynamic_replan"
+    )
+    blocked = _method_source(
+        "_set_dynamic_blocked_no_route", "_auto_start_shortest_dynamic_route"
+    )
+
+    assert 'result="EXHAUSTED"' in recover
+    assert 'result="NO_SAFE_ROUTE"' in recover
+    assert 'self.dynamic_recovery_state = "ACTIVE_RELOCATION"' in recover
+    assert 'result="ACTIVE_RELOCATION_REQUESTED"' in recover
+    assert "self._start_turn_bay_recovery(" in recover
+    assert (
+        recover.index("self._start_turn_bay_recovery(")
+        < recover.rindex("self._set_dynamic_blocked_no_route(")
+    )
+    assert recover.count("self._set_dynamic_blocked_no_route(") >= 2
+    assert 'self.dynamic_recovery_state = "EXHAUSTED"' in blocked
+    assert 'self._set_state("BLOCKED"' in blocked
+    assert "WAITING_FOR_DYNAMIC_CLEAR" not in blocked
 
 
 def test_dynamic_local_bypass_thresholds_are_explicit_configuration() -> None:
@@ -1678,6 +1748,17 @@ def test_dynamic_local_bypass_thresholds_are_explicit_configuration() -> None:
 
     assert parameters["dynamic_local_bypass_minimum_overlap"] == 0.35
     assert parameters["dynamic_local_bypass_maximum_deviation_m"] == 0.50
+    assert parameters["dynamic_obstacle_persistence_seconds"] == 0.75
+    assert parameters["dynamic_route_selection_timeout_seconds"] == 10.0
+
+
+def test_clearance_planners_share_stable_topology_in_conservative_bands() -> None:
+    factory = _method_source(
+        "_stop_turn_planner_for_clearance", "_live_start_escape_directions"
+    )
+
+    assert "requested * 500.0" in factory
+    assert "planner._stable_primary_routes = base._stable_primary_routes" in factory
 
 
 def test_static_disconnect_remains_retryable_and_preserves_runtime_mission() -> None:
@@ -1704,6 +1785,50 @@ def test_runtime_detects_lost_steering_and_turn_hard_stop_as_recovery() -> None:
     assert "self._start_turn_bay_recovery(" in safety
     assert 'action="REJECT_ERROR_INCREASING_DIRECTION"' in turn
     assert 'self.execution_phase = "WAIT_FOR_TURN_CLEAR"' in turn
+
+
+def test_turn_block_recovery_moves_one_safe_step_before_global_replanning() -> None:
+    relocate = _method_source(
+        "_find_and_start_turn_bay", "_odom_pose"
+    )
+    wait = _method_source("_enter_dynamic_wait", "_dynamic_recovery_tick")
+    tick = _method_source("_dynamic_recovery_tick", "_dynamic_route_relation")
+    relation = _method_source(
+        "_dynamic_route_relation", "_present_dynamic_route_selection"
+    )
+    candidates = _method_source(
+        "_attempt_dynamic_local_bypass_or_selection", "_attempt_dynamic_replan"
+    )
+    prepare = _method_source(
+        "_prepare_active_segment", "_begin_turn_or_settling"
+    )
+    complete = _method_source(
+        "_complete_active_segment", "_finish_execution_success"
+    )
+
+    assert "self._dynamic_planning_exclusions()" in relocate
+    assert "segment_departs_exclusions(" in relocate
+    assert "endpoint_clearance=self.planning_footprint_padding" in relocate
+    assert 'self._enter_dynamic_wait("TURN_BLOCKED_NO_SAFE_RELOCATION")' in relocate
+    assert "dynamic_block_requires_alternative(reason)" in wait
+    assert '== "TURN_BLOCKED_NO_SAFE_RELOCATION"' in tick
+    assert "self._safety_blocks_turn(" in tick
+    assert "self.dynamic_local_bypass_minimum_deviation" in relation
+    assert "maximum_deviation" in candidates
+    assert "self.dynamic_local_bypass_minimum_deviation" in candidates
+    assert '"START_ESCAPE", "TURN_BAY"' in prepare
+    assert "allow_monotonic_initial_overlap=active_relocation" in prepare
+    assert "minimum_relocation_distance" in relocate
+    assert "self.footprint_half_length" in relocate
+    assert "planner.plan_result" not in relocate
+    assert "selected = (candidate, direction)" in relocate
+    assert "display = [dict(pose), dict(candidate)]" in relocate
+    assert 'relocation_reason == "TURN_BAY"' in complete
+    assert "self.latest_corridor.can_go_straight" in complete
+    assert "not self.latest_corridor.can_rotate" in complete
+    assert 'status="CONTINUE_NARROW_TRANSLATION"' in complete
+    assert "preferred_translation_direction=active.motion_direction" in complete
+    assert "preferred_translation_direction in live_directions" in relocate
 
 
 def test_scan_map_mismatch_never_destroys_a_continuously_tracked_pose() -> None:
@@ -2019,3 +2144,7 @@ def test_adapter_visualization_contract_always_identifies_route_authority() -> N
     assert '"route_id": (' in dispatch
     assert "self.execution_route_id" in dispatch
     assert "self.selected_route_id" in dispatch
+
+
+def test_edge_health_keeps_route_selection_bound_to_its_mission() -> None:
+    assert '"mission_id": backend_state.get("mission_id", "")' in EDGE_CLIENT_SOURCE

@@ -168,7 +168,9 @@ rovera_navigation_adapter:
     # retains immediate stop authority while this planning evidence matures.
     dynamic_planning_minimum_observations: 6
     dynamic_overlay_max_cells: 600
-    dynamic_obstacle_persistence_seconds: 1.5
+    # Stop immediately, but spend at most this short evidence window deciding
+    # whether the blocker is moving or fixed before planning a real bypass.
+    dynamic_obstacle_persistence_seconds: 0.75
     # A controller corridor stop without a repeatedly located obstacle cannot
     # create a safe keepout. Collect evidence for a bounded interval, then
     # expose BLOCKED while preserving the destination instead of waiting and
@@ -188,6 +190,9 @@ rovera_navigation_adapter:
     # sideways scan while waiting must never restart the blocked segment.
     dynamic_obstacle_clear_dwell_seconds: 1.00
     dynamic_replan_retry_seconds: 2.0
+    # A route with only pose-noise-sized changes is the same failed route, not
+    # a bypass. Require visible lateral displacement before auto-resuming it.
+    dynamic_local_bypass_minimum_deviation_m: 0.12
     start_escape_max_distance: 0.60
     turn_bay_max_relocation_distance: 0.80
     # Prefer capture-time TF, wait briefly for normal listener jitter, then
@@ -245,6 +250,9 @@ rovera_navigation_adapter:
     alternative_route_max_candidates: 3
     alternative_route_overlap_threshold: 0.85
     alternative_route_keepout_radius: 0.18
+    # A global recovery route is visible and cancellable before autonomous
+    # execution. If the operator does nothing, the shortest valid route starts.
+    dynamic_route_selection_timeout_seconds: 10.0
     # A footprint-valid detour may run automatically only while it remains in
     # the accepted route's local corridor and rejoins it. Anything farther
     # away is a new global route and requires explicit operator selection.
@@ -281,7 +289,10 @@ rovera_navigation_adapter:
     stop_turn_heading_reentry_tolerance_degrees: 6.0
     stop_turn_stable_dwell_seconds: 0.40
     stop_turn_reentry_dwell_seconds: 0.20
-    stop_turn_safety_block_timeout_seconds: 5.0
+    # A fresh full-body LiDAR sweep blocks angular output immediately. After
+    # one second of continuous blockage, relocate along the current heading
+    # instead of repeatedly attempting the same unsafe turn.
+    stop_turn_safety_block_timeout_seconds: 1.0
     stop_turn_heading_kp: 1.8
     stop_turn_max_angular_speed: 0.50
     # The Pi chassis did not move reliably below ~0.13 rad/s. If wheel odom

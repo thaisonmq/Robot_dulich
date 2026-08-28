@@ -80,6 +80,7 @@ from navigation_core import (
     execution_pose_continuity,
     filter_static_map_scan,
     find_start_escape,
+    front_keepout_can_precede_route_search,
     global_scan_candidate_uniqueness,
     heading_diversity,
     heading_position_spread,
@@ -100,6 +101,7 @@ from navigation_core import (
     route_geometry_metadata,
     scan_raycast_consistency,
     scan_to_map_match,
+    segment_departs_exclusions,
     segment_travel_watchdog,
     straight_heading_lock,
     straight_segment_progress,
@@ -735,7 +737,7 @@ class NavigationAdapter(Node):
             ).value),
         )
         self.dynamic_obstacle_wait = configured(
-            "dynamic_obstacle_persistence_seconds", 1.5
+            "dynamic_obstacle_persistence_seconds", 0.75
         )
         self.dynamic_unconfirmed_blocker_timeout = max(
             self.dynamic_obstacle_wait,
@@ -768,6 +770,9 @@ class NavigationAdapter(Node):
         )
         self.dynamic_replan_retry = configured(
             "dynamic_replan_retry_seconds", 2.0
+        )
+        self.dynamic_local_bypass_minimum_deviation = configured(
+            "dynamic_local_bypass_minimum_deviation_m", 0.12
         )
         self.dynamic_conflict_ttc_horizon = configured(
             "dynamic_obstacle_conflict_ttc_seconds", 3.0
@@ -905,6 +910,10 @@ class NavigationAdapter(Node):
         self.dynamic_local_bypass_maximum_deviation = configured(
             "dynamic_local_bypass_maximum_deviation_m", 0.50
         )
+        self.dynamic_route_selection_timeout = max(
+            1.0,
+            configured("dynamic_route_selection_timeout_seconds", 10.0),
+        )
         self.stop_turn_planning_budget = configured(
             "stop_turn_planning_budget_seconds", 12.0
         )
@@ -970,6 +979,7 @@ class NavigationAdapter(Node):
         self.dynamic_replan_attempt_count = 0
         self.dynamic_replan_requires_alternative = False
         self.dynamic_recovery_expires_monotonic = 0.0
+        self.dynamic_route_selection_deadline_monotonic = 0.0
         self.dynamic_last_unconfirmed_log_monotonic = 0.0
         self.dynamic_last_untrusted_log_monotonic = 0.0
         self.latest_global_costmap: OccupancyGrid | None = None
@@ -1073,7 +1083,7 @@ class NavigationAdapter(Node):
             "stop_turn_reentry_dwell_seconds", 0.20
         )
         self.execution_turn_safety_block_timeout = configured(
-            "stop_turn_safety_block_timeout_seconds", 5.0
+            "stop_turn_safety_block_timeout_seconds", 1.0
         )
         self.straight_steering_authority_timeout = configured(
             "straight_steering_authority_timeout_seconds", 0.20
@@ -2561,6 +2571,12 @@ class NavigationAdapter(Node):
             return self._manual_handoff(str(payload.get("reason") or "NARROW_PATH"))
         if command == "navigation.alternatives":
             self._validate_command_map(payload)
+            # A preview is motionless and may be rehydrated by a fresh browser
+            # before alternatives are requested. Rebind the edge state to the
+            # Center mission carried by every mission action.
+            self.current_mission_id = str(
+                payload.get("mission_id") or self.current_mission_id
+            )
             return self._compute_alternative_routes()
         if command == "navigation.select_route":
             self._validate_command_map(payload)
@@ -2568,19 +2584,13 @@ class NavigationAdapter(Node):
         if command == "navigation.route_selection_back":
             self._validate_command_map(payload)
             target = self.route_selection_return_state
+            if target == "WAITING_FOR_DYNAMIC_CLEAR":
+                # Older Center clients called this "keep waiting for the old
+                # route". Bounded recovery no longer has an indefinite-wait
+                # branch, so treat that legacy action as the user's cancel.
+                return self._cancel_navigation("CANCELED")
             self.route_candidates = {}
             self.selected_route_id = ""
-            if target == "WAITING_FOR_DYNAMIC_CLEAR":
-                self.dynamic_recovery_state = "WAITING_OLD_ROUTE_ONLY"
-                self.execution_phase = "WAITING_FOR_DYNAMIC_CLEAR"
-                self.latest_feedback["execution_phase"] = (
-                    "WAITING_FOR_DYNAMIC_CLEAR"
-                )
-                self.latest_feedback["recovery_reason"] = (
-                    "WAITING_FOR_OLD_ROUTE"
-                )
-                self.latest_global_path = list(self.dynamic_blocked_route)
-                self.visualization_revision += 1
             self._set_state(target, "route_selection_back")
             self.navigation_velocity.publish(Twist())
             return {
@@ -3834,6 +3844,7 @@ class NavigationAdapter(Node):
         self.dynamic_replan_attempt_count = 0
         self.dynamic_replan_requires_alternative = False
         self.dynamic_recovery_expires_monotonic = 0.0
+        self.dynamic_route_selection_deadline_monotonic = 0.0
         self.dynamic_last_unconfirmed_log_monotonic = 0.0
 
     def _dynamic_affects_remaining_route(self) -> bool:
@@ -4478,9 +4489,12 @@ class NavigationAdapter(Node):
             raise AdapterError("STATE_CONFLICT", "No destination is available")
         if self.stop_turn_planner is None or self.pose is None:
             raise AdapterError("PLANNER_NOT_READY", "Stop-turn planner is unavailable")
+        request_state = self.current_state
         return_state = (
             "NARROW_PATH_DECISION"
-            if self.current_state == "NARROW_PATH_DECISION"
+            if request_state == "NARROW_PATH_DECISION"
+            else "BLOCKED"
+            if request_state == "BLOCKED"
             else "READY"
         )
         with self.state_lock:
@@ -4493,6 +4507,11 @@ class NavigationAdapter(Node):
             maximum_candidates=self.alternative_route_max_candidates,
             overlap_threshold=self.alternative_route_overlap_threshold,
             planning_time_budget=self.stop_turn_planning_budget,
+            exclusions=(
+                self._dynamic_planning_exclusions()
+                if request_state == "BLOCKED"
+                else ()
+            ),
         )
         candidates = self._serialize_stop_turn_candidates(planned)
         self._nav_debug(
@@ -5818,6 +5837,15 @@ class NavigationAdapter(Node):
         return bool(
             self.safety_snapshot.get(key, False)
             or self.safety_direction_mask & mask
+        )
+
+    def _live_rotation_sweep_clear(self, now: float | None = None) -> bool:
+        """Require a fresh full-body LiDAR sweep before any angular command."""
+        timestamp = time.monotonic() if now is None else float(now)
+        return bool(
+            timestamp - self.last_scan_monotonic <= 0.30
+            and self._critical_sensor_time_healthy()
+            and self.latest_corridor.can_rotate
         )
 
     def _manual_takeover_callback(self, message: Bool) -> None:
@@ -8930,12 +8958,13 @@ class NavigationAdapter(Node):
             if required_side_clearance is None
             else max(0.0, float(required_side_clearance))
         )
-        # Round upward, never downward, so tiny covariance jitter neither
-        # weakens safety nor changes the search bands for sub-millimetre noise.
-        hard_margin = math.ceil(requested * 1000.0 - 1e-9) / 1000.0
+        # Use conservative 2 mm bands. Rounding upward never weakens safety,
+        # while keeping sub-millimetre covariance jitter from changing the
+        # topology selected for an otherwise identical request.
+        hard_margin = math.ceil(requested * 500.0 - 1e-9) / 500.0
         if abs(hard_margin - base.hard_side_margin) <= 1e-9:
             return base
-        return StopTurnStateLatticePlanner(
+        planner = StopTurnStateLatticePlanner(
             base.saved_map,
             base.geometry,
             half_length=base.half_length,
@@ -8952,6 +8981,11 @@ class NavigationAdapter(Node):
                 hard_margin, base.preferred_side_margin
             ),
         )
+        # Exact validation caches stay request-local, but topology stability
+        # must span those planners because localization clearance is rebuilt
+        # for every preview/replan request.
+        planner._stable_primary_routes = base._stable_primary_routes
+        return planner
 
     def _live_start_escape_directions(
         self,
@@ -9093,7 +9127,7 @@ class NavigationAdapter(Node):
             0.80,
             self.corridor_lookahead + self.footprint_half_length,
         )
-        live_front_keepout = self._live_front_keepout_for_route(
+        observed_front_keepout = self._live_front_keepout_for_route(
             [
                 dict(start_pose),
                 {
@@ -9112,11 +9146,19 @@ class NavigationAdapter(Node):
             # again below before any motion is dispatched.
             blocked_only=True,
         )
+        presearch_front_keepout = bool(
+            observed_front_keepout is not None
+            and front_keepout_can_precede_route_search(live_start_directions)
+        )
+        live_front_keepout = (
+            observed_front_keepout if presearch_front_keepout else None
+        )
         dynamic_exclusions = (
             (live_front_keepout,)
             if live_front_keepout is not None
             else self._dynamic_exclusions()
         )
+        planning_exclusions = dynamic_exclusions
         if live_front_keepout is not None:
             self._nav_debug(
                 "PLAN_LIVE_FRONT_KEEPOUT",
@@ -9129,6 +9171,20 @@ class NavigationAdapter(Node):
                     float(self.latest_corridor.front_clearance)
                 ),
                 action="APPLY_BEFORE_SEARCH",
+            )
+        elif observed_front_keepout is not None:
+            self._nav_debug(
+                "PLAN_LIVE_FRONT_KEEPOUT",
+                center=(
+                    round(observed_front_keepout[0], 3),
+                    round(observed_front_keepout[1], 3),
+                ),
+                radius=round(observed_front_keepout[2], 3),
+                front_clearance=self._finite_metric(
+                    float(self.latest_corridor.front_clearance)
+                ),
+                action="DEFER_UNTIL_FIRST_SEGMENT",
+                reason="REVERSE_ESCAPE_AVAILABLE",
             )
         live_obstacle_search = live_front_keepout is not None
         planning_time_budget = (
@@ -9146,7 +9202,7 @@ class NavigationAdapter(Node):
         planner_result = request_planner.plan_result(
             start_pose,
             resolved_goal,
-            exclusions=dynamic_exclusions,
+            exclusions=planning_exclusions,
             planning_time_budget=planning_time_budget,
             allow_start_escape=True,
             maximum_start_escape_distance=self.start_escape_max_distance,
@@ -9154,9 +9210,16 @@ class NavigationAdapter(Node):
             live_start_clear=live_start_clear,
             live_start_directions=live_start_directions,
         )
-        if planner_result.status in {
-            "SEARCH_EXPANSION_LIMIT", "SEARCH_TIME_BUDGET_EXCEEDED"
-        } and not live_obstacle_search:
+        if (
+            planner_result.status == "SEARCH_EXPANSION_LIMIT"
+            and not live_obstacle_search
+        ):
+            # An expansion-bound result can return well before the transport
+            # deadline, so a larger bounded retry is useful. A time-bound
+            # result has already occupied the complete 12-second request; an
+            # immediate additional 15-second retry exceeds the edge adapter's
+            # 20-second RPC timeout and is surfaced incorrectly as
+            # NAVIGATION_ADAPTER_UNAVAILABLE even though ROS remains healthy.
             retry_expansion_limit = (
                 request_planner.max_expansions
                 * self.stop_turn_retry_expansion_multiplier
@@ -9174,7 +9237,7 @@ class NavigationAdapter(Node):
             planner_result = request_planner.plan_result(
                 start_pose,
                 resolved_goal,
-                exclusions=dynamic_exclusions,
+                exclusions=planning_exclusions,
                 planning_time_budget=self.stop_turn_retry_planning_budget,
                 search_expansion_limit=retry_expansion_limit,
                 allow_start_escape=True,
@@ -9224,6 +9287,7 @@ class NavigationAdapter(Node):
                     live_start_clear=live_start_clear,
                     live_start_directions=live_start_directions,
                 )
+                planning_exclusions = (live_front_keepout,)
         turn_diagnostics = dict(planner_result.diagnostics)
         if turn_diagnostics:
             rejections = list(
@@ -9269,7 +9333,7 @@ class NavigationAdapter(Node):
                 maximum_candidates=1,
                 overlap_threshold=self.alternative_route_overlap_threshold,
                 planning_time_budget=self.stop_turn_planning_budget,
-                exclusions=dynamic_exclusions,
+                exclusions=planning_exclusions,
                 primary_route=planner_result.route,
             )
         )
@@ -9332,6 +9396,11 @@ class NavigationAdapter(Node):
         # reintroduce needless elbows after clearance is already ample.
         selected = candidates[0]
         with self.state_lock:
+            self.current_mission_id = str(
+                payload.get("mission_id")
+                or payload.get("request_id")
+                or self.current_mission_id
+            )
             self.route_candidates = {
                 str(candidate["route_id"]): candidate for candidate in candidates
             }
@@ -9378,6 +9447,7 @@ class NavigationAdapter(Node):
         command_payload: dict[str, Any],
         *,
         recovery_attempt: bool = False,
+        expected_generation: int | None = None,
     ) -> dict[str, Any]:
         self._validate_command_map(command_payload)
         goal_payload = self._execution_destination(goal_payload)
@@ -9436,6 +9506,7 @@ class NavigationAdapter(Node):
                     route_id=route_id,
                     display_points=points,
                     recovery_attempt=recovery_attempt,
+                    expected_generation=expected_generation,
                 )
         if not points and route_id == self.selected_route_id:
             points = list(self.latest_global_path)
@@ -9486,13 +9557,26 @@ class NavigationAdapter(Node):
         if not route_metadata["valid"]:
             raise AdapterError("ROUTE_INVALIDATED", "Selected route is no longer safe")
         with self.state_lock:
+            if (
+                expected_generation is not None
+                and expected_generation != self.navigation_goal_generation
+            ):
+                raise AdapterError(
+                    "STALE_ROUTE_SELECTION",
+                    "Navigation selection changed before motion could start",
+                )
             self.navigation_goal_generation += 1
+            if recovery_attempt:
+                # Count only a validated route that is about to receive motion
+                # authority. Planner-only retries are not physical attempts.
+                self.navigation_recovery_attempts += 1
+            else:
+                self.navigation_recovery_attempts = 0
             self.latest_feedback = {
-                "recoveries": 0,
+                "recoveries": self.navigation_recovery_attempts,
                 "execution_phase": "STRAIGHT_PREPARE",
             }
             if not recovery_attempt:
-                self.navigation_recovery_attempts = 0
                 self.execution_replan_attempts = 0
                 self.navigation_corridor_clear_retried = False
                 self.navigation_original_path_length = self._path_length(points)
@@ -9571,6 +9655,7 @@ class NavigationAdapter(Node):
         route_id: str,
         display_points: list[dict[str, float]],
         recovery_attempt: bool,
+        expected_generation: int | None = None,
     ) -> dict[str, Any]:
         if self.saved_map is None or self.pose is None:
             raise AdapterError("PLANNER_NOT_READY", "Saved Map or current pose is unavailable")
@@ -9603,7 +9688,19 @@ class NavigationAdapter(Node):
                 "No monotonic-overlap straight escape remains from the current pose",
             )
         with self.state_lock:
+            if (
+                expected_generation is not None
+                and expected_generation != self.navigation_goal_generation
+            ):
+                raise AdapterError(
+                    "STALE_ROUTE_SELECTION",
+                    "Navigation selection changed before motion could start",
+                )
             self.navigation_goal_generation += 1
+            if recovery_attempt:
+                self.navigation_recovery_attempts += 1
+            else:
+                self.navigation_recovery_attempts = 0
             self.execution_segment_token += 1
             self.active_segment = None
             self.execution_points = [dict(escape.start), dict(escape.end)]
@@ -9622,7 +9719,7 @@ class NavigationAdapter(Node):
             self.current_goal_handle = None
             self.motion_owner = "NONE"
             self.latest_feedback = {
-                "recoveries": int(recovery_attempt),
+                "recoveries": self.navigation_recovery_attempts,
                 "execution_phase": "START_ESCAPE",
                 "recovery_reason": "START_STATIC_OVERLAP",
             }
@@ -9946,8 +10043,15 @@ class NavigationAdapter(Node):
                 left_static = self._turn_static_safe(pose, target, 1)
                 right_static = self._turn_static_safe(pose, target, -1)
                 snapshot_fresh = self._atomic_safety_fresh(now)
-                left_live = snapshot_fresh and not self._safety_blocks_turn(1)
-                right_live = snapshot_fresh and not self._safety_blocks_turn(-1)
+                rotation_sweep_clear = (
+                    snapshot_fresh and self._live_rotation_sweep_clear(now)
+                )
+                left_live = (
+                    rotation_sweep_clear and not self._safety_blocks_turn(1)
+                )
+                right_live = (
+                    rotation_sweep_clear and not self._safety_blocks_turn(-1)
+                )
                 direction = choose_turn_direction(
                     error,
                     left_static_safe=left_static,
@@ -10045,8 +10149,7 @@ class NavigationAdapter(Node):
             return
         atomic_fresh = self._atomic_safety_fresh(now)
         live_safe_sample = (
-            now - self.last_scan_monotonic <= 0.30
-            and self._critical_sensor_time_healthy()
+            self._live_rotation_sweep_clear(now)
             and not self.estop_active
             and atomic_fresh
             and not self._safety_blocks_turn(direction)
@@ -10183,7 +10286,10 @@ class NavigationAdapter(Node):
             self.last_turn_command_log_monotonic = now
 
     def _start_turn_bay_recovery(
-        self, pose: dict[str, float], goal_generation: int
+        self,
+        pose: dict[str, float],
+        goal_generation: int,
+        preferred_translation_direction: int | None = None,
     ) -> None:
         if (
             goal_generation != self.navigation_goal_generation
@@ -10197,21 +10303,23 @@ class NavigationAdapter(Node):
         self._set_state("TURN_BAY_RECOVERY", "persistent_turn_safety_block")
         threading.Thread(
             target=self._find_and_start_turn_bay,
-            args=(dict(pose), goal_generation),
+            args=(
+                dict(pose),
+                goal_generation,
+                preferred_translation_direction,
+            ),
             daemon=True,
         ).start()
 
     def _find_and_start_turn_bay(
-        self, pose: dict[str, float], goal_generation: int
+        self,
+        pose: dict[str, float],
+        goal_generation: int,
+        preferred_translation_direction: int | None = None,
     ) -> None:
-        planner = (
-            None
-            if self.stop_turn_planner is None
-            else self._stop_turn_planner_for_clearance()
-        )
         saved_map = self.saved_map
         goal = dict(self.execution_goal or self.paused_goal or {})
-        if planner is None or saved_map is None or not goal:
+        if saved_map is None or not goal:
             return
         if (
             not self._atomic_safety_fresh()
@@ -10224,18 +10332,48 @@ class NavigationAdapter(Node):
             return
         yaw = float(pose.get("yaw", 0.0))
         step = max(saved_map.resolution, 0.025)
-        exclusions = self._dynamic_exclusions()
-        selected: tuple[dict[str, float], Any, int] | None = None
-        directions = tuple(
+        # When a side obstacle prevents rotation but translation is still
+        # allowed, a 5 cm relocation is too short: it stops the chassis in the
+        # same narrow slice and immediately launches another expensive global
+        # replan. Move at least one half-body length along the fixed heading;
+        # motion-safety still gates every centimetre and the exact static sweep
+        # validates the complete segment before it is dispatched.
+        minimum_relocation_distance = (
+            step
+            if self.latest_corridor.can_rotate
+            else max(step, self.footprint_half_length)
+        )
+        minimum_relocation_index = max(
+            1, math.ceil(minimum_relocation_distance / step)
+        )
+        exclusions = self._dynamic_planning_exclusions()
+        selected: tuple[dict[str, float], int] | None = None
+        live_directions = tuple(
             direction
             for direction in preferred_turn_bay_directions(pose, goal)
             if not (
                 self.safety_direction_mask & (2 if direction < 0 else 1)
             )
         )
+        # During a multi-step narrow translation, retain the already-proven
+        # forward/reverse direction. Re-ranking solely from the goal projection
+        # after every chunk can flip the preference at the projection point and
+        # make the chassis oscillate. If that direction becomes unsafe, the
+        # fresh direction mask still removes it and permits the other escape.
+        directions = live_directions
+        if preferred_translation_direction in live_directions:
+            directions = (
+                int(preferred_translation_direction),
+                *(
+                    direction
+                    for direction in live_directions
+                    if direction != preferred_translation_direction
+                ),
+            )
         for direction in directions:
             for index in range(
-                1, math.floor(self.turn_bay_max_distance / step) + 1
+                minimum_relocation_index,
+                math.floor(self.turn_bay_max_distance / step) + 1,
             ):
                 distance = direction * index * step
                 candidate = {
@@ -10256,43 +10394,37 @@ class NavigationAdapter(Node):
                 )
                 if (
                     not straight.valid
-                    or planner._segment_excluded(pose, candidate, exclusions)
+                    or not segment_departs_exclusions(
+                        pose,
+                        candidate,
+                        exclusions,
+                        endpoint_clearance=self.planning_footprint_padding,
+                    )
                 ):
                     continue
-                result = planner.plan_result(
-                    candidate,
-                    goal,
-                    exclusions=exclusions,
-                    planning_time_budget=min(
-                        3.0, self.stop_turn_planning_budget
-                    ),
-                )
-                if result.success:
-                    selected = (candidate, result.route, direction)
-                    break
+                # Move to the nearest locally safe bay first. Requiring a
+                # complete global route for every 5 cm candidate can spend
+                # minutes in planner searches while the robot is already
+                # allowed to translate. Segment execution rechecks live
+                # motion safety, and completion either turns/replans from the
+                # new pose or continues another bounded step in this direction.
+                selected = (candidate, direction)
+                break
             if selected is not None:
                 break
         if goal_generation != self.navigation_goal_generation:
             return
         if selected is None:
-            self.execution_phase = "WAITING_FOR_DYNAMIC_CLEAR"
-            self.latest_feedback["execution_phase"] = "WAITING_FOR_DYNAMIC_CLEAR"
-            self.latest_feedback["recovery_reason"] = (
-                "TURN_BLOCKED_NO_SAFE_RELOCATION"
-            )
-            self.dynamic_wait_started = time.monotonic()
-            self._set_state(
-                "WAITING_FOR_DYNAMIC_CLEAR", "turn_blocked_no_safe_relocation"
-            )
             self._nav_debug(
                 "TURN_BAY_RECOVERY",
                 result="WAIT",
                 reason="TURN_BLOCKED_NO_SAFE_RELOCATION",
                 destination_preserved=True,
             )
+            self._enter_dynamic_wait("TURN_BLOCKED_NO_SAFE_RELOCATION")
             return
-        candidate, continuation, direction = selected
-        display = [dict(pose), dict(candidate), *[dict(p) for p in continuation.points[1:]]]
+        candidate, direction = selected
+        display = [dict(pose), dict(candidate)]
         self.execution_segment_token += 1
         self.active_segment = None
         self.execution_points = [dict(pose), dict(candidate)]
@@ -10595,6 +10727,9 @@ class NavigationAdapter(Node):
             {"x": float(endpoint["x"]), "y": float(endpoint["y"])},
         ]
         start_escape = self.execution_relocation_reason == "START_ESCAPE"
+        active_relocation = self.execution_relocation_reason in {
+            "START_ESCAPE", "TURN_BAY",
+        }
         if start_escape and self.saved_map is not None:
             refreshed_escape = find_start_escape(
                 self.saved_map,
@@ -10644,7 +10779,7 @@ class NavigationAdapter(Node):
             live_validation = self._validate_executable_path(
                 candidate,
                 context="STRAIGHT_REANCHOR",
-                allow_monotonic_initial_overlap=start_escape,
+                allow_monotonic_initial_overlap=active_relocation,
                 maximum_new_initial_overlap_cells=(1 if start_escape else 0),
             )
         except AdapterError:
@@ -10812,8 +10947,15 @@ class NavigationAdapter(Node):
             left_static = self._turn_static_safe(pose, target, 1)
             right_static = self._turn_static_safe(pose, target, -1)
             snapshot_fresh = self._atomic_safety_fresh(now)
-            left_live = snapshot_fresh and not self._safety_blocks_turn(1)
-            right_live = snapshot_fresh and not self._safety_blocks_turn(-1)
+            rotation_sweep_clear = (
+                snapshot_fresh and self._live_rotation_sweep_clear(now)
+            )
+            left_live = (
+                rotation_sweep_clear and not self._safety_blocks_turn(1)
+            )
+            right_live = (
+                rotation_sweep_clear and not self._safety_blocks_turn(-1)
+            )
             direction = choose_turn_direction(
                 error,
                 left_static_safe=left_static,
@@ -11007,6 +11149,48 @@ class NavigationAdapter(Node):
         if cancel_action and handle is not None:
             handle.cancel_goal_async()
         if relocation_complete:
+            goal = dict(self.execution_goal or self.paused_goal or {})
+            pose = None if self.pose is None else dict(self.pose)
+            translation_directions = (
+                ()
+                if pose is None or not goal
+                else self._live_start_escape_directions(pose, goal)
+            )
+            continue_narrow_translation = bool(
+                relocation_reason == "TURN_BAY"
+                and active is not None
+                and pose is not None
+                and not self.latest_corridor.can_rotate
+                and active.motion_direction in translation_directions
+                and (
+                    active.motion_direction < 0
+                    or self.latest_corridor.can_go_straight
+                )
+            )
+            if continue_narrow_translation:
+                # Side clearance can forbid rotation while the rectangular
+                # forward/reverse sweep is still valid. Keep translating with
+                # the chassis heading fixed instead of stopping after one bay
+                # probe and burning a full global-planner timeout.
+                self._nav_debug(
+                    "TURN_BAY",
+                    status="CONTINUE_NARROW_TRANSLATION",
+                    motion=(
+                        "REVERSE"
+                        if active.motion_direction < 0
+                        else "FORWARD"
+                    ),
+                    can_go_straight=self.latest_corridor.can_go_straight,
+                    can_rotate=self.latest_corridor.can_rotate,
+                    destination=goal,
+                    destination_preserved=True,
+                )
+                self._start_turn_bay_recovery(
+                    pose,
+                    goal_generation,
+                    preferred_translation_direction=active.motion_direction,
+                )
+                return True
             self._nav_debug(
                 relocation_reason,
                 status="COMPLETE",
@@ -11563,9 +11747,6 @@ class NavigationAdapter(Node):
             self._enter_dynamic_wait("REPLAN_BUDGET_COOLDOWN")
             return
         self.execution_replan_attempts += 1
-        self.latest_feedback["recoveries"] = (
-            self.navigation_recovery_attempts + self.execution_replan_attempts
-        )
         handle = self.current_goal_handle
         self.current_goal_handle = None
         self.execution_segment_token += 1
@@ -11708,16 +11889,36 @@ class NavigationAdapter(Node):
             and self.dynamic_recovery_state
             == "AWAITING_USER_ROUTE_CONFIRMATION"
         )
-        waiting_old_route_only = bool(
-            self.current_state == "WAITING_FOR_DYNAMIC_CLEAR"
-            and self.dynamic_recovery_state == "WAITING_OLD_ROUTE_ONLY"
-        )
         if self.current_state not in {
             "WAIT_FOR_DYNAMIC_CLEAR",
             "WAITING_FOR_DYNAMIC_CLEAR",
         } and not awaiting_user_route:
             return
         self.navigation_velocity.publish(Twist())
+        if awaiting_user_route:
+            remaining = max(
+                0.0,
+                self.dynamic_route_selection_deadline_monotonic - now,
+            )
+            self.latest_feedback["route_selection_seconds_remaining"] = int(
+                math.ceil(remaining)
+            )
+            if (
+                self.dynamic_route_selection_deadline_monotonic > 0.0
+                and remaining <= 0.0
+            ):
+                self.dynamic_route_selection_deadline_monotonic = 0.0
+                self.dynamic_recovery_state = "AUTO_SELECT_RUNNING"
+                self.latest_feedback["recovery_reason"] = (
+                    "AUTO_SELECTING_SHORTEST_ROUTE"
+                )
+                generation = self.navigation_goal_generation
+                threading.Thread(
+                    target=self._auto_start_shortest_dynamic_route,
+                    args=(generation,),
+                    daemon=True,
+                ).start()
+            return
         self.dynamic_recovery_state = "CLASSIFYING"
         fresh = self._atomic_safety_fresh(now)
         corridor_blocked, _ = self._fresh_corridor_blockage(now)
@@ -11743,6 +11944,14 @@ class NavigationAdapter(Node):
             self._atomic_dynamic_blockage(now)
             or self._dynamic_affects_remaining_route()
             or controller_corridor_blocked
+            or (
+                self.dynamic_block_reason
+                == "TURN_BLOCKED_NO_SAFE_RELOCATION"
+                and fresh
+                and self._safety_blocks_turn(
+                    self.execution_turn_direction or 1
+                )
+            )
         )
         blocked_route_needs_corridor = len(self.dynamic_blocked_route) >= 2
         if (
@@ -11757,49 +11966,31 @@ class NavigationAdapter(Node):
             self.dynamic_clear_started is not None
             and now - self.dynamic_clear_started >= self.dynamic_clear_dwell
         )
-        if awaiting_user_route and not clear_dwelled:
-            # Alternatives remain a proposal only. Keep monitoring the old
-            # route so removing the obstacle resumes it automatically, but do
-            # not keep recomputing or silently start a proposed global route.
-            self.dynamic_recovery_state = (
-                "AWAITING_USER_ROUTE_CONFIRMATION"
-            )
-            return
-        if waiting_old_route_only and not clear_dwelled:
-            self.dynamic_recovery_state = "WAITING_OLD_ROUTE_ONLY"
-            return
         persistent = bool(
             self.dynamic_wait_started is not None
             and now - self.dynamic_wait_started >= self.dynamic_obstacle_wait
         )
         replan_around = bool(
             persistent
-            and (stationary_route_blocked or controller_corridor_blocked)
-        )
-        moving_wait_expired = bool(
-            self.dynamic_wait_started is not None
-            and now - self.dynamic_wait_started
-            >= self.dynamic_moving_obstacle_max_wait
+            and (
+                stationary_route_blocked
+                or moving_route_blocked
+                or controller_corridor_blocked
+                # Planner/execution failures such as START_ESCAPE_UNAVAILABLE
+                # have already proved that the accepted route cannot proceed.
+                # They must get a bounded alternative search even when scan/map
+                # disagreement prevents dynamic-object classification.
+                or bool(self.dynamic_block_reason)
+            )
         )
         if (
             moving_route_blocked
             and not stationary_route_blocked
             and not clear_dwelled
-            and moving_wait_expired
+            and not persistent
         ):
-            # A confirmed person may legitimately remain on the route. Renew
-            # the visible wait window while preserving the destination; do
-            # not turn a long-lived moving track into a terminal mission.
-            self._stop_persistent_moving_dynamic_recovery()
-            return
-        if (
-            moving_route_blocked
-            and not stationary_route_blocked
-            and not clear_dwelled
-        ):
-            # A person/trolley that is still moving gets right of way. Keep
-            # the original mission instead of oscillating between left/right
-            # replans as its costmap cells move.
+            # Stop immediately for a moving person, but only for the short
+            # classification window. Once it expires, plan a route around it.
             self._set_state(
                 "WAITING_FOR_DYNAMIC_CLEAR", "moving_obstacle_has_priority"
             )
@@ -11816,19 +12007,12 @@ class NavigationAdapter(Node):
             self.dynamic_recovery_state = "WAITING"
             return
         requires_alternative = bool(not clear_dwelled and replan_around)
-        if requires_alternative and not self._observe_controller_blocker():
-            # Continue collecting evidence. Never run an alternative search
-            # against a fabricated keepout near the robot. At the end of each
-            # evidence window, retain the destination and begin a fresh one.
-            self.dynamic_recovery_state = "WAITING"
-            self.latest_feedback["recovery_reason"] = "BLOCKER_POSITION_UNCONFIRMED"
-            if (
-                self.dynamic_wait_started is not None
-                and now - self.dynamic_wait_started
-                >= self.dynamic_unconfirmed_blocker_timeout
-            ):
-                self._stop_unconfirmed_dynamic_recovery()
-            return
+        if requires_alternative:
+            # Use a real, repeatedly observed keepout when available. If scan
+            # classification is unavailable, the live master costmap and exact
+            # swept-footprint validator still gate every candidate; do not turn
+            # missing classification into an infinite wait.
+            self._observe_controller_blocker()
         self.dynamic_recovery_state = "REPLAN_PENDING"
         self.dynamic_replan_requires_alternative = requires_alternative
         self.dynamic_last_replan = now
@@ -11836,6 +12020,11 @@ class NavigationAdapter(Node):
         self.dynamic_recovery_state = "REPLAN_RUNNING"
         self._set_state("DYNAMIC_REPLAN", "dynamic_replan_due")
         self.latest_feedback["execution_phase"] = "DYNAMIC_REPLAN"
+        self.latest_feedback["recovery_reason"] = (
+            "SEARCHING_ALTERNATIVE_ROUTES"
+            if requires_alternative
+            else "VERIFYING_ORIGINAL_ROUTE"
+        )
         generation = self.navigation_goal_generation
         threading.Thread(
             target=self._attempt_dynamic_replan,
@@ -11857,6 +12046,8 @@ class NavigationAdapter(Node):
         local_bypass = bool(
             overlap >= self.dynamic_local_bypass_minimum_overlap
             and maximum_deviation
+            >= self.dynamic_local_bypass_minimum_deviation
+            and maximum_deviation
             <= self.dynamic_local_bypass_maximum_deviation
         )
         return local_bypass, overlap, maximum_deviation
@@ -11866,14 +12057,24 @@ class NavigationAdapter(Node):
         candidates: list[dict[str, Any]],
         goal: dict[str, Any],
     ) -> None:
-        """Stop and expose global alternatives; never execute one implicitly."""
+        """Expose global alternatives, then auto-start the shortest after 10 s."""
         if not candidates:
             return
+        candidates.sort(
+            key=lambda item: (
+                float(item.get("total_length", math.inf)),
+                str(item.get("route_id") or ""),
+            )
+        )
         for index, candidate in enumerate(candidates):
             candidate["recommended"] = index == 0
             candidate["requires_user_confirmation"] = True
             candidate["recovery_route_kind"] = "GLOBAL_ALTERNATIVE"
         selected = candidates[0]
+        now_monotonic = time.monotonic()
+        deadline_unix_ms = int(
+            (time.time() + self.dynamic_route_selection_timeout) * 1000
+        )
         with self.state_lock:
             self.route_candidates = {
                 str(candidate["route_id"]): candidate
@@ -11885,11 +12086,23 @@ class NavigationAdapter(Node):
             self.execution_phase = "IDLE"
             self.latest_feedback["execution_phase"] = "ROUTE_SELECTION"
             self.latest_feedback["recovery_reason"] = (
-                "USER_ROUTE_CONFIRMATION_REQUIRED"
+                "ALTERNATIVE_ROUTE_SELECTION_COUNTDOWN"
             )
             self.latest_feedback["destination_preserved"] = True
+            self.latest_feedback["route_selection_timeout_seconds"] = int(
+                math.ceil(self.dynamic_route_selection_timeout)
+            )
+            self.latest_feedback["route_selection_seconds_remaining"] = int(
+                math.ceil(self.dynamic_route_selection_timeout)
+            )
+            self.latest_feedback["route_selection_deadline_unix_ms"] = (
+                deadline_unix_ms
+            )
             self.dynamic_recovery_state = (
                 "AWAITING_USER_ROUTE_CONFIRMATION"
+            )
+            self.dynamic_route_selection_deadline_monotonic = (
+                now_monotonic + self.dynamic_route_selection_timeout
             )
             self.dynamic_replan_requires_alternative = False
             self.motion_owner = "NONE"
@@ -11908,13 +12121,100 @@ class NavigationAdapter(Node):
         )
         self._nav_debug(
             "DYNAMIC_ROUTE_SELECTION",
-            action="USER_CONFIRMATION_REQUIRED",
+            action="COUNTDOWN_STARTED",
             candidate_count=len(candidates),
             candidate_route_ids=[item["route_id"] for item in candidates],
+            auto_route_id=selected["route_id"],
+            timeout_seconds=self.dynamic_route_selection_timeout,
             blocked_route_signature=self.dynamic_blocked_route_signature,
             destination=goal,
             destination_preserved=True,
             autonomous_global_route_started=False,
+        )
+
+    def _set_dynamic_blocked_no_route(
+        self,
+        reason: str,
+        goal: dict[str, Any],
+    ) -> None:
+        """End a recovery decision explicitly instead of waiting forever."""
+        with self.state_lock:
+            if goal:
+                self.paused_goal = dict(goal)
+            self.dynamic_route_selection_deadline_monotonic = 0.0
+            self.dynamic_recovery_state = "EXHAUSTED"
+            self.execution_phase = "IDLE"
+            self.motion_owner = "NONE"
+            self.route_candidates = {}
+            self.selected_route_id = ""
+            self.latest_feedback["execution_phase"] = "BLOCKED"
+            self.latest_feedback["recovery_reason"] = reason
+            self.latest_feedback["destination_preserved"] = bool(goal)
+            self.latest_feedback.pop("route_selection_deadline_unix_ms", None)
+            self.latest_feedback.pop("route_selection_seconds_remaining", None)
+            self._set_state("BLOCKED", reason.lower())
+            self.visualization_revision += 1
+        self.navigation_velocity.publish(Twist())
+        if goal:
+            self._persist_active_navigation_mission(
+                resume_automatically=False,
+                goal=goal,
+                path=self.dynamic_blocked_route or self.latest_global_path,
+                segment_directions=self.dynamic_blocked_segment_directions,
+            )
+        self._nav_debug(
+            "DYNAMIC_RECOVERY_EXHAUSTED",
+            reason=reason,
+            destination=goal or None,
+            destination_preserved=bool(goal),
+        )
+
+    def _auto_start_shortest_dynamic_route(
+        self,
+        expected_generation: int,
+    ) -> None:
+        if expected_generation != self.navigation_goal_generation:
+            return
+        ordered = sorted(
+            self.route_candidates.values(),
+            key=lambda item: (
+                float(item.get("total_length", math.inf)),
+                str(item.get("route_id") or ""),
+            ),
+        )
+        goal = dict(self.paused_goal or self.execution_goal or {})
+        for candidate in ordered:
+            if expected_generation != self.navigation_goal_generation:
+                return
+            route_id = str(candidate.get("route_id") or "")
+            try:
+                self._start_selected_route(
+                    route_id,
+                    choice="AUTO_TIMEOUT",
+                    expected_generation=expected_generation,
+                )
+            except AdapterError as exc:
+                self._nav_debug(
+                    "DYNAMIC_ROUTE_SELECTION",
+                    action="AUTO_CANDIDATE_REJECTED",
+                    route_id=route_id,
+                    error=exc.code,
+                )
+                if expected_generation != self.navigation_goal_generation:
+                    return
+                continue
+            self._nav_debug(
+                "DYNAMIC_ROUTE_SELECTION",
+                action="AUTO_SHORTEST_STARTED",
+                route_id=route_id,
+                candidate_count=len(ordered),
+            )
+            return
+        if expected_generation != self.navigation_goal_generation:
+            return
+        self._set_dynamic_blocked_no_route(
+            "ALL_ALTERNATIVE_ROUTES_INVALIDATED",
+            goal,
         )
 
     def _attempt_dynamic_local_bypass_or_selection(
@@ -11942,22 +12242,16 @@ class NavigationAdapter(Node):
         except AdapterError as exc:
             if expected_generation != self.navigation_goal_generation:
                 return
-            self.dynamic_recovery_state = "WAITING"
-            self._set_state(
-                "WAITING_FOR_DYNAMIC_CLEAR",
-                "dynamic_bypass_search_unavailable",
-            )
-            self.execution_phase = "WAITING_FOR_DYNAMIC_CLEAR"
-            self.latest_feedback["execution_phase"] = (
-                "WAITING_FOR_DYNAMIC_CLEAR"
-            )
-            self.latest_feedback["recovery_reason"] = exc.code
             self._nav_debug(
                 "DYNAMIC_LOCAL_BYPASS",
-                result="WAIT",
+                result="EXHAUSTED",
                 error=exc.code,
                 destination=goal,
                 destination_preserved=True,
+            )
+            self._set_dynamic_blocked_no_route(
+                exc.code or "ALTERNATIVE_ROUTE_SEARCH_FAILED",
+                goal,
             )
             return
         if expected_generation != self.navigation_goal_generation:
@@ -11995,12 +12289,17 @@ class NavigationAdapter(Node):
                     horizon=length + 0.01,
                 )
             )
+            local_bypass, overlap, maximum_deviation = (
+                self._dynamic_route_relation(points)
+            )
             minimum_clearance = candidate.get("minimum_side_clearance")
             rejected = bool(
                 len(points) < 2
                 or still_hits_blocker
                 or signature == self.dynamic_blocked_route_signature
                 or signature in self.dynamic_failed_route_signatures
+                or maximum_deviation
+                < self.dynamic_local_bypass_minimum_deviation
                 or (
                     minimum_clearance is not None
                     and float(minimum_clearance) + 1e-9 < hard_clearance
@@ -12028,9 +12327,6 @@ class NavigationAdapter(Node):
                     hard_clearance_required=hard_clearance,
                 )
                 continue
-            local_bypass, overlap, maximum_deviation = (
-                self._dynamic_route_relation(points)
-            )
             candidate["overlap_with_blocked_route"] = overlap
             candidate["maximum_deviation_from_blocked_route"] = round(
                 maximum_deviation, 3
@@ -12051,8 +12347,8 @@ class NavigationAdapter(Node):
             directions = list(selected.get("segment_directions") or [])
             signature = self._route_signature(points)
             route_root = self.execution_route_id.split(
-                "-local-bypass", 1
-            )[0]
+                "-dynamic-", 1
+            )[0].split("-local-bypass", 1)[0]
             route_id = f"{route_root}-local-bypass-{signature[:10]}"
             self.route_candidates = {}
             self.selected_route_id = ""
@@ -12089,25 +12385,47 @@ class NavigationAdapter(Node):
             self._present_dynamic_route_selection(global_candidates, goal)
             return
 
-        self.dynamic_recovery_state = "WAITING"
-        self._set_state(
-            "WAITING_FOR_DYNAMIC_CLEAR",
-            "no_safe_local_bypass_or_alternative",
-        )
-        self.execution_phase = "WAITING_FOR_DYNAMIC_CLEAR"
-        self.latest_feedback["execution_phase"] = (
-            "WAITING_FOR_DYNAMIC_CLEAR"
-        )
-        self.latest_feedback["recovery_reason"] = (
-            "NO_SAFE_LOCAL_BYPASS_OR_ALTERNATIVE"
-        )
         self._nav_debug(
             "DYNAMIC_LOCAL_BYPASS",
-            result="NO_ROUTE_WAIT_FOR_OLD_ROUTE",
+            result="NO_SAFE_ROUTE",
             candidate_count=len(candidates),
             destination=goal,
             destination_preserved=True,
             autonomous_global_route_started=False,
+        )
+        # A route search from a chassis stopped only centimetres from the
+        # obstacle can legitimately return no serializable candidate: the live
+        # costmap includes the current footprint in the inflated obstacle even
+        # though a short, directionally-safe departure is possible.  Do not
+        # turn that start-condition into a terminal standstill.  Move for real
+        # to the nearest exact-valid turn bay (normally a short reverse when
+        # the front is blocked), then the relocation executor replans the
+        # preserved destination from that clear pose.
+        if (
+            self.pose is not None
+            and self.dynamic_replan_attempt_count
+            <= self.failed_segment_max_replans
+        ):
+            self.dynamic_recovery_state = "ACTIVE_RELOCATION"
+            self.latest_feedback["execution_phase"] = "ACTIVE_RELOCATION"
+            self.latest_feedback["recovery_reason"] = (
+                "MOVING_TO_SAFE_BYPASS_POSITION"
+            )
+            self._nav_debug(
+                "DYNAMIC_LOCAL_BYPASS",
+                result="ACTIVE_RELOCATION_REQUESTED",
+                attempt_count=self.dynamic_replan_attempt_count,
+                preferred_action="REVERSE_IF_FRONT_BLOCKED",
+                destination=goal,
+                destination_preserved=True,
+            )
+            self._start_turn_bay_recovery(
+                dict(self.pose), expected_generation
+            )
+            return
+        self._set_dynamic_blocked_no_route(
+            "NO_SAFE_LOCAL_BYPASS_OR_ALTERNATIVE",
+            goal,
         )
 
     def _attempt_dynamic_replan(
@@ -12342,7 +12660,8 @@ class NavigationAdapter(Node):
                 )
                 return
             digest = candidate_signature[:10]
-            route_id = f"{self.execution_route_id}-dynamic-{digest}"
+            route_root = self.execution_route_id.split("-dynamic-", 1)[0]
+            route_id = f"{route_root}-dynamic-{digest}"
             if self.pending_start_escape is not None:
                 self.route_candidates[route_id] = {
                     "route_id": route_id,
@@ -12925,6 +13244,7 @@ class NavigationAdapter(Node):
                 self.selected_route_id = ""
                 self.current_mission_id = ""
                 self.route_selection_return_state = "READY"
+                self.dynamic_route_selection_deadline_monotonic = 0.0
                 self.latest_global_path = []
                 self.visualization_revision += 1
         if target == "PAUSED" and preserved_goal:
@@ -13128,9 +13448,36 @@ class NavigationAdapter(Node):
             },
         )
 
-    def _start_selected_route(self, route_id: str) -> dict[str, Any]:
-        candidate = self.route_candidates.get(route_id)
-        if candidate is None or self.paused_goal is None:
+    def _start_selected_route(
+        self,
+        route_id: str,
+        *,
+        choice: str = "USER",
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
+        with self.state_lock:
+            if self.current_state != "ROUTE_SELECTION":
+                raise AdapterError(
+                    "STATE_CONFLICT",
+                    "Route selection is no longer active",
+                )
+            selection_generation = (
+                self.navigation_goal_generation
+                if expected_generation is None
+                else expected_generation
+            )
+            candidate = self.route_candidates.get(route_id)
+            goal = dict(self.paused_goal or {})
+            dynamic_recovery_route = bool(
+                candidate is not None
+                and (
+                    candidate.get("recovery_route_kind")
+                    == "GLOBAL_ALTERNATIVE"
+                    or self.route_selection_return_state
+                    == "WAITING_FOR_DYNAMIC_CLEAR"
+                )
+            )
+        if candidate is None or not goal:
             raise AdapterError("ROUTE_NOT_FOUND", "Selected route is no longer available")
         points = list(candidate["points"])
         segment_directions = list(
@@ -13149,16 +13496,27 @@ class NavigationAdapter(Node):
                 "ROUTE_INVALIDATED",
                 "Selected route is no longer clear; choose another route",
             )
-        self._nav_debug("ROUTE_SELECTED", route_id=route_id, choice="USER")
-        return self._navigate(
-            dict(self.paused_goal),
+        self._nav_debug("ROUTE_SELECTED", route_id=route_id, choice=choice)
+        result = self._navigate(
+            goal,
             {
                 "map_id": self.map_id,
                 "version": self.map_version,
+                "mission_id": self.current_mission_id,
                 "route_id": route_id,
                 "points": points,
+                "segment_directions": segment_directions,
             },
+            recovery_attempt=dynamic_recovery_route,
+            expected_generation=selection_generation,
         )
+        self.dynamic_route_selection_deadline_monotonic = 0.0
+        if dynamic_recovery_route:
+            self._reset_dynamic_recovery()
+            self.execution_replan_attempts = 0
+        self.route_candidates = {}
+        self.selected_route_id = route_id
+        return result
 
     def _mapping_command(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
         if self.mode != "MAPPING":

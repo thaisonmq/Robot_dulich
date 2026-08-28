@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, Globe2, Search, X } from "lucide-react";
+import { Check, ChevronDown, Search, X } from "lucide-react";
 import {
-  getLanguage, LANGUAGE_OPTIONS, normalizeLanguageSearch,
+  getLanguage, getLanguageDisplayName, LANGUAGE_OPTIONS, normalizeLanguageSearch,
 } from "../data/languages";
 import { useI18n } from "../i18n/I18nProvider";
 
@@ -17,20 +17,21 @@ function showNativeLabel(language: { label: string; nativeLabel: string }): bool
 }
 
 export function LanguageSelect({ value, onChange, compact = false }: LanguageSelectProps) {
-  const { t } = useI18n();
+  const { language: interfaceLanguage, t } = useI18n();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const selected = getLanguage(value);
+  const selectedLabel = getLanguageDisplayName(selected.code, interfaceLanguage);
 
   const filteredLanguages = useMemo(() => {
     const normalizedQuery = normalizeLanguageSearch(query);
     if (!normalizedQuery) return LANGUAGE_OPTIONS;
     return LANGUAGE_OPTIONS.filter((language) => normalizeLanguageSearch(
-      `${language.label} ${language.nativeLabel} ${language.code}`,
+      `${language.label} ${language.nativeLabel} ${getLanguageDisplayName(language.code, interfaceLanguage)} ${language.code}`,
     ).includes(normalizedQuery));
-  }, [query]);
+  }, [interfaceLanguage, query]);
 
   useEffect(() => {
     if (!open) return;
@@ -66,10 +67,10 @@ export function LanguageSelect({ value, onChange, compact = false }: LanguageSel
           }
         }}
       >
-        <Globe2 size={18} />
+        <span className="language-select__flag" aria-hidden="true">{selected.flag}</span>
         <span>
-          <strong>{selected.label}</strong>
-          {showNativeLabel(selected) && <small>{selected.nativeLabel}</small>}
+          <strong>{selectedLabel}</strong>
+          {selected.nativeLabel !== selectedLabel && <small>{selected.nativeLabel}</small>}
         </span>
         <ChevronDown size={16} className={open ? "is-open" : ""} />
       </button>
@@ -111,9 +112,11 @@ export function LanguageSelect({ value, onChange, compact = false }: LanguageSel
                 key={language.code}
                 onClick={() => selectLanguage(language.code)}
               >
+                <span className="language-select__flag" aria-hidden="true">{language.flag}</span>
                 <span>
-                  <strong>{language.label}</strong>
-                  {showNativeLabel(language) && <small>{language.nativeLabel}</small>}
+                  <strong>{getLanguageDisplayName(language.code, interfaceLanguage)}</strong>
+                  {language.nativeLabel !== getLanguageDisplayName(language.code, interfaceLanguage)
+                    && showNativeLabel(language) && <small>{language.nativeLabel}</small>}
                 </span>
                 <code>{language.code.toUpperCase()}</code>
                 {language.code === value && <Check size={15} />}

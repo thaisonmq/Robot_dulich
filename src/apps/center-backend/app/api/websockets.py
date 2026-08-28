@@ -90,9 +90,14 @@ def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict)
                 cache.status = str(payload.get("status", cache.status)).upper()
                 cache.progress_percent = float(payload.get("progress_percent", cache.progress_percent))
                 cache.error_message = payload.get("error_message")
-        elif message_type in {"navigation.status", "navigation.result"}:
+        elif message_type in {"navigation.status", "navigation.result", "robot.health"}:
             runtime_mode = str(payload.get("mode", "")).upper()
-            runtime_state = str(payload.get("state") or payload.get("status") or "").upper()
+            runtime_state = str(
+                payload.get("state")
+                or payload.get("map_state")
+                or payload.get("status")
+                or ""
+            ).upper()
             if runtime_mode == "MAPPING" and runtime_state in {
                 "IDLE",
                 "MAPPING_STARTING",
@@ -147,7 +152,7 @@ def persist_robot_runtime_event(robot_id: str, message_type: str, payload: dict)
             mission_id = str(payload.get("mission_id", ""))
             mission = database.get(NavigationMission, mission_id) if mission_id else None
             if mission is not None and mission.robot_id == robot_id:
-                status_value = str(payload.get("state") or payload.get("status") or mission.status).upper()
+                status_value = runtime_state or str(mission.status).upper()
                 status_value = {
                     "MOVING": "NAVIGATING",
                     "CANCELLED": "CANCELED",
@@ -279,6 +284,7 @@ async def robot_gateway(socket: WebSocket, settings: Settings = Depends(get_sett
                 "map.cache.state",
                 "navigation.status",
                 "navigation.result",
+                "robot.health",
             }:
                 persist_robot_runtime_event(robot_id, message.message_type, message.payload)
             if message.message_type != "robot.heartbeat":

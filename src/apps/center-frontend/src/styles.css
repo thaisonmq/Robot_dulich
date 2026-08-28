@@ -665,7 +665,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   z-index: 12;
   min-width: 0;
   min-height: 40px;
-  padding: 4px 5px 4px 10px;
+  padding: 3px;
   display: flex;
   align-items: center;
   gap: 7px;
@@ -674,16 +674,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   border: 1px solid var(--line);
   border-radius: 9px;
 }
-.global-language-select > svg { flex: 0 0 auto; color: var(--blue); }
-.global-language-select > span {
-  font-size: 8px;
-  font-weight: 750;
-  letter-spacing: .04em;
-}
-.global-language-select .language-select { width: 142px; }
+.global-language-select > svg,
+.global-language-select > span { display: none; }
+.global-language-select .language-select { width: 112px; }
 .global-language-select .language-select__trigger {
   min-height: 30px;
-  padding: 3px 6px 3px 8px;
+  padding: 3px 5px;
   color: var(--ink);
   background: #fff;
   border-color: var(--line-dark);
@@ -1308,16 +1304,16 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   border-radius: 10px;
 }
 .configuration-tabs button {
-  min-height: 42px;
+  min-height: 40px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
+  gap: 6px;
   color: var(--muted);
   background: transparent;
   border: 0;
   border-radius: 7px;
-  font-size: 12px;
+  font-size: 9px;
   font-weight: 750;
   cursor: pointer;
   transition: color .18s, background .18s, box-shadow .18s;
@@ -1379,6 +1375,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 }
 .config-field input:focus, .config-field select:focus { background: #fff; border-color: var(--blue); box-shadow: 0 0 0 4px rgba(23,89,214,.08); }
 .config-field small { color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.4; }
+.configuration-form .button {
+  min-height: 40px;
+  padding-inline: 13px;
+  gap: 7px;
+  font-size: 9px;
+}
 .source-picker {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -1397,7 +1399,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   background: var(--blue);
   border: 1px solid var(--blue);
   border-radius: 9px;
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 750;
   cursor: pointer;
   transition: background .2s, border-color .2s, box-shadow .2s, transform .2s;
@@ -1773,11 +1775,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .configuration-error p { margin: 0 0 18px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .configuration-actions {
   margin-top: auto;
-  padding-top: 22px;
+  padding-top: 18px;
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 10px;
+  gap: 8px;
   border-top: 1px solid var(--line);
 }
 .configuration-actions > span {
@@ -1786,7 +1788,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   align-items: center;
   gap: 7px;
   color: var(--green);
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 700;
 }
 
@@ -2375,6 +2377,19 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .language-select__trigger > svg:last-child { color: #8998ad; transition: transform .2s; }
 .language-select__trigger > svg.is-open { transform: rotate(180deg); }
 .language-select__trigger > span { min-width: 0; display: grid; }
+.language-select__flag {
+  width: 22px;
+  height: 17px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  overflow: hidden;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+  font-size: 16px;
+  line-height: 1;
+  filter: saturate(.92);
+}
+.language-select.is-compact .language-select__trigger small { display: none; }
 .language-select__trigger strong {
   overflow: hidden;
   font-size: 9px;
@@ -2393,7 +2408,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   z-index: 7;
   left: -7px;
   bottom: calc(100% + 10px);
-  width: min(330px, calc(100vw - 48px));
+  width: min(270px, calc(100vw - 48px));
   padding: 7px;
   color: var(--ink);
   background: rgba(250, 251, 253, .98);
@@ -2470,7 +2485,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
   min-height: 42px;
   padding: 5px 8px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto 17px;
+  grid-template-columns: 22px minmax(0, 1fr) auto 17px;
   align-items: center;
   gap: 8px;
   color: var(--ink);

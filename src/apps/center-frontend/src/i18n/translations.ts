@@ -6,6 +6,15 @@ import korean from "./locales/ko.json";
 import russian from "./locales/ru.json";
 import thai from "./locales/th.json";
 import chinese from "./locales/zh.json";
+import recentGerman from "./locales/recent/de.json";
+import recentEnglish from "./locales/recent/en.json";
+import recentSpanish from "./locales/recent/es.json";
+import recentFrench from "./locales/recent/fr.json";
+import recentJapanese from "./locales/recent/ja.json";
+import recentKorean from "./locales/recent/ko.json";
+import recentRussian from "./locales/recent/ru.json";
+import recentThai from "./locales/recent/th.json";
+import recentChinese from "./locales/recent/zh.json";
 import { MAP_TRANSLATIONS } from "./mapTranslations";
 
 export type TranslationVariables = Record<string, string | number>;
@@ -856,19 +865,31 @@ const JAPANESE: Record<string, string> = {
   "Ảnh kiểm thử tự động": "自動テストパターン",
 };
 
-const ENGLISH_CATALOGUE = { ...MAP_TRANSLATIONS.en, ...ENGLISH };
+const ENGLISH_CATALOGUE: Record<string, string> = {
+  ...MAP_TRANSLATIONS.en,
+  ...ENGLISH,
+  ...recentEnglish,
+};
 
 const CATALOGUES: Record<string, Record<string, string>> = {
-  de: { ...MAP_TRANSLATIONS.de, ...german },
+  de: { ...MAP_TRANSLATIONS.de, ...german, ...recentGerman },
   en: ENGLISH_CATALOGUE,
-  es: { ...MAP_TRANSLATIONS.es, ...spanish },
-  fr: { ...MAP_TRANSLATIONS.fr, ...french },
-  ja: { ...MAP_TRANSLATIONS.ja, ...generatedJapanese, ...JAPANESE },
-  ko: { ...MAP_TRANSLATIONS.ko, ...korean },
-  ru: { ...MAP_TRANSLATIONS.ru, ...russian },
-  th: { ...MAP_TRANSLATIONS.th, ...thai },
-  zh: { ...MAP_TRANSLATIONS.zh, ...chinese },
+  es: { ...MAP_TRANSLATIONS.es, ...spanish, ...recentSpanish },
+  fr: { ...MAP_TRANSLATIONS.fr, ...french, ...recentFrench },
+  ja: { ...MAP_TRANSLATIONS.ja, ...generatedJapanese, ...JAPANESE, ...recentJapanese },
+  ko: { ...MAP_TRANSLATIONS.ko, ...korean, ...recentKorean },
+  ru: { ...MAP_TRANSLATIONS.ru, ...russian, ...recentRussian },
+  th: { ...MAP_TRANSLATIONS.th, ...thai, ...recentThai },
+  zh: { ...MAP_TRANSLATIONS.zh, ...chinese, ...recentChinese },
 };
+
+export function hasTranslation(language: string, source: string): boolean {
+  if (language === "vi") return true;
+  return Object.prototype.hasOwnProperty.call(
+    CATALOGUES[language] ?? {},
+    source,
+  );
+}
 
 export function translate(
   language: string,

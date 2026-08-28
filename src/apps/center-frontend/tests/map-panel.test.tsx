@@ -333,9 +333,11 @@ describe("MapPanel navigation controls", () => {
     const onSelect = vi.fn();
     panel({ onSelect, allowCustomDestination: false });
 
+    expect(screen.queryByRole("button", { name: "Chọn Lobby" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Điểm đến đã lưu/ }));
     const dialog = screen.getByRole("dialog", { name: "Chọn điểm đến" });
     expect(within(dialog).getByText("Điểm đã lưu")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Chọn Lobby" })).toBeInTheDocument();
     fireEvent.click(within(within(dialog).getByRole("list"))
       .getByRole("button", { name: /Lobby/ }));
 
@@ -504,18 +506,19 @@ describe("MapPanel navigation controls", () => {
     expect(screen.queryByRole("button", { name: "Chọn điểm đến" })).not.toBeInTheDocument();
   });
 
-  it("requires confirmation before using a different obstacle-recovery route", () => {
+  it("offers alternate routes for 10 seconds before auto-selecting the shortest", () => {
     const onSelectRoute = vi.fn();
     const onConfirmRoute = vi.fn();
-    const onBackRouteSelection = vi.fn();
+    const onCancel = vi.fn();
     panel({
       localized: true,
       localizationState: "READY",
       mapState: "ROUTE_SELECTION",
       navigationStatus: "route_selection",
       feedback: {
-        recovery_reason: "USER_ROUTE_CONFIRMATION_REQUIRED",
+        recovery_reason: "ALTERNATIVE_ROUTE_SELECTION_COUNTDOWN",
         destination_preserved: true,
+        route_selection_seconds_remaining: 10,
       },
       routeCandidates: [
         {
@@ -548,21 +551,51 @@ describe("MapPanel navigation controls", () => {
       selectedRouteId: "alternative-a",
       onSelectRoute,
       onConfirmRoute,
-      onBackRouteSelection,
+      onCancel,
     });
 
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Đường cũ không còn khoảng trống đủ an toàn để đi tiếp.",
     );
     expect(screen.getByRole("alert")).toHaveTextContent(
-      "robot chỉ bắt đầu sau khi bạn nhấn “Đi theo tuyến này”",
+      "robot sẽ tự đi tuyến ngắn nhất sau 10 giây",
     );
     fireEvent.click(screen.getByText("Tuyến 2"));
     expect(onSelectRoute).toHaveBeenCalledWith("alternative-b");
     fireEvent.click(screen.getByRole("button", { name: "Đi theo tuyến này" }));
     expect(onConfirmRoute).toHaveBeenCalledOnce();
-    fireEvent.click(screen.getByRole("button", { name: "Tiếp tục chờ đường cũ" }));
+    fireEvent.click(screen.getByRole("button", { name: "Hủy, không đi" }));
+    expect(onCancel).toHaveBeenCalledOnce();
+  });
+
+  it("returns from an explicit alternative search to the destination picker", async () => {
+    const onBackRouteSelection = vi.fn().mockResolvedValue(undefined);
+    panel({
+      localized: true,
+      localizationState: "READY",
+      mapState: "ROUTE_SELECTION",
+      navigationStatus: "route_selection",
+      routeCandidates: [{
+        route_id: "alternative-a",
+        points: [{ x: 0, y: 0 }, { x: 1, y: 1 }],
+        total_length: 1.5,
+        estimated_time: 20,
+        minimum_clearance: 0.1,
+        narrow_segments: 0,
+        overlap_with_original: 0.2,
+        valid: true,
+        recommended: true,
+      }],
+      selectedRouteId: "alternative-a",
+      onBackRouteSelection,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Quay lại" }));
+
     expect(onBackRouteSelection).toHaveBeenCalledOnce();
+    expect(await screen.findByRole("dialog", { name: "Chọn điểm đến" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Đóng danh sách điểm đến" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   });
 
   it("shows a blocking progress state while a safe route is being computed", () => {
