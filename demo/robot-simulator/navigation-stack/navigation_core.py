@@ -4148,6 +4148,10 @@ class StopTurnStateLatticePlanner:
         points = [dict(point) for point in baseline.points]
         if len(points) < 4:
             return None
+        directions = tuple(
+            baseline.segment_directions
+            or (1 for _ in range(len(points) - 1))
+        )
         required_side_clearance = max(
             0.0,
             float(minimum_center_clearance)
@@ -4156,6 +4160,22 @@ class StopTurnStateLatticePlanner:
         )
         best: StopTurnRoute | None = None
         for first_removed in range(1, len(points) - 2):
+            local_directions = directions[
+                first_removed - 1:first_removed + 2
+            ]
+            # Replacing two waypoints by one must not erase a real
+            # forward/reverse boundary. In particular, preserve the initial
+            # reverse escape and only simplify the forward route after its
+            # turn bay.
+            if len(set(local_directions)) != 1:
+                continue
+            replacement_direction = local_directions[0]
+            candidate_directions = (
+                *directions[:first_removed - 1],
+                replacement_direction,
+                replacement_direction,
+                *directions[first_removed + 2:],
+            )
             left = points[first_removed - 1]
             right = points[first_removed + 2]
             visible_replacements: list[tuple[float, dict[str, float]]] = []
@@ -4232,20 +4252,271 @@ class StopTurnStateLatticePlanner:
                     candidate,
                     start_yaw=start_yaw,
                     goal_yaw=goal_yaw,
+                    segment_directions=candidate_directions,
+                    allow_initial_reverse_clearance_recovery=(
+                        baseline.initial_reverse_clearance_recovery
+                    ),
                 )
+                clearance_result = result
+                if (
+                    result is not None
+                    and result.initial_reverse_clearance_recovery
+                ):
+                    first_travel_yaw = math.atan2(
+                        candidate[1]["y"] - candidate[0]["y"],
+                        candidate[1]["x"] - candidate[0]["x"],
+                    )
+                    first_chassis_yaw = _angle_delta(
+                        first_travel_yaw
+                        + (
+                            math.pi
+                            if candidate_directions[0] < 0
+                            else 0.0
+                        ),
+                        0.0,
+                    )
+                    # The bounded initial escape is intentionally allowed to
+                    # start below the request-local side reserve. Measure the
+                    # clearance band only after that escape; _route_result()
+                    # already proved that the first segment is physically
+                    # clear and the bay recovers the full hard margin.
+                    clearance_result = self._route_result(
+                        candidate[1:],
+                        start_yaw=first_chassis_yaw,
+                        goal_yaw=goal_yaw,
+                        segment_directions=candidate_directions[1:],
+                    )
                 if (
                     result is None
+                    or clearance_result is None
                     or result.metadata.turn_count
                     >= baseline.metadata.turn_count
                     or result.metadata.total_length
                     > float(maximum_total_length) + 1e-9
-                    or result.metadata.minimum_side_clearance + 1e-9
+                    or clearance_result.metadata.minimum_side_clearance + 1e-9
                     < required_side_clearance
                 ):
                     continue
                 if best is None or self.ranking_key(result) < self.ranking_key(best):
                     best = result
         return best
+
+    def _has_short_shallow_corner_pair(
+        self,
+        route: StopTurnRoute,
+    ) -> bool:
+        """Return whether one short segment causes two small stop-turns."""
+        points = list(route.points)
+        if len(points) < 4:
+            return False
+        directions = tuple(
+            route.segment_directions
+            or (1 for _ in range(len(points) - 1))
+        )
+        headings = []
+        for direction, (left, right) in zip(
+            directions, zip(points, points[1:])
+        ):
+            heading = math.atan2(
+                float(right["y"]) - float(left["y"]),
+                float(right["x"]) - float(left["x"]),
+            )
+            headings.append(
+                _angle_delta(
+                    heading + (math.pi if direction < 0 else 0.0),
+                    0.0,
+                )
+            )
+        maximum_middle_length = max(
+            0.20, 2.0 * (self.half_length + self.padding)
+        )
+        maximum_shallow_turn = math.radians(30.0)
+        for middle_segment in range(1, len(points) - 2):
+            if len(set(directions[
+                middle_segment - 1:middle_segment + 2
+            ])) != 1:
+                continue
+            middle_length = math.hypot(
+                float(points[middle_segment + 1]["x"])
+                - float(points[middle_segment]["x"]),
+                float(points[middle_segment + 1]["y"])
+                - float(points[middle_segment]["y"]),
+            )
+            incoming_turn = abs(_angle_delta(
+                headings[middle_segment], headings[middle_segment - 1]
+            ))
+            outgoing_turn = abs(_angle_delta(
+                headings[middle_segment + 1], headings[middle_segment]
+            ))
+            if (
+                middle_length <= maximum_middle_length + 1e-9
+                and STOP_TURN_ANGLE_TOLERANCE < incoming_turn
+                and incoming_turn + 1e-9 < maximum_shallow_turn
+                and STOP_TURN_ANGLE_TOLERANCE < outgoing_turn
+                and outgoing_turn + 1e-9 < maximum_shallow_turn
+            ):
+                return True
+        return False
+
+    def _straight_axis_detour_candidate(
+        self,
+        baseline: StopTurnRoute,
+        exclusions: tuple[tuple[float, float, float], ...],
+        *,
+        start_yaw: float,
+        goal_yaw: float | None,
+        deadline_monotonic: float | None,
+    ) -> StopTurnRoute | None:
+        """Replace a heading-lattice staircase by long straight aisles.
+
+        A bounded lattice fallback can approximate one obstacle detour with
+        many 15-degree segments. That geometry looks like a broad curve and
+        is a poor fit for a stop-turn chassis. Reuse an already exact-valid
+        entry waypoint, then try axis-aligned trunks through levels observed
+        on the safe baseline. Exact footprint and rotation validation remains
+        authoritative, and the detour may add at most one body length.
+        """
+        points = [dict(point) for point in baseline.points]
+        directions = tuple(
+            baseline.segment_directions
+            or (1 for _ in range(max(0, len(points) - 1)))
+        )
+        if (
+            len(points) < 6
+            or self._route_internal_turn_count(baseline) < 4
+            or not directions
+            or any(direction < 0 for direction in directions)
+        ):
+            return None
+        maximum_total_length = baseline.metadata.total_length + 2.0 * (
+            self.half_length + self.padding
+        )
+        best: StopTurnRoute | None = None
+        maximum_entry_index = min(4, len(points) - 3)
+        goal = points[-1]
+        interior = points[2:-1]
+        quantum = max(1e-6, self.saved_map.resolution / 2.0)
+
+        def prioritized_levels(axis: str) -> list[float]:
+            counts: dict[int, int] = {}
+            first_value: dict[int, float] = {}
+            for point in interior:
+                value = float(point[axis])
+                key = round(value / quantum)
+                counts[key] = counts.get(key, 0) + 1
+                first_value.setdefault(key, value)
+            return [
+                first_value[key]
+                for key in sorted(
+                    counts,
+                    key=lambda item: (-counts[item], item),
+                )
+            ]
+
+        horizontal_levels = prioritized_levels("y")
+        vertical_levels = prioritized_levels("x")
+        level_count = max(len(horizontal_levels), len(vertical_levels))
+        for level_index in range(level_count):
+            proposals: list[tuple[int, list[dict[str, float]]]] = []
+            for entry_index in range(1, maximum_entry_index + 1):
+                entry = points[entry_index]
+                prefix = points[: entry_index + 1]
+                if level_index < len(horizontal_levels):
+                    level_y = horizontal_levels[level_index]
+                    proposals.append((entry_index, [
+                        *prefix,
+                        {"x": float(entry["x"]), "y": level_y},
+                        {"x": float(goal["x"]), "y": level_y},
+                        dict(goal),
+                    ]))
+                if level_index < len(vertical_levels):
+                    level_x = vertical_levels[level_index]
+                    proposals.append((entry_index, [
+                        *prefix,
+                        {"x": level_x, "y": float(entry["y"])},
+                        {"x": level_x, "y": float(goal["y"])},
+                        dict(goal),
+                    ]))
+            for _, proposed in proposals:
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    return best
+                candidate = canonicalize_stop_turn_path(proposed)
+                if (
+                    len(candidate) < 2
+                    or candidate[0] != points[0]
+                    or candidate[-1] != points[-1]
+                    or any(
+                        self._segment_excluded(left, right, exclusions)
+                        for left, right in zip(candidate, candidate[1:])
+                    )
+                ):
+                    continue
+                result = self._route_result(
+                    candidate,
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                    segment_directions=tuple(
+                        1 for _ in range(len(candidate) - 1)
+                    ),
+                )
+                if (
+                    result is None
+                    or self._route_internal_turn_count(result)
+                    >= self._route_internal_turn_count(baseline)
+                    or result.metadata.total_length
+                    > maximum_total_length + 1e-9
+                ):
+                    continue
+                if (
+                    best is None
+                    or self.ranking_key(result) < self.ranking_key(best)
+                ):
+                    best = result
+        return best
+
+    def _reduce_shallow_route_corners(
+        self,
+        baseline: StopTurnRoute,
+        exclusions: tuple[tuple[float, float, float], ...],
+        *,
+        start_yaw: float,
+        goal_yaw: float | None,
+        deadline_monotonic: float | None,
+    ) -> StopTurnRoute | None:
+        """Remove bounded short/shallow stop-turn pairs before execution."""
+        if not self._has_short_shallow_corner_pair(baseline):
+            return None
+        maximum_total_length = baseline.metadata.total_length + 2.0 * (
+            self.half_length + self.padding
+        )
+        minimum_center_clearance = (
+            self.half_width + self.padding + self.hard_side_margin
+        )
+        current = baseline
+        changed = False
+        while self._has_short_shallow_corner_pair(current):
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                break
+            reduced = self._reduce_one_route_corner(
+                current,
+                exclusions,
+                maximum_total_length=maximum_total_length,
+                minimum_center_clearance=minimum_center_clearance,
+                start_yaw=start_yaw,
+                goal_yaw=goal_yaw,
+                deadline_monotonic=deadline_monotonic,
+            )
+            if reduced is None:
+                break
+            current = reduced
+            changed = True
+        return current if changed else None
 
     def _canonical_route_from_seed(
         self,
@@ -4822,6 +5093,82 @@ class StopTurnStateLatticePlanner:
             ]
             return None if not compliant else min(compliant, key=self.ranking_key)
 
+        def refined_best_executable_policy_candidate() -> StopTurnRoute | None:
+            selected = best_executable_policy_candidate()
+            if selected is None:
+                return selected
+            has_shallow_pair = self._has_short_shallow_corner_pair(selected)
+            has_heading_staircase = (
+                self._route_internal_turn_count(selected) >= 4
+            )
+            if not has_shallow_pair and not has_heading_staircase:
+                return selected
+            refinement_started = time.monotonic()
+            # Leave headroom for one in-flight swept-footprint validation,
+            # which cannot be interrupted between deadline checks.
+            refinement_deadline = refinement_started + 0.20
+            if deadline_monotonic is not None:
+                refinement_deadline = min(
+                    refinement_deadline, deadline_monotonic
+                )
+            if refinement_deadline <= refinement_started:
+                return selected
+            original_turns = self._route_internal_turn_count(selected)
+            if has_heading_staircase:
+                self._last_plan_diagnostics["straightening_attempted"] = True
+                straightened = self._straight_axis_detour_candidate(
+                    selected,
+                    forbidden,
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                    deadline_monotonic=refinement_deadline,
+                )
+                if straightened is not None:
+                    candidate_pool.append(straightened)
+                    selected = (
+                        best_executable_policy_candidate() or selected
+                    )
+                self._last_plan_diagnostics["straightening_applied"] = (
+                    self._route_internal_turn_count(selected) < original_turns
+                )
+
+            if (
+                time.monotonic() < refinement_deadline
+                and self._has_short_shallow_corner_pair(selected)
+            ):
+                self._last_plan_diagnostics["corner_reduction_attempted"] = True
+                before_reduction_turns = self._route_internal_turn_count(
+                    selected
+                )
+                reduced = self._reduce_shallow_route_corners(
+                    selected,
+                    forbidden,
+                    start_yaw=start_yaw,
+                    goal_yaw=goal_yaw,
+                    deadline_monotonic=refinement_deadline,
+                )
+                if reduced is not None:
+                    candidate_pool.append(reduced)
+                    selected = (
+                        best_executable_policy_candidate() or selected
+                    )
+                self._last_plan_diagnostics.update({
+                    "corner_reduction_applied": (
+                        self._route_internal_turn_count(selected)
+                        < before_reduction_turns
+                    ),
+                    "corner_reduction_original_turns": (
+                        before_reduction_turns
+                    ),
+                    "corner_reduction_selected_turns": (
+                        self._route_internal_turn_count(selected)
+                    ),
+                })
+            self._last_plan_diagnostics["route_refinement_elapsed_ms"] = round(
+                (time.monotonic() - refinement_started) * 1000.0, 3
+            )
+            return selected
+
         if not self._segment_excluded(direct_points[0], direct_points[1], forbidden):
             direct_candidates = [
                 result
@@ -5163,7 +5510,7 @@ class StopTurnStateLatticePlanner:
         )
         if visibility_result is not None:
             candidate_pool.append(visibility_result)
-            selected = best_executable_policy_candidate()
+            selected = refined_best_executable_policy_candidate()
             if selected is not None:
                 self._last_plan_expansions = int(
                     getattr(self, "_last_visibility_expansions", 0)
@@ -5194,7 +5541,7 @@ class StopTurnStateLatticePlanner:
             )
         if turn_bay_result is not None:
             candidate_pool.append(turn_bay_result)
-            selected = best_executable_policy_candidate()
+            selected = refined_best_executable_policy_candidate()
             if selected is not None:
                 self._complete_plan_diagnostics(
                     selected,
@@ -5208,7 +5555,7 @@ class StopTurnStateLatticePlanner:
         ):
             if not candidate_pool:
                 self._last_plan_limit = "SEARCH_TIME_BUDGET_EXCEEDED"
-            selected = best_executable_policy_candidate()
+            selected = refined_best_executable_policy_candidate()
             self._complete_plan_diagnostics(
                 selected,
                 candidate_count=len(candidate_pool),
@@ -5469,7 +5816,7 @@ class StopTurnStateLatticePlanner:
                             lattice_results.append(lattice_result)
                     if lattice_results:
                         candidate_pool.extend(lattice_results)
-                        selected = best_executable_policy_candidate()
+                        selected = refined_best_executable_policy_candidate()
                         if selected is not None:
                             self._complete_plan_diagnostics(
                                 selected,
@@ -5581,7 +5928,7 @@ class StopTurnStateLatticePlanner:
             and time.monotonic() >= deadline_monotonic
         ):
             self._last_plan_limit = "SEARCH_TIME_BUDGET_EXCEEDED"
-        selected = best_executable_policy_candidate()
+        selected = refined_best_executable_policy_candidate()
         self._complete_plan_diagnostics(
             selected,
             candidate_count=len(candidate_pool),

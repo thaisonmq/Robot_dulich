@@ -74,7 +74,13 @@ export function useTeleoperation() {
 
   useEffect(() => {
     const unsubscribe = manager.subscribe(setInputState);
-    const detach = new KeyboardInputAdapter(manager).attach();
+    // DashboardPage is the only screen where keyboard driving is valid. Keep
+    // an explicit route guard as well so a delayed React unmount cannot capture
+    // typing after navigation to another part of the web app.
+    const detach = new KeyboardInputAdapter(
+      manager,
+      () => /^\/control\/[^/]+$/.test(window.location.pathname),
+    ).attach();
     return () => {
       detach();
       unsubscribe();

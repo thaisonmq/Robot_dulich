@@ -3044,6 +3044,121 @@ def test_adjacent_shallow_corners_can_move_to_one_safe_waypoint() -> None:
     assert reduced.metadata.total_length <= baseline.metadata.total_length + 0.30
 
 
+def test_shallow_corner_reduction_preserves_initial_reverse_escape() -> None:
+    saved = _manual_map(60, 60, _free_rectangle(2, 57, 2, 57))
+    planner = StopTurnStateLatticePlanner(
+        saved,
+        saved.navigation_geometry,
+        hard_side_margin=0.02,
+    )
+    points = [
+        {"x": 0.40, "y": 0.40},
+        {"x": 0.70, "y": 0.40},
+        {"x": 1.00, "y": 0.80},
+        {"x": 1.40, "y": 0.80},
+        {"x": 1.55, "y": 0.75},
+        {"x": 1.85, "y": 0.55},
+    ]
+    baseline = planner._route_result(
+        points,
+        start_yaw=math.pi,
+        segment_directions=(-1, 1, 1, 1, 1),
+        allow_initial_reverse_clearance_recovery=True,
+    )
+
+    assert baseline is not None
+    assert planner._has_short_shallow_corner_pair(baseline)
+    reduced = planner._reduce_shallow_route_corners(
+        baseline,
+        (),
+        start_yaw=math.pi,
+        goal_yaw=None,
+        deadline_monotonic=None,
+    )
+
+    assert reduced is not None
+    assert reduced.points[0] == baseline.points[0]
+    assert reduced.points[-1] == baseline.points[-1]
+    assert reduced.segment_directions[0] == -1
+    assert all(direction > 0 for direction in reduced.segment_directions[1:])
+    assert reduced.initial_reverse_clearance_recovery
+    assert (
+        planner._route_internal_turn_count(reduced)
+        < planner._route_internal_turn_count(baseline)
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_turn_degrees", "expected"),
+    ((29.0, True), (30.0, False)),
+)
+def test_only_turns_strictly_below_thirty_degrees_are_shallow(
+    first_turn_degrees: float,
+    expected: bool,
+) -> None:
+    saved = _manual_map(60, 60, _free_rectangle(2, 57, 2, 57))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    first_turn = math.radians(first_turn_degrees)
+    final_heading = math.radians(45.0)
+    points = [
+        {"x": 0.50, "y": 0.50},
+        {"x": 0.90, "y": 0.50},
+        {
+            "x": 0.90 + 0.20 * math.cos(first_turn),
+            "y": 0.50 + 0.20 * math.sin(first_turn),
+        },
+        {
+            "x": (
+                0.90
+                + 0.20 * math.cos(first_turn)
+                + 0.40 * math.cos(final_heading)
+            ),
+            "y": (
+                0.50
+                + 0.20 * math.sin(first_turn)
+                + 0.40 * math.sin(final_heading)
+            ),
+        },
+    ]
+    route = planner._route_result(points, start_yaw=0.0)
+
+    assert route is not None
+    assert planner._has_short_shallow_corner_pair(route) is expected
+
+
+def test_axis_straightening_replaces_heading_lattice_staircase() -> None:
+    saved = _manual_map(60, 60, _free_rectangle(2, 57, 2, 57))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    points = [
+        {"x": 0.50, "y": 0.50},
+        {"x": 0.80, "y": 0.60},
+        {"x": 0.80, "y": 0.90},
+        {"x": 1.00, "y": 1.10},
+        {"x": 0.70, "y": 1.30},
+        {"x": 1.50, "y": 1.50},
+        {"x": 1.80, "y": 1.80},
+    ]
+    start_yaw = math.atan2(0.10, 0.30)
+    baseline = planner._route_result(points, start_yaw=start_yaw)
+
+    assert baseline is not None
+    straightened = planner._straight_axis_detour_candidate(
+        baseline,
+        (),
+        start_yaw=start_yaw,
+        goal_yaw=None,
+        deadline_monotonic=None,
+    )
+
+    assert straightened is not None
+    assert (
+        planner._route_internal_turn_count(straightened)
+        < planner._route_internal_turn_count(baseline)
+    )
+    assert straightened.metadata.total_length <= baseline.metadata.total_length + 0.30
+    assert all(direction > 0 for direction in straightened.segment_directions)
+
+
 def test_equally_safe_direct_candidate_wins_by_using_fewer_turns(
     monkeypatch,
 ) -> None:

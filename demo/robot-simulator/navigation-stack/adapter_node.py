@@ -436,7 +436,6 @@ class NavigationAdapter(Node):
         self.verification_started_monotonic = 0.0
         self.ready_evidence_since: float | None = None
         self.ready_evidence_invalid_since: float | None = None
-        self.execution_scan_map_mismatch_since: float | None = None
         self.laser_in_base: tuple[float, float, float] | None = None
         self.low_confidence_since: float | None = None
         self.last_nomotion_request_monotonic = 0.0
@@ -501,9 +500,6 @@ class NavigationAdapter(Node):
         self.localization_low_grace = configured(
             "localization_low_confidence_grace_seconds", 5.0,
             "LOCALIZATION_LOW_CONFIDENCE_GRACE_SECONDS",
-        )
-        self.execution_scan_map_mismatch_confirmation = configured(
-            "execution_scan_map_mismatch_confirmation_seconds", 0.50
         )
         self.localization_ready_hold = configured(
             "localization_ready_hold_seconds", 2.0
@@ -7336,62 +7332,14 @@ class NavigationAdapter(Node):
         self._refresh_localization_confidence()
         if self.localized and self.localization_state == "READY":
             navigation_in_progress = self._navigation_in_progress()
-            scan_map_mismatch = bool(
-                navigation_in_progress
-                and now - self.last_scan_map_monotonic
-                <= self.scan_map_freshness
-                and self.scan_map_valid_beams >= self.scan_map_minimum_beams
-                and (
-                    self.scan_map_score
-                    < self.tracking_scan_map_sanity_threshold
-                    or (
-                        self.raycast_comparable_beams
-                        >= self.localization_raycast_minimum_beams
-                        and self.raycast_contradiction_ratio
-                        > self.localization_tracking_maximum_contradiction_ratio
-                    )
-                )
-            )
-            if scan_map_mismatch:
-                # Stop on the first contradictory window. A short confirmation
-                # rejects one transient scan; a sustained mismatch starts the
-                # existing automatic relocalize/replan path with the goal
-                # preserved instead of letting a wrong map pose steer onward.
-                self.motion_owner = "NONE"
-                self.navigation_velocity.publish(Twist())
-                if self.execution_scan_map_mismatch_since is None:
-                    self.execution_scan_map_mismatch_since = now
-                    self._nav_debug(
-                        "LOCALIZATION_RECOVERY",
-                        action="HOLD_FOR_SCAN_MAP_CONFIRMATION",
-                        scan_score=self.scan_map_score,
-                        scan_score_minimum=(
-                            self.tracking_scan_map_sanity_threshold
-                        ),
-                        raycast_contradiction_ratio=(
-                            self.raycast_contradiction_ratio
-                        ),
-                        contradiction_maximum=(
-                            self.localization_tracking_maximum_contradiction_ratio
-                        ),
-                        destination_preserved=bool(self.paused_goal),
-                    )
-                elif (
-                    now - self.execution_scan_map_mismatch_since
-                    >= self.execution_scan_map_mismatch_confirmation
-                ):
-                    self.execution_scan_map_mismatch_since = None
-                    self._localization_lost("SUSTAINED_SCAN_MAP_MISMATCH")
-                    return
-            else:
-                if (
-                    self.execution_scan_map_mismatch_since is not None
-                    and self.current_state == "NAVIGATING"
-                    and self.execution_phase
-                    in {"STRAIGHT", "NARROW_STRAIGHT", "TURN"}
-                ):
-                    self.motion_owner = "NAVIGATION"
-                self.execution_scan_map_mismatch_since = None
+            # Scan/map disagreement is evidence about the environment, not
+            # proof that the tracked map pose disappeared. Doors, moved
+            # furniture and people can all raise the raycast contradiction
+            # ratio while AMCL, TF and the map<-odom trajectory remain
+            # continuous. Motion safety and the live costmaps retain authority
+            # over those observations. Localization is revoked only by the
+            # independent confidence/freshness gates below after their full
+            # grace period; never reset AMCL globally from this scalar alone.
             # During normal travel AMCL refreshes from odometry. If Nav2 keeps
             # an action active while collision checking holds the chassis at
             # zero, force a bounded scan update before the pose freshness gate

@@ -55,6 +55,84 @@ describe("KeyboardInputAdapter", () => {
     expect(manager.state()[action]).toBe(false);
   });
 
+  it.each(["input", "textarea", "select"])(
+    "does not capture movement keys while typing in a %s",
+    (tagName) => {
+      const velocity = vi.fn();
+      const manager = new InputManager(velocity, vi.fn());
+      const detach = new KeyboardInputAdapter(manager).attach();
+      cleanups.push(detach, () => manager.destroy());
+      const field = document.createElement(tagName);
+      document.body.appendChild(field);
+      cleanups.push(() => field.remove());
+
+      const event = new KeyboardEvent("keydown", {
+        key: "w", code: "KeyW", bubbles: true, cancelable: true,
+      });
+      field.dispatchEvent(event);
+
+      expect(event.defaultPrevented).toBe(false);
+      expect(manager.state()).toEqual(EMPTY_INPUT);
+      expect(velocity).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not capture movement keys in contenteditable fields", () => {
+    const manager = new InputManager(vi.fn(), vi.fn());
+    const detach = new KeyboardInputAdapter(manager).attach();
+    cleanups.push(detach, () => manager.destroy());
+    const editor = document.createElement("div");
+    editor.setAttribute("contenteditable", "true");
+    document.body.appendChild(editor);
+    cleanups.push(() => editor.remove());
+
+    fireEvent.keyDown(editor, { key: "a", code: "KeyA" });
+
+    expect(manager.state()).toEqual(EMPTY_INPUT);
+  });
+
+  it("does not intercept browser or application shortcuts", () => {
+    const manager = new InputManager(vi.fn(), vi.fn());
+    const detach = new KeyboardInputAdapter(manager).attach();
+    cleanups.push(detach, () => manager.destroy());
+    const event = new KeyboardEvent("keydown", {
+      key: "a", code: "KeyA", ctrlKey: true, bubbles: true, cancelable: true,
+    });
+
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(manager.state()).toEqual(EMPTY_INPUT);
+  });
+
+  it("only captures keys while keyboard driving is enabled", () => {
+    const manager = new InputManager(vi.fn(), vi.fn());
+    const detach = new KeyboardInputAdapter(manager, () => false).attach();
+    cleanups.push(detach, () => manager.destroy());
+    const event = new KeyboardEvent("keydown", {
+      key: "d", code: "KeyD", bubbles: true, cancelable: true,
+    });
+
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(manager.state()).toEqual(EMPTY_INPUT);
+  });
+
+  it("releases a captured key even if focus moves into an input", () => {
+    const manager = new InputManager(vi.fn(), vi.fn());
+    const detach = new KeyboardInputAdapter(manager).attach();
+    cleanups.push(detach, () => manager.destroy());
+    const field = document.createElement("input");
+    document.body.appendChild(field);
+    cleanups.push(() => field.remove());
+
+    fireEvent.keyDown(window, { key: "w", code: "KeyW" });
+    fireEvent.keyUp(field, { key: "w", code: "KeyW" });
+
+    expect(manager.state().forward).toBe(false);
+  });
+
   it("stops and clears input on blur", () => {
     const stop = vi.fn();
     const manager = new InputManager(vi.fn(), stop);

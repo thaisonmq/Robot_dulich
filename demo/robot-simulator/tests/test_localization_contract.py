@@ -1706,15 +1706,16 @@ def test_runtime_detects_lost_steering_and_turn_hard_stop_as_recovery() -> None:
     assert 'self.execution_phase = "WAIT_FOR_TURN_CLEAR"' in turn
 
 
-def test_sustained_scan_map_mismatch_pauses_then_automatically_relocalizes() -> None:
+def test_scan_map_mismatch_never_destroys_a_continuously_tracked_pose() -> None:
     tick = _method_source("_localization_tick", "_load_map")
     lost = _method_source("_localization_lost", "_global_heading_requirement")
 
-    assert "self.execution_scan_map_mismatch_confirmation" in tick
-    assert 'action="HOLD_FOR_SCAN_MAP_CONFIRMATION"' in tick
-    assert 'self._localization_lost("SUSTAINED_SCAN_MAP_MISMATCH")' in tick
-    assert '"goal": dict(self.paused_goal)' in lost
-    assert "self.localization_resume_context" in lost
+    assert "SUSTAINED_SCAN_MAP_MISMATCH" not in tick
+    assert "execution_scan_map_mismatch" not in tick
+    assert "self._localization_tracking_evidence_ready(now)" in tick
+    assert "now - self.ready_evidence_invalid_since >= self.localization_low_grace" in tick
+    # Genuine evidence expiry still owns the destructive recovery path.
+    assert "self.trajectory_map_from_odom = None" in lost
     assert "self._start_global_localization()" in lost
 
 

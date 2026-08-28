@@ -173,19 +173,42 @@ const KEY_ACTIONS: Record<string, InputAction> = {
   " ": "emergencyStop",
 };
 
+function isEditableKeyboardTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  return Boolean(target.closest(
+    'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]',
+  ));
+}
+
 export class KeyboardInputAdapter {
-  constructor(private readonly manager: InputManager) {}
+  constructor(
+    private readonly manager: InputManager,
+    private readonly isEnabled: () => boolean = () => true,
+  ) {}
 
   attach(): () => void {
+    const heldKeys = new Map<string, InputAction>();
     const keydown = (event: KeyboardEvent) => {
       const action = KEY_ACTIONS[event.code] ?? KEY_ACTIONS[event.key];
-      if (!action) return;
+      if (
+        !action
+        || !this.isEnabled()
+        || isEditableKeyboardTarget(event.target)
+        || event.ctrlKey
+        || event.altKey
+        || event.metaKey
+      ) return;
       event.preventDefault();
-      if (!event.repeat) this.manager.setAction("keyboard", action, true);
+      if (!event.repeat) {
+        heldKeys.set(event.code || event.key, action);
+        this.manager.setAction("keyboard", action, true);
+      }
     };
     const keyup = (event: KeyboardEvent) => {
-      const action = KEY_ACTIONS[event.code] ?? KEY_ACTIONS[event.key];
+      const key = event.code || event.key;
+      const action = heldKeys.get(key);
       if (!action) return;
+      heldKeys.delete(key);
       event.preventDefault();
       this.manager.setAction("keyboard", action, false);
     };
@@ -204,6 +227,7 @@ export class KeyboardInputAdapter {
       window.removeEventListener("keyup", keyup);
       window.removeEventListener("blur", blur);
       document.removeEventListener("visibilitychange", visibility);
+      heldKeys.clear();
       this.manager.clear("keyboard_unmount", true);
     };
   }

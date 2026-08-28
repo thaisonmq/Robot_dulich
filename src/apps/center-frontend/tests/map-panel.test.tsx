@@ -197,6 +197,27 @@ describe("MapPanel navigation controls", () => {
     expect(onRetryLocalization).toHaveBeenCalledOnce();
   });
 
+  it("keeps recovery controls usable when a preserved mission needs localization assistance", () => {
+    const onRetryLocalization = vi.fn();
+    const onCancel = vi.fn();
+    panel({
+      mapState: "AMBIGUOUS",
+      localizationState: "AMBIGUOUS",
+      navigationStatus: "recovery",
+      onRetryLocalization,
+      onCancel,
+    });
+
+    const rescan = screen.getByRole("button", { name: "Quét lại vị trí hiện tại" });
+    expect(rescan).toBeEnabled();
+    fireEvent.click(rescan);
+    expect(onRetryLocalization).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole("button", { name: "Dừng điều hướng" }));
+    expect(onCancel).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "Chọn điểm đến" })).not.toBeInTheDocument();
+  });
+
   it("offers a broad location hint only when the adapter reports ambiguity", () => {
     const onApproximateHint = vi.fn();
     const rendered = panel({

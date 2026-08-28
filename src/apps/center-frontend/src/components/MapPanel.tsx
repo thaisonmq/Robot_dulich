@@ -582,9 +582,15 @@ export function MapPanel({
   const localizationNeedsAssistance = localizationFailed || [
     "LOCALIZATION_REQUIRED", "AMBIGUOUS", "LOW_CONFIDENCE", "LOCALIZATION_LOST",
   ].includes(localizationState);
-  const rescanBlocked = activeMission
-    || ["NAVIGATING", "MOVING", "ROTATING", "PLANNING", "RECOVERY"].includes(mapState)
-    || localizationInProgress;
+  // A preserved mission is already motionless when localization explicitly
+  // asks for assistance. Do not let its stale `moving/recovery` presentation
+  // state hide the only controls that can recover or cancel that mission.
+  const rescanBlocked = localizationInProgress || (
+    !localizationNeedsAssistance && (
+      activeMission
+      || ["NAVIGATING", "MOVING", "ROTATING", "PLANNING", "RECOVERY"].includes(mapState)
+    )
+  );
   const ready = localized && localizationState === "READY" && pose.map_id === map.map_id
     && (pose.map_version == null || pose.map_version === map.active_version)
     && (health?.map_version == null || health.map_version === map.active_version);
@@ -780,7 +786,9 @@ export function MapPanel({
           <LocateFixed /> {t("Chỉ vị trí robot gần đúng")}</button>}
         <button type="button" disabled={readOnly || loading || rescanBlocked || !onRetryLocalization}
           title={rescanBlocked ? t("Không thể quét lại khi robot đang di chuyển hoặc định vị.") : undefined}
-          onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button></>
+          onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button>
+        {activeMission && <button type="button" className="is-danger" onClick={onCancel}>
+          <X /> {t("Dừng điều hướng")}</button>}</>
         : activeMission ? <><button type="button" onClick={onPause}><Pause /> {t("Tạm dừng")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
         : paused ? <><button type="button" onClick={onResume}><Play /> {t("Tiếp tục")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button>
           <button type="button" disabled={readOnly || loading || rescanBlocked || !onRetryLocalization}
