@@ -47,6 +47,7 @@ function dataStatusLabel(status: string | undefined, t: (source: string) => stri
     SYNC_PENDING: "Chờ đồng bộ",
     UPLOADING: "Đang tải lên",
     FAILED: "Đồng bộ lỗi",
+    SYNC_FAILED: "Đồng bộ thất bại",
     RUNNING: "Đang chạy",
     MAPPING_RUNNING: "Đang mapping",
     MAPPING_LOCALIZING: "Đang khớp vị trí",
@@ -118,6 +119,9 @@ export function MapManagementPage() {
     queryKey: ["map", selectedMapId],
     queryFn: () => api.map(selectedMapId!),
     enabled: Boolean(selectedMapId),
+    refetchInterval: (query) => query.state.data?.versions?.some(
+      (version) => version.sync_status === "SYNC_PENDING",
+    ) ? 2_000 : false,
   });
   const refreshRegistry = async () => {
     await queryClient.invalidateQueries({ queryKey: ["maps"] });
@@ -139,9 +143,12 @@ export function MapManagementPage() {
   });
   const resync = useMutation({
     mutationFn: ({ mapId, version }: { mapId: string; version: number }) => api.resyncMapVersion(mapId, version),
-    onSuccess: async () => {
+    onSuccess: async (result) => {
       await refreshRegistry();
-      showToast(t("Đã đồng bộ"));
+      showToast(
+        t(result.sync_status === "SYNCED" ? "Đã đồng bộ" : "Chờ đồng bộ"),
+        result.sync_status === "SYNCED" ? "success" : "info",
+      );
     },
   });
   const update = useMutation({
@@ -393,16 +400,26 @@ export function MapManagementPage() {
         <header><div><h3>{t("Các phiên bản bản đồ")}</h3></div><span>{t("{count} phiên bản", { count: detail.versions?.length ?? 0 })}</span></header>
         <div className="map-version-list">
           <header><span>{t("Phiên bản")}</span><span>{t("Dữ liệu bản đồ")}</span><span>{t("Ngày tạo")}</span><span>{t("Thao tác")}</span></header>
-          {(detail.versions ?? []).map((version) => <article key={version.version} className={version.version === detail.active_version ? "is-active" : ""}>
+          {(detail.versions ?? []).map((version) => {
+            const requestingThisVersion = resync.isPending
+              && resync.variables?.mapId === detail.map_id
+              && resync.variables.version === version.version;
+            const waitingForUpload = version.sync_status === "SYNC_PENDING";
+            return <article key={version.version} className={version.version === detail.active_version ? "is-active" : ""}>
             <span className="map-version-number"><strong>v{version.version}</strong>{version.version === detail.active_version && <small>{t("ĐANG DÙNG")}</small>}</span>
             <div className="map-version-artifact"><strong>{statusLabel(version.status, t)}</strong><code>{version.checksum.slice(0, 16)}…</code><small>{version.width_pixels} × {version.height_pixels} · {version.resolution} m/px · {version.created_by_robot}</small></div>
             <div className="map-version-date"><strong>{formatDate(version.created_at, language)}</strong><small>{dataStatusLabel(version.local_status, t)} · {dataStatusLabel(version.sync_status, t)}</small><small>{t(version.has_posegraph ? "Có dữ liệu posegraph" : "Thiếu dữ liệu posegraph")}</small></div>
             <div className="map-version-actions">
               <button type="button" title={t("Tải bundle")} onClick={() => void downloadVersion(version.download_url, `${detail.map_id}-v${version.version}.tar.gz`)}><Download size={15} /><span>{t("Tải xuống")}</span></button>
-              {canOperate && <button type="button" title={t("Đồng bộ lại")} disabled={resync.isPending} onClick={() => resync.mutate({ mapId: detail.map_id, version: version.version })}><RefreshCw size={15} /><span>{t("Đồng bộ lại")}</span></button>}
+              {canOperate && <button type="button"
+                title={t(waitingForUpload ? "Chờ đồng bộ" : "Đồng bộ lại")}
+                disabled={requestingThisVersion || waitingForUpload}
+                onClick={() => resync.mutate({ mapId: detail.map_id, version: version.version })}>
+                <RefreshCw size={15} /><span>{t(requestingThisVersion || waitingForUpload ? "Chờ đồng bộ" : "Đồng bộ lại")}</span></button>}
               {canOperate && version.status === "VALIDATING" && <button type="button" className="is-primary" disabled={activate.isPending} onClick={() => activate.mutate({ mapId: detail.map_id, version: version.version })}><CheckCircle2 size={15} /><span>{t("Kích hoạt")}</span></button>}
             </div>
-          </article>)}
+          </article>;
+          })}
           {!detail.versions?.length && <div className="map-version-empty"><Layers3 size={24} /><strong>{t("Chưa có phiên bản đã lưu")}</strong><p>{t("Hoàn tất và lưu một phiên mapping để tạo phiên bản đầu tiên.")}</p></div>}
         </div>
       </section>}

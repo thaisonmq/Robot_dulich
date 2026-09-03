@@ -23,7 +23,14 @@ describe("compact stream controls", () => {
       cancel: vi.fn(),
     } as unknown as OnScreenControlAdapter;
 
-    renderWithI18n(<ControlPad adapter={adapter} input={EMPTY_INPUT} disabled={false} />);
+    renderWithI18n(<ControlPad
+      adapter={adapter}
+      input={EMPTY_INPUT}
+      disabled={false}
+      estopActive={false}
+      stopping={false}
+      onResetEstop={vi.fn()}
+    />);
 
     for (const name of ["Tiến", "Trái", "Phải", "Lùi", "Dừng khẩn cấp"]) {
       expect(screen.getByRole("button", { name })).toBeInTheDocument();
@@ -34,6 +41,31 @@ describe("compact stream controls", () => {
     fireEvent.click(screen.getByRole("button", { name: "Dừng khẩn cấp" }));
     expect(adapter.press).toHaveBeenCalledWith("emergencyStop");
     expect(adapter.release).toHaveBeenCalledWith("emergencyStop");
+  });
+
+  it("locks movement and exposes an explicit software E-stop reset", () => {
+    const adapter = {
+      press: vi.fn(),
+      release: vi.fn(),
+      cancel: vi.fn(),
+    } as unknown as OnScreenControlAdapter;
+    const onResetEstop = vi.fn();
+
+    renderWithI18n(<ControlPad
+      adapter={adapter}
+      input={EMPTY_INPUT}
+      disabled={false}
+      estopActive
+      stopping={false}
+      onResetEstop={onResetEstop}
+    />);
+
+    for (const name of ["Tiến", "Trái", "Phải", "Lùi"]) {
+      expect(screen.getByRole("button", { name })).toBeDisabled();
+    }
+    expect(screen.getByRole("button", { name: "Dừng khẩn cấp" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Nhả E-stop phần mềm" }));
+    expect(onResetEstop).toHaveBeenCalledOnce();
   });
 
   it("changes manual speed, auto speed, and obstacle avoidance from settings", () => {

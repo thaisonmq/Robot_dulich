@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     sample_data_dir: str = "/sample-data"
     map_storage_dir: str = "./map-storage"
     map_bundle_max_bytes: int = 512 * 1024 * 1024
+    map_bundle_max_uncompressed_bytes: int = 1024 * 1024 * 1024
+    map_bundle_max_member_bytes: int = 768 * 1024 * 1024
+    map_bundle_max_members: int = 64
+    map_bundle_max_compression_ratio: float = 2000.0
+    map_bundle_max_image_pixels: int = 100_000_000
     robot_command_timeout_seconds: float = 15.0
     # Stop-turn planning has its own bounded budget on the Pi. Keep a wider
     # transport envelope so scheduling cannot turn a valid planner result into

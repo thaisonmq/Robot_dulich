@@ -7,6 +7,7 @@ import { KeyboardInputAdapter, InputManager, OnScreenControlAdapter, type InputS
 export function useTeleoperation() {
   const setCommandStatus = useAppStore((state) => state.setCommandStatus);
   const setControlState = useAppStore((state) => state.setControlState);
+  const estopActive = useAppStore((state) => state.health.estop);
   const [inputState, setInputState] = useState<InputState>(EMPTY_INPUT);
   const [speedLevel, setSpeedLevelState] = useState<MotionSpeedLevel>(DEFAULT_MOTION_SPEED_LEVEL);
   const [obstacleAvoidanceEnabled, setObstacleAvoidanceEnabledState] = useState(true);
@@ -14,10 +15,28 @@ export function useTeleoperation() {
   const control = useMemo(
     () => new WebSocketControlTransport(
       (status, messageType) => {
+        if (messageType === "control.stop") {
+          if (status === "completed") {
+            setControlState("ready");
+            setCommandStatus("Đã xác nhận robot đứng yên");
+          } else {
+            setControlState("stopping");
+            setCommandStatus("Chưa xác nhận robot đứng yên");
+          }
+          return;
+        }
+        if (messageType === "control.estop.reset") {
+          if (status === "completed") {
+            setControlState("ready");
+            setCommandStatus("Đã nhả E-stop phần mềm an toàn");
+          } else {
+            setControlState("stopping");
+            setCommandStatus("Chưa xác nhận nhả E-stop");
+          }
+          return;
+        }
         setCommandStatus(
-          messageType === "control.stop" && ["accepted", "completed"].includes(status)
-            ? "Đã dừng an toàn"
-            : status === "accepted" ? "Lệnh đã nhận" : `Lệnh: ${status}`,
+          status === "accepted" ? "Lệnh đã nhận" : `Lệnh: ${status}`,
         );
       },
       () => {
@@ -37,6 +56,8 @@ export function useTeleoperation() {
   const manager = useMemo(
     () => new InputManager(
       (command) => {
+        const runtime = useAppStore.getState();
+        if (runtime.health.estop || runtime.controlState === "stopping") return;
         control.sendVelocity(command);
         setControlState("active");
         const parts = [
@@ -48,8 +69,7 @@ export function useTeleoperation() {
       (reason) => {
         control.sendStop(reason);
         setControlState("stopping");
-        setCommandStatus("Đã dừng an toàn");
-        window.setTimeout(() => setControlState("ready"), 140);
+        setCommandStatus("Đang xác minh robot đã đứng yên");
       },
     ),
     [control, setCommandStatus, setControlState],
@@ -71,6 +91,16 @@ export function useTeleoperation() {
         : "Chống vật cản thủ công đã tắt",
     );
   }, [control, manager, setCommandStatus]);
+  const resetEstop = useCallback(() => {
+    manager.clear("estop_reset_requested", false);
+    setControlState("stopping");
+    setCommandStatus("Đang xác minh nhả E-stop");
+    control.resetEstop();
+  }, [control, manager, setCommandStatus, setControlState]);
+
+  useEffect(() => {
+    if (estopActive) manager.clear("estop_active", false);
+  }, [estopActive, manager]);
 
   useEffect(() => {
     const unsubscribe = manager.subscribe(setInputState);
@@ -98,5 +128,6 @@ export function useTeleoperation() {
     setSpeedLevel,
     obstacleAvoidanceEnabled,
     setObstacleAvoidanceEnabled,
+    resetEstop,
   };
 }

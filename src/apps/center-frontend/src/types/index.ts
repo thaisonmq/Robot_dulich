@@ -356,7 +356,15 @@ export interface Health {
       searched_pose?: { x: number; y: number; yaw: number };
     };
   } | null;
-  map_registry?: { localCount: number; pendingSync: number; pendingDeletion?: number };
+  map_registry?: {
+    localCount: number;
+    pendingSync: number;
+    pendingDeletion?: number;
+    ready?: boolean;
+    syncStatus?: "PENDING" | "READY" | "ERROR";
+    lastSyncAt?: number;
+    error?: string;
+  };
 }
 
 export interface MessageEnvelope<T = Record<string, unknown>> {

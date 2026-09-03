@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { api } from "../src/api/client";
 import { I18nProvider } from "../src/i18n/I18nProvider";
 import { MapManagementPage } from "../src/pages/MapManagementPage";
+import { ToastViewport } from "../src/components/ToastViewport";
 import { useAppStore } from "../src/state/appStore";
 import type { MapData, User } from "../src/types";
 
@@ -73,6 +74,11 @@ describe("MapManagementPage detail workspace", () => {
     vi.spyOn(api, "maps").mockResolvedValue([activeMap]);
     vi.spyOn(api, "map").mockResolvedValue(activeMap);
     vi.spyOn(api, "deleteMap").mockResolvedValue(undefined);
+    vi.spyOn(api, "resyncMapVersion").mockResolvedValue({
+      map_id: activeMap.map_id,
+      version: 2,
+      sync_status: "SYNC_PENDING",
+    });
   });
 
   afterEach(() => {
@@ -155,6 +161,25 @@ describe("MapManagementPage detail workspace", () => {
       "SESSION-RECOVERABLE", "recover", expect.any(String), "IDLE",
     ));
     expect(sessionStorage.getItem("rovera:mapping-intent")).toContain("SESSION-RECOVERABLE");
+  });
+
+  it("reports resync as pending until the robot upload reaches Center", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(<QueryClientProvider client={queryClient}><I18nProvider>
+      <MapManagementPage /><ToastViewport />
+    </I18nProvider></QueryClientProvider>);
+
+    fireEvent.click(await screen.findByRole("tab", { name: /Phiên bản/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Đồng bộ lại" }));
+
+    await waitFor(() => expect(api.resyncMapVersion).toHaveBeenCalledWith(
+      activeMap.map_id, 2,
+    ));
+    expect(await screen.findByRole("status")).toHaveTextContent("Chờ đồng bộ");
+    expect(screen.queryByText("Đã đồng bộ", { selector: ".app-toast strong" }))
+      .not.toBeInTheDocument();
   });
 
   it("paginates the map registry and keeps the list controls visible", async () => {

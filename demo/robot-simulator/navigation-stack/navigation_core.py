@@ -785,6 +785,7 @@ def dynamic_block_requires_alternative(reason: str) -> bool:
             "CONFIRMED_DYNAMIC_ROUTE_BLOCK",
             "LIVE_ROUTE_CLEARANCE_INSUFFICIENT",
             "TURN_BLOCKED_NO_SAFE_RELOCATION",
+            "CORRIDOR_BLOCKED_NO_SAFE_RELOCATION",
         }
     )
 
@@ -7564,6 +7565,10 @@ class CorridorAssessment:
     reason: str = ""
     localization_uncertainty: float = 0.0
     physically_passable: bool = True
+    left_observed: bool = False
+    right_observed: bool = False
+    paired_sides_observed: bool = False
+    observed_hard_side_violation: bool = False
 
 
 def heading_diversity(
@@ -7722,6 +7727,13 @@ def evaluate_corridor(
         else 0.0
     )
     hard_margin = max(0.0, float(hard_side_margin))
+    hard_epsilon = 1e-9
+    left_observed = math.isfinite(left_center)
+    right_observed = math.isfinite(right_center)
+    observed_hard_side_violation = bool(
+        (left_observed and left_clearance + hard_epsilon < hard_margin)
+        or (right_observed and right_clearance + hard_epsilon < hard_margin)
+    )
     uncertainty = max(0.0, float(localization_uncertainty))
     hard_required_width = 2.0 * width + 2.0 * hard_margin
     auto_required_width = 2.0 * width + 2.0 * margin + uncertainty
@@ -7737,7 +7749,8 @@ def evaluate_corridor(
         default=math.inf,
     )
     hard_side_clear = (
-        left_clearance >= hard_margin and right_clearance >= hard_margin
+        left_clearance + hard_epsilon >= hard_margin
+        and right_clearance + hard_epsilon >= hard_margin
     )
     auto_side_requirement = margin + uncertainty / 2.0
     auto_side_clear = (
@@ -7748,10 +7761,16 @@ def evaluate_corridor(
     both_sides_observed = bool(paired)
     physically_passable = (
         hard_side_clear
-        and available_width >= hard_required_width
+        and available_width + hard_epsilon >= hard_required_width
         and front_clear
     )
-    if not both_sides_observed and front_clear:
+    if observed_hard_side_violation:
+        # Missing data on the opposite side is uncertainty; it must never
+        # erase a measured hard-margin violation on the side we can see.
+        physically_passable = False
+        classification = "PHYSICALLY_BLOCKED"
+        reason = "OBSERVED_SIDE_HARD_MARGIN"
+    elif not both_sides_observed and front_clear:
         # Missing live wall data is uncertainty, not infinite clearance and
         # not proof of a physical blockage. The prevalidated static route is
         # authoritative; motion-safety still handles every live return.
@@ -7795,6 +7814,10 @@ def evaluate_corridor(
         reason=reason,
         localization_uncertainty=uncertainty,
         physically_passable=physically_passable,
+        left_observed=left_observed,
+        right_observed=right_observed,
+        paired_sides_observed=both_sides_observed,
+        observed_hard_side_violation=observed_hard_side_violation,
     )
 
 

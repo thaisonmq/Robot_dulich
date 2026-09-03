@@ -144,8 +144,6 @@ def localization_callback(method: Any) -> Any:
             try:
                 return method(self, *args, **kwargs)
             except Exception as exc:  # ROS executors otherwise stop spinning.
-                self.localized = False
-                self.localization_state = "LOCALIZATION_FAILED"
                 self.get_logger().error(
                     f"{method.__name__} failed: {type(exc).__name__}: {exc}"
                 )
@@ -156,8 +154,7 @@ def localization_callback(method: Any) -> Any:
                     error=str(exc),
                     traceback=traceback.format_exc(),
                 )
-                self._stop_localization_rotation()
-                self._set_state("LOCALIZATION_FAILED", "localization_callback_error")
+                self._fail_closed_localization_callback(method.__name__, exc)
                 return None
 
     return guarded
@@ -203,6 +200,10 @@ class NavigationAdapter(Node):
             ),
         )
         self.state_lock = threading.Lock()
+        # SLAM Toolbox serialization, map saving and pause/resume are one
+        # stateful authority. Keep operator commands and periodic autosaves
+        # from toggling or snapshotting that authority concurrently.
+        self.mapping_operation_lock = threading.RLock()
         # Localization state is also touched by the socket worker and the
         # independent global-scan worker, not just ROS callbacks.
         self.localization_lock = threading.RLock()
@@ -1715,6 +1716,19 @@ class NavigationAdapter(Node):
                         reasons = tuple(reasons) + (
                             "DIRECTIONAL_SAFETY_BLOCK",
                         )
+                corridor_blocked, _ = self._fresh_corridor_blockage(now)
+                if (
+                    corridor_blocked
+                    and self.execution_relocation_reason != "TURN_BAY"
+                ):
+                    # Stop on the first fresh physical corridor violation.
+                    # Repeated samples select the bounded recovery below; the
+                    # confirmation dwell must not be extra travel distance.
+                    linear = 0.0
+                    angular = 0.0
+                    reasons = tuple(reasons) + (
+                        "CORRIDOR_PHYSICAL_BLOCK",
+                    )
                 # RPP remains the linear/collision proposal only. Its changing
                 # carrot curvature is intentionally never steering authority.
                 if abs(float(message.angular.z) - angular) > 0.02:
@@ -1939,8 +1953,12 @@ class NavigationAdapter(Node):
         }
 
     @staticmethod
-    def _finite_metric(value: float) -> float | None:
-        return round(value, 3) if math.isfinite(value) else None
+    def _finite_metric(value: Any) -> float | None:
+        try:
+            metric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return round(metric, 3) if math.isfinite(metric) else None
 
     def _navigation_metrics(self) -> dict[str, Any]:
         return {
@@ -2292,6 +2310,19 @@ class NavigationAdapter(Node):
                 ),
                 "safety": "HEALTHY" if self.safety_health.startswith("HEALTHY") else self.safety_health,
                 "estop": self.estop_active,
+                "measured_velocity_fresh": bool(
+                    self._atomic_safety_fresh()
+                    and self.safety_snapshot.get("measured_velocity_fresh", False)
+                ),
+                "measured_linear_velocity": self._finite_metric(
+                    self.safety_snapshot.get("measured_linear")
+                ),
+                "measured_angular_velocity": self._finite_metric(
+                    self.safety_snapshot.get("measured_angular")
+                ),
+                "measured_velocity_age_ms": self._finite_metric(
+                    self.safety_snapshot.get("measured_velocity_age_ms")
+                ),
                 "mission_id": self.current_mission_id,
                 "auto_speed_mode": self.auto_speed_mode,
                 "auto_speed_profile": self._speed_profile_state(),
@@ -2440,11 +2471,7 @@ class NavigationAdapter(Node):
             return self._set_initial_pose(payload)
         if command == "map.relocalize":
             self._validate_command_map(payload)
-            if self.current_goal_handle is not None:
-                raise AdapterError(
-                    "NAVIGATION_ACTIVE",
-                    "Cancel navigation before localization verification",
-                )
+            self._prepare_motionless_localization_command()
             allow_rotation = bool(payload.get("allow_rotation", False))
             force_global = bool(payload.get("force_global", False))
             self._nav_debug(
@@ -4100,6 +4127,96 @@ class NavigationAdapter(Node):
             return "PHYSICALLY_BLOCKED", assessments[-1]
         return "UNCONFIRMED", assessments[-1]
 
+    def _recover_confirmed_corridor_blockage(
+        self, reason: str, corridor: Any
+    ) -> None:
+        """Stop, relocate without turning, then replan the preserved goal."""
+        with self.state_lock:
+            if (
+                self.current_state != "NAVIGATING"
+                or self.narrow_decision_in_progress
+                or self.execution_phase in {"RECOVERING", "TURN_BAY_SEARCH"}
+                or self.execution_relocation_reason == "TURN_BAY"
+            ):
+                return
+            self.narrow_decision_in_progress = True
+            generation = self.navigation_goal_generation
+            handle = self.current_goal_handle
+            self.current_goal_handle = None
+            self.execution_segment_token += 1
+            self.active_segment = None
+            self.execution_phase = "RECOVERING"
+            self.latest_feedback["execution_phase"] = "CORRIDOR_RECOVERY"
+            self.latest_feedback["recovery_reason"] = reason
+            self.latest_feedback["destination_preserved"] = bool(
+                self.execution_goal or self.paused_goal
+            )
+            self.motion_owner = "NONE"
+            pose = None if self.pose is None else dict(self.pose)
+            goal = dict(self.execution_goal or self.paused_goal or {})
+        self.navigation_velocity.publish(Twist())
+        self.profile_limiter.reset()
+        if handle is not None:
+            handle.cancel_goal_async()
+
+        with self.state_lock:
+            recovery_current = bool(
+                generation == self.navigation_goal_generation
+                and self.current_state == "NAVIGATING"
+                and self.execution_phase == "RECOVERING"
+            )
+            if not recovery_current:
+                self.narrow_decision_in_progress = False
+                return
+        if pose is not None and goal:
+            self._mark_failed_segment(reason, corridor)
+        observed_clearances = [
+            float(clearance)
+            for observed, clearance in (
+                (bool(corridor.left_observed), corridor.left_clearance),
+                (bool(corridor.right_observed), corridor.right_clearance),
+            )
+            if observed and math.isfinite(float(clearance))
+        ]
+        recovery_translation_proven = bool(
+            pose is not None
+            and goal
+            and self.saved_map is not None
+            and observed_clearances
+            and min(observed_clearances) > 0.0
+        )
+        with self.state_lock:
+            recovery_current = bool(
+                generation == self.navigation_goal_generation
+                and self.current_state == "NAVIGATING"
+                and self.execution_phase == "RECOVERING"
+            )
+            self.narrow_decision_in_progress = False
+        if not recovery_current:
+            return
+        if not recovery_translation_proven:
+            # Zero clearance, stale pose or unavailable map is not permission
+            # to back up blindly. The bounded wait state keeps the destination
+            # and periodically searches for a newly provable route.
+            self._enter_dynamic_wait(
+                "CORRIDOR_BLOCKED_NO_SAFE_RELOCATION"
+            )
+            return
+        self._nav_debug(
+            "CORRIDOR_RECOVERY",
+            action="SEARCH_REVERSE_FIRST_TURN_BAY",
+            reason=reason,
+            destination=goal,
+            destination_preserved=True,
+            observed_clearances=observed_clearances,
+        )
+        self._start_turn_bay_recovery(
+            pose,
+            generation,
+            preferred_translation_direction=-1,
+            recovery_reason="CORRIDOR_PHYSICAL_BLOCK",
+        )
+
     def _enter_narrow_path_decision(self, reason: str, corridor: Any) -> None:
         """Pause Auto before a stable narrow segment while preserving goal."""
         with self.state_lock:
@@ -5564,7 +5681,9 @@ class NavigationAdapter(Node):
             # heading-locked mode. Only confirmed physical blockage may end
             # the segment; uncertainty alone must not hand off to Manual.
             if evidence_reason == "PHYSICALLY_BLOCKED":
-                self._enter_narrow_path_decision(evidence_reason, confirmed)
+                self._recover_confirmed_corridor_blockage(
+                    evidence_reason, confirmed
+                )
         heading_observation_valid = self._update_scan_map_match(message)
         self._record_heading_observation(
             message, heading_observation_valid=heading_observation_valid
@@ -5808,15 +5927,34 @@ class NavigationAdapter(Node):
             self._stop_localization_rotation()
             with self.state_lock:
                 handle = self.current_goal_handle
+                navigation_was_active = bool(
+                    handle is not None
+                    or self.execution_phase != "IDLE"
+                    or self.current_state in {
+                        "NAVIGATING",
+                        "PLANNING",
+                        "WAIT_FOR_DYNAMIC_CLEAR",
+                        "WAITING_FOR_DYNAMIC_CLEAR",
+                        "DYNAMIC_REPLAN",
+                        "RECOVERY",
+                        "TURN_BAY_RECOVERY",
+                        "ROUTE_SELECTION",
+                    }
+                )
                 self.current_goal_handle = None
                 self.motion_owner = "NONE"
                 self.navigation_goal_generation += 1
                 self.execution_segment_token += 1
                 self.active_segment = None
                 self.execution_phase = "IDLE"
-                if self.current_state == "NAVIGATING":
+                self.sensor_time_resume_context = None
+                self.sensor_time_resume_in_progress = False
+                self.localization_resume_context = None
+                self.localization_resume_in_progress = False
+                if navigation_was_active:
                     self._set_state("CANCELED", "emergency_stop")
             self.navigation_velocity.publish(Twist())
+            self.localization_velocity.publish(Twist())
             if handle is not None:
                 handle.cancel_goal_async()
 
@@ -5856,7 +5994,17 @@ class NavigationAdapter(Node):
             message.data
             and self.mode == "NAVIGATION"
             and self.current_state in {
-                "NAVIGATING", "PAUSED", "BLOCKED", "NARROW_PATH_DECISION"
+                "NAVIGATING",
+                "PLANNING",
+                "PAUSED",
+                "BLOCKED",
+                "NARROW_PATH_DECISION",
+                "WAIT_FOR_DYNAMIC_CLEAR",
+                "WAITING_FOR_DYNAMIC_CLEAR",
+                "DYNAMIC_REPLAN",
+                "RECOVERY",
+                "TURN_BAY_RECOVERY",
+                "ROUTE_SELECTION",
             }
         )
         if active_navigation:
@@ -5874,13 +6022,18 @@ class NavigationAdapter(Node):
                 self.execution_segment_token += 1
                 self.active_segment = None
                 self.execution_phase = "IDLE"
+                self.sensor_time_resume_context = None
+                self.sensor_time_resume_in_progress = False
+                self.localization_resume_context = None
+                self.localization_resume_in_progress = False
+                self.motion_owner = "NONE"
                 self.manual_handoff_reason = "MANUAL_TAKEOVER"
                 self.visualization_revision += 1
             self.profile_limiter.reset()
-            self.motion_owner = "NONE"
             self.rotation_metric_active = False
             self.obstacle_slowdown_active = False
             self.navigation_velocity.publish(Twist())
+            self.localization_velocity.publish(Twist())
             if handle is not None:
                 future = handle.cancel_goal_async()
 
@@ -5899,6 +6052,11 @@ class NavigationAdapter(Node):
             # that in-flight generation so _navigate cancels the late handle.
             with self.state_lock:
                 self.navigation_goal_generation += 1
+                self.execution_segment_token += 1
+                self.sensor_time_resume_context = None
+                self.sensor_time_resume_in_progress = False
+                self.localization_resume_context = None
+                self.localization_resume_in_progress = False
 
     def _record_odometry_trajectory(self, transform: Any) -> None:
         x = float(transform.transform.translation.x)
@@ -6421,6 +6579,149 @@ class NavigationAdapter(Node):
         if self.motion_owner == "LOCALIZATION":
             self.motion_owner = "NONE"
 
+    def _fail_closed_localization_callback(
+        self,
+        callback_name: str,
+        error: Exception,
+        expected_generation: int | None = None,
+    ) -> None:
+        """Revoke every motion authority after an unexpected localization fault."""
+        with self.state_lock:
+            if (
+                expected_generation is not None
+                and expected_generation != self.navigation_goal_generation
+            ):
+                return
+            handle = self.current_goal_handle
+            preserved_goal = dict(self.execution_goal or self.paused_goal or {})
+            preserved_route_id = self.execution_route_id
+            preserved_path = list(self.execution_points or self.latest_global_path)
+            preserved_directions = list(self.execution_segment_directions)
+            self.current_goal_handle = None
+            self.navigation_goal_generation += 1
+            self.execution_segment_token += 1
+            self.active_segment = None
+            self.execution_phase = "IDLE"
+            self.motion_owner = "NONE"
+            # An internal callback exception is not an authorized recovery
+            # trigger. Keep the destination available to the operator, but no
+            # background worker may restart it automatically.
+            self.sensor_time_resume_context = None
+            self.sensor_time_resume_in_progress = False
+            self.localization_resume_context = None
+            self.localization_resume_in_progress = False
+            self.localized = False
+            self.trajectory_map_from_odom = None
+            self.localization_state = "LOCALIZATION_FAILED"
+            self.latest_global_path = []
+            self.latest_feedback.pop("terminal_reason", None)
+            self.latest_feedback["recovery_reason"] = (
+                f"LOCALIZATION_CALLBACK_ERROR:{callback_name}"
+            )
+            self.latest_feedback["destination_preserved"] = bool(preserved_goal)
+            self.visualization_revision += 1
+
+        try:
+            self._stop_localization_rotation()
+        except Exception as stop_error:
+            self.get_logger().error(
+                f"failed to stop localization rotation after callback fault: {stop_error}"
+            )
+        # Ownership is revoked above, so late Nav2 callbacks are already
+        # ignored. Publish zero before exposing the terminal state or waiting
+        # for the asynchronous action cancellation.
+        for publisher in (self.navigation_velocity, self.localization_velocity):
+            try:
+                publisher.publish(Twist())
+            except Exception as publish_error:
+                self.get_logger().error(
+                    "failed to publish fail-closed localization stop: "
+                    f"{publish_error}"
+                )
+        try:
+            self.profile_limiter.reset()
+        except Exception as reset_error:
+            self.get_logger().error(
+                f"failed to reset motion profile after localization fault: {reset_error}"
+            )
+        if handle is not None:
+            try:
+                handle.cancel_goal_async()
+            except Exception as cancel_error:
+                self.get_logger().error(
+                    f"failed to cancel navigation after localization fault: {cancel_error}"
+                )
+        with self.state_lock:
+            self._set_state(
+                "LOCALIZATION_FAILED",
+                "localization_callback_error",
+            )
+        if preserved_goal:
+            try:
+                self._persist_active_navigation_mission(
+                    resume_automatically=False,
+                    goal=preserved_goal,
+                    route_id=preserved_route_id,
+                    path=preserved_path,
+                    segment_directions=preserved_directions,
+                )
+            except Exception as persist_error:
+                self.get_logger().error(
+                    "failed to persist paused mission after localization fault: "
+                    f"{persist_error}"
+                )
+        try:
+            self._nav_debug(
+                "LOCALIZATION_CALLBACK_FAIL_CLOSED",
+                callback=callback_name,
+                error_type=type(error).__name__,
+                motion_owner=self.motion_owner,
+                destination_preserved=bool(preserved_goal),
+            )
+        except Exception as debug_error:
+            self.get_logger().error(
+                f"failed to record localization fail-closed event: {debug_error}"
+            )
+
+    def _prepare_motionless_localization_command(self) -> None:
+        """Fence recovery work and reject pose changes while motion is active."""
+        with self.state_lock:
+            motion_active = bool(
+                self.current_goal_handle is not None
+                or self.motion_owner != "NONE"
+                or self.rotation_active
+                or self.execution_phase != "IDLE"
+                or self.current_state in {
+                    "NAVIGATING",
+                    "PLANNING",
+                    "WAIT_FOR_DYNAMIC_CLEAR",
+                    "WAITING_FOR_DYNAMIC_CLEAR",
+                    "DYNAMIC_REPLAN",
+                    "RECOVERY",
+                    "TURN_BAY_RECOVERY",
+                }
+            )
+            if motion_active:
+                raise AdapterError(
+                    "MOTION_ACTIVE",
+                    "Stop or cancel motion before changing localization",
+                )
+            # Invalidate any worker that finished planning just before this
+            # command. Explicit pose/relocalize commands never inherit an old
+            # automatic-resume context; the operator may resume the preserved
+            # destination explicitly after READY.
+            self.navigation_goal_generation += 1
+            self.execution_segment_token += 1
+            self.active_segment = None
+            self.sensor_time_resume_context = None
+            self.sensor_time_resume_in_progress = False
+            self.localization_resume_context = None
+            self.localization_resume_in_progress = False
+            self.motion_owner = "NONE"
+        self.navigation_velocity.publish(Twist())
+        self.localization_velocity.publish(Twist())
+        self.profile_limiter.reset()
+
     def _degrade_localization(
         self,
         reason: str,
@@ -6612,6 +6913,7 @@ class NavigationAdapter(Node):
             goal = dict(context["goal"])
             route_id = str(context.get("route_id") or "sensor-time-resume")
             mission_id = str(context.get("mission_id") or self.current_mission_id)
+            expected_generation = self.navigation_goal_generation
             self._set_state("PLANNING", "sensor_time_recovery_replan")
 
         def resume() -> None:
@@ -6640,9 +6942,12 @@ class NavigationAdapter(Node):
                         "route_id": route_id,
                         "points": points,
                     },
+                    expected_generation=expected_generation,
                 )
             except AdapterError as exc:
                 with self.state_lock:
+                    if expected_generation != self.navigation_goal_generation:
+                        return
                     self._set_state(
                         "WAITING_FOR_DYNAMIC_CLEAR",
                         "sensor_time_recovery_replan_wait",
@@ -6659,6 +6964,13 @@ class NavigationAdapter(Node):
                     error=exc.code,
                     destination=goal,
                     destination_preserved=True,
+                )
+                return
+            except Exception as exc:
+                self._fail_closed_localization_callback(
+                    "sensor_time_navigation_resume",
+                    exc,
+                    expected_generation=expected_generation,
                 )
                 return
             with self.state_lock:
@@ -6694,6 +7006,7 @@ class NavigationAdapter(Node):
             old_route_id = str(context.get("route_id") or "localization-resume")
             original_points = [dict(point) for point in context.get("path") or []]
             original_directions = list(context.get("segment_directions") or [])
+            expected_generation = self.navigation_goal_generation
             self._set_state("PLANNING", "localization_recovery_revalidate")
 
         def resume() -> None:
@@ -6706,14 +7019,15 @@ class NavigationAdapter(Node):
                         "Verified pose is unavailable for route revalidation",
                     )
                 points = list(original_points)
+                directions = list(original_directions)
                 if len(points) >= 2:
                     points[0] = {
                         "x": float(self.pose["x"]),
                         "y": float(self.pose["y"]),
                     }
                     points = canonicalize_stop_turn_path(points)
-                    if len(original_directions) != max(0, len(points) - 1):
-                        original_directions = [
+                    if len(directions) != max(0, len(points) - 1):
+                        directions = [
                             1 for _ in range(max(0, len(points) - 1))
                         ]
                     try:
@@ -6725,9 +7039,10 @@ class NavigationAdapter(Node):
                                 "mission_id": mission_id,
                                 "route_id": route_id,
                                 "points": points,
-                                "segment_directions": original_directions,
+                                "segment_directions": directions,
                             },
                             recovery_attempt=True,
+                            expected_generation=expected_generation,
                         )
                     except AdapterError:
                         points = []
@@ -6754,9 +7069,12 @@ class NavigationAdapter(Node):
                             "points": replanned,
                         },
                         recovery_attempt=True,
+                        expected_generation=expected_generation,
                     )
             except AdapterError as exc:
                 with self.state_lock:
+                    if expected_generation != self.navigation_goal_generation:
+                        return
                     self.localization_resume_in_progress = False
                     self._set_state(
                         "WAITING_FOR_DYNAMIC_CLEAR",
@@ -6771,6 +7089,13 @@ class NavigationAdapter(Node):
                     error=exc.code,
                     destination=goal,
                     destination_preserved=True,
+                )
+                return
+            except Exception as exc:
+                self._fail_closed_localization_callback(
+                    "localization_navigation_resume",
+                    exc,
+                    expected_generation=expected_generation,
                 )
                 return
             with self.state_lock:
@@ -8523,6 +8848,7 @@ class NavigationAdapter(Node):
         self._validate_command_map(payload)
         if self.saved_map is None or self.saved_map.world_to_cell(float(pose["x"]), float(pose["y"])) is None:
             raise AdapterError("POSE_OUTSIDE_MAP", "Vị trí gần đúng nằm ngoài bản đồ")
+        self._prepare_motionless_localization_command()
         # The operator supplies a search region only. Deliberately discard yaw
         # so a click can never masquerade as a complete robot pose.
         operator_pose = {
@@ -10290,17 +10616,20 @@ class NavigationAdapter(Node):
         pose: dict[str, float],
         goal_generation: int,
         preferred_translation_direction: int | None = None,
+        recovery_reason: str = "PERSISTENT_TURN_SAFETY_BLOCK",
     ) -> None:
-        if (
-            goal_generation != self.navigation_goal_generation
-            or self.execution_phase == "TURN_BAY_SEARCH"
-        ):
-            return
-        self.execution_phase = "TURN_BAY_SEARCH"
-        self.latest_feedback["execution_phase"] = "TURN_BAY_RECOVERY"
-        self.motion_owner = "NONE"
+        with self.state_lock:
+            if (
+                goal_generation != self.navigation_goal_generation
+                or self.execution_phase == "TURN_BAY_SEARCH"
+            ):
+                return
+            self.execution_phase = "TURN_BAY_SEARCH"
+            self.latest_feedback["execution_phase"] = "TURN_BAY_RECOVERY"
+            self.latest_feedback["recovery_reason"] = recovery_reason
+            self.motion_owner = "NONE"
+            self._set_state("TURN_BAY_RECOVERY", recovery_reason.lower())
         self.navigation_velocity.publish(Twist())
-        self._set_state("TURN_BAY_RECOVERY", "persistent_turn_safety_block")
         threading.Thread(
             target=self._find_and_start_turn_bay,
             args=(
@@ -10321,14 +10650,14 @@ class NavigationAdapter(Node):
         goal = dict(self.execution_goal or self.paused_goal or {})
         if saved_map is None or not goal:
             return
-        if (
-            not self._atomic_safety_fresh()
-            or self.estop_active
-        ):
-            self._set_state(
-                "WAITING_FOR_DYNAMIC_CLEAR", "turn_bay_safety_unavailable"
-            )
-            self.dynamic_wait_started = time.monotonic()
+        if not self._atomic_safety_fresh() or self.estop_active:
+            with self.state_lock:
+                if goal_generation != self.navigation_goal_generation:
+                    return
+                self._set_state(
+                    "WAITING_FOR_DYNAMIC_CLEAR", "turn_bay_safety_unavailable"
+                )
+                self.dynamic_wait_started = time.monotonic()
             return
         yaw = float(pose.get("yaw", 0.0))
         step = max(saved_map.resolution, 0.025)
@@ -10412,9 +10741,9 @@ class NavigationAdapter(Node):
                 break
             if selected is not None:
                 break
-        if goal_generation != self.navigation_goal_generation:
-            return
         if selected is None:
+            if goal_generation != self.navigation_goal_generation:
+                return
             self._nav_debug(
                 "TURN_BAY_RECOVERY",
                 result="WAIT",
@@ -10425,18 +10754,26 @@ class NavigationAdapter(Node):
             return
         candidate, direction = selected
         display = [dict(pose), dict(candidate)]
-        self.execution_segment_token += 1
-        self.active_segment = None
-        self.execution_points = [dict(pose), dict(candidate)]
-        self.execution_segment_directions = [direction]
-        self.execution_segment_index = 0
-        self.execution_phase = "STRAIGHT_PREPARE"
-        self.execution_phase_started = time.monotonic()
-        self.execution_relocation_reason = "TURN_BAY"
-        self.execution_relocation_plan = canonicalize_stop_turn_path(display)
-        self.execution_narrow_segments = set()
-        self.latest_global_path = list(self.execution_relocation_plan)
-        self._set_state("NAVIGATING", "move_to_turn_bay")
+        with self.state_lock:
+            # Cancel, E-stop and manual takeover all invalidate this worker by
+            # incrementing the generation. Check and commit atomically so a
+            # completed bay search cannot resurrect automatic motion.
+            if goal_generation != self.navigation_goal_generation:
+                return
+            self.execution_segment_token += 1
+            self.active_segment = None
+            self.execution_points = [dict(pose), dict(candidate)]
+            self.execution_segment_directions = [direction]
+            self.execution_segment_index = 0
+            self.execution_phase = "STRAIGHT_PREPARE"
+            self.execution_phase_started = time.monotonic()
+            self.execution_relocation_reason = "TURN_BAY"
+            self.execution_relocation_plan = canonicalize_stop_turn_path(display)
+            # A clearance-recovery translation is always slow, including the
+            # reverse-first escape used for a one-sided corridor violation.
+            self.execution_narrow_segments = {0}
+            self.latest_global_path = list(self.execution_relocation_plan)
+            self._set_state("NAVIGATING", "move_to_turn_bay")
         self._nav_debug(
             "TURN_BAY_RECOVERY",
             result="MOVE_TO_TURN_BAY",
@@ -12378,6 +12715,7 @@ class NavigationAdapter(Node):
                     "segment_directions": directions,
                 },
                 recovery_attempt=True,
+                expected_generation=expected_generation,
             )
             return
 
@@ -12466,8 +12804,11 @@ class NavigationAdapter(Node):
                         "segment_directions": resume_directions,
                     },
                     recovery_attempt=True,
+                    expected_generation=expected_generation,
                 )
             except AdapterError as exc:
+                if expected_generation != self.navigation_goal_generation:
+                    return
                 self._nav_debug(
                     "DYNAMIC_REPLAN",
                     result="ORIGINAL_ROUTE_INVALIDATED",
@@ -12698,6 +13039,7 @@ class NavigationAdapter(Node):
                     "points": points,
                 },
                 recovery_attempt=True,
+                expected_generation=expected_generation,
             )
         except AdapterError as exc:
             if expected_generation != self.navigation_goal_generation:
@@ -12826,8 +13168,11 @@ class NavigationAdapter(Node):
                     "points": points,
                 },
                 recovery_attempt=True,
+                expected_generation=goal_generation,
             )
         except AdapterError as exc:
+            if goal_generation != self.navigation_goal_generation:
+                return
             self._enter_dynamic_wait(
                 exc.code or "DYNAMIC_ROUTES_TEMPORARILY_BLOCKED"
             )
@@ -13204,6 +13549,7 @@ class NavigationAdapter(Node):
                     "points": recovery_points,
                 },
                 recovery_attempt=True,
+                expected_generation=expected_generation,
             )
         except AdapterError as exc:
             self._set_recovery_terminal("FAILED", exc.code, expected_generation)
@@ -13222,6 +13568,12 @@ class NavigationAdapter(Node):
             self.execution_phase = "IDLE"
             self._set_state(target, "operator_navigation_command")
             self.motion_owner = "NONE"
+            # An explicit operator command owns the outcome. Neither sensor
+            # nor localization recovery may auto-resume an older mission.
+            self.sensor_time_resume_context = None
+            self.sensor_time_resume_in_progress = False
+            self.localization_resume_context = None
+            self.localization_resume_in_progress = False
         # Revoke ownership and inject zero before waiting for Nav2's
         # acknowledgement; cancel latency must never extend chassis motion.
         self.navigation_velocity.publish(Twist())
@@ -13234,8 +13586,6 @@ class NavigationAdapter(Node):
             self.execution_points = []
             self.execution_segment_directions = []
             if target != "PAUSED":
-                self.sensor_time_resume_context = None
-                self.sensor_time_resume_in_progress = False
                 self.paused_goal = None
                 self.execution_goal = None
                 self.execution_route_id = ""
@@ -13294,6 +13644,10 @@ class NavigationAdapter(Node):
             self.active_segment = None
             self.motion_owner = "NONE"
             self.execution_phase = "IDLE"
+            self.sensor_time_resume_context = None
+            self.sensor_time_resume_in_progress = False
+            self.localization_resume_context = None
+            self.localization_resume_in_progress = False
             self.manual_handoff_reason = reason
             self._set_state("MANUAL_BYPASS", "operator_manual_handoff")
         self.profile_limiter.reset()
@@ -13519,6 +13873,12 @@ class NavigationAdapter(Node):
         return result
 
     def _mapping_command(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.mapping_operation_lock:
+            return self._mapping_command_locked(command, payload)
+
+    def _mapping_command_locked(
+        self, command: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         if self.mode != "MAPPING":
             raise AdapterError("WRONG_MODE", "Navigation stack is not in MAPPING mode")
         if command == "mapping.start":
@@ -14018,15 +14378,192 @@ class NavigationAdapter(Node):
         threading.Thread(target=self._autosave_posegraph, daemon=True).start()
 
     def _autosave_posegraph(self) -> None:
+        if not self.mapping_operation_lock.acquire(blocking=False):
+            return
+        staging: Path | None = None
+        paused_by_autosave = False
         try:
-            map_id = str(self.mapping_payload.get("map_id", "session"))
-            autosave = self.map_root / ".autosave"
-            autosave.mkdir(parents=True, exist_ok=True)
-            request = SerializePoseGraph.Request()
-            request.filename = str(autosave / f"{map_id}-latest")
-            self._call_empty_like(self.slam_serialize_client, request, "AUTOSAVE_FAILED")
+            with self.state_lock:
+                state = self.current_state
+                map_id = str(self.mapping_payload.get("map_id") or "")
+                version = int(self.mapping_payload.get("version") or 1)
+                terminal_pose = dict(self.pose) if self.pose else None
+            if state not in {"MAPPING", "MAPPING_RUNNING", "PAUSED"}:
+                return
+            if not map_id or Path(map_id).name != map_id:
+                raise AdapterError("AUTOSAVE_FAILED", "Mapping session has an invalid map_id")
+            if not isinstance(terminal_pose, dict) or not all(
+                axis in terminal_pose
+                and math.isfinite(float(terminal_pose[axis]))
+                for axis in ("x", "y", "yaw")
+            ):
+                raise AdapterError(
+                    "AUTOSAVE_FAILED",
+                    "No finite terminal map pose is available for safe recovery",
+                )
+            if state in {"MAPPING", "MAPPING_RUNNING"}:
+                measured_fresh = bool(
+                    self._atomic_safety_fresh()
+                    and self.safety_snapshot.get("measured_velocity_fresh", False)
+                )
+                try:
+                    measured_linear = float(
+                        self.safety_snapshot.get("measured_linear")
+                    )
+                    measured_angular = float(
+                        self.safety_snapshot.get("measured_angular")
+                    )
+                    commanded_linear = float(
+                        self.safety_snapshot.get("input_v")
+                    )
+                    commanded_angular = float(
+                        self.safety_snapshot.get("input_w")
+                    )
+                except (TypeError, ValueError):
+                    return
+                if (
+                    not measured_fresh
+                    or not math.isfinite(measured_linear)
+                    or not math.isfinite(measured_angular)
+                    or not math.isfinite(commanded_linear)
+                    or not math.isfinite(commanded_angular)
+                    or abs(measured_linear) > 0.01
+                    or abs(measured_angular) > 0.03
+                    or abs(commanded_linear) > 0.001
+                    or abs(commanded_angular) > 0.001
+                ):
+                    # Never toggle measurement ingestion underneath a moving
+                    # chassis. The next timer tick will retry at rest.
+                    return
+
+            # Freeze new measurements so the raster, pose graph and terminal
+            # pose describe one generation rather than adjacent SLAM states.
+            if state in {"MAPPING", "MAPPING_RUNNING"}:
+                self._call_empty_like(
+                    self.slam_pause_client,
+                    Pause.Request(),
+                    "AUTOSAVE_PAUSE_FAILED",
+                )
+                paused_by_autosave = True
+
+            generation = (
+                f"{time.time_ns()}-{os.getpid()}-{threading.get_ident()}"
+            )
+            autosave_root = self.map_root / ".autosave" / map_id
+            generations = autosave_root / "generations"
+            generations.mkdir(parents=True, exist_ok=True)
+            staging = generations / f".{generation}.tmp"
+            staging.mkdir()
+
+            save = SaveMap.Request()
+            save.name.data = str(staging / "map")
+            self._call_empty_like(
+                self.slam_save_client, save, "AUTOSAVE_MAP_FAILED"
+            )
+            serialize = SerializePoseGraph.Request()
+            serialize.filename = str(staging / "posegraph")
+            self._call_empty_like(
+                self.slam_serialize_client,
+                serialize,
+                "AUTOSAVE_POSEGRAPH_FAILED",
+            )
+
+            required = (
+                "map.yaml",
+                "map.pgm",
+                "posegraph.posegraph",
+                "posegraph.data",
+            )
+            for filename in required:
+                artifact = staging / filename
+                if not artifact.is_file() or artifact.stat().st_size <= 0:
+                    raise AdapterError(
+                        "AUTOSAVE_FAILED",
+                        f"SLAM Toolbox did not create {filename}",
+                    )
+            try:
+                SavedOccupancyMap.load(staging / "map.yaml")
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise AdapterError(
+                    "AUTOSAVE_FAILED", f"Invalid autosave occupancy map: {exc}"
+                ) from exc
+
+            files = {
+                filename: hashlib.sha256((staging / filename).read_bytes()).hexdigest()
+                for filename in required
+            }
+            manifest = {
+                "schema_version": 1,
+                "map_id": map_id,
+                "version": version,
+                "generation": generation,
+                "created_at": time.time(),
+                "terminal_pose": {
+                    axis: float(terminal_pose[axis])
+                    for axis in ("x", "y", "yaw")
+                },
+                "files": files,
+            }
+            manifest_path = staging / "manifest.json"
+            with manifest_path.open("x") as destination:
+                json.dump(manifest, destination, indent=2, sort_keys=True)
+                destination.flush()
+                os.fsync(destination.fileno())
+            for filename in (*required, "manifest.json"):
+                with (staging / filename).open("rb") as artifact:
+                    os.fsync(artifact.fileno())
+
+            committed = generations / generation
+            os.replace(staging, committed)
+            staging = None
+            self._fsync_directory(generations)
+
+            pointer_staging = autosave_root / f".latest-{generation}.tmp"
+            with pointer_staging.open("x") as destination:
+                json.dump({"generation": generation}, destination)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.replace(pointer_staging, autosave_root / "latest.json")
+            self._fsync_directory(autosave_root)
+
+            committed_generations = sorted(
+                (
+                    item
+                    for item in generations.iterdir()
+                    if item.is_dir() and not item.name.startswith(".")
+                ),
+                key=lambda item: item.stat().st_mtime_ns,
+                reverse=True,
+            )
+            for obsolete in committed_generations[2:]:
+                shutil.rmtree(obsolete, ignore_errors=True)
         except AdapterError as exc:
             self.get_logger().warning(str(exc))
+        except OSError as exc:
+            self.get_logger().warning(f"AUTOSAVE_FAILED: {exc}")
+        finally:
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
+            if paused_by_autosave:
+                try:
+                    self._call_empty_like(
+                        self.slam_pause_client,
+                        Pause.Request(),
+                        "AUTOSAVE_RESUME_FAILED",
+                    )
+                except AdapterError as exc:
+                    with self.state_lock:
+                        self.current_state = "MAPPING_ERROR"
+                    self.get_logger().error(str(exc))
+            self.mapping_operation_lock.release()
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def destroy_node(self) -> bool:
         self._closing.set()

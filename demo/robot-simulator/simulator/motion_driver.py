@@ -34,6 +34,8 @@ class MotionDriver(Protocol):
 
     def stop(self, reason: str = "") -> None: ...
 
+    def reset_estop(self, reason: str = "") -> None: ...
+
     def watchdog(self, now: float | None = None) -> bool: ...
 
     def close(self) -> None: ...
@@ -60,6 +62,11 @@ class DisabledMotionDriver:
 
     def stop(self, _reason: str = "") -> None:
         return
+
+    def reset_estop(self, _reason: str = "") -> None:
+        raise MotionDisabledError(
+            "Web motion is disabled while the legacy /cmd_vel owner is active"
+        )
 
     def watchdog(self, _now: float | None = None) -> bool:
         return False
@@ -120,6 +127,15 @@ class UnixMotionDriver:
         # datagram is cheap and covers a transient full receive buffer.
         for _ in range(3):
             self._send("stop", reason=reason, now=self.clock())
+
+    def reset_estop(self, reason: str = "") -> None:
+        if self._closed:
+            raise MotionDisabledError("ROS motion bridge is closed")
+        self.linear_x = 0.0
+        self.angular_z = 0.0
+        self.last_command_monotonic = 0.0
+        for _ in range(3):
+            self._send("estop_reset", reason=reason, now=self.clock())
 
     def watchdog(self, now: float | None = None) -> bool:
         now = self.clock() if now is None else now

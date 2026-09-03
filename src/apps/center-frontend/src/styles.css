@@ -2715,6 +2715,18 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .spectator-control-state small { margin-top: 3px; color: var(--muted); font-size: 8px; }
 .spectator-control-state p { max-width: 29ch; margin: 13px 0 0; color: #667389; font-size: 8px; line-height: 1.55; }
 .drive-controls { display: grid; justify-items: center; }
+.control-pad__estop-reset {
+  margin-top: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid color-mix(in srgb, var(--red) 55%, transparent);
+  border-radius: 999px;
+  padding: 8px 13px;
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  font-weight: 700;
+}
 .control-pad {
   position: relative;
   width: 136px;

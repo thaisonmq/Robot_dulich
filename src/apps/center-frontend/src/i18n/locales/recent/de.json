@@ -1,4 +1,12 @@
 {
+  "Nhả E-stop phần mềm": "Software-Not-Aus freigeben",
+  "Đang xác minh dừng": "Stopp wird bestätigt",
+  "Đã xác nhận robot đứng yên": "Stillstand des Roboters bestätigt",
+  "Chưa xác nhận robot đứng yên": "Stillstand des Roboters nicht bestätigt",
+  "Đã nhả E-stop phần mềm an toàn": "Software-Not-Aus sicher freigegeben",
+  "Chưa xác nhận nhả E-stop": "Freigabe des Not-Aus nicht bestätigt",
+  "Đang xác minh robot đã đứng yên": "Stillstand des Roboters wird bestätigt",
+  "Đang xác minh nhả E-stop": "Freigabe des Not-Aus wird bestätigt",
   "Tốc độ thủ công": "Manuelle Geschwindigkeit",
   "Tốc độ tự động": "Automatische Geschwindigkeit",
   "Chống vật cản": "Anti-Hindernis",

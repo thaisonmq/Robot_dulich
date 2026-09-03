@@ -172,4 +172,18 @@ describe("WebSocketControlTransport", () => {
     expect(messages[0].payload.obstacle_avoidance_enabled).toBe(true);
     expect(messages[1].payload.obstacle_avoidance_enabled).toBe(false);
   });
+
+  it("uses a distinct command to reset the software E-stop", async () => {
+    const transport = new WebSocketControlTransport(vi.fn(), vi.fn());
+    const connecting = transport.connect("ROBOT-001", "session-1", "/ws/control");
+    FakeWebSocket.instances[0].open();
+    FakeWebSocket.instances[0].acceptControl();
+    await connecting;
+
+    transport.resetEstop();
+
+    const message = JSON.parse(FakeWebSocket.instances[0].sent[0]);
+    expect(message.message_type).toBe("control.estop.reset");
+    expect(message.payload.reason).toBe("operator_estop_reset");
+  });
 });

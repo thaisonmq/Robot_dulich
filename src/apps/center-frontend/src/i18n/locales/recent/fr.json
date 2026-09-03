@@ -1,4 +1,12 @@
 {
+  "Nhả E-stop phần mềm": "Libérer l’arrêt d’urgence logiciel",
+  "Đang xác minh dừng": "Confirmation de l’arrêt",
+  "Đã xác nhận robot đứng yên": "Immobilité du robot confirmée",
+  "Chưa xác nhận robot đứng yên": "Immobilité du robot non confirmée",
+  "Đã nhả E-stop phần mềm an toàn": "Arrêt d’urgence logiciel libéré en sécurité",
+  "Chưa xác nhận nhả E-stop": "Libération de l’arrêt d’urgence non confirmée",
+  "Đang xác minh robot đã đứng yên": "Confirmation de l’immobilité du robot",
+  "Đang xác minh nhả E-stop": "Confirmation de la libération de l’arrêt d’urgence",
   "Tốc độ thủ công": "Vitesse manuelle",
   "Tốc độ tự động": "Vitesse automatique",
   "Chống vật cản": "Anti-obstacle",
@@ -172,4 +180,3 @@
   "Quét lại": "Scannez à nouveau",
   "Chọn bản đồ điều hướng mặc định cho robot.": "Choisissez la carte de navigation par défaut pour le robot."
 }
-

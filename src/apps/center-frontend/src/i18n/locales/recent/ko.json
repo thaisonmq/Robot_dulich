@@ -1,4 +1,12 @@
 {
+  "Nhả E-stop phần mềm": "소프트웨어 비상 정지 해제",
+  "Đang xác minh dừng": "정지 확인 중",
+  "Đã xác nhận robot đứng yên": "로봇 정지 확인됨",
+  "Chưa xác nhận robot đứng yên": "로봇 정지 확인 안 됨",
+  "Đã nhả E-stop phần mềm an toàn": "소프트웨어 비상 정지가 안전하게 해제됨",
+  "Chưa xác nhận nhả E-stop": "비상 정지 해제 확인 안 됨",
+  "Đang xác minh robot đã đứng yên": "로봇 정지 확인 중",
+  "Đang xác minh nhả E-stop": "비상 정지 해제 확인 중",
   "Tốc độ thủ công": "수동 속도",
   "Tốc độ tự động": "자동 속도",
   "Chống vật cản": "장애물 방지",

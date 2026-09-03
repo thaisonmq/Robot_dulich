@@ -1,4 +1,12 @@
 {
+  "Nhả E-stop phần mềm": "ソフトウェア非常停止を解除",
+  "Đang xác minh dừng": "停止を確認中",
+  "Đã xác nhận robot đứng yên": "ロボットの停止を確認しました",
+  "Chưa xác nhận robot đứng yên": "ロボットの停止を確認できません",
+  "Đã nhả E-stop phần mềm an toàn": "ソフトウェア非常停止を安全に解除しました",
+  "Chưa xác nhận nhả E-stop": "非常停止の解除を確認できません",
+  "Đang xác minh robot đã đứng yên": "ロボットの停止を確認中",
+  "Đang xác minh nhả E-stop": "非常停止の解除を確認中",
   "Tốc độ thủ công": "手動速度",
   "Tốc độ tự động": "自動速度",
   "Chống vật cản": "対障害物",

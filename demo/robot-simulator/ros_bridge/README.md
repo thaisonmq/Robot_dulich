@@ -24,6 +24,10 @@ Obstacle detector -> /rovera/obstacle_* -> motion-safety (mọi nguồn)
   Bridge bỏ lệnh cũ/trùng/hết hạn và chỉ giữ lệnh mới nhất chưa xử lý.
 - Edge và bridge có watchdog độc lập. Mất WebSocket, tiến trình hoặc lệnh mới quá
   250 ms đều phát lệnh dừng; STOP được gửi thành một cụm ba gói.
+- Software E-stop được latch khi nhận emergency stop. Velocity mới không thể
+  nhả latch; chỉ datagram `estop_reset` riêng mới được phép reset và transition
+  này vẫn phát zero. Edge chỉ báo hoàn tất về Center sau khi odometry mới xác
+  nhận vận tốc tuyến tính/góc bằng zero trong toàn bộ dwell cấu hình.
 - Managed-motion thay đúng tiến trình joystick vendor bằng cùng image/launch,
   chỉ remap `cmd_vel` sang `/cmd_vel_joy`; `/joy`, `/JoyState` và `/rpi5_ip`
   được giữ. Nó cũng chạy lại `yahboomcar_bringup` để giữ `/odom`, `/imu/data`,
@@ -43,10 +47,10 @@ Obstacle detector -> /rovera/obstacle_* -> motion-safety (mọi nguồn)
   `/rovera/obstacle_stop`: `true` khóa và phát zero liên tục, `false` mở khóa.
   Lệnh velocity của Web không thể tự xóa khóa này. Motion safety nhận tín hiệu
   trực tiếp nên khóa áp dụng cho Web, joystick và Nav2.
-- `ROS_OBSTACLE_WATCHDOG_MS=0` giữ tương thích khi chưa cài chương trình cảm
-  biến. Khi đã tích hợp, đặt giá trị dương (khuyến nghị bắt đầu từ 500 ms) và
-  publish cả `true` lẫn `false` định kỳ; bridge sẽ khóa ngay từ lúc khởi động
-  và khóa lại nếu heartbeat quá hạn.
+- Production mặc định `ROS_OBSTACLE_WATCHDOG_MS=500` và nguồn cảm biến phải
+  publish cả `true` lẫn `false` định kỳ; bridge khóa ngay từ lúc khởi động và
+  khóa lại nếu heartbeat quá hạn. Chỉ đặt `0` trong bench/service mode khi
+  nguồn obstacle ngoài chủ ý không được lắp và motion output đã bị cô lập.
 - Để chỉ khóa chiều gần vật cản, publish `std_msgs/UInt8` lên
   `/rovera/obstacle_directions`: bit 0 chặn tiến, bit 1 chặn lùi, bit 2 chặn
   quay trái và bit 3 chặn quay phải. Các thành phần vận tốc không hướng vào vật

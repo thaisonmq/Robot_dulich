@@ -9,7 +9,7 @@ from typing import Literal
 
 MOTION_PROTOCOL_VERSION = 1
 MAX_MOTION_DATAGRAM_BYTES = 1024
-MotionMessageType = Literal["velocity", "stop"]
+MotionMessageType = Literal["velocity", "stop", "estop_reset"]
 OBSTACLE_FRONT = 1 << 0
 OBSTACLE_REAR = 1 << 1
 OBSTACLE_LEFT = 1 << 2
@@ -105,6 +105,40 @@ class SafetyInterlock:
         return linear_x, angular_z
 
 
+@dataclass(slots=True)
+class MeasuredZeroWindow:
+    """Require fresh, near-zero measured motion for one continuous dwell."""
+
+    linear_threshold: float = 0.015
+    angular_threshold: float = 0.03
+    dwell_seconds: float = 0.25
+    stable_since: float | None = None
+
+    def observe(
+        self,
+        *,
+        now: float,
+        fresh: bool,
+        linear_velocity: float | None,
+        angular_velocity: float | None,
+    ) -> bool:
+        valid = bool(
+            fresh
+            and linear_velocity is not None
+            and angular_velocity is not None
+            and math.isfinite(linear_velocity)
+            and math.isfinite(angular_velocity)
+            and abs(linear_velocity) <= self.linear_threshold
+            and abs(angular_velocity) <= self.angular_threshold
+        )
+        if not valid:
+            self.stable_since = None
+            return False
+        if self.stable_since is None or now < self.stable_since:
+            self.stable_since = now
+        return now - self.stable_since >= self.dwell_seconds
+
+
 @dataclass(frozen=True, slots=True)
 class MotionDatagram:
     protocol_version: int
@@ -195,7 +229,7 @@ def decode_motion_datagram(
         raise ValueError("invalid motion boot id")
     if command.sequence < 0:
         raise ValueError("invalid motion sequence")
-    if command.message_type not in {"velocity", "stop"}:
+    if command.message_type not in {"velocity", "stop", "estop_reset"}:
         raise ValueError("invalid motion message type")
     if not 50 <= command.ttl_ms <= 2_000:
         raise ValueError("invalid motion TTL")

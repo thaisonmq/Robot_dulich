@@ -151,6 +151,7 @@ export function DashboardPage() {
     setSpeedLevel,
     obstacleAvoidanceEnabled,
     setObstacleAvoidanceEnabled,
+    resetEstop,
   } = useTeleoperation();
   const [micEnabled, setMicEnabled] = useState(false);
   const [speakerMuted, setSpeakerMuted] = useState(false);
@@ -1582,7 +1583,13 @@ export function DashboardPage() {
                   <h1>{isSpectator ? t("Theo dõi phiên") : t("Điều khiển")}</h1>
                 </div>
                 <span className={`control-state control-state--${isSpectator ? "spectating" : controlState}`}>
-                  {isSpectator ? t("Chỉ xem") : controlState === "active" ? t("Đang chạy") : t("Sẵn sàng")}
+                  {isSpectator
+                    ? t("Chỉ xem")
+                    : controlState === "active"
+                      ? t("Đang chạy")
+                      : controlState === "stopping"
+                        ? t("Đang xác minh dừng")
+                        : t("Sẵn sàng")}
                 </span>
               </div>
               {isSpectator ? (
@@ -1598,6 +1605,9 @@ export function DashboardPage() {
                     adapter={screen}
                     input={inputState}
                     disabled={manualControlDisabled}
+                    estopActive={Boolean(health.estop)}
+                    stopping={controlState === "stopping"}
+                    onResetEstop={resetEstop}
                   />
                   <div className="command-readout">
                     <span className="command-readout__icon"><Speaker size={20} /></span>

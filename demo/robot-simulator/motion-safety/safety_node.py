@@ -20,6 +20,7 @@ from safety_core import (
     StopHysteresis,
     clip_motion_by_mask,
     evaluate_scan,
+    protective_input_timeout_reason,
     safety_snapshot_payload,
 )
 
@@ -38,7 +39,7 @@ class MotionSafetyNode(Node):
         self.declare_parameter("side_margin", 0.04)
         self.declare_parameter("translation_lateral_margin", 0.01)
         self.declare_parameter("rotation_margin", 0.03)
-        self.declare_parameter("laser_x", -0.0046412)
+        self.declare_parameter("laser_x", 0.0)
         self.declare_parameter("laser_y", 0.0)
         self.declare_parameter("laser_yaw", 0.0)
         self.declare_parameter("slow_extra", 0.10)
@@ -47,6 +48,21 @@ class MotionSafetyNode(Node):
         self.declare_parameter("angular_braking_acceleration", 2.0)
         self.declare_parameter("rotation_preview_angle", 0.30)
         self.declare_parameter("trajectory_samples", 6)
+        # Software E-stop is a continuously republished control heartbeat.
+        # Optional physical sources remain disabled until their hardware is
+        # installed; enabling one makes missing/stale clear values fail closed.
+        self.declare_parameter("estop_heartbeat_required", True)
+        self.declare_parameter("estop_timeout", 1.20)
+        self.declare_parameter("cliff_heartbeat_required", False)
+        self.declare_parameter("cliff_timeout", 0.60)
+        self.declare_parameter("bumper_heartbeat_required", False)
+        self.declare_parameter("bumper_timeout", 0.60)
+        self.declare_parameter("range_heartbeat_required", False)
+        self.declare_parameter("range_timeout", 0.35)
+        self.declare_parameter("external_stop_heartbeat_required", False)
+        self.declare_parameter("external_stop_timeout", 0.60)
+        self.declare_parameter("external_directions_heartbeat_required", False)
+        self.declare_parameter("external_directions_timeout", 0.60)
         self.config = SafetyConfig(
             half_length=float(self.get_parameter("half_length").value),
             half_width=float(self.get_parameter("half_width").value),
@@ -128,6 +144,26 @@ class MotionSafetyNode(Node):
         self.measured_linear_x = 0.0
         self.measured_angular_z = 0.0
         self.last_odometry = 0.0
+        self.protective_source_required = {
+            name: bool(
+                self.get_parameter(f"{name}_heartbeat_required").value
+            )
+            for name in (
+                "estop",
+                "cliff",
+                "bumper",
+                "range",
+                "external_stop",
+                "external_directions",
+            )
+        }
+        self.protective_source_timeout = {
+            name: float(self.get_parameter(f"{name}_timeout").value)
+            for name in self.protective_source_required
+        }
+        self.last_protective_source = {
+            name: 0.0 for name in self.protective_source_required
+        }
         self.estop = False
         self.cliff = False
         self.bumper = False
@@ -203,6 +239,7 @@ class MotionSafetyNode(Node):
         self.last_odometry = time.monotonic()
 
     def _on_estop(self, message: Bool) -> None:
+        self.last_protective_source["estop"] = time.monotonic()
         self.estop = bool(message.data)
         if self.estop:
             self._trip_immediately("estop")
@@ -219,16 +256,19 @@ class MotionSafetyNode(Node):
         )
 
     def _on_cliff(self, message: Bool) -> None:
+        self.last_protective_source["cliff"] = time.monotonic()
         self.cliff = bool(message.data)
         if self.cliff:
             self._trip_immediately("cliff")
 
     def _on_bumper(self, message: Bool) -> None:
+        self.last_protective_source["bumper"] = time.monotonic()
         self.bumper = bool(message.data)
         if self.bumper:
             self._trip_immediately("bumper")
 
     def _on_range(self, message: Range) -> None:
+        self.last_protective_source["range"] = time.monotonic()
         self.range_stop = math.isfinite(message.range) and message.min_range <= message.range <= 0.20
         if (
             self.range_stop
@@ -237,6 +277,7 @@ class MotionSafetyNode(Node):
             self._trip_immediately("range")
 
     def _on_obstacle_stop(self, message: Bool) -> None:
+        self.last_protective_source["external_stop"] = time.monotonic()
         self.external_stop = bool(message.data)
         if (
             self.external_stop
@@ -253,6 +294,7 @@ class MotionSafetyNode(Node):
                 f"dropping invalid obstacle direction mask={value}"
             )
             return
+        self.last_protective_source["external_directions"] = time.monotonic()
         self.external_directions = Direction(value)
         # Compatibility masks are directional geometry, not hard faults. They
         # are clipped component-wise in _tick and never arm full-stop hold.
@@ -368,6 +410,11 @@ class MotionSafetyNode(Node):
         hard_stop: bool | None = None,
     ) -> None:
         self.safety_sequence += 1
+        measured_velocity_age = (
+            math.inf
+            if self.last_odometry <= 0.0
+            else max(0.0, time.monotonic() - self.last_odometry)
+        )
         payload = safety_snapshot_payload(
             sequence=self.safety_sequence,
             stamp=self.get_clock().now().nanoseconds / 1_000_000_000.0,
@@ -382,6 +429,12 @@ class MotionSafetyNode(Node):
             output_angular=float(output_angular),
             measured_linear=float(self.measured_linear_x),
             measured_angular=float(self.measured_angular_z),
+            measured_velocity_fresh=measured_velocity_age <= 0.30,
+            measured_velocity_age_ms=(
+                None
+                if not math.isfinite(measured_velocity_age)
+                else measured_velocity_age * 1000.0
+            ),
             decision=decision,
             hard_stop=hard_stop,
         )
@@ -436,6 +489,25 @@ class MotionSafetyNode(Node):
 
     def _tick(self) -> None:
         now = time.monotonic()
+        protective_timeout = protective_input_timeout_reason(
+            now,
+            (
+                (
+                    name,
+                    self.protective_source_required[name],
+                    self.last_protective_source[name],
+                    self.protective_source_timeout[name],
+                )
+                for name in self.protective_source_required
+            ),
+        )
+        if protective_timeout:
+            self.fault_hysteresis.update(True, now)
+            self._publish_zero(
+                protective_timeout,
+                Direction.FRONT | Direction.REAR | Direction.LEFT | Direction.RIGHT,
+            )
+            return
         manual_obstacle_bypass = self._manual_obstacle_bypass_active(now)
         if (
             self.estop

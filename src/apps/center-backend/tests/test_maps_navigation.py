@@ -8,40 +8,48 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
-
+from app.api import maps as maps_api
+from app.api import navigation as navigation_api
 from app.api.maps import (
     MappingInitialPose,
-    _mapping_pose_hint,
     _map_view,
     _mapping_action_reached,
+    _mapping_pose_hint,
     _mapping_pose_in_version,
     _mapping_start_health_failures,
     _posegraph_basename,
 )
-from app.api import maps as maps_api
-from app.api import navigation as navigation_api
-from app.core.config import Settings
 from app.api.navigation import (
     ComputePathRequest,
     InitialPoseRequest,
     RelocalizeRequest,
     _mission_start_rejection,
+    _navigation_preflight,
     _normalized_route_candidates,
     _robot_by_public_id,
     _selected_candidate,
 )
 from app.api.websockets import persist_robot_runtime_event
+from app.core.config import Settings
 from app.models.database import Base, SessionLocal
-from app.models.entities import MapRecord, MappingSession, MapVersion, NavigationMission, Robot
+from app.models.entities import (
+    MapDeletionAck,
+    MappingSession,
+    MapRecord,
+    MapVersion,
+    NavigationMission,
+    Robot,
+)
+from app.services.hub import hub
 from app.services.map_storage import InvalidMapBundle, MapBundleStore
 from app.services.state_machines import (
     InvalidTransition,
     mapping_transition,
     navigation_transition,
 )
+from fastapi import HTTPException, UploadFile
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
 
 
 def test_navigation_resolves_robot_by_public_robot_id() -> None:
@@ -62,6 +70,78 @@ def test_navigation_resolves_robot_by_public_robot_id() -> None:
         assert robot is not None
         assert robot.robot_id == "ROBOT-001"
         assert robot.id == "internal-robot-uuid"
+
+
+@pytest.mark.asyncio
+async def test_robot_tombstone_snapshot_remains_authoritative_after_ack() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    deleted_at = datetime.now(timezone.utc)
+    with Session(engine) as database:
+        database.add(
+            MapRecord(
+                map_id="MAP-DELETED-SNAPSHOT",
+                name="Deleted map",
+                image_url="",
+                width_pixels=1,
+                height_pixels=1,
+                resolution_m_per_pixel=0.05,
+                origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+                status="DELETED",
+                deleted_at=deleted_at,
+                deletion_status="DELETED",
+            )
+        )
+        database.add(
+            MapDeletionAck(
+                map_id="MAP-DELETED-SNAPSHOT",
+                robot_id="ROBOT-001",
+            )
+        )
+        database.commit()
+
+        snapshot = await maps_api.map_tombstones(
+            ("robot", "ROBOT-001"), database
+        )
+
+    assert snapshot["robot_id"] == "ROBOT-001"
+    assert snapshot["snapshot_at"]
+    assert [item["map_id"] for item in snapshot["items"]] == [
+        "MAP-DELETED-SNAPSHOT"
+    ]
+
+
+def test_navigation_preflight_requires_reconnect_registry_barrier() -> None:
+    robot_id = "ROBOT-REGISTRY-BARRIER"
+    runtime = hub.sync_registry_robot(
+        robot_id,
+        "Registry barrier robot",
+        "test",
+        "MAP-TEST",
+        enrolled=True,
+    )
+    runtime.status = "online"
+    runtime.capabilities["source"] = "robot"
+    runtime.health.update(
+        {
+            "map_registry": {"ready": False},
+            "map_state": "READY",
+            "localized": True,
+            "localization_state": "READY",
+            "nav2": "READY",
+            "safety": "HEALTHY",
+            "scan_fresh": True,
+            "estop": False,
+            "collision_fault": False,
+            "battery_percent": 90,
+        }
+    )
+    try:
+        assert _navigation_preflight(robot_id) == ["MAP_REGISTRY_NOT_READY"]
+        runtime.health["map_registry"]["ready"] = True
+        assert _navigation_preflight(robot_id) == []
+    finally:
+        hub.robots.pop(robot_id, None)
 
 
 def test_compute_path_auto_recovery_is_explicit_and_opt_in() -> None:
@@ -395,11 +475,20 @@ def test_plan_failure_messages_distinguish_unknown_and_blocked_start() -> None:
     assert "hard safety margin" in rejection["message"]
 
 
-def bundle_bytes(*, unsafe: bool = False) -> bytes:
+def bundle_bytes(
+    *,
+    unsafe: bool = False,
+    yaml_content: bytes | None = None,
+    metadata_overrides: dict | None = None,
+    extra_artifacts: dict[str, bytes] | None = None,
+    duplicate_member: str | None = None,
+) -> bytes:
     output = io.BytesIO()
     artifacts = {
-        "map.yaml": b"image: map.pgm\nresolution: 0.05\norigin: [-1, -2, 0.1]\n",
+        "map.yaml": yaml_content
+        or b"image: map.pgm\nresolution: 0.05\norigin: [-1, -2, 0.1]\n",
         "map.pgm": b"P2\n2 2\n255\n254 0 254 0\n",
+        **(extra_artifacts or {}),
     }
     metadata = {
         "map_id": "MAP-TEST",
@@ -421,14 +510,18 @@ def bundle_bytes(*, unsafe: bool = False) -> bytes:
             for name, payload in artifacts.items()
         },
     }
+    metadata.update(metadata_overrides or {})
+    members = [
+        *artifacts.items(),
+        ("metadata.json", json.dumps(metadata).encode()),
+    ]
+    if unsafe:
+        members.append(("../escape", b"unsafe"))
+    if duplicate_member is not None:
+        source_name = duplicate_member.removeprefix("./")
+        members.append((duplicate_member, artifacts[source_name]))
     with tarfile.open(fileobj=output, mode="w:gz") as archive:
-        for name, payload in {
-            **artifacts,
-            "metadata.json": json.dumps(metadata).encode(),
-            "../escape": b"unsafe",
-        }.items():
-            if name == "../escape" and not unsafe:
-                continue
+        for name, payload in members:
             info = tarfile.TarInfo(name)
             info.size = len(payload)
             archive.addfile(info, io.BytesIO(payload))
@@ -465,6 +558,193 @@ def test_map_bundle_rejects_path_traversal(tmp_path: Path) -> None:
             expected_checksum=hashlib.sha256(content).hexdigest(),
         )
     assert not (tmp_path / "escape").exists()
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        (
+            bundle_bytes(yaml_content=(
+                b"image: ../outside.pgm\nresolution: 0.05\n"
+                b"origin: [-1, -2, 0.1]\n"
+            )),
+            "bundle basename",
+        ),
+        (
+            bundle_bytes(metadata_overrides={"width": 3}),
+            "dimensions do not match",
+        ),
+        (
+            bundle_bytes(metadata_overrides={"resolution": float("nan")}),
+            "non-finite JSON",
+        ),
+        (
+            bundle_bytes(duplicate_member="./map.yaml"),
+            "duplicate member",
+        ),
+    ],
+)
+def test_map_bundle_rejects_semantic_mismatch_and_ambiguous_members(
+    tmp_path: Path,
+    content: bytes,
+    message: str,
+) -> None:
+    with pytest.raises(InvalidMapBundle, match=message):
+        MapBundleStore(tmp_path, 1024 * 1024).save(
+            io.BytesIO(content),
+            map_id="MAP-TEST",
+            version=1,
+            expected_checksum=hashlib.sha256(content).hexdigest(),
+        )
+
+
+def test_map_bundle_enforces_unpacked_and_compression_limits(
+    tmp_path: Path,
+) -> None:
+    expanded = bundle_bytes(extra_artifacts={"padding.bin": b"0" * 100_000})
+    checksum = hashlib.sha256(expanded).hexdigest()
+    with pytest.raises(InvalidMapBundle, match="uncompressed size limit"):
+        MapBundleStore(
+            tmp_path / "unpacked",
+            max_bytes=1024 * 1024,
+            max_uncompressed_bytes=50_000,
+        ).save(
+            io.BytesIO(expanded),
+            map_id="MAP-TEST",
+            version=1,
+            expected_checksum=checksum,
+        )
+    with pytest.raises(InvalidMapBundle, match="compression ratio limit"):
+        MapBundleStore(
+            tmp_path / "ratio",
+            max_bytes=1024 * 1024,
+            max_compression_ratio=2.0,
+        ).save(
+            io.BytesIO(expanded),
+            map_id="MAP-TEST",
+            version=1,
+            expected_checksum=checksum,
+        )
+
+
+@pytest.mark.asyncio
+async def test_existing_version_upload_repairs_missing_center_bundle(
+    tmp_path: Path,
+) -> None:
+    content = bundle_bytes()
+    checksum = hashlib.sha256(content).hexdigest()
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as database:
+        record = MapRecord(
+            map_id="MAP-TEST",
+            name="Test map",
+            image_url="",
+            width_pixels=2,
+            height_pixels=2,
+            resolution_m_per_pixel=0.05,
+            origin={"x": -1.0, "y": -2.0, "yaw": 0.1},
+            status="ACTIVE",
+            active_version=1,
+        )
+        version = MapVersion(
+            map_id="MAP-TEST",
+            version=1,
+            status="ACTIVE",
+            checksum=checksum,
+            storage_path=str(tmp_path / "missing.tar.gz"),
+            resolution=0.05,
+            origin={"x": -1.0, "y": -2.0, "yaw": 0.1},
+            width=2,
+            height=2,
+            metadata_json={},
+            created_by_robot="ROBOT-001",
+            sync_status="SYNC_PENDING",
+        )
+        database.add_all((record, version))
+        database.commit()
+
+        result = await maps_api.upload_version(
+            "MAP-TEST",
+            version=1,
+            robot_id="ROBOT-001",
+            checksum=checksum,
+            bundle=UploadFile(filename="map-bundle.tar.gz", file=io.BytesIO(content)),
+            principal=("robot", "ROBOT-001"),
+            database=database,
+            settings=Settings(map_storage_dir=str(tmp_path / "storage")),
+        )
+
+        repaired = database.scalar(
+            select(MapVersion).where(
+                MapVersion.map_id == "MAP-TEST", MapVersion.version == 1
+            )
+        )
+        assert repaired is not None
+        assert Path(repaired.storage_path).read_bytes() == content
+        assert repaired.sync_status == "SYNCED"
+        assert result["local_status"] == "AVAILABLE"
+        assert result["sync_status"] == "SYNCED"
+
+
+@pytest.mark.asyncio
+async def test_resync_status_tracks_robot_acceptance(monkeypatch) -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as database:
+        database.add(MapRecord(
+            map_id="MAP-RESYNC",
+            name="Resync map",
+            image_url="",
+            width_pixels=2,
+            height_pixels=2,
+            resolution_m_per_pixel=0.05,
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            status="ACTIVE",
+            active_version=1,
+        ))
+        database.add(MapVersion(
+            map_id="MAP-RESYNC",
+            version=1,
+            status="ACTIVE",
+            checksum="a" * 64,
+            storage_path="/missing/map-bundle.tar.gz",
+            resolution=0.05,
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            width=2,
+            height=2,
+            metadata_json={},
+            created_by_robot="ROBOT-001",
+            sync_status="SYNCED",
+        ))
+        database.commit()
+
+        async def accepted(database, **kwargs):
+            del database, kwargs
+            return {"status": "accepted", "sync_status": "SYNC_PENDING"}
+
+        monkeypatch.setattr(maps_api, "_dispatch_idempotent", accepted)
+        result = await maps_api.resync_version(
+            "MAP-RESYNC", 1, "operator-1", database, Settings()
+        )
+        assert result["sync_status"] == "SYNC_PENDING"
+        assert database.scalar(
+            select(MapVersion).where(MapVersion.map_id == "MAP-RESYNC")
+        ).sync_status == "SYNC_PENDING"
+
+        async def rejected(database, **kwargs):
+            del database, kwargs
+            return {"status": "rejected", "error_message": "bundle local bị thiếu"}
+
+        monkeypatch.setattr(maps_api, "_dispatch_idempotent", rejected)
+        with pytest.raises(HTTPException, match="bundle local bị thiếu") as failure:
+            await maps_api.resync_version(
+                "MAP-RESYNC", 1, "operator-1", database, Settings()
+            )
+        assert failure.value.status_code == 409
+        assert database.scalar(
+            select(MapVersion).where(MapVersion.map_id == "MAP-RESYNC")
+        ).sync_status == "SYNC_FAILED"
 
 
 def test_mapping_and_navigation_state_machines_are_idempotent_and_strict() -> None:
@@ -520,6 +800,7 @@ def test_mapping_start_from_idle_defers_health_gate_to_started_slam_adapter() ->
         {"source": "robot"},
         {
             "mode": "IDLE",
+            "map_registry": {"ready": True},
             "scan_fresh": False,
             "odometry_ready": False,
             "lidar_tf_ready": False,
@@ -533,6 +814,7 @@ def test_mapping_start_keeps_strict_gate_when_ros_runtime_is_active() -> None:
         {"source": "robot"},
         {
             "mode": "NAVIGATION",
+            "map_registry": {"ready": True},
             "scan_fresh": True,
             "odometry_ready": True,
             "lidar_tf_ready": True,
@@ -542,6 +824,13 @@ def test_mapping_start_keeps_strict_gate_when_ros_runtime_is_active() -> None:
     )
 
     assert failures == ["Motion safety chưa sẵn sàng."]
+
+
+def test_mapping_start_waits_for_registry_tombstone_barrier() -> None:
+    assert _mapping_start_health_failures(
+        {"source": "robot"},
+        {"mode": "IDLE", "map_registry": {"ready": False}},
+    ) == ["Map registry chưa đồng bộ tombstone."]
 
 
 def test_map_version_only_continues_with_complete_posegraph_pair() -> None:

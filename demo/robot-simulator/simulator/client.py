@@ -10,6 +10,7 @@ import random
 import ssl
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ import websockets
 
 from simulator.camera_ptz import CameraPtzController
 from simulator.config import SimulatorConfig
+from simulator.control_protocol import MeasuredZeroWindow
+from simulator.map_cache import MapCacheError, RobotMapCacheManager
 from simulator.media import MediaPublisher, redact_media_source
 from simulator.media_devices import (
     discover_media_sources,
@@ -42,22 +45,91 @@ from simulator.navigation_backends import (
     NavigationBackendError,
     build_navigation_backend,
 )
-from simulator.map_cache import MapCacheError, RobotMapCacheManager
 
 
-def mapping_autosave_posegraph(
+@dataclass(frozen=True)
+class MappingAutosaveRecovery:
+    posegraph_path: Path
+    initial_pose: dict[str, float]
+    generation: str
+
+
+def _artifact_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def mapping_autosave_recovery(
     map_cache_dir: str,
     map_id: str,
     version: int,
-) -> Path:
-    """Resolve one complete, local-only SLAM autosave without trusting Center paths."""
+) -> MappingAutosaveRecovery:
+    """Resolve one committed SLAM autosave generation and verify every artifact."""
     RobotMapCacheManager._validate_identity(map_id, version)
     map_root = Path(map_cache_dir).parent
-    posegraph = map_root / ".autosave" / f"{map_id}-latest"
-    artifacts = (posegraph.with_suffix(".posegraph"), posegraph.with_suffix(".data"))
-    if any(not artifact.is_file() or artifact.stat().st_size <= 0 for artifact in artifacts):
-        raise MapCacheError("robot has no complete mapping autosave for this map")
-    return posegraph
+    autosave_root = map_root / ".autosave" / map_id
+    pointer_path = autosave_root / "latest.json"
+    try:
+        if pointer_path.is_symlink():
+            raise ValueError("latest pointer must not be a symlink")
+        pointer = json.loads(pointer_path.read_text())
+        generation = str(pointer["generation"])
+        if (
+            Path(generation).name != generation
+            or generation.startswith(".")
+            or not generation
+        ):
+            raise ValueError("invalid autosave generation")
+        generation_root = autosave_root / "generations" / generation
+        manifest_path = generation_root / "manifest.json"
+        if manifest_path.is_symlink():
+            raise ValueError("manifest must not be a symlink")
+        manifest = json.loads(manifest_path.read_text())
+        if (
+            manifest.get("schema_version") != 1
+            or manifest.get("map_id") != map_id
+            or int(manifest.get("version", 0)) != version
+            or manifest.get("generation") != generation
+        ):
+            raise ValueError("autosave identity does not match recovery request")
+        files = manifest.get("files")
+        required = {
+            "map.yaml",
+            "map.pgm",
+            "posegraph.posegraph",
+            "posegraph.data",
+        }
+        if not isinstance(files, dict) or not required.issubset(files):
+            raise ValueError("autosave manifest is incomplete")
+        for filename, expected_sha256 in files.items():
+            if Path(str(filename)).name != filename:
+                raise ValueError("autosave manifest contains an unsafe path")
+            expected = str(expected_sha256).lower()
+            if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+                raise ValueError("autosave manifest contains an invalid checksum")
+            artifact = generation_root / filename
+            if artifact.is_symlink() or not artifact.is_file() or artifact.stat().st_size <= 0:
+                raise ValueError(f"autosave artifact is missing: {filename}")
+            if _artifact_sha256(artifact) != expected:
+                raise ValueError(f"autosave artifact checksum mismatch: {filename}")
+        pose = manifest.get("terminal_pose")
+        if not isinstance(pose, dict) or not all(
+            axis in pose and math.isfinite(float(pose[axis]))
+            for axis in ("x", "y", "yaw")
+        ):
+            raise ValueError("autosave terminal pose is missing")
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise MapCacheError(
+            "robot has no complete committed mapping autosave for this map"
+        ) from exc
+    return MappingAutosaveRecovery(
+        posegraph_path=generation_root / "posegraph",
+        initial_pose={axis: float(pose[axis]) for axis in ("x", "y", "yaw")},
+        generation=generation,
+    )
 
 
 logger = logging.getLogger("simulator.gateway")
@@ -175,6 +247,12 @@ class RobotConnectionClient:
             config.center_api_url,
             self._robot_bearer_token,
             verify=self.http_verify,
+            max_bundle_bytes=config.map_bundle_max_bytes,
+            max_uncompressed_bytes=config.map_bundle_max_uncompressed_bytes,
+            max_member_bytes=config.map_bundle_max_member_bytes,
+            max_members=config.map_bundle_max_members,
+            max_compression_ratio=config.map_bundle_max_compression_ratio,
+            max_image_pixels=config.map_bundle_max_image_pixels,
         )
         self.media = MediaPublisher(config, self._media_token)
         self.camera_ptz = CameraPtzController()
@@ -187,6 +265,13 @@ class RobotConnectionClient:
         self.socket: Any = None
         self.media_restart_requested = asyncio.Event()
         self.media_lease_changed = asyncio.Event()
+        # Cleared for every Center connection. No cached map may be restored,
+        # uploaded or granted motion until that connection has consumed its
+        # authoritative tombstone snapshot.
+        self.map_registry_ready = asyncio.Event()
+        self.map_registry_sync_status = "PENDING"
+        self.map_registry_sync_error = ""
+        self.map_registry_last_sync_at = 0.0
         self.media_leases: dict[str, float] = {}
         self._camera_inventory_cache: list[dict[str, Any]] = []
         self.robot_access_token = ""
@@ -569,6 +654,10 @@ class RobotConnectionClient:
             delay = min(15.0, delay * 2)
 
     async def _connected(self, socket: Any) -> None:
+        self.map_registry_ready.clear()
+        self.map_registry_sync_status = "PENDING"
+        self.map_registry_sync_error = ""
+        self._stop_motion("map_registry_sync_pending")
         local_address = getattr(socket, "local_address", None)
         if (
             local_address
@@ -776,7 +865,26 @@ class RobotConnectionClient:
             elif message.message_type == "control.stop":
                 self._stop_motion(str(message.payload.get("reason", "control_stop")))
                 self._dispatch_ptz({"operation": "stop"})
-                await self._ack(socket, message, "completed")
+                status, details = await self._wait_for_measured_zero()
+                await self._ack(socket, message, status, details)
+            elif message.message_type == "control.estop.reset":
+                try:
+                    self.motion_driver.reset_estop("operator_estop_reset")
+                except MotionDisabledError as exc:
+                    await self._ack(
+                        socket,
+                        message,
+                        "rejected",
+                        {
+                            "error_code": "MOTION_DISABLED",
+                            "error_message": str(exc),
+                        },
+                    )
+                    continue
+                status, details = await self._wait_for_measured_zero(
+                    require_estop_released=True
+                )
+                await self._ack(socket, message, status, details)
             elif message.message_type == "camera.ptz":
                 accepted = self._dispatch_ptz(message.payload)
                 await self._ack(socket, message, "accepted" if accepted else "rejected")
@@ -1470,6 +1578,7 @@ class RobotConnectionClient:
     async def _execute_navigation_command(
         self, command: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
+        self._require_map_registry_ready(command)
         recovering_autosave = False
         if command == "map.resync":
             map_id = str(payload.get("map_id", ""))
@@ -1509,7 +1618,7 @@ class RobotConnectionClient:
                 )
             map_id = str(payload.get("map_id", ""))
             version = int(payload.get("version", 0))
-            posegraph = mapping_autosave_posegraph(
+            autosave = mapping_autosave_recovery(
                 self.config.map_cache_dir,
                 map_id,
                 version,
@@ -1518,12 +1627,9 @@ class RobotConnectionClient:
             command = "mapping.start"
             payload = {
                 **payload,
-                "posegraph_path": str(posegraph),
-                # A powered-off runtime has no authoritative terminal pose.
-                # Resuming from the first graph node permits an immediate save;
-                # collecting more scans requires returning to the original
-                # mapping start pose first.
-                "initial_pose": None,
+                "posegraph_path": str(autosave.posegraph_path),
+                "initial_pose": dict(autosave.initial_pose),
+                "autosave_generation": autosave.generation,
             }
         if command in {
             "mapping.start", "mapping.stop", "mapping.finish", "mapping.save",
@@ -1598,10 +1704,9 @@ class RobotConnectionClient:
             recovering_autosave
             and result.get("status") in {"accepted", "completed"}
         ):
-            # Do not ingest scans at the charging location as though the robot
-            # were still at the graph's first node. The operator must choose
-            # Resume explicitly after returning the chassis to the mapping
-            # start, or save the recovered graph without adding new scans.
+            # Recovery performs the same scan-to-saved-map verification used
+            # by normal map continuation before accepting new measurements.
+            # Keep it paused until the operator explicitly resumes mapping.
             result = await self.navigation_backend.execute(
                 "mapping.pause",
                 {"expected_state": str(result.get("current_state", "MAPPING_RUNNING"))},
@@ -1615,10 +1720,14 @@ class RobotConnectionClient:
                 Path(str(command_payload["map_path"])),
             )
         if command == "map.deactivate" and payload.get("delete_local"):
+            deleted_map_id = str(payload["map_id"])
             self.map_cache.delete_local(
-                str(payload["map_id"]),
+                deleted_map_id,
                 deleted_at=float(payload.get("deleted_at") or time.time()),
             )
+            # The command ACK is Center's evidence for this online deletion.
+            # Keep the durable tombstone but close its local pending state.
+            self.map_cache.acknowledge_tombstone(deleted_map_id)
         bundle_path = str(result.get("bundle_path", ""))
         if command in {"mapping.save", "mapping.save_draft", "mapping.finish"} and bundle_path:
             upload = {
@@ -1646,6 +1755,32 @@ class RobotConnectionClient:
                 logger.warning("background operation failed error=%s", exc)
 
         task.add_done_callback(finished)
+
+    def _require_map_registry_ready(self, command: str) -> None:
+        safety_commands = {
+            "map.deactivate",
+            "mapping.cancel",
+            "mapping.discard",
+            "mapping.pause",
+            "mapping.stop",
+            "navigation.cancel",
+            "navigation.manual_handoff",
+            "navigation.pause",
+            "navigation.speed_mode",
+        }
+        registry_sensitive = command.startswith(("map.", "mapping.", "navigation."))
+        if (
+            registry_sensitive
+            and command not in safety_commands
+            and not self.map_registry_ready.is_set()
+        ):
+            raise NavigationBackendError(
+                "MAP_REGISTRY_SYNC_PENDING",
+                "Map registry tombstones have not been reconciled for this connection",
+                current_state=str(
+                    self.navigation_backend.state().get("state", "FAULT")
+                ),
+            )
 
     async def _handle_navigation_command(self, socket: Any, message: Message) -> None:
         try:
@@ -1737,7 +1872,25 @@ class RobotConnectionClient:
 
     def _queue_mapping_upload(self, upload: dict[str, Any]) -> None:
         marker = Path(str(upload["bundle_path"])).with_name(".upload-pending.json")
-        marker.write_text(json.dumps(upload))
+        temporary = marker.with_name(
+            f".{marker.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        try:
+            with temporary.open("x") as destination:
+                json.dump(upload, destination, sort_keys=True)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.replace(temporary, marker)
+            directory = os.open(marker.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            raise MapCacheError(
+                "cannot persist mapping upload retry marker"
+            ) from exc
         try:
             checksum = self._file_sha256(Path(str(upload["bundle_path"])))
             self.map_cache.mark_local(
@@ -1749,6 +1902,7 @@ class RobotConnectionClient:
     async def _mapping_upload_retry_loop(self) -> None:
         root = Path(self.config.map_cache_dir) / "created"
         while True:
+            await self.map_registry_ready.wait()
             for marker in (root.glob("*/*/.upload-pending.json") if root.exists() else ()):
                 try:
                     upload = json.loads(marker.read_text())
@@ -1760,64 +1914,143 @@ class RobotConnectionClient:
                     logger.warning("mapping bundle retry pending marker=%s error=%s", marker, exc)
             await asyncio.sleep(10)
 
+    async def _quiesce_navigation_for_registry_sync(self) -> None:
+        """Revoke autonomous motion before trusting a reconnecting registry."""
+        self._stop_motion("map_registry_sync_pending")
+        state = self.navigation_backend.state()
+        current = str(state.get("state", "")).upper()
+        if current not in {"NAVIGATING", "PAUSED", "BLOCKED", "RECOVERY"}:
+            return
+        await self.navigation_backend.execute(
+            "navigation.cancel",
+            {"expected_state": current, "reason": "map_registry_reconnect_barrier"},
+        )
+
+    async def _synchronize_map_registry_once(self) -> int:
+        """Apply one authoritative tombstone snapshot before opening restore."""
+        if not self.map_registry_ready.is_set():
+            await self._quiesce_navigation_for_registry_sync()
+        token = await self._robot_bearer_token()
+        processed = 0
+        failures: list[str] = []
+        async with httpx.AsyncClient(
+            base_url=self.config.center_api_url.rstrip("/"),
+            verify=self.http_verify,
+            timeout=20,
+        ) as client:
+            response = await client.get(
+                "/api/maps/tombstones",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, dict) or not isinstance(body.get("items"), list):
+                raise MapCacheError("Center returned an invalid tombstone snapshot")
+            for item in body["items"]:
+                if not isinstance(item, dict):
+                    failures.append("invalid_tombstone")
+                    continue
+                map_id = str(item.get("map_id", ""))
+                if not map_id:
+                    failures.append("missing_map_id")
+                    continue
+                try:
+                    deleted_at = float(
+                        item.get("deleted_at_unix") or time.time()
+                    )
+                    active = self.map_cache.active()
+                    # Tombstone authority is persisted first. A crash, adapter
+                    # timeout or power loss after this line can no longer make
+                    # active_load_payload() restore this map.
+                    self.map_cache.record_tombstone(
+                        map_id, deleted_at=deleted_at
+                    )
+                    backend_state = self.navigation_backend.state()
+                    runtime_has_map = (
+                        str(backend_state.get("map_id") or "") == map_id
+                    )
+                    runtime_state = str(
+                        backend_state.get("state", "FAULT")
+                    ).upper()
+                    was_locally_active = bool(
+                        active and active.get("map_id") == map_id
+                    )
+                    runtime_may_have_map = bool(
+                        runtime_has_map
+                        or (
+                            was_locally_active
+                            and runtime_state not in {"IDLE", "NO_ACTIVE_MAP"}
+                        )
+                    )
+                    if runtime_may_have_map:
+                        self._stop_motion("map_tombstone_deactivate")
+                        result = await self.navigation_backend.execute(
+                            "map.deactivate",
+                            {"expected_state": backend_state.get("state", "")},
+                        )
+                        terminal = str(
+                            result.get("current_state")
+                            or self.navigation_backend.state().get("state", "")
+                        ).upper()
+                        if result.get("status") not in {"accepted", "completed"} or terminal not in {
+                            "IDLE",
+                            "NO_ACTIVE_MAP",
+                        }:
+                            raise NavigationBackendError(
+                                "MAP_DEACTIVATION_UNCONFIRMED",
+                                "Deleted map runtime did not reach an inactive state",
+                                current_state=terminal or "FAULT",
+                            )
+                    self.map_cache.purge_tombstoned_artifacts(map_id)
+                    ack = await client.post(
+                        f"/api/maps/tombstones/{map_id}/ack",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={"robot_id": self.config.robot_id},
+                    )
+                    ack.raise_for_status()
+                    self.map_cache.acknowledge_tombstone(map_id)
+                    processed += 1
+                except (NavigationBackendError, httpx.HTTPError, OSError, ValueError, MapCacheError) as exc:
+                    self._stop_motion("map_tombstone_reconcile_failed")
+                    failures.append(f"{map_id}:{exc}")
+                    logger.warning(
+                        "map tombstone reconciliation pending map_id=%s error=%s",
+                        map_id,
+                        exc,
+                    )
+        if failures:
+            raise MapCacheError(
+                "tombstone reconciliation incomplete: " + ", ".join(failures)
+            )
+        return processed
+
     async def _map_registry_sync_loop(self) -> None:
-        """Apply Center tombstones after reconnect so deleted maps never resurrect."""
+        """Open restore only after the reconnect tombstone barrier succeeds."""
+        retry_delay = 1.0
         while True:
             try:
-                token = await self._robot_bearer_token()
-                async with httpx.AsyncClient(
-                    base_url=self.config.center_api_url.rstrip("/"),
-                    verify=self.http_verify,
-                    timeout=20,
-                ) as client:
-                    response = await client.get(
-                        "/api/maps/tombstones",
-                        headers={"Authorization": f"Bearer {token}"},
+                processed = await self._synchronize_map_registry_once()
+                first_ready = not self.map_registry_ready.is_set()
+                self.map_registry_sync_status = "READY"
+                self.map_registry_sync_error = ""
+                self.map_registry_last_sync_at = time.time()
+                self.map_registry_ready.set()
+                if first_ready:
+                    logger.info(
+                        "map registry reconnect barrier opened tombstones=%d",
+                        processed,
                     )
-                    response.raise_for_status()
-                    for item in response.json().get("items", []):
-                        map_id = str(item.get("map_id", ""))
-                        if not map_id:
-                            continue
-                        active = self.map_cache.active()
-                        backend_state = self.navigation_backend.state()
-                        runtime_has_map = str(backend_state.get("map_id") or "") == map_id
-                        if runtime_has_map or (active and active.get("map_id") == map_id):
-                            try:
-                                await self.navigation_backend.execute(
-                                    "map.deactivate",
-                                    {"expected_state": backend_state.get("state", "")},
-                                )
-                            except NavigationBackendError as exc:
-                                self._stop_motion("map_tombstone_deactivate_failed")
-                                # Persist the tombstone immediately so a reboot
-                                # cannot resurrect the map, but do not ACK
-                                # Center until the ROS runtime is confirmed IDLE.
-                                self.map_cache.delete_local(
-                                    map_id,
-                                    deleted_at=float(item.get("deleted_at_unix") or time.time()),
-                                )
-                                logger.warning(
-                                    "map tombstone waiting for runtime deactivation map_id=%s error=%s",
-                                    map_id,
-                                    exc,
-                                )
-                                continue
-                        self.map_cache.delete_local(
-                            map_id, deleted_at=float(item.get("deleted_at_unix") or time.time())
-                        )
-                        ack = await client.post(
-                            f"/api/maps/tombstones/{map_id}/ack",
-                            headers={"Authorization": f"Bearer {token}"},
-                            json={"robot_id": self.config.robot_id},
-                        )
-                        ack.raise_for_status()
-                        self.map_cache.acknowledge_tombstone(map_id)
+                retry_delay = 30.0
             except asyncio.CancelledError:
                 raise
-            except (httpx.HTTPError, OSError, ValueError, MapCacheError) as exc:
-                logger.debug("map registry sync pending error=%s", exc)
-            await asyncio.sleep(30)
+            except (httpx.HTTPError, OSError, ValueError, MapCacheError, NavigationBackendError) as exc:
+                self.map_registry_sync_status = "ERROR"
+                self.map_registry_sync_error = str(exc)[:240]
+                if not self.map_registry_ready.is_set():
+                    self._stop_motion("map_registry_sync_failed")
+                logger.warning("map registry sync pending error=%s", exc)
+                retry_delay = min(15.0, max(1.0, retry_delay * 2.0))
+            await asyncio.sleep(retry_delay)
 
     async def _restore_active_navigation_map(
         self, state: dict[str, Any]
@@ -1832,6 +2065,8 @@ class RobotConnectionClient:
         if str(state.get("state", "")).upper() != "NO_ACTIVE_MAP":
             return None
         if str(state.get("mode", "NAVIGATION")).upper() != "NAVIGATION":
+            return None
+        if not self.map_registry_ready.is_set():
             return None
         payload = self.map_cache.active_load_payload(expected_state="NO_ACTIVE_MAP")
         if payload is None:
@@ -2035,6 +2270,14 @@ class RobotConnectionClient:
                 )
             backend_state = self.navigation_backend.state()
             registry_health = self.map_cache.health()
+            registry_health.update(
+                {
+                    "ready": self.map_registry_ready.is_set(),
+                    "syncStatus": self.map_registry_sync_status,
+                    "lastSyncAt": self.map_registry_last_sync_at,
+                    "error": self.map_registry_sync_error,
+                }
+            )
             await socket.send(
                 json.dumps(
                     make_message(
@@ -2218,6 +2461,98 @@ class RobotConnectionClient:
         self.motion_driver.stop(reason)
         if self.motion_driver is not self.motion:
             self.motion.stop(reason)
+
+    async def _measured_motion_sample(
+        self,
+    ) -> tuple[bool, float | None, float | None, bool, float | None]:
+        if self.config.motion_backend == "simulator":
+            return (
+                True,
+                float(self.motion.pose.linear_velocity),
+                float(self.motion.pose.angular_velocity),
+                False,
+                0.0,
+            )
+        if self.config.navigation_backend != "ros2":
+            return False, None, None, False, None
+        try:
+            result = await asyncio.wait_for(
+                self.navigation_backend.execute("system.status", {}),
+                timeout=0.6,
+            )
+        except (asyncio.TimeoutError, NavigationBackendError, OSError):
+            return False, None, None, False, None
+        state = dict(result.get("state") or {})
+
+        def finite(value: Any) -> float | None:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            return number if math.isfinite(number) else None
+
+        return (
+            bool(state.get("measured_velocity_fresh", False)),
+            finite(state.get("measured_linear_velocity")),
+            finite(state.get("measured_angular_velocity")),
+            bool(state.get("estop", False)),
+            finite(state.get("measured_velocity_age_ms")),
+        )
+
+    async def _wait_for_measured_zero(
+        self,
+        *,
+        require_estop_released: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        window = MeasuredZeroWindow(
+            linear_threshold=self.config.stop_linear_threshold,
+            angular_threshold=self.config.stop_angular_threshold,
+            dwell_seconds=self.config.stop_zero_dwell_seconds,
+        )
+        deadline = time.monotonic() + self.config.stop_confirmation_timeout_seconds
+        latest: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            fresh, linear, angular, estop, age_ms = await self._measured_motion_sample()
+            now = time.monotonic()
+            latest = {
+                "measured_velocity_fresh": fresh,
+                "measured_linear_velocity": linear,
+                "measured_angular_velocity": angular,
+                "measured_velocity_age_ms": age_ms,
+                "estop": estop,
+            }
+            released = not require_estop_released or not estop
+            if released and window.observe(
+                now=now,
+                fresh=fresh,
+                linear_velocity=linear,
+                angular_velocity=angular,
+            ):
+                return "completed", {
+                    **latest,
+                    "measured_zero": True,
+                    "stop_confirmation": "MEASURED_ZERO",
+                    "zero_dwell_ms": round(self.config.stop_zero_dwell_seconds * 1000),
+                }
+            if not released:
+                window.stable_since = None
+            await asyncio.sleep(0.05)
+        error_code = (
+            "ESTOP_RESET_UNCONFIRMED"
+            if require_estop_released
+            else "MEASURED_ZERO_UNCONFIRMED"
+        )
+        return "unknown", {
+            **latest,
+            "measured_zero": False,
+            "stop_confirmation": "UNCONFIRMED",
+            "error_code": error_code,
+            "error_message": (
+                "E-stop reset was dispatched but safe release was not confirmed"
+                if require_estop_released
+                else "Stop was dispatched but fresh measured-zero feedback was not confirmed"
+            ),
+        }
 
     def _ptz_source(self) -> tuple[str, str]:
         source_type = self.config.simulator_media_source_type

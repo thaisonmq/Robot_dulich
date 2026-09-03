@@ -38,11 +38,11 @@ class SensorNormalizer(Node):
         self.declare_parameter("scan_arrival_timeout_seconds", 0.30)
         self.declare_parameter("odom_arrival_timeout_seconds", 0.25)
         self.declare_parameter("imu_arrival_timeout_seconds", 0.25)
-        # Defaults match the live-calibrated LiDAR-visible body envelope.  The
-        # normal parameter file remains authoritative in deployed containers.
-        self.declare_parameter("scan_self_filter_half_length", 0.20)
-        self.declare_parameter("scan_self_filter_half_width", 0.18)
-        self.declare_parameter("scan_laser_x", -0.0046412)
+        # Defaults match the physical 0.30 x 0.20 m footprint. The centered,
+        # top-mounted LiDAR must never create a blind mask outside that body.
+        self.declare_parameter("scan_self_filter_half_length", 0.15)
+        self.declare_parameter("scan_self_filter_half_width", 0.10)
+        self.declare_parameter("scan_laser_x", 0.0)
         self.declare_parameter("scan_laser_y", 0.0)
         self.declare_parameter("scan_laser_yaw", 0.0)
         self.declare_parameter("scan_deskew_minimum_linear_speed", 0.03)

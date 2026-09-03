@@ -1,4 +1,12 @@
 {
+  "Nhả E-stop phần mềm": "Liberar parada de emergencia de software",
+  "Đang xác minh dừng": "Confirmando parada",
+  "Đã xác nhận robot đứng yên": "Inmovilidad del robot confirmada",
+  "Chưa xác nhận robot đứng yên": "Inmovilidad del robot no confirmada",
+  "Đã nhả E-stop phần mềm an toàn": "Parada de emergencia de software liberada de forma segura",
+  "Chưa xác nhận nhả E-stop": "Liberación de parada de emergencia no confirmada",
+  "Đang xác minh robot đã đứng yên": "Confirmando inmovilidad del robot",
+  "Đang xác minh nhả E-stop": "Confirmando liberación de parada de emergencia",
   "Tốc độ thủ công": "velocidad manual",
   "Tốc độ tự động": "Velocidad automática",
   "Chống vật cản": "Anti-obstáculo",

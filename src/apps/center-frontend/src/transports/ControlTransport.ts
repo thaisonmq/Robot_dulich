@@ -14,6 +14,7 @@ export interface IControlTransport {
   setObstacleAvoidanceEnabled(enabled: boolean): void;
   sendVelocity(command: VelocityCommand): void;
   sendStop(reason: string): void;
+  resetEstop(): void;
   sendPtz(command: PtzCommand): void;
   disconnect(): Promise<void>;
   isConnected(): boolean;
@@ -209,6 +210,15 @@ export class WebSocketControlTransport implements IControlTransport {
   sendStop(reason: string): void {
     if (!this.isConnected()) return;
     const message = this.envelope("control.stop", { reason });
+    this.commandTypes.set(message.message_id, message.message_type);
+    this.socket!.send(JSON.stringify(message));
+  }
+
+  resetEstop(): void {
+    if (!this.isConnected()) return;
+    const message = this.envelope("control.estop.reset", {
+      reason: "operator_estop_reset",
+    });
     this.commandTypes.set(message.message_id, message.message_type);
     this.socket!.send(JSON.stringify(message));
   }

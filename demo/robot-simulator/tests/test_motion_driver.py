@@ -6,12 +6,13 @@ import pytest
 from simulator.client import RobotConnectionClient
 from simulator.config import SimulatorConfig
 from simulator.control_protocol import (
-    LatestMotionSlot,
     MOTION_PROTOCOL_VERSION,
     OBSTACLE_FRONT,
     OBSTACLE_LEFT,
     OBSTACLE_REAR,
     OBSTACLE_RIGHT,
+    LatestMotionSlot,
+    MeasuredZeroWindow,
     MotionDatagram,
     SafetyInterlock,
     decode_motion_datagram,
@@ -182,6 +183,23 @@ def test_safety_interlock_rejects_unknown_direction_bits() -> None:
         interlock.update_directions(16, now=10.0)
 
 
+def test_measured_zero_window_requires_fresh_continuous_dwell() -> None:
+    window = MeasuredZeroWindow(dwell_seconds=0.25)
+
+    assert not window.observe(
+        now=10.0, fresh=True, linear_velocity=0.01, angular_velocity=0.02
+    )
+    assert not window.observe(
+        now=10.2, fresh=False, linear_velocity=0.0, angular_velocity=0.0
+    )
+    assert not window.observe(
+        now=10.3, fresh=True, linear_velocity=0.0, angular_velocity=0.0
+    )
+    assert window.observe(
+        now=10.55, fresh=True, linear_velocity=0.0, angular_velocity=0.0
+    )
+
+
 def test_unix_motion_driver_clamps_and_never_blocks() -> None:
     transport = FakeDatagramSocket()
     now = [10.0]
@@ -246,10 +264,35 @@ def test_unix_motion_watchdog_sends_repeated_zero_stop() -> None:
     assert stops[-1].reason == "edge_watchdog"
 
 
+def test_unix_motion_driver_uses_explicit_estop_reset_datagrams() -> None:
+    transport = FakeDatagramSocket()
+    now = [30.0]
+    config = SimulatorConfig(
+        motion_backend="ros2",
+        motion_socket_path="/tmp/motion.sock",
+    )
+    driver = UnixMotionDriver(
+        config,
+        transport=transport,  # type: ignore[arg-type]
+        clock=lambda: now[0],
+    )
+
+    driver.reset_estop("operator_estop_reset")
+
+    resets = [
+        decode_motion_datagram(payload, now_ns=int(now[0] * 1_000_000_000))
+        for payload, _path in transport.sent
+    ]
+    assert len(resets) == 3
+    assert all(command.message_type == "estop_reset" for command in resets)
+    assert all(command.linear_x == 0.0 for command in resets)
+
+
 class FakeMotionDriver:
     def __init__(self) -> None:
         self.velocities: list[tuple[float, float, bool]] = []
         self.stops: list[str] = []
+        self.estop_resets: list[str] = []
 
     def set_velocity(
         self,
@@ -264,6 +307,9 @@ class FakeMotionDriver:
 
     def stop(self, reason: str = "") -> None:
         self.stops.append(reason)
+
+    def reset_estop(self, reason: str = "") -> None:
+        self.estop_resets.append(reason)
 
     def watchdog(self, _now: float | None = None) -> bool:
         return False
@@ -299,6 +345,7 @@ async def test_disabled_motion_backend_rejects_web_velocity(tmp_path) -> None:
             map_cache_dir=str(tmp_path / "maps"),
         )
     )
+
     socket = FakeGatewaySocket(
         [
             make_message(
@@ -334,6 +381,11 @@ async def test_ros2_backends_route_velocity_and_stop_without_simulator_fallback(
             robot_state_file=str(tmp_path / "missing-device.json"),
         )
     )
+
+    async def measured_zero():
+        return True, 0.0, 0.0, False, 10.0
+
+    monkeypatch.setattr(client, "_measured_motion_sample", measured_zero)
     socket = FakeGatewaySocket(
         [
             make_message(
@@ -373,6 +425,49 @@ async def test_ros2_backends_route_velocity_and_stop_without_simulator_fallback(
         "completed",
     ]
     assert client.navigation.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_ros2_estop_reset_requires_explicit_command_and_measured_zero(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    driver = FakeMotionDriver()
+    monkeypatch.setattr(
+        "simulator.client.build_motion_driver", lambda _config, _simulator: driver
+    )
+    client = RobotConnectionClient(
+        SimulatorConfig(
+            motion_backend="ros2",
+            navigation_backend="ros2",
+            robot_state_file=str(tmp_path / "missing-device.json"),
+            stop_zero_dwell_seconds=0.1,
+        )
+    )
+
+    async def measured_zero():
+        return True, 0.0, 0.0, False, 5.0
+
+    monkeypatch.setattr(client, "_measured_motion_sample", measured_zero)
+    socket = FakeGatewaySocket(
+        [
+            make_message(
+                "control.estop.reset",
+                "ROBOT-001",
+                1,
+                {},
+                "session-1",
+                1000,
+            )
+        ]
+    )
+
+    await client._receive_loop(socket)
+
+    assert driver.estop_resets == ["operator_estop_reset"]
+    assert socket.sent[-1]["payload"]["status"] == "completed"
+    assert socket.sent[-1]["payload"]["measured_zero"] is True
+    assert socket.sent[-1]["payload"]["estop"] is False
 
 
 @pytest.mark.asyncio

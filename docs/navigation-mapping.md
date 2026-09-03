@@ -20,10 +20,28 @@ Web Center ──HTTP/WebSocket──> Center Backend ──authenticated WS─�
 ```
 
 - Center là map registry chính. PostgreSQL giữ metadata/lifecycle; bundle lớn nằm ở `MAP_STORAGE_DIR` (mặc định `/var/lib/rovera/map-storage`).
-- Robot cache bundle đã verify trong volume `ROBOT_STATE_DIR`; tải qua HTTP, kiểm SHA-256, giải nén vào thư mục tạm rồi atomic rename.
+- Robot cache bundle đã verify trong volume `ROBOT_STATE_DIR`; tải qua HTTP,
+  kiểm SHA-256, giải nén vào thư mục tạm rồi atomic rename. Fast path/restore
+  không tin riêng marker: Edge re-hash archive gốc, đối chiếu metadata trong
+  archive và kiểm lại schema, ảnh cùng checksum từng artifact trước khi load.
+- Sau mỗi reconnect, restore map, retry upload và các lệnh có thể cấp motion
+  authority bị chặn đến khi Edge đã lấy snapshot tombstone có thẩm quyền, ghi
+  tombstone bền vững và deactivate/xóa mọi map bị thu hồi. Trạng thái hàng rào
+  được công bố ở `health.map_registry`; Center preflight cũng fail-closed khi
+  `ready=false`.
 - Robot Agent tiếp tục sở hữu WebSocket, WebRTC và audio. ROS 2 chạy ở process/container khác và trao đổi với agent qua Unix socket, vì vậy Nav2 chết không kéo media xuống.
 - `navigation-stack` chỉ chạy một mode: `MAPPING` dùng SLAM Toolbox `online_async`; `NAVIGATION` dùng Map Server, AMCL và Nav2.
 - `motion-safety` chạy độc lập ở cả hai mode và phải là publisher duy nhất của `/cmd_vel` cuối.
+
+Trong mode mapping, autosave định kỳ là một transaction local theo generation,
+không phải một cặp posegraph ghi đè tại chỗ. Adapter chỉ bắt đầu khi safety
+snapshot còn fresh và vận tốc command/odometry đều bằng zero; các service
+pause/save/serialize/resume được single-flight với command operator. Một
+generation chỉ được công bố qua `latest.json` sau khi `map.yaml`, `map.pgm`,
+posegraph/data, terminal pose và SHA-256 đã validate, `fsync` và atomic rename.
+Recovery bỏ qua mọi staging/generation chưa commit, kiểm lại toàn bộ checksum,
+dùng terminal pose làm vùng tìm kiếm scan-to-map rồi giữ session ở `PAUSED` cho
+tới khi operator chọn Resume.
 
 Realtime chỉ gửi occupancy RLE đã giảm mẫu 1–2 Hz, scan giảm mẫu 5 Hz, pose/feedback 5 Hz và health 1–2 Hz. Center giữ snapshot mới nhất để reconnect; không replay queue patch cũ và không gửi raw costmap.
 
@@ -192,7 +210,13 @@ vcgencmd measure_temp
   capability mapping và khóa nút Start thay vì tạo phiên lỗi.
 - `odom -> base_footprint` chỉ do EKF publish; vendor `/odom_raw` được normalize từ `odom_frame` sang `odom`.
 - `map -> odom` chỉ do SLAM Toolbox ở mode mapping hoặc AMCL ở mode navigation publish.
-- Footprint/phụ kiện và offset LiDAR/IMU đã được đo lại từ scan sống. Cấu hình dùng base ở tâm, envelope bảo thủ 0,40 × 0,36 m và LiDAR gần tâm. Sensor normalizer loại duy nhất các endpoint nằm bên trong envelope này; lần đo trên robot 170 loại 88 tia self-return phía sau/phải nhưng giữ nguyên mọi vật cản bên ngoài.
+- Nguồn hình học hiện tại là thân xe `0,30 × 0,20 × 0,15 m`, base ở tâm mặt đáy và LiDAR ở giữa mặt trên (`x=0`, `y=0`, `z=0,15 m`). Sensor normalizer chỉ loại endpoint nằm trong footprint vật lý 0,30 × 0,20 m; không còn envelope 0,40 × 0,36 m có thể che vật cản ở ngoài thân xe.
+- Live corridor không được dùng phía thiếu dữ liệu để xóa một hard-margin
+  violation ở phía đã quan sát. Vi phạm đầu tiên khóa velocity; sau chuỗi xác
+  nhận, adapter giữ nguyên destination, ưu tiên một đoạn lùi thẳng chậm tới turn
+  bay nếu rear safety + Saved Map swept-footprint cùng cho phép, rồi replan tới
+  đích cũ. Nếu không chứng minh được relocation an toàn, robot giữ zero và chạy
+  bounded periodic alternative replan; không lùi/quay mù.
 - IMU đã được kiểm tra trục/yaw. Hiện orientation bị đánh dấu unavailable và chưa fusion yaw để tránh dùng covariance/axis sai.
 
 Không chạy đồng thời MAPPING và NAVIGATION. Không start motion-safety cạnh stack cũ còn ghi thẳng `/cmd_vel`.
@@ -218,7 +242,11 @@ hướng; LaserScan timeout, obstacle hình học, E-stop hoặc watchdog vẫn 
 2. Bấm **Start Mapping**. Agent yêu cầu stack ở mode `MAPPING`; manual control đi qua motion-safety.
 3. Theo dõi occupancy, pose/hướng, scan đỏ, trail, pin, kết nối và `/scan` health. Nút **DỪNG** gửi stop ngay. UI luôn ghi cliff sensor chưa khả dụng.
 4. **Pause/Resume** tạm dừng/tiếp tục nhận scan của SLAM. **Save Draft** giữ session để làm tiếp; **Finish & Save** kết thúc version. Mất mạng không xóa session: bundle và marker retry ở volume robot, pose graph auto-save định kỳ.
-5. Robot ghi map/pose graph/preview/metadata vào staging, checksum từng file, atomic rename và upload bundle. Center kiểm metadata/checksum/path traversal trước khi lưu.
+5. Robot ghi map/pose graph/preview/metadata vào staging, checksum từng file,
+   atomic rename và upload bundle. Center chỉ nhận flat regular-file archive,
+   giới hạn cả kích thước nén/giải nén/member/tỷ lệ nén/pixel, parse YAML/JSON
+   chặt, decode ảnh và bắt buộc `map.yaml`–image–metadata–artifact hash nhất
+   quán trước khi lưu.
 6. Mở chi tiết map, kiểm resolution/origin/dimensions/checksum rồi **Activate**. Lifecycle là `DRAFT → VALIDATING → ACTIVE → ARCHIVED`; không ghi đè version active.
 
 Bundle có `map.yaml`, `map.pgm`, pose graph, `preview.png`, `metadata.json`; POI/keepout/speed zones được lưu riêng theo version trong registry.

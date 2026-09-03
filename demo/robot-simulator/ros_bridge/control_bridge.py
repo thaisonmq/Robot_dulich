@@ -104,7 +104,7 @@ class RosControlBridge(Node):
         self.max_angular = _float_env("ROS_MAX_ANGULAR_SPEED", 0.8)
         self.use_twist_mux = _bool_env("ROS_USE_TWIST_MUX", False)
         self.obstacle_watchdog_ms = _nonnegative_int_env(
-            "ROS_OBSTACLE_WATCHDOG_MS", 0
+            "ROS_OBSTACLE_WATCHDOG_MS", 500
         )
         self.legacy_joy_deadzone = _float_env("ROS_LEGACY_JOY_DEADZONE", 0.12)
         self.legacy_joy_axes = _axis_indices_env("ROS_LEGACY_JOY_AXES", "1,2")
@@ -276,6 +276,13 @@ class RosControlBridge(Node):
 
         now = time.monotonic()
         self._last_receive_monotonic = now
+        if command.message_type == "estop_reset":
+            self._active_command = None
+            self._stop_burst_remaining = 0
+            self._publish_manual_obstacle_avoidance_mode(True)
+            self._set_estop(False)
+            self._publish_zero_burst()
+            return
         if command.message_type == "stop":
             self._active_command = None
             self._publish_manual_obstacle_avoidance_mode(True)
@@ -312,9 +319,12 @@ class RosControlBridge(Node):
             return
 
         if self._estop_latched:
-            # A fresh deliberate movement command re-arms the software stop.
-            # A physical emergency-stop circuit is still required on the car.
-            self._set_estop(False)
+            # Fail closed: a velocity command can never double as an E-stop
+            # reset. Only the explicit estop_reset transition may re-arm it.
+            self._active_command = None
+            self._stop_burst_remaining = 0
+            self._publish_safety_zero(now)
+            return
         self._active_command = command
         self._stop_burst_remaining = 0
         self._publish_velocity(command)

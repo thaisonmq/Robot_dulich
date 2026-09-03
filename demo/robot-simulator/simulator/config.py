@@ -37,8 +37,26 @@ class SimulatorConfig(BaseSettings):
     navigation_mode_request_path: str = "/var/lib/rovera/navigation/mode-request.json"
     navigation_mode_switch_timeout_seconds: float = Field(default=60.0, ge=15.0, le=120.0)
     map_cache_dir: str = "/var/lib/rovera/maps"
+    map_bundle_max_bytes: int = Field(default=512 * 1024 * 1024, ge=1024 * 1024)
+    map_bundle_max_uncompressed_bytes: int = Field(
+        default=1024 * 1024 * 1024, ge=1024 * 1024
+    )
+    map_bundle_max_member_bytes: int = Field(
+        default=768 * 1024 * 1024, ge=1024 * 1024
+    )
+    map_bundle_max_members: int = Field(default=64, ge=4, le=1024)
+    map_bundle_max_compression_ratio: float = Field(
+        default=2000.0, ge=1.0, le=100_000.0
+    )
+    map_bundle_max_image_pixels: int = Field(
+        default=100_000_000, ge=1, le=500_000_000
+    )
     motion_socket_path: str = "/var/lib/rovera/control/motion.sock"
     motion_watchdog_ms: int = Field(default=250, ge=150, le=500)
+    stop_confirmation_timeout_seconds: float = Field(default=3.0, ge=1.0, le=10.0)
+    stop_zero_dwell_seconds: float = Field(default=0.25, ge=0.1, le=1.0)
+    stop_linear_threshold: float = Field(default=0.015, gt=0.0, le=0.1)
+    stop_angular_threshold: float = Field(default=0.03, gt=0.0, le=0.2)
     ros_max_forward_speed: float = Field(default=0.33, gt=0, le=1.0)
     ros_max_reverse_speed: float = Field(default=0.25, gt=0, le=1.0)
     ros_max_angular_speed: float = Field(default=0.8, gt=0, le=3.0)

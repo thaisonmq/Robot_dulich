@@ -1747,6 +1747,83 @@ def test_corridor_geometry_reports_all_three_decision_states() -> None:
     assert front_blocked.reason == "FRONT_CLEARANCE"
 
 
+@pytest.mark.parametrize("wall_y", [0.11, -0.11])
+def test_one_sided_hard_margin_violation_is_never_overridden(
+    wall_y: float,
+) -> None:
+    assessment = evaluate_corridor(
+        [(x, wall_y) for x in (-0.10, 0.0, 0.10)],
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.07,
+        hard_side_margin=0.02,
+        front_clearance_required=0.14,
+    )
+
+    assert assessment.observed_hard_side_violation
+    assert assessment.left_observed is (wall_y > 0.0)
+    assert assessment.right_observed is (wall_y < 0.0)
+    assert not assessment.paired_sides_observed
+    assert not assessment.physically_passable
+    assert not assessment.can_go_straight
+    assert assessment.classification == "PHYSICALLY_BLOCKED"
+    assert assessment.reason == "OBSERVED_SIDE_HARD_MARGIN"
+
+
+def test_safe_observed_side_with_other_side_missing_remains_uncertain() -> None:
+    assessment = evaluate_corridor(
+        [(x, 0.13) for x in (-0.10, 0.0, 0.10)],
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.07,
+        hard_side_margin=0.02,
+        front_clearance_required=0.14,
+    )
+
+    assert not assessment.observed_hard_side_violation
+    assert assessment.left_observed
+    assert not assessment.right_observed
+    assert assessment.physically_passable
+    assert assessment.can_go_straight
+    assert assessment.classification == "NARROW_OR_UNCERTAIN"
+    assert assessment.reason == "LIVE_SIDE_INCOMPLETE"
+
+
+@pytest.mark.parametrize("wall_y", [0.12, -0.12])
+def test_one_sided_clearance_exactly_at_hard_margin_is_not_a_violation(
+    wall_y: float,
+) -> None:
+    assessment = evaluate_corridor(
+        [(0.0, wall_y)],
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.07,
+        hard_side_margin=0.02,
+        front_clearance_required=0.14,
+    )
+
+    assert not assessment.observed_hard_side_violation
+    assert assessment.can_go_straight
+    assert assessment.classification == "NARROW_OR_UNCERTAIN"
+
+
+def test_unpaired_opposite_returns_do_not_erase_observed_hard_violation() -> None:
+    assessment = evaluate_corridor(
+        [(0.0, 0.11), (0.30, -0.20)],
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.07,
+        hard_side_margin=0.02,
+        front_clearance_required=0.14,
+    )
+
+    assert assessment.left_observed and assessment.right_observed
+    assert not assessment.paired_sides_observed
+    assert assessment.observed_hard_side_violation
+    assert not assessment.can_go_straight
+    assert assessment.reason == "OBSERVED_SIDE_HARD_MARGIN"
+
+
 def test_corridor_comfort_margin_does_not_expand_hard_front_envelope() -> None:
     assessment = evaluate_corridor(
         [(0.0, -0.20), (0.0, 0.20), (0.24, 0.13)],
@@ -4580,6 +4657,7 @@ def test_hard_controller_block_requires_a_distinct_route() -> None:
         "CONFIRMED_DYNAMIC_ROUTE_BLOCK",
         "LIVE_ROUTE_CLEARANCE_INSUFFICIENT",
         "TURN_BLOCKED_NO_SAFE_RELOCATION",
+        "CORRIDOR_BLOCKED_NO_SAFE_RELOCATION",
     ):
         assert dynamic_block_requires_alternative(reason)
 
@@ -5215,19 +5293,19 @@ def test_scan_self_filter_masks_only_points_inside_calibrated_body() -> None:
         angle_increment=math.pi / 2,
         range_min=0.05,
         range_max=8.0,
-        laser_x=-0.0046412,
+        laser_x=0.0,
         laser_y=0.0,
         laser_yaw=0.0,
-        half_length=0.20,
-        half_width=0.18,
+        half_length=0.15,
+        half_width=0.10,
     )
     assert masked == 1
     assert math.isnan(filtered[0])
     assert filtered[1:] == ranges[1:]
 
 
-def test_scan_self_filter_removes_live_right_body_returns_but_keeps_obstacle() -> None:
-    laser_x = -0.0046412
+def test_scan_self_filter_never_masks_points_outside_physical_body() -> None:
+    laser_x = 0.0
 
     def filter_point(point_x: float, point_y: float) -> tuple[list[float], int]:
         sensor_x = point_x - laser_x
@@ -5242,18 +5320,17 @@ def test_scan_self_filter_removes_live_right_body_returns_but_keeps_obstacle() -
             laser_x=laser_x,
             laser_y=0.0,
             laser_yaw=0.0,
-            half_length=0.20,
-            half_width=0.18,
+            half_length=0.15,
+            half_width=0.10,
         )
 
-    # Exact blocker coordinates observed on robot 170 while Mapping was active.
-    for body_point in ((-0.1416, -0.1632), (0.1307, -0.1671)):
+    for body_point in ((-0.14, 0.0), (0.0, -0.09)):
         filtered, masked = filter_point(*body_point)
         assert masked == 1
         assert math.isnan(filtered[0])
 
-    outside_distance = math.hypot(0.0 - laser_x, -0.20)
-    filtered, masked = filter_point(0.0, -0.20)
+    outside_distance = math.hypot(0.0 - laser_x, -0.11)
+    filtered, masked = filter_point(0.0, -0.11)
     assert masked == 0
     assert filtered == pytest.approx([outside_distance])
 
@@ -5385,10 +5462,39 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert safety["lidar_obstacle_avoidance_enabled"] is True
     assert safety["half_length"] == localization["footprint_half_length"]
     assert safety["half_width"] == localization["footprint_half_width"]
-    # The self-return mask may be wider than the physical collision body; it
-    # removes LiDAR hits from wheels/accessories and is not planning padding.
-    assert sensor_time["scan_self_filter_half_length"] >= safety["half_length"]
-    assert sensor_time["scan_self_filter_half_width"] >= safety["half_width"]
+    # A centered, top-mounted LiDAR must not hide any point outside the body.
+    assert sensor_time["scan_self_filter_half_length"] == safety["half_length"]
+    assert sensor_time["scan_self_filter_half_width"] == safety["half_width"]
+    assert sensor_time["scan_laser_x"] == safety["laser_x"] == 0.0
+    assert sensor_time["scan_laser_y"] == safety["laser_y"] == 0.0
+    robot = ElementTree.parse(
+        project / "navigation-stack/config/robot.urdf"
+    ).getroot()
+    box_sizes = {
+        element.attrib["size"]
+        for element in robot.findall(".//geometry/box")
+    }
+    assert box_sizes == {"0.30 0.20 0.15"}
+    joints = {joint.attrib["name"]: joint for joint in robot.findall("joint")}
+    assert joints["base_footprint_to_base_link"].find("origin").attrib["xyz"] == (
+        "0 0 0.075"
+    )
+    assert joints["base_link_to_laser"].find("origin").attrib["xyz"] == (
+        "0 0 0.075"
+    )
+    assert safety["estop_heartbeat_required"] is True
+    assert safety["estop_timeout"] > 0.5
+    for optional_source in (
+        "cliff",
+        "bumper",
+        "range",
+        "external_stop",
+        "external_directions",
+    ):
+        # These inputs are not installed on the declared robot. If hardware is
+        # added, enabling its heartbeat flag turns absence/staleness into stop.
+        assert safety[f"{optional_source}_heartbeat_required"] is False
+        assert safety[f"{optional_source}_timeout"] > 0.0
     assert safety["clearance"] == 0.04
     assert safety["clear_hysteresis"] == 0.20
     assert localization["corridor_hard_side_margin"] <= safety["side_margin"]
@@ -5471,6 +5577,35 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert 4.0 <= localization["localization_verify_timeout_seconds"] <= 6.0
     # This stale block was never launched; motion-safety owns the one smoother source of truth.
     assert "velocity_smoother" not in navigation
+
+
+def test_production_external_obstacle_stream_has_a_nonzero_watchdog() -> None:
+    project = Path(__file__).parents[1]
+    compose = yaml.safe_load((project / "compose.yaml").read_text())
+    bridge = compose["services"]["ros-control-bridge"]
+    assert bridge["environment"]["ROS_OBSTACLE_WATCHDOG_MS"] == (
+        "${ROS_OBSTACLE_WATCHDOG_MS:-500}"
+    )
+    source = (project / "ros_bridge/control_bridge.py").read_text()
+    assert '"ROS_OBSTACLE_WATCHDOG_MS", 500' in source
+    safety_node = (project / "motion-safety/safety_node.py").read_text()
+    assert "protective_input_timeout_reason(" in safety_node
+    assert 'self.declare_parameter("estop_heartbeat_required", True)' in safety_node
+
+
+def test_software_estop_requires_an_explicit_reset_command() -> None:
+    project = Path(__file__).parents[1]
+    protocol = (project / "simulator/control_protocol.py").read_text()
+    bridge = (project / "ros_bridge/control_bridge.py").read_text()
+
+    assert 'Literal["velocity", "stop", "estop_reset"]' in protocol
+    reset_branch = bridge.index('command.message_type == "estop_reset"')
+    velocity_latch_guard = bridge.index("if self._estop_latched:", reset_branch)
+    velocity_dispatch = bridge.index("self._active_command = command", velocity_latch_guard)
+    assert "self._set_estop(False)" in bridge[reset_branch:velocity_latch_guard]
+    assert "self._set_estop(False)" not in bridge[
+        velocity_latch_guard:velocity_dispatch
+    ]
 
 
 def test_micro_ros_agent_uses_stable_info_verbosity_by_default() -> None:

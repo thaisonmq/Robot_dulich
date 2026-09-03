@@ -339,6 +339,49 @@ def test_gateway_session_command_and_telemetry_flow() -> None:
                 control_ws.send_json(ptz)
                 assert robot_ws.receive_json()["message_id"] == ptz["message_id"]
                 assert control_ws.receive_json()["payload"]["status"] == "accepted"
+                stop = envelope(
+                    "control.stop", session_id, 3, {"reason": "input_released"}
+                )
+                control_ws.send_json(stop)
+                stop_request = robot_ws.receive_json()
+                assert stop_request["message_type"] == "control.stop"
+                assert stop_request["payload"]["request_id"] == stop["message_id"]
+                robot_ws.send_json(
+                    envelope(
+                        "command.ack",
+                        "",
+                        25,
+                        {
+                            "request_id": stop["message_id"],
+                            "status": "completed",
+                            "measured_zero": True,
+                            "stop_confirmation": "MEASURED_ZERO",
+                        },
+                    )
+                )
+                stop_ack = control_ws.receive_json()["payload"]
+                assert stop_ack["status"] == "completed"
+                assert stop_ack["measured_zero"] is True
+                reset = envelope("control.estop.reset", session_id, 4, {})
+                control_ws.send_json(reset)
+                reset_request = robot_ws.receive_json()
+                assert reset_request["message_type"] == "control.estop.reset"
+                robot_ws.send_json(
+                    envelope(
+                        "command.ack",
+                        "",
+                        26,
+                        {
+                            "request_id": reset["message_id"],
+                            "status": "completed",
+                            "measured_zero": True,
+                            "estop": False,
+                        },
+                    )
+                )
+                reset_ack = control_ws.receive_json()["payload"]
+                assert reset_ack["status"] == "completed"
+                assert reset_ack["estop"] is False
                 duplicate_query = (
                     f"?session_id={session_id}&token={token}"
                     "&client_id=duplicated-tab"
@@ -366,7 +409,7 @@ def test_gateway_session_command_and_telemetry_flow() -> None:
                     robot_ws.send_json(pose)
                     received = telemetry_ws.receive_json()
                     assert received["payload"]["x"] == 6.0
-                heartbeat = envelope("session.heartbeat", session_id, 3, {})
+                heartbeat = envelope("session.heartbeat", session_id, 5, {})
                 control_ws.send_json(heartbeat)
                 assert control_ws.receive_json()["payload"]["status"] == "accepted"
             with client.websocket_connect(

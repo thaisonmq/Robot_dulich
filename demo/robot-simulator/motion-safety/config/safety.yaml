@@ -14,9 +14,8 @@ rovera_motion_safety:
     translation_lateral_margin: 0.01
     side_margin: 0.04
     rotation_margin: 0.03
-    # URDF laser_joint transform into base_footprint. Safety evaluates every
-    # beam in the chassis frame instead of assuming the sensor is at (0, 0).
-    laser_x: -0.0046412
+    # LiDAR is centered on the top face; its planar x/y offset is zero.
+    laser_x: 0.0
     laser_y: 0.0
     laser_yaw: 0.0
     clearance: 0.04
@@ -30,6 +29,21 @@ rovera_motion_safety:
     rotation_preview_angle: 0.30
     trajectory_samples: 6
     scan_timeout: 0.28
+    # The control bridge republishes software E-stop state every 0.5 s. A
+    # missing heartbeat is therefore a fault, even when the last value was
+    # false. Optional hardware sources must be explicitly enabled when fitted.
+    estop_heartbeat_required: true
+    estop_timeout: 1.20
+    cliff_heartbeat_required: false
+    cliff_timeout: 0.60
+    bumper_heartbeat_required: false
+    bumper_timeout: 0.60
+    range_heartbeat_required: false
+    range_timeout: 0.35
+    external_stop_heartbeat_required: false
+    external_stop_timeout: 0.60
+    external_directions_heartbeat_required: false
+    external_directions_timeout: 0.60
     # Applied independently to front/rear/left/right; hard faults retain their
     # own full-chassis instance.
     clear_hysteresis: 0.20

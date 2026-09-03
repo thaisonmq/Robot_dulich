@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 import yaml
@@ -27,6 +28,21 @@ def _method_source(name: str, next_name: str) -> str:
     start = ADAPTER_SOURCE.index(f"    def {name}(")
     end = ADAPTER_SOURCE.index(f"    def {next_name}(", start)
     return ADAPTER_SOURCE[start:end]
+
+
+def _navigate_calls(source: str) -> list[ast.Call]:
+    tree = ast.parse(source)
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_navigate"
+    ]
+
+
+def _keyword(call: ast.Call, name: str) -> ast.expr | None:
+    return next((item.value for item in call.keywords if item.arg == name), None)
 
 
 def test_stale_safety_subscription_accepts_a_restarted_sequence_epoch() -> None:
@@ -1308,6 +1324,34 @@ def test_live_narrow_uncertainty_does_not_cancel_prevalidated_auto_route() -> No
     assert 'evidence_reason in {"NARROW_OR_UNCERTAIN"' not in decision
 
 
+def test_confirmed_physical_corridor_block_runs_bounded_goal_recovery() -> None:
+    callback = _method_source("_scan_callback", "_sensor_time_callback")
+    recover = _method_source(
+        "_recover_confirmed_corridor_blockage", "_enter_narrow_path_decision"
+    )
+    velocity = _method_source("_auto_velocity_callback", "_update_motion_metrics")
+    turn_bay = _method_source(
+        "_find_and_start_turn_bay", "_odom_pose"
+    )
+    completion = _method_source(
+        "_complete_active_segment", "_finish_execution_success"
+    )
+
+    assert "self._recover_confirmed_corridor_blockage(" in callback
+    assert "self._enter_narrow_path_decision(" not in callback
+    assert '"CORRIDOR_PHYSICAL_BLOCK"' in velocity
+    assert "self._fresh_corridor_blockage(now)" in velocity
+    assert "self.execution_segment_token += 1" in recover
+    assert "handle.cancel_goal_async()" in recover
+    assert "self._mark_failed_segment(reason, corridor)" in recover
+    assert "preferred_translation_direction=-1" in recover
+    assert 'recovery_reason="CORRIDOR_PHYSICAL_BLOCK"' in recover
+    assert '"CORRIDOR_BLOCKED_NO_SAFE_RELOCATION"' in recover
+    assert "self.execution_narrow_segments = {0}" in turn_bay
+    assert 'action="REPLAN_ORIGINAL_DESTINATION"' in completion
+    assert "target=self._replan_execution_from_current" in completion
+
+
 def test_follow_path_abort_diagnostics_precede_retry_budget_and_preserve_goal() -> None:
     result = _method_source("_navigation_result", "_set_recovery_terminal")
     policy = _method_source(
@@ -2148,3 +2192,132 @@ def test_adapter_visualization_contract_always_identifies_route_authority() -> N
 
 def test_edge_health_keeps_route_selection_bound_to_its_mission() -> None:
     assert '"mission_id": backend_state.get("mission_id", "")' in EDGE_CLIENT_SOURCE
+
+
+def test_unexpected_localization_callback_fault_revokes_all_motion_authority() -> None:
+    decorator = ADAPTER_SOURCE[
+        ADAPTER_SOURCE.index("def localization_callback("):
+        ADAPTER_SOURCE.index("\n\nclass NavigationAdapter")
+    ]
+    fail_closed = _method_source(
+        "_fail_closed_localization_callback",
+        "_prepare_motionless_localization_command",
+    )
+
+    assert "self._fail_closed_localization_callback(method.__name__, exc)" in decorator
+    for required in (
+        "expected_generation != self.navigation_goal_generation",
+        "self.current_goal_handle = None",
+        "self.navigation_goal_generation += 1",
+        "self.execution_segment_token += 1",
+        'self.execution_phase = "IDLE"',
+        'self.motion_owner = "NONE"',
+        "self.sensor_time_resume_context = None",
+        "self.localization_resume_context = None",
+        "for publisher in (self.navigation_velocity, self.localization_velocity)",
+        "handle.cancel_goal_async()",
+        'resume_automatically=False',
+    ):
+        assert required in fail_closed
+    assert fail_closed.index("publisher.publish(Twist())") < fail_closed.index(
+        'self._set_state(\n                "LOCALIZATION_FAILED"'
+    )
+
+
+def test_explicit_pose_changes_require_motionless_state_and_fence_recovery() -> None:
+    dispatch = _method_source("_dispatch", "_foreign_mapping_authorities")
+    set_pose = _method_source("_set_initial_pose", "_deactivate_map")
+    fence = _method_source(
+        "_prepare_motionless_localization_command",
+        "_degrade_localization",
+    )
+
+    relocalize = dispatch.split('if command == "map.relocalize":', 1)[1]
+    assert "self._prepare_motionless_localization_command()" in relocalize
+    assert "self._prepare_motionless_localization_command()" in set_pose
+    for required in (
+        "self.current_goal_handle is not None",
+        'self.motion_owner != "NONE"',
+        "self.rotation_active",
+        'self.execution_phase != "IDLE"',
+        '"MOTION_ACTIVE"',
+        "self.navigation_goal_generation += 1",
+        "self.execution_segment_token += 1",
+        "self.sensor_time_resume_context = None",
+        "self.localization_resume_context = None",
+        "self.navigation_velocity.publish(Twist())",
+        "self.localization_velocity.publish(Twist())",
+    ):
+        assert required in fence
+
+
+def test_all_automatic_recovery_navigation_commits_are_generation_fenced() -> None:
+    recovery_calls = [
+        call
+        for call in _navigate_calls(ADAPTER_SOURCE)
+        if isinstance(_keyword(call, "recovery_attempt"), ast.Constant)
+        and _keyword(call, "recovery_attempt").value is True
+    ]
+
+    assert recovery_calls
+    for call in recovery_calls:
+        assert _keyword(call, "expected_generation") is not None, (
+            f"recovery _navigate call at line {call.lineno} has no generation fence"
+        )
+
+    sensor_resume = _method_source(
+        "_resume_sensor_time_navigation_if_ready",
+        "_resume_localization_navigation_if_ready",
+    )
+    assert "expected_generation = self.navigation_goal_generation" in sensor_resume
+    assert "expected_generation=expected_generation" in sensor_resume
+    assert '"sensor_time_navigation_resume"' in sensor_resume
+
+
+def test_localization_resume_does_not_rebind_outer_directions_in_worker() -> None:
+    resume = _method_source(
+        "_resume_localization_navigation_if_ready",
+        "_localization_lost",
+    )
+    worker = resume.split("        def resume() -> None:", 1)[1]
+
+    assert "directions = list(original_directions)" in worker
+    assert "original_directions =" not in worker
+    assert worker.count("expected_generation=expected_generation") == 3
+    assert '"localization_navigation_resume"' in worker
+
+
+def test_operator_motion_interrupts_clear_every_automatic_resume_context() -> None:
+    estop = _method_source("_estop_callback", "_direction_mask_callback")
+    manual = _method_source(
+        "_manual_takeover_callback", "_record_odometry_trajectory"
+    )
+    methods = (
+        estop,
+        manual,
+        _method_source("_cancel_navigation", "_pause_navigation"),
+        _method_source("_manual_handoff", "_resume_auto_from_current_pose"),
+    )
+
+    for source in methods:
+        assert "self.sensor_time_resume_context = None" in source
+        assert "self.sensor_time_resume_in_progress = False" in source
+        assert "self.localization_resume_context = None" in source
+        assert "self.localization_resume_in_progress = False" in source
+    assert '"TURN_BAY_RECOVERY"' in estop
+    assert "self.localization_velocity.publish(Twist())" in estop
+    assert '"TURN_BAY_RECOVERY"' in manual
+    assert "self.localization_velocity.publish(Twist())" in manual
+
+
+def test_turn_bay_worker_checks_generation_inside_atomic_state_commit() -> None:
+    start = _method_source("_start_turn_bay_recovery", "_find_and_start_turn_bay")
+    worker = _method_source("_find_and_start_turn_bay", "_odom_pose")
+    commit = worker.split("        candidate, direction = selected", 1)[1]
+
+    assert "with self.state_lock:" in start
+    assert "goal_generation != self.navigation_goal_generation" in start
+    assert "with self.state_lock:" in commit
+    assert commit.index("goal_generation != self.navigation_goal_generation") < (
+        commit.index('self.execution_phase = "STRAIGHT_PREPARE"')
+    )

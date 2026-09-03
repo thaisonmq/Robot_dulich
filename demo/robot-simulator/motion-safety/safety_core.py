@@ -14,6 +14,21 @@ class Direction(IntFlag):
     RIGHT = 8
 
 
+def protective_input_timeout_reason(
+    now: float,
+    sources: Iterable[tuple[str, bool, float, float]],
+) -> str:
+    """Return the first missing/stale required protective heartbeat."""
+    timestamp = float(now)
+    for name, required, last_update, timeout in sources:
+        if not required:
+            continue
+        age = math.inf if last_update <= 0.0 else timestamp - float(last_update)
+        if age < 0.0 or age > max(0.0, float(timeout)):
+            return f"{name}_timeout"
+    return ""
+
+
 @dataclass(frozen=True, slots=True)
 class SafetyConfig:
     half_length: float = 0.15
@@ -87,6 +102,8 @@ def safety_snapshot_payload(
     output_angular: float,
     measured_linear: float,
     measured_angular: float,
+    measured_velocity_fresh: bool = False,
+    measured_velocity_age_ms: float | None = None,
     decision: SafetyDecision | None = None,
     hard_stop: bool | None = None,
 ) -> dict[str, float | int | bool | str | None]:
@@ -130,6 +147,8 @@ def safety_snapshot_payload(
         ),
         "measured_linear": float(measured_linear),
         "measured_angular": float(measured_angular),
+        "measured_velocity_fresh": bool(measured_velocity_fresh),
+        "measured_velocity_age_ms": finite(measured_velocity_age_ms),
         "predicted_swept_clearance": finite(
             None if decision is None else decision.predicted_swept_clearance
         ),

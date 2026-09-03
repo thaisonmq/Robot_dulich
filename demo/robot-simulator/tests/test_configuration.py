@@ -3,18 +3,20 @@ import hashlib
 import json
 import time
 from fractions import Fraction
+from pathlib import Path
+from typing import Any
 
 import pytest
-
 from simulator.client import (
     RobotConnectionClient,
     localization_pose_safe_to_persist,
-    mapping_autosave_posegraph,
+    mapping_autosave_recovery,
 )
 from simulator.config import SimulatorConfig
 from simulator.map_cache import MapCacheError
 from simulator.media import MediaPublisher, SourceVideoProbe
 from simulator.messages import make_message
+from simulator.navigation_backends import NavigationBackendError
 
 
 def test_pose_persistence_requires_sustained_independent_localization_evidence() -> None:
@@ -42,21 +44,74 @@ def test_pose_persistence_requires_sustained_independent_localization_evidence()
     assert not localization_pose_safe_to_persist(state)
 
 
-def test_mapping_autosave_recovery_requires_a_complete_safe_pair(tmp_path) -> None:
+def _write_autosave_generation(
+    autosave: Path,
+    map_id: str,
+    version: int,
+    generation: str,
+    *,
+    publish: bool = True,
+) -> Path:
+    root = autosave / map_id
+    destination = root / "generations" / generation
+    destination.mkdir(parents=True)
+    artifacts = {
+        "map.yaml": b"image: map.pgm\nresolution: 0.05\norigin: [0, 0, 0]\n",
+        "map.pgm": b"P5\n1 1\n255\n\xff",
+        "posegraph.posegraph": b"posegraph",
+        "posegraph.data": b"scan-data",
+    }
+    for filename, content in artifacts.items():
+        (destination / filename).write_bytes(content)
+    manifest = {
+        "schema_version": 1,
+        "map_id": map_id,
+        "version": version,
+        "generation": generation,
+        "terminal_pose": {"x": 1.25, "y": -0.5, "yaw": 0.75},
+        "files": {
+            filename: hashlib.sha256(content).hexdigest()
+            for filename, content in artifacts.items()
+        },
+    }
+    (destination / "manifest.json").write_text(json.dumps(manifest))
+    if publish:
+        (root / "latest.json").write_text(json.dumps({"generation": generation}))
+    return destination / "posegraph"
+
+
+def test_mapping_autosave_recovery_requires_a_committed_verified_generation(
+    tmp_path,
+) -> None:
     cache = tmp_path / "maps" / "cache"
     autosave = tmp_path / "maps" / ".autosave"
     autosave.mkdir(parents=True)
-    basename = autosave / "MAP-RECOVERY-latest"
-    basename.with_suffix(".posegraph").write_bytes(b"posegraph")
 
-    with pytest.raises(MapCacheError, match="complete mapping autosave"):
-        mapping_autosave_posegraph(str(cache), "MAP-RECOVERY", 1)
+    with pytest.raises(MapCacheError, match="complete committed mapping autosave"):
+        mapping_autosave_recovery(str(cache), "MAP-RECOVERY", 1)
 
-    basename.with_suffix(".data").write_bytes(b"scan-data")
-    assert mapping_autosave_posegraph(str(cache), "MAP-RECOVERY", 1) == basename
+    basename = _write_autosave_generation(
+        autosave, "MAP-RECOVERY", 1, "generation-1"
+    )
+    recovery = mapping_autosave_recovery(str(cache), "MAP-RECOVERY", 1)
+    assert recovery.posegraph_path == basename
+    assert recovery.initial_pose == {"x": 1.25, "y": -0.5, "yaw": 0.75}
+    assert recovery.generation == "generation-1"
+
+    # An interrupted next write is not visible until latest.json is replaced.
+    _write_autosave_generation(
+        autosave, "MAP-RECOVERY", 1, "generation-2", publish=False
+    )
+    assert mapping_autosave_recovery(
+        str(cache), "MAP-RECOVERY", 1
+    ).generation == "generation-1"
+
+    basename.with_suffix(".data").write_bytes(b"corrupt")
+    with pytest.raises(MapCacheError, match="complete committed mapping autosave"):
+        mapping_autosave_recovery(str(cache), "MAP-RECOVERY", 1)
 
     with pytest.raises(MapCacheError, match="invalid map identity"):
-        mapping_autosave_posegraph(str(cache), "../escape", 1)
+        mapping_autosave_recovery(str(cache), "../escape", 1)
 
 
 @pytest.mark.asyncio
@@ -64,9 +119,9 @@ async def test_mapping_recovery_dispatches_local_autosave_as_mapping_start(tmp_p
     cache = tmp_path / "maps" / "cache"
     autosave = tmp_path / "maps" / ".autosave"
     autosave.mkdir(parents=True)
-    basename = autosave / "MAP-RECOVERY-latest"
-    basename.with_suffix(".posegraph").write_bytes(b"posegraph")
-    basename.with_suffix(".data").write_bytes(b"scan-data")
+    basename = _write_autosave_generation(
+        autosave, "MAP-RECOVERY", 1, "generation-1"
+    )
     client = RobotConnectionClient(SimulatorConfig(
         navigation_backend="ros2",
         map_cache_dir=str(cache),
@@ -86,6 +141,7 @@ async def test_mapping_recovery_dispatches_local_autosave_as_mapping_start(tmp_p
             }
 
     client.navigation_backend = FakeNavigationBackend()  # type: ignore[assignment]
+    client.map_registry_ready.set()
 
     result = await client._execute_navigation_command(
         "mapping.recover",
@@ -100,7 +156,57 @@ async def test_mapping_recovery_dispatches_local_autosave_as_mapping_start(tmp_p
     assert result["recovered_from_autosave"] is True
     assert [item["command"] for item in dispatched] == ["mapping.start", "mapping.pause"]
     assert dispatched[0]["payload"]["posegraph_path"] == str(basename)
-    assert dispatched[0]["payload"]["initial_pose"] is None
+    assert dispatched[0]["payload"]["initial_pose"] == {
+        "x": 1.25,
+        "y": -0.5,
+        "yaw": 0.75,
+    }
+    assert dispatched[0]["payload"]["autosave_generation"] == "generation-1"
+
+
+@pytest.mark.asyncio
+async def test_map_resync_queues_the_exact_local_bundle(tmp_path) -> None:
+    cache = tmp_path / "maps" / "cache"
+    bundle = cache / "created" / "MAP-RESYNC" / "v2" / "map-bundle.tar.gz"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_bytes(b"complete-local-bundle")
+    client = RobotConnectionClient(SimulatorConfig(
+        navigation_backend="ros2",
+        map_cache_dir=str(cache),
+        media_enabled=False,
+    ))
+
+    class FakeNavigationBackend:
+        def state(self) -> dict:
+            return {"state": "IDLE"}
+
+    def close_background(operation: Any) -> None:
+        operation.close()
+
+    client.navigation_backend = FakeNavigationBackend()  # type: ignore[assignment]
+    client._spawn_background = close_background  # type: ignore[method-assign]
+    client.map_registry_ready.set()
+
+    result = await client._execute_navigation_command(
+        "map.resync", {"map_id": "MAP-RESYNC", "version": 2}
+    )
+
+    assert result["sync_status"] == "SYNC_PENDING"
+    marker = bundle.with_name(".upload-pending.json")
+    assert json.loads(marker.read_text()) == {
+        "map_id": "MAP-RESYNC",
+        "version": 2,
+        "robot_id": client.config.robot_id,
+        "bundle_path": str(bundle),
+    }
+    assert not list(bundle.parent.glob("..upload-pending.json.*.tmp"))
+
+    bundle.unlink()
+    with pytest.raises(NavigationBackendError, match="bundle local") as failure:
+        await client._execute_navigation_command(
+            "map.resync", {"map_id": "MAP-RESYNC", "version": 2}
+        )
+    assert failure.value.code == "LOCAL_MAP_MISSING"
 
 
 @pytest.mark.asyncio

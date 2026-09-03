@@ -43,6 +43,11 @@ class MotionSimulator:
         self.pose.linear_velocity = 0.0
         self.pose.angular_velocity = 0.0
 
+    def reset_estop(self, reason: str = "") -> None:
+        # The in-process simulator has no separate latch, but reset remains an
+        # explicit zero-motion transition so it follows the hardware contract.
+        self.stop(reason)
+
     def close(self) -> None:
         self.stop("simulator_shutdown")
 

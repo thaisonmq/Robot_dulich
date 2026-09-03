@@ -1,4 +1,12 @@
 {
+  "Nhả E-stop phần mềm": "Release software E-stop",
+  "Đang xác minh dừng": "Confirming stop",
+  "Đã xác nhận robot đứng yên": "Robot standstill confirmed",
+  "Chưa xác nhận robot đứng yên": "Robot standstill not confirmed",
+  "Đã nhả E-stop phần mềm an toàn": "Software E-stop safely released",
+  "Chưa xác nhận nhả E-stop": "E-stop release not confirmed",
+  "Đang xác minh robot đã đứng yên": "Confirming robot standstill",
+  "Đang xác minh nhả E-stop": "Confirming E-stop release",
   "Không thể sửa điểm đến": "Cannot edit destination",
   "Không thể xóa điểm đến": "Destinations cannot be deleted",
   "Điểm đến đã lưu": "Saved destination",
@@ -102,4 +110,3 @@
   "Vui lòng chờ trong giây lát.": "Please wait a moment.",
   "Chọn bản đồ điều hướng mặc định cho robot.": "Choose the default navigation map for the robot."
 }
-

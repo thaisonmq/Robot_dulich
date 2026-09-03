@@ -20,7 +20,8 @@ JWT phải khớp `robot_id`; token người dùng không thể dùng cho robot 
 
 Robot sends `robot.heartbeat`, `robot.pose`, `robot.health`,
 `navigation.status`, and `command.ack`. Center sends `control.velocity`,
-`control.stop`, `camera.ptz`, `navigation.goal`, and `navigation.cancel`.
+`control.stop`, `control.estop.reset`, `camera.ptz`, `navigation.goal`, and
+`navigation.cancel`.
 
 ## User control
 
@@ -29,6 +30,13 @@ Robot sends `robot.heartbeat`, `robot.pose`, `robot.health`,
 The backend validates the JWT, session ownership, monotonic sequence, timestamp,
 TTL and live robot connection before forwarding. Joystick messages are never
 queued or retried. `control.stop` is forwarded immediately.
+
+`control.stop` và `control.estop.reset` là hai safety transition đặc biệt:
+Center correlate `request_id` và chỉ trả ACK cuối về control socket sau ACK của
+Edge. Edge trả `completed` khi odometry mới nằm trong ngưỡng zero liên tục theo
+dwell cấu hình; hết timeout trả `unknown`, không suy diễn rằng robot đã đứng
+yên. `control.estop.reset` là cách duy nhất nhả software latch; một velocity mới
+không tự reset E-stop.
 
 `camera.ptz` chỉ được chuyển từ tab đang giữ quyền điều khiển. Payload dùng
 `operation=move|zoom|stop`, hai trục `pan`/`tilt` hoặc `zoom` trong khoảng

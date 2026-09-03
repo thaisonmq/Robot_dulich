@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ShieldCheck, ShieldOff, Square } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, RotateCcw, ShieldCheck, ShieldOff, Square } from "lucide-react";
 import { useI18n } from "../i18n/I18nProvider";
 import type { MotionSpeedLevel } from "../config/control";
 import type { AutoNavigationSpeedMode } from "../types";
@@ -8,6 +8,9 @@ interface Props {
   adapter: OnScreenControlAdapter;
   input: InputState;
   disabled: boolean;
+  estopActive: boolean;
+  stopping: boolean;
+  onResetEstop: () => void;
 }
 
 interface ControlSettingsProps {
@@ -44,6 +47,9 @@ export function ControlPad({
   adapter,
   input,
   disabled,
+  estopActive,
+  stopping,
+  onResetEstop,
 }: Props) {
   const { t } = useI18n();
   const pointerDown = (event: React.PointerEvent<HTMLButtonElement>, action: InputAction) => {
@@ -72,7 +78,7 @@ export function ControlPad({
           className={`${className} ${input[action as keyof InputState] ? "is-pressed" : ""}`}
           aria-label={t(label)}
           aria-pressed={input[action as keyof InputState]}
-          disabled={disabled}
+          disabled={disabled || estopActive || stopping}
           onPointerDown={(event) => pointerDown(event, action)}
           onPointerUp={(event) => pointerUp(event, action)}
           onPointerCancel={() => adapter.cancel()}
@@ -96,6 +102,15 @@ export function ControlPad({
         <span>{t("DỪNG")}</span>
       </button>
     </div>
+    {estopActive && <button
+      type="button"
+      className="control-pad__estop-reset"
+      disabled={disabled}
+      onClick={onResetEstop}
+    >
+      <RotateCcw size={16} />
+      <span>{t("Nhả E-stop phần mềm")}</span>
+    </button>}
   </div>;
 }
 

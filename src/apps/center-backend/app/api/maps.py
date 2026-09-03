@@ -300,10 +300,13 @@ def _mapping_start_health_failures(capabilities: dict, health: dict) -> list[str
     """Return preflight failures available before a SLAM runtime is started."""
     if capabilities.get("source") == "simulator":
         return []
+    failures = []
+    if not bool((health.get("map_registry") or {}).get("ready")):
+        failures.append("Map registry chưa đồng bộ tombstone.")
     if str(health.get("mode") or "").upper() == "IDLE":
         # No ROS authority exists by design. The edge will start SLAM and its
         # adapter performs the authoritative sensor/safety gate.
-        return []
+        return failures
     checks = (
         (bool(health.get("scan_fresh")), "Không nhận được LiDAR."),
         (bool(health.get("odometry_ready")), "Odometry không hoạt động."),
@@ -311,7 +314,7 @@ def _mapping_start_health_failures(capabilities: dict, health: dict) -> list[str
         (health.get("safety") == "HEALTHY", "Motion safety chưa sẵn sàng."),
         (not bool(health.get("estop")), "E-stop đang bật."),
     )
-    return [message for healthy, message in checks if not healthy]
+    return [*failures, *(message for healthy, message in checks if not healthy)]
 
 
 async def _dispatch_idempotent(
@@ -418,13 +421,16 @@ async def registry_health(
 
 @router.get("/tombstones")
 async def map_tombstones(
-    _: tuple[str, str] = Depends(operator_or_robot),
+    principal: tuple[str, str] = Depends(operator_or_robot),
     database: Session = Depends(get_db),
 ) -> dict:
     records = database.scalars(
         select(MapRecord).where(MapRecord.deleted_at.is_not(None))
     ).all()
+    snapshot_at = datetime.now(timezone.utc)
     return {
+        "snapshot_at": snapshot_at.isoformat(),
+        "robot_id": principal[1] if principal[0] == "robot" else None,
         "items": [
             {
                 "map_id": item.map_id,
@@ -432,7 +438,8 @@ async def map_tombstones(
                 "deleted_at_unix": item.deleted_at.timestamp(),
                 "status": item.deletion_status or "DELETION_PENDING",
             }
-            for item in records if item.deleted_at is not None
+            for item in records
+            if item.deleted_at is not None
         ]
     }
 
@@ -996,22 +1003,17 @@ async def upload_version(
     existing = database.scalar(
         select(MapVersion).where(MapVersion.map_id == map_id, MapVersion.version == version)
     )
-    if existing is not None:
-        if existing.checksum == checksum.lower():
-            existing.sync_status = "SYNCED"
-            for cache in database.scalars(
-                select(RobotMapCache).where(
-                    RobotMapCache.map_id == map_id,
-                    RobotMapCache.version == version,
-                    RobotMapCache.robot_id == robot_id,
-                )
-            ):
-                cache.local_status = "AVAILABLE"
-                cache.sync_status = "SYNCED"
-            database.commit()
-            return _version_view(existing)
+    if existing is not None and existing.checksum != checksum.lower():
         raise HTTPException(status_code=409, detail="Version đã tồn tại và không được ghi đè")
-    store = MapBundleStore(settings.map_storage_dir, settings.map_bundle_max_bytes)
+    store = MapBundleStore(
+        settings.map_storage_dir,
+        settings.map_bundle_max_bytes,
+        max_uncompressed_bytes=settings.map_bundle_max_uncompressed_bytes,
+        max_member_bytes=settings.map_bundle_max_member_bytes,
+        max_members=settings.map_bundle_max_members,
+        max_compression_ratio=settings.map_bundle_max_compression_ratio,
+        max_image_pixels=settings.map_bundle_max_image_pixels,
+    )
     try:
         destination, verified_checksum, metadata = store.save(
             bundle.file,
@@ -1029,6 +1031,45 @@ async def upload_version(
             raise InvalidMapBundle("invalid map dimensions")
     except (InvalidMapBundle, KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if existing is not None:
+        # A resync must repair a missing/corrupt Center artifact, not merely
+        # acknowledge the checksum already stored in the database. save()
+        # has atomically replaced the bundle and verified every member above.
+        existing.storage_path = str(destination)
+        existing.resolution = resolution
+        existing.origin = origin
+        existing.width = width
+        existing.height = height
+        existing.metadata_json = metadata
+        existing.sync_status = "SYNCED"
+        if record.active_version == version:
+            record.width_pixels = width
+            record.height_pixels = height
+            record.resolution_m_per_pixel = resolution
+            record.origin = origin
+        for cache in database.scalars(
+            select(RobotMapCache).where(
+                RobotMapCache.map_id == map_id,
+                RobotMapCache.version == version,
+                RobotMapCache.robot_id == robot_id,
+            )
+        ):
+            cache.local_status = "AVAILABLE"
+            cache.sync_status = "SYNCED"
+        mapping = database.scalar(
+            select(MappingSession).where(
+                MappingSession.map_id == map_id,
+                MappingSession.robot_id == robot_id,
+            ).order_by(MappingSession.created_at.desc())
+        )
+        if mapping is not None:
+            mapping_metadata = dict(mapping.metadata_json or {})
+            mapping_metadata["local_status"] = "AVAILABLE"
+            mapping_metadata["sync_status"] = "SYNCED"
+            mapping.metadata_json = mapping_metadata
+        database.commit()
+        database.refresh(existing)
+        return _version_view(existing)
     map_version = MapVersion(
         map_id=map_id,
         version=version,
@@ -1085,15 +1126,27 @@ async def resync_version(
     database.commit()
     runtime = hub.robots.get(item.created_by_robot)
     expected_state = str((runtime.health if runtime else {}).get("map_state") or "IDLE")
-    result = await _dispatch_idempotent(
-        database,
-        request_id=str(uuid4()),
-        robot_id=item.created_by_robot,
-        command_type="map.resync",
-        expected_state=expected_state,
-        payload={"map_id": map_id, "version": version},
-        timeout_seconds=settings.robot_command_timeout_seconds,
-    )
+    try:
+        result = await _dispatch_idempotent(
+            database,
+            request_id=str(uuid4()),
+            robot_id=item.created_by_robot,
+            command_type="map.resync",
+            expected_state=expected_state,
+            payload={"map_id": map_id, "version": version},
+            timeout_seconds=settings.robot_command_timeout_seconds,
+        )
+    except HTTPException:
+        item.sync_status = "SYNC_FAILED"
+        database.commit()
+        raise
+    if result.get("status") not in {"accepted", "completed"}:
+        item.sync_status = "SYNC_FAILED"
+        database.commit()
+        raise HTTPException(
+            status_code=409,
+            detail=str(result.get("error_message") or "Robot từ chối đồng bộ map"),
+        )
     return {"map_id": map_id, "version": version, "sync_status": "SYNC_PENDING", "robot": result}
 
 

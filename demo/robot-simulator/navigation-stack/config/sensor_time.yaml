@@ -13,13 +13,12 @@ rovera_sensor_normalizer:
     scan_arrival_timeout_seconds: 0.30
     odom_arrival_timeout_seconds: 0.25
     imu_arrival_timeout_seconds: 0.25
-    # Live scan calibration on robot 170 finds a stable rear/right return at
-    # y=-0.16..-0.17 m.  This is the LiDAR-visible body/accessory envelope,
-    # which is intentionally independent from the floor collision footprint.
-    # Mask only endpoints inside it; every point outside remains available to
-    # SLAM, AMCL, costmaps and motion-safety.
-    scan_self_filter_half_length: 0.20
-    scan_self_filter_half_width: 0.18
-    scan_laser_x: -0.0046412
+    # Physical body is 0.30 x 0.20 x 0.15 m and the LiDAR is centered on its
+    # top face. Never mask beyond the collision footprint: doing so would hide
+    # a real obstacle beside the chassis. Points inside the physical body are
+    # impossible free-space observations and may be discarded as self-return.
+    scan_self_filter_half_length: 0.15
+    scan_self_filter_half_width: 0.10
+    scan_laser_x: 0.0
     scan_laser_y: 0.0
     scan_laser_yaw: 0.0

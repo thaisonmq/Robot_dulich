@@ -317,6 +317,9 @@ def _navigation_preflight(robot_id: str) -> list[str]:
         return []
     health = robot.health
     checks = {
+        "MAP_REGISTRY_NOT_READY": bool(
+            (health.get("map_registry") or {}).get("ready")
+        ),
         "MAP_NOT_READY": health.get("map_state") == "READY",
         "NOT_LOCALIZED": bool(health.get("localized")) and health.get("localization_state", "READY") == "READY",
         "NAV2_NOT_READY": health.get("nav2") == "READY",

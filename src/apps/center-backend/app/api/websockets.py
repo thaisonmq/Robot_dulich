@@ -387,6 +387,7 @@ async def user_control(
             message = RealtimeMessage.model_validate_json(raw)
             session.control_last_seen_at = datetime.now(timezone.utc)
             ack_status = "accepted"
+            robot_ack: dict = {}
             if session.status != "active":
                 ack_status = "invalid_session"
             elif message.robot_id != robot_id or message.session_id != session_id:
@@ -396,18 +397,58 @@ async def user_control(
             elif message.sequence <= session.last_sequence:
                 ack_status = "rejected"
             elif message.message_type not in {
-                "control.velocity", "control.stop", "camera.ptz", "session.heartbeat"
+                "control.velocity",
+                "control.stop",
+                "control.estop.reset",
+                "camera.ptz",
+                "session.heartbeat",
             }:
                 ack_status = "rejected"
             else:
                 session.last_sequence = message.sequence
-                if (
+                if message.message_type in {"control.stop", "control.estop.reset"}:
+                    try:
+                        robot_ack = await hub.request_robot(
+                            robot_id,
+                            message.message_type,
+                            message.payload,
+                            timeout_seconds=4.5,
+                            request_id=str(message.message_id),
+                        )
+                        ack_status = str(robot_ack.get("status", "unknown"))
+                    except TimeoutError:
+                        ack_status = "unknown"
+                        robot_ack = {
+                            "error_code": "ROBOT_ACK_TIMEOUT",
+                            "error_message": "Robot did not confirm the safety transition",
+                            "measured_zero": False,
+                        }
+                    except ConnectionError:
+                        ack_status = "robot_offline"
+                        robot_ack = {}
+                elif (
                     message.message_type != "session.heartbeat"
                     and not await hub.forward_to_robot(
                         robot_id, message.model_dump(mode="json")
                     )
                 ):
                     ack_status = "robot_offline"
+            ack_details = {
+                key: robot_ack[key]
+                for key in (
+                    "error_code",
+                    "error_message",
+                    "measured_zero",
+                    "measured_velocity_fresh",
+                    "measured_linear_velocity",
+                    "measured_angular_velocity",
+                    "measured_velocity_age_ms",
+                    "stop_confirmation",
+                    "zero_dwell_ms",
+                    "estop",
+                )
+                if key in robot_ack
+            }
             await socket.send_json(
                 {
                     "message_id": str(uuid4()),
@@ -421,6 +462,7 @@ async def user_control(
                     "payload": {
                         "command_message_id": str(message.message_id),
                         "status": ack_status,
+                        **ack_details,
                     },
                 }
             )

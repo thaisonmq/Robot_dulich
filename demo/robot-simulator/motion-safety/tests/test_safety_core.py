@@ -9,12 +9,33 @@ from safety_core import (
     evaluate_scan,
     motion_blocked_by_mask,
     maximum_safe_speed,
+    protective_input_timeout_reason,
     safety_snapshot_payload,
     stopping_clearance,
 )
 
 
 CONFIG = SafetyConfig()
+
+
+def test_required_protective_heartbeat_is_fail_closed() -> None:
+    sources = (
+        ("estop", True, 0.0, 1.2),
+        ("cliff", False, 0.0, 0.6),
+    )
+    assert protective_input_timeout_reason(10.0, sources) == "estop_timeout"
+    assert protective_input_timeout_reason(
+        10.0,
+        (("estop", True, 9.0, 1.2),),
+    ) == ""
+    assert protective_input_timeout_reason(
+        10.3,
+        (("estop", True, 9.0, 1.2),),
+    ) == "estop_timeout"
+    assert protective_input_timeout_reason(
+        9.0,
+        (("estop", True, 10.0, 1.2),),
+    ) == "estop_timeout"
 
 
 def scan_with_points(points: list[tuple[float, float]]) -> ScanSample:

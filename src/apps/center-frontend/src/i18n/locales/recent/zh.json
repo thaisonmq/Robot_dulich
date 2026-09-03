@@ -1,4 +1,12 @@
 {
+  "Nhả E-stop phần mềm": "解除软件急停",
+  "Đang xác minh dừng": "正在确认停止",
+  "Đã xác nhận robot đứng yên": "已确认机器人静止",
+  "Chưa xác nhận robot đứng yên": "尚未确认机器人静止",
+  "Đã nhả E-stop phần mềm an toàn": "已安全解除软件急停",
+  "Chưa xác nhận nhả E-stop": "尚未确认急停解除",
+  "Đang xác minh robot đã đứng yên": "正在确认机器人静止",
+  "Đang xác minh nhả E-stop": "正在确认急停解除",
   "Tốc độ thủ công": "手动速度",
   "Tốc độ tự động": "自动调速",
   "Chống vật cản": "防障碍物",
@@ -172,4 +180,3 @@
   "Quét lại": "再次扫描",
   "Chọn bản đồ điều hướng mặc định cho robot.": "选择机器人的默认导航地图。"
 }
-
