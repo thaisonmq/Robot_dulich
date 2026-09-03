@@ -677,9 +677,14 @@ def test_motion_safety_uses_only_normalized_scan_and_publishes_atomic_status() -
     assert 'LaserScan, "/scan", self._on_scan' not in safety_node
     assert 'String, "/safety/status"' in adapter
     assert 'self.status_state = self.create_publisher(String, "/safety/status"' in safety_node
+    assert 'Bool, "/safety/bridge_interlock"' in safety_node
+    assert "self.bridge_interlock.publish(Bool(data=bool(stop)))" in safety_node
     # Compatibility topics remain available for non-navigation consumers.
     assert '"/safety/health"' in safety_node
     assert '"/safety/directional_mask"' in safety_node
+
+    compose = (project / "compose.yaml").read_text()
+    assert "ROS_OBSTACLE_STOP_TOPIC: /safety/bridge_interlock" in compose
 
 
 def test_visualization_delta_is_route_aware_and_explicit_about_clear() -> None:

@@ -772,6 +772,7 @@ def test_mapping_and_navigation_state_machines_are_idempotent_and_strict() -> No
     assert navigation_transition("NAVIGATING", "PAUSED") == "PAUSED"
     assert navigation_transition("RECOVERY", "PAUSED") == "PAUSED"
     assert navigation_transition("RECOVERY", "ROUTE_SELECTION") == "ROUTE_SELECTION"
+    assert navigation_transition("RECOVERY", "COMPUTING_ALTERNATIVES") == "COMPUTING_ALTERNATIVES"
     assert navigation_transition("ROUTE_SELECTION", "BLOCKED") == "BLOCKED"
     assert navigation_transition("BLOCKED", "COMPUTING_ALTERNATIVES") == "COMPUTING_ALTERNATIVES"
     assert navigation_transition("COMPUTING_ALTERNATIVES", "READY") == "READY"

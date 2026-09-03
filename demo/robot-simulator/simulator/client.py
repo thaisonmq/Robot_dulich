@@ -2068,7 +2068,52 @@ class RobotConnectionClient:
             return None
         if not self.map_registry_ready.is_set():
             return None
-        payload = self.map_cache.active_load_payload(expected_state="NO_ACTIVE_MAP")
+        try:
+            payload = self.map_cache.active_load_payload(
+                expected_state="NO_ACTIVE_MAP"
+            )
+        except MapCacheError as exc:
+            active = self.map_cache.active()
+            if active is None:
+                raise
+            try:
+                map_id = str(active["map_id"])
+                version = int(active["version"])
+                checksum = str(active["checksum"])
+                self.map_cache._validate_identity(map_id, version)
+            except (KeyError, TypeError, ValueError) as identity_error:
+                raise MapCacheError(
+                    "active map registry entry is invalid"
+                ) from identity_error
+            logger.warning(
+                "active map cache is invalid; downloading authoritative bundle "
+                "map_id=%s version=%s error=%s",
+                map_id,
+                version,
+                exc,
+            )
+            destination = await self.map_cache.ensure(
+                map_id=map_id,
+                version=version,
+                checksum=checksum,
+                download_url=(
+                    f"/api/maps/{map_id}/versions/{version}/download"
+                ),
+            )
+            self.map_cache.mark_active(
+                map_id,
+                version,
+                checksum,
+                destination,
+            )
+            payload = self.map_cache.active_load_payload(
+                expected_state="NO_ACTIVE_MAP"
+            )
+            logger.info(
+                "repaired active map cache from Center map_id=%s version=%s",
+                map_id,
+                version,
+            )
         if payload is None:
             return None
         self._stop_motion("restore_active_navigation_map")

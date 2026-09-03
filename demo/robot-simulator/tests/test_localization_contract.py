@@ -1012,6 +1012,8 @@ def test_executable_validator_combines_live_master_and_saved_static_walls() -> N
     )
 
     assert 'validation_source = "GLOBAL_MASTER_COSTMAP"' in validate
+    assert "self._wait_for_global_costmap_after(" in validate
+    assert "baseline_generation = self.global_costmap_generation" in validate
     assert "self.saved_map.occupancy" in validate
     assert "lethal_threshold=100" in validate
     assert "None if allow_monotonic_initial_overlap else 99" in validate
@@ -1042,6 +1044,52 @@ def test_started_compute_failure_becomes_nonterminal_automatic_recovery() -> Non
     assert "self._enter_dynamic_wait(" in compute
     assert "resume_automatically=True" in compute
     assert 'self.latest_feedback.pop("terminal_reason", None)' in compute
+
+
+def test_started_initial_no_route_reverses_only_from_a_fully_gated_pose() -> None:
+    direction_gate = _method_source(
+        "_initial_reverse_turn_bay_recovery_allowed", "_compute_path"
+    )
+    relocation = _method_source(
+        "_initial_reverse_relocation_candidate",
+        "_plan_from_initial_reverse_turn_bay",
+    )
+    fast_plan = _method_source(
+        "_plan_from_initial_reverse_turn_bay", "_compute_path"
+    )
+    compute = _method_source("_compute_path", "_navigate")
+
+    assert '"INITIAL_REVERSE_ESCAPE_REQUIRED"' in direction_gate
+    assert '"NO_EXACT_STOP_TURN_ROUTE"' in direction_gate
+    assert "self._atomic_safety_fresh()" in direction_gate
+    assert "self._initial_reverse_relocation_candidate(" in direction_gate
+    assert "self.safety_direction_mask & 1" in relocation
+    assert "self.safety_direction_mask & 2" in relocation
+    assert "self._turn_bay_rotation_available(pose)" in relocation
+    assert "not forward_validation.valid" in relocation
+    assert "forward_turn_bay_available" in relocation
+    assert "if forward_turn_sweep.valid" in relocation
+    assert "or not forward_turn_bay_available" in relocation
+    assert "not reverse_validation.valid" in relocation
+    assert "segment_departs_exclusions(" in relocation
+    assert "segment_directions=(-1,)" in relocation
+    assert "self.turn_bay_max_distance" in relocation
+    assert "for candidate_index in range(candidate_count)" in relocation
+    assert "yaw + math.pi" in relocation
+    assert "validate_rotation_sweep_neighborhood(" in relocation
+    assert "if not turn_sweep.valid" in relocation
+    assert "allow_initial_reverse_clearance_recovery=True" in fast_plan
+    assert "allow_initial_translation_clearance_recovery=True" in fast_plan
+    assert '"initial_reverse_fast_path": True' in fast_plan
+    reverse_plan = compute.index("_plan_from_initial_reverse_turn_bay(")
+    normal_plan = compute.index("request_planner.plan_result(")
+    assert reverse_plan < normal_plan
+    assert "min(6.0, planning_time_budget)" in compute
+    assert "remaining_planning_budget" in compute
+    assert 'bool(payload.get("auto_recover"))' in compute
+    assert "preferred_translation_direction=-1" in compute
+    assert 'recovery_reason="INITIAL_REVERSE_ESCAPE"' in compute
+    assert '"reverse_escape_started": reverse_escape_started' in compute
 
 
 def test_invalid_preview_never_falls_back_to_a_curved_planner() -> None:
@@ -1130,6 +1178,9 @@ def test_active_segment_is_the_execution_geometry_authority() -> None:
     assert "motion_direction=motion_direction" in prepare
     assert 'context="STRAIGHT_REANCHOR"' in prepare
     assert "validate_stop_turn_route" in prepare
+    assert '"REANCHOR_MARGIN_FALLBACK"' in prepare
+    assert "physical_static_validation.valid" in prepare
+    assert "half_width=self.footprint_half_width" in prepare
     assert '"REANCHOR_TRANSLATION_INVALID"' in prepare
     assert "self._schedule_execution_replan" in prepare
     assert "active.effective_start" in sender
@@ -1265,7 +1316,17 @@ def test_segment_transitions_wait_for_measured_zero_and_turn_momentum_brakes() -
     assert "self.turn_motion_tracker.observe(" in tick
     assert "current_angular_speed=turn_motion.angular_speed" in tick
     assert "self.execution_turn_min_effective_speed" in tick
+    assert "self.execution_turn_angular_acceleration" in tick
+    assert "maximum_change = turn_slew_rate * command_elapsed" in tick
     assert '"TURN_STALL_BOOST"' in tick
+
+    project = Path(__file__).parents[1]
+    parameters = yaml.safe_load(
+        (project / "navigation-stack/config/nav2_params.yaml").read_text()
+    )["rovera_navigation_adapter"]["ros__parameters"]
+    assert parameters["stop_turn_max_angular_speed"] == 0.40
+    assert parameters["stop_turn_angular_acceleration"] == 0.80
+    assert parameters["stop_turn_angular_deceleration"] == 1.20
 
 
 def test_navigation_debug_events_cover_new_geometry_and_recovery_sources() -> None:
@@ -1304,6 +1365,10 @@ def test_initial_preview_produces_candidates_without_persistent_scratch_state() 
     assert "_publish_failed_segments" not in alternatives
     assert 'source="EXPLICIT_ALTERNATIVE_SEARCH"' in alternatives
     assert "request_planner.plan_candidates" in alternatives
+    assert '"WAITING_FOR_DYNAMIC_CLEAR"' in alternatives
+    assert "self.navigation_goal_generation += 1" in alternatives
+    assert 'self.dynamic_recovery_state = "OPERATOR_ALTERNATIVE_SEARCH"' in alternatives
+    assert "if recovering_from_blockage" in alternatives
 
 
 def test_preview_and_alternative_search_preserve_center_mission_identity() -> None:
@@ -1396,6 +1461,20 @@ def test_rotation_sweep_stop_and_start_escape_remain_runtime_recoverable() -> No
     )
     assert "preferred_turn_bay_directions(pose, goal)" in direction_gate
     assert "((1, 1), (-1, 2))" in direction_gate
+
+
+def test_turn_bay_rotation_exit_requires_live_and_static_clearance() -> None:
+    turn_exit = _method_source(
+        "_turn_bay_rotation_available",
+        "_initial_reverse_turn_bay_recovery_allowed",
+    )
+
+    assert "self._atomic_safety_fresh()" in turn_exit
+    assert "self._live_rotation_sweep_clear()" in turn_exit
+    assert "self._safety_blocks_turn(turn_direction)" in turn_exit
+    assert "validate_rotation_sweep(" in turn_exit
+    assert "self._hard_route_side_clearance()" in turn_exit
+    assert "direction=turn_direction" in turn_exit
 
 
 def test_navigation_pose_jump_stops_before_replan_and_preserves_destination() -> None:
@@ -1869,7 +1948,8 @@ def test_turn_block_recovery_moves_one_safe_step_before_global_replanning() -> N
     assert "display = [dict(pose), dict(candidate)]" in relocate
     assert 'relocation_reason == "TURN_BAY"' in complete
     assert "self.latest_corridor.can_go_straight" in complete
-    assert "not self.latest_corridor.can_rotate" in complete
+    assert "not turn_available" in complete
+    assert "self._turn_bay_rotation_available(pose)" in complete
     assert 'status="CONTINUE_NARROW_TRANSLATION"' in complete
     assert "preferred_translation_direction=active.motion_direction" in complete
     assert "preferred_translation_direction in live_directions" in relocate
@@ -2306,6 +2386,8 @@ def test_operator_motion_interrupts_clear_every_automatic_resume_context() -> No
         assert "self.localization_resume_in_progress = False" in source
     assert '"TURN_BAY_RECOVERY"' in estop
     assert "self.localization_velocity.publish(Twist())" in estop
+    assert "self._persist_active_navigation_mission(" in manual
+    assert "resume_automatically=False" in manual
     assert '"TURN_BAY_RECOVERY"' in manual
     assert "self.localization_velocity.publish(Twist())" in manual
 

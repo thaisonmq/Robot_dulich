@@ -491,17 +491,21 @@ describe("MapPanel navigation controls", () => {
   });
 
   it("keeps the destination active while replanning around an obstacle", () => {
+    const onFindAlternatives = vi.fn();
     panel({
       localized: true,
       localizationState: "READY",
       mapState: "DYNAMIC_REPLAN",
       navigationStatus: "recovery",
       onPause: vi.fn(),
+      onFindAlternatives,
     });
 
     expect(screen.getByText("NAV2 · Đang tìm đường tránh vật cản")).toBeInTheDocument();
     expect(screen.getByText(/Điểm đến vẫn được giữ/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Tạm dừng" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Tìm đường khác" }));
+    expect(onFindAlternatives).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "Tạm dừng" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Dừng điều hướng" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Chọn điểm đến" })).not.toBeInTheDocument();
   });

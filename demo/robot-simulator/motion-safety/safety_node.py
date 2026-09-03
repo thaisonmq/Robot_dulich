@@ -97,6 +97,12 @@ class MotionSafetyNode(Node):
         self.health = self.create_publisher(String, "/safety/health", 1)
         self.stop_source = self.create_publisher(String, "/safety/stop_source", 1)
         self.status_state = self.create_publisher(String, "/safety/status", 1)
+        # Independent heartbeat consumed by the Web/joystick bridge.  It is
+        # false while safety is healthy (including stationary idle), true for
+        # a hard stop, and disappears entirely if this final safety node dies.
+        self.bridge_interlock = self.create_publisher(
+            Bool, "/safety/bridge_interlock", 1
+        )
         self.manual_takeover = self.create_publisher(Bool, "/safety/manual_takeover", 1)
         self.create_subscription(Twist, "/cmd_vel_smoothed", self._on_command, 1)
         self.create_subscription(Twist, "/cmd_vel_muxed", self._on_muxed, 1)
@@ -438,6 +444,7 @@ class MotionSafetyNode(Node):
             decision=decision,
             hard_stop=hard_stop,
         )
+        self.bridge_interlock.publish(Bool(data=bool(stop)))
         self.status_state.publish(String(data=json.dumps(
             payload, separators=(",", ":"), allow_nan=False
         )))

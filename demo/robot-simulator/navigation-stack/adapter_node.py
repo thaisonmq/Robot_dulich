@@ -58,6 +58,7 @@ from navigation_core import (
     MapNavigationGeometry,
     NavigationDebugLog,
     ParticleCloudUniqueness,
+    PlannerResult,
     PoseStability,
     SavedOccupancyMap,
     StopTurnStateLatticePlanner,
@@ -109,6 +110,7 @@ from navigation_core import (
     turn_hysteresis_transition,
     validate_executable_grid_path,
     validate_rotation_sweep,
+    validate_rotation_sweep_neighborhood,
     validate_stop_turn_route,
 )
 from speed_profiles import (
@@ -1062,6 +1064,7 @@ class NavigationAdapter(Node):
         self.segment_last_travel_pose: tuple[float, float] | None = None
         self.straight_recovery_requested = ""
         self.last_turn_command = (0.0, 0.0)
+        self.last_turn_command_monotonic = 0.0
         self.last_turn_command_log_monotonic = 0.0
         self.last_goal_completion_deferred_log_monotonic = 0.0
         self.execution_settle_seconds = configured(
@@ -1092,6 +1095,9 @@ class NavigationAdapter(Node):
         self.execution_turn_kp = configured("stop_turn_heading_kp", 1.8)
         self.execution_turn_max_speed = configured(
             "stop_turn_max_angular_speed", 0.60
+        )
+        self.execution_turn_angular_acceleration = configured(
+            "stop_turn_angular_acceleration", 0.80
         )
         self.execution_turn_angular_deceleration = configured(
             "stop_turn_angular_deceleration", 2.0
@@ -4607,16 +4613,40 @@ class NavigationAdapter(Node):
         if self.stop_turn_planner is None or self.pose is None:
             raise AdapterError("PLANNER_NOT_READY", "Stop-turn planner is unavailable")
         request_state = self.current_state
+        recovering_from_blockage = request_state in {
+            "BLOCKED",
+            "RECOVERY",
+            "WAIT_FOR_DYNAMIC_CLEAR",
+            "WAITING_FOR_DYNAMIC_CLEAR",
+            "DYNAMIC_REPLAN",
+        }
         return_state = (
             "NARROW_PATH_DECISION"
             if request_state == "NARROW_PATH_DECISION"
             else "BLOCKED"
-            if request_state == "BLOCKED"
+            if recovering_from_blockage
             else "READY"
         )
+        handle = None
         with self.state_lock:
+            if recovering_from_blockage:
+                # An explicit operator request supersedes the automatic retry
+                # thread. Invalidate its generation before planning so it
+                # cannot resume the old route while choices are being built.
+                self.navigation_goal_generation += 1
+                handle = self.current_goal_handle
+                self.current_goal_handle = None
+                self.execution_segment_token += 1
+                self.active_segment = None
+                self.execution_phase = "IDLE"
+                self.motion_owner = "NONE"
+                self.dynamic_recovery_state = "OPERATOR_ALTERNATIVE_SEARCH"
             self.route_selection_return_state = return_state
             self._set_state("COMPUTING_ALTERNATIVES", "operator_requested_routes")
+        self.navigation_velocity.publish(Twist())
+        self.profile_limiter.reset()
+        if handle is not None:
+            handle.cancel_goal_async()
         request_planner = self._stop_turn_planner_for_clearance()
         planned = request_planner.plan_candidates(
             dict(self.pose),
@@ -4626,7 +4656,7 @@ class NavigationAdapter(Node):
             planning_time_budget=self.stop_turn_planning_budget,
             exclusions=(
                 self._dynamic_planning_exclusions()
-                if request_state == "BLOCKED"
+                if recovering_from_blockage
                 else ()
             ),
         )
@@ -4683,6 +4713,17 @@ class NavigationAdapter(Node):
         maximum_new_initial_overlap_cells: int = 0,
     ) -> ExecutablePathValidation:
         message = self.latest_global_costmap
+        if (
+            message is None
+            or time.monotonic() - self.last_global_costmap_monotonic > 1.5
+        ):
+            # A CPU-bound exact search can finish just before the next 2 Hz
+            # costmap publication. Wait for that publication instead of
+            # rejecting an already valid route because its validation image
+            # is a few hundred milliseconds over the freshness boundary.
+            baseline_generation = self.global_costmap_generation
+            self._wait_for_global_costmap_after(baseline_generation, 1.0)
+            message = self.latest_global_costmap
         if (
             message is None
             or time.monotonic() - self.last_global_costmap_monotonic > 1.5
@@ -6015,6 +6056,16 @@ class NavigationAdapter(Node):
             # manual the higher priority, so invalidate Auto synchronously and
             # let the cancel acknowledgement finish asynchronously.
             with self.state_lock:
+                preserved_goal = dict(
+                    self.execution_goal or self.paused_goal or {}
+                )
+                preserved_route_id = self.execution_route_id
+                preserved_path = list(
+                    self.execution_points or self.latest_global_path
+                )
+                preserved_directions = list(
+                    self.execution_segment_directions
+                )
                 handle = self.current_goal_handle
                 self.current_goal_handle = None
                 self._set_state("MANUAL_BYPASS", "manual_takeover")
@@ -6034,6 +6085,14 @@ class NavigationAdapter(Node):
             self.obstacle_slowdown_active = False
             self.navigation_velocity.publish(Twist())
             self.localization_velocity.publish(Twist())
+            if preserved_goal:
+                self._persist_active_navigation_mission(
+                    resume_automatically=False,
+                    goal=preserved_goal,
+                    route_id=preserved_route_id,
+                    path=preserved_path,
+                    segment_directions=preserved_directions,
+                )
             if handle is not None:
                 future = handle.cancel_goal_async()
 
@@ -9332,6 +9391,290 @@ class NavigationAdapter(Node):
             if direction in permitted
         )
 
+    def _turn_bay_rotation_available(
+        self,
+        pose: dict[str, float],
+    ) -> bool:
+        """Return true only when one first turn step is live and static safe."""
+        if (
+            self.saved_map is None
+            or self.stop_turn_planner is None
+            or self.estop_active
+            or not self._atomic_safety_fresh()
+            or not self._live_rotation_sweep_clear()
+        ):
+            return False
+        yaw = float(pose.get("yaw", 0.0))
+        heading_step = float(self.stop_turn_planner.heading_step)
+        reserved_half_width = (
+            self.footprint_half_width + self._hard_route_side_clearance()
+        )
+        for turn_direction in (1, -1):
+            if self._safety_blocks_turn(turn_direction):
+                continue
+            turn = validate_rotation_sweep(
+                self.saved_map,
+                float(pose["x"]),
+                float(pose["y"]),
+                yaw,
+                yaw + turn_direction * heading_step,
+                half_length=self.footprint_half_length,
+                half_width=reserved_half_width,
+                padding=self.planning_footprint_padding,
+                direction=turn_direction,
+            )
+            if turn.valid:
+                return True
+        return False
+
+    def _initial_reverse_turn_bay_recovery_allowed(
+        self,
+        error_code: str,
+        pose: dict[str, float] | None = None,
+    ) -> bool:
+        """Gate autonomous reverse recovery at an immobile initial pose."""
+        if str(error_code) not in {
+            "INITIAL_REVERSE_ESCAPE_REQUIRED",
+            "NO_EXACT_STOP_TURN_ROUTE",
+            "START_TURN_BLOCKED_STATIC",
+            "SEARCH_TIME_LIMIT",
+            "SEARCH_EXPANSION_LIMIT",
+        }:
+            return False
+        current_pose = dict(self.pose or {}) if pose is None else dict(pose)
+        if (
+            self.saved_map is None
+            or not current_pose
+            or self.estop_active
+            or not self._atomic_safety_fresh()
+        ):
+            return False
+        return bool(
+            self._initial_reverse_relocation_candidate(
+                current_pose,
+                (),
+            )
+        )
+
+    def _initial_reverse_relocation_candidate(
+        self,
+        pose: dict[str, float],
+        exclusions: tuple[tuple[float, float, float], ...],
+    ) -> dict[str, Any] | None:
+        """Return a short reverse bay only when forward/turn cannot start."""
+        if (
+            self.saved_map is None
+            or self.stop_turn_planner is None
+            or self.estop_active
+            or not self._atomic_safety_fresh()
+            or self.safety_direction_mask & 2
+            or self._turn_bay_rotation_available(pose)
+        ):
+            return None
+        yaw = float(pose.get("yaw", 0.0))
+        step = max(self.saved_map.resolution, 0.025)
+        minimum_distance = max(step, self.footprint_half_length)
+        maximum_distance = max(minimum_distance, self.turn_bay_max_distance)
+        candidate_count = max(
+            1,
+            int(math.floor(
+                (maximum_distance - minimum_distance) / step + 1e-9
+            )) + 1,
+        )
+        reserved_half_width = (
+            self.footprint_half_width + self.translation_lateral_margin
+        )
+        rotation_half_width = (
+            self.footprint_half_width + self._hard_route_side_clearance()
+        )
+        forward_validation = None
+        forward_turn_bay_available = False
+        for candidate_index in range(candidate_count):
+            distance = minimum_distance + candidate_index * step
+            forward = {
+                "x": float(pose["x"]) + distance * math.cos(yaw),
+                "y": float(pose["y"]) + distance * math.sin(yaw),
+                "yaw": yaw,
+            }
+            forward_validation = validate_stop_turn_route(
+                self.saved_map,
+                (pose, forward),
+                half_length=self.footprint_half_length,
+                half_width=reserved_half_width,
+                padding=self.planning_footprint_padding,
+                segment_directions=(1,),
+            )
+            if not forward_validation.valid:
+                break
+            if not segment_departs_exclusions(
+                pose,
+                forward,
+                exclusions,
+                endpoint_clearance=self.planning_footprint_padding,
+            ):
+                continue
+            forward_turn_sweep = validate_rotation_sweep_neighborhood(
+                self.saved_map,
+                float(forward["x"]),
+                float(forward["y"]),
+                yaw,
+                yaw + math.pi,
+                half_length=self.footprint_half_length,
+                half_width=rotation_half_width,
+                padding=self.planning_footprint_padding,
+                robustness_radius=0.0,
+            )
+            if forward_turn_sweep.valid:
+                forward_turn_bay_available = True
+                break
+        forward_unavailable = bool(
+            self.safety_direction_mask & 1
+            or not self.latest_corridor.can_go_straight
+            or not forward_turn_bay_available
+        )
+        if not forward_unavailable:
+            return None
+        for candidate_index in range(candidate_count):
+            distance = minimum_distance + candidate_index * step
+            reverse = {
+                "x": float(pose["x"]) - distance * math.cos(yaw),
+                "y": float(pose["y"]) - distance * math.sin(yaw),
+                "yaw": yaw,
+            }
+            reverse_validation = validate_stop_turn_route(
+                self.saved_map,
+                (pose, reverse),
+                half_length=self.footprint_half_length,
+                half_width=reserved_half_width,
+                padding=self.planning_footprint_padding,
+                segment_directions=(-1,),
+            )
+            if not reverse_validation.valid:
+                break
+            if not segment_departs_exclusions(
+                pose,
+                reverse,
+                exclusions,
+                endpoint_clearance=self.planning_footprint_padding,
+            ):
+                continue
+            # A 180-degree sweep covers every distinct orientation of the
+            # rectangular chassis. Select the first bay where the next route
+            # can turn either way, instead of stopping at a 15 cm point that
+            # still forces the planner into several tiny corrective corners.
+            turn_sweep = validate_rotation_sweep_neighborhood(
+                self.saved_map,
+                float(reverse["x"]),
+                float(reverse["y"]),
+                yaw,
+                yaw + math.pi,
+                half_length=self.footprint_half_length,
+                half_width=rotation_half_width,
+                padding=self.planning_footprint_padding,
+                robustness_radius=0.0,
+            )
+            if not turn_sweep.valid:
+                continue
+            return {
+                **reverse,
+                "distance": distance,
+                "forward_static_code": (
+                    "NO_FORWARD_TURN_BAY"
+                    if forward_validation is None or forward_validation.valid
+                    else forward_validation.code
+                ),
+            }
+        return None
+
+    def _plan_from_initial_reverse_turn_bay(
+        self,
+        planner: StopTurnStateLatticePlanner,
+        start: dict[str, float],
+        goal: dict[str, float],
+        bay: dict[str, Any],
+        exclusions: tuple[tuple[float, float, float], ...],
+        planning_time_budget: float,
+    ) -> PlannerResult | None:
+        """Plan the forward suffix, then exact-validate one initial reverse."""
+        started = time.monotonic()
+        bay_pose = {
+            "x": float(bay["x"]),
+            "y": float(bay["y"]),
+            "yaw": float(bay["yaw"]),
+        }
+        suffix_result = planner.plan_result(
+            bay_pose,
+            goal,
+            exclusions=exclusions,
+            planning_time_budget=max(0.10, float(planning_time_budget)),
+            allow_start_escape=False,
+            live_start_clear=False,
+            live_start_directions=(),
+        )
+        suffix = suffix_result.route
+        if suffix is None:
+            self._nav_debug(
+                "INITIAL_REVERSE_ESCAPE",
+                action="SUFFIX_NOT_FOUND",
+                status=suffix_result.status,
+                distance=bay["distance"],
+                duration_ms=round(
+                    (time.monotonic() - started) * 1000.0,
+                    3,
+                ),
+            )
+            return None
+        suffix_directions = tuple(
+            suffix.segment_directions
+            or (1 for _ in range(len(suffix.points) - 1))
+        )
+        combined_points = [
+            {"x": float(start["x"]), "y": float(start["y"])},
+            *(dict(point) for point in suffix.points),
+        ]
+        combined = planner._route_result(
+            combined_points,
+            start_yaw=float(start.get("yaw", 0.0)),
+            goal_yaw=(
+                None
+                if goal.get("yaw") is None
+                else float(goal["yaw"])
+            ),
+            segment_directions=(-1, *suffix_directions),
+            allow_initial_reverse_clearance_recovery=True,
+            allow_initial_translation_clearance_recovery=True,
+        )
+        if combined is None:
+            self._nav_debug(
+                "INITIAL_REVERSE_ESCAPE",
+                action="COMBINED_ROUTE_REJECTED",
+                distance=bay["distance"],
+            )
+            return None
+        diagnostics = dict(suffix_result.diagnostics)
+        diagnostics.update({
+            "candidate_count": max(
+                1, int(diagnostics.get("candidate_count", 1))
+            ),
+            "selected_points": len(combined.points),
+            "selected_segments": len(combined.points) - 1,
+            "selected_turn_count": combined.metadata.turn_count,
+            "total_execution_turns": combined.metadata.turn_count,
+            "route_length": round(combined.metadata.total_length, 4),
+            "reverse_distance": round(float(bay["distance"]), 4),
+            "initial_reverse_clearance_recovery": True,
+            "initial_reverse_fast_path": True,
+            "forward_static_code": bay.get("forward_static_code") or "",
+            "start_escape_segments": 1,
+        })
+        return PlannerResult(
+            "SUCCESS",
+            route=combined,
+            expansions=suffix_result.expansions,
+            elapsed_seconds=time.monotonic() - started,
+            diagnostics=diagnostics,
+        )
+
     def _compute_path(self, payload: dict[str, Any]) -> dict[str, Any]:
         planning_started = time.monotonic()
         self._validate_command_map(payload)
@@ -9354,6 +9697,13 @@ class NavigationAdapter(Node):
                 json.dumps(resolved_goal, sort_keys=True).encode()
             ).hexdigest()[:10]
             route_id = f"auto-recovery-{route_digest}"
+            recovery_pose = None if self.pose is None else dict(self.pose)
+            reverse_escape_started = (
+                self._initial_reverse_turn_bay_recovery_allowed(
+                    error.code,
+                    recovery_pose,
+                )
+            )
             with self.state_lock:
                 self.current_mission_id = str(
                     payload.get("mission_id")
@@ -9373,10 +9723,22 @@ class NavigationAdapter(Node):
                 self.latest_feedback.pop("terminal_reason", None)
                 self.latest_feedback["recovery_reason"] = error.code
                 self.latest_feedback["destination_preserved"] = True
+                if reverse_escape_started:
+                    # This compute request carries auto_recover only after the
+                    # operator presses Go. Claim a new execution generation so
+                    # cancel, E-stop or manual takeover can invalidate the
+                    # bounded relocation worker before it publishes motion.
+                    self.navigation_goal_generation += 1
+                    recovery_generation = self.navigation_goal_generation
+                    self.execution_phase = "RECOVERING"
+                    self.execution_replan_attempts = 0
+                    self.navigation_recovery_attempts = 0
+                    self.motion_owner = "NONE"
+                else:
+                    recovery_generation = self.navigation_goal_generation
             self._record_planning_failure(
                 error, requested_goal, resolved_goal, planning_started
             )
-            self._enter_dynamic_wait(error.code or "PLAN_RETRY_PENDING")
             self._persist_active_navigation_mission(
                 resume_automatically=True,
                 goal=resolved_goal,
@@ -9384,6 +9746,28 @@ class NavigationAdapter(Node):
                 path=[],
                 segment_directions=[],
             )
+            if reverse_escape_started and recovery_pose is not None:
+                self._nav_debug(
+                    "INITIAL_REVERSE_ESCAPE",
+                    action="START_TURN_BAY_RECOVERY",
+                    reason=error.code,
+                    forward_blocked=True,
+                    rotation_unavailable=True,
+                    reverse_safe=True,
+                    destination=resolved_goal,
+                    destination_preserved=True,
+                )
+                self._start_turn_bay_recovery(
+                    recovery_pose,
+                    recovery_generation,
+                    preferred_translation_direction=-1,
+                    recovery_reason="INITIAL_REVERSE_ESCAPE",
+                )
+            else:
+                self._enter_dynamic_wait(
+                    error.code or "PLAN_RETRY_PENDING"
+                )
+            recovery_state = self.current_state
             self._nav_debug(
                 "PLAN_RESULT",
                 status="RECOVERY_PENDING",
@@ -9391,10 +9775,11 @@ class NavigationAdapter(Node):
                 destination=resolved_goal,
                 destination_preserved=True,
                 automatic_retry=True,
+                reverse_escape_started=reverse_escape_started,
             )
             return {
                 "status": "accepted",
-                "current_state": "WAITING_FOR_DYNAMIC_CLEAR",
+                "current_state": recovery_state,
                 "route_id": route_id,
                 "points": [],
                 "route_candidates": [],
@@ -9404,6 +9789,7 @@ class NavigationAdapter(Node):
                 "goal_adjusted": bool(goal_adjusted),
                 "recovery_pending": True,
                 "recovery_reason": error.code,
+                "reverse_escape_started": reverse_escape_started,
                 "destination_preserved": True,
                 "state": self._state(),
             }
@@ -9525,20 +9911,68 @@ class NavigationAdapter(Node):
         request_planner = self._stop_turn_planner_for_clearance(
             hard_side_clearance
         )
-        planner_result = request_planner.plan_result(
+        initial_reverse_bay = self._initial_reverse_relocation_candidate(
             start_pose,
-            resolved_goal,
-            exclusions=planning_exclusions,
-            planning_time_budget=planning_time_budget,
-            allow_start_escape=True,
-            maximum_start_escape_distance=self.start_escape_max_distance,
-            maximum_start_escape_new_overlap_cells=1,
-            live_start_clear=live_start_clear,
-            live_start_directions=live_start_directions,
+            planning_exclusions,
         )
+        reverse_plan_started = time.monotonic()
+        planner_result = (
+            None
+            if initial_reverse_bay is None
+            else self._plan_from_initial_reverse_turn_bay(
+                request_planner,
+                start_pose,
+                resolved_goal,
+                initial_reverse_bay,
+                planning_exclusions,
+                min(6.0, planning_time_budget),
+            )
+        )
+        if planner_result is None:
+            remaining_planning_budget = max(
+                0.10,
+                planning_time_budget
+                - (
+                    0.0
+                    if initial_reverse_bay is None
+                    else time.monotonic() - reverse_plan_started
+                ),
+            )
+            planner_result = request_planner.plan_result(
+                start_pose,
+                resolved_goal,
+                exclusions=planning_exclusions,
+                planning_time_budget=remaining_planning_budget,
+                allow_start_escape=True,
+                maximum_start_escape_distance=self.start_escape_max_distance,
+                maximum_start_escape_new_overlap_cells=1,
+                live_start_clear=live_start_clear,
+                live_start_directions=live_start_directions,
+            )
+        else:
+            self._nav_debug(
+                "INITIAL_REVERSE_ESCAPE",
+                action="ROUTE_SELECTED",
+                bay={
+                    "x": initial_reverse_bay["x"],
+                    "y": initial_reverse_bay["y"],
+                    "yaw": initial_reverse_bay["yaw"],
+                },
+                distance=initial_reverse_bay["distance"],
+                forward_static_code=(
+                    initial_reverse_bay.get("forward_static_code") or None
+                ),
+                points=len(planner_result.route.points),
+                turns=planner_result.route.metadata.turn_count,
+                duration_ms=round(
+                    planner_result.elapsed_seconds * 1000.0,
+                    3,
+                ),
+            )
         if (
             planner_result.status == "SEARCH_EXPANSION_LIMIT"
             and not live_obstacle_search
+            and initial_reverse_bay is None
         ):
             # An expansion-bound result can return well before the transport
             # deadline, so a larger bounded retry is useful. A time-bound
@@ -10325,6 +10759,7 @@ class NavigationAdapter(Node):
         if self.execution_phase == "TURN_SETTLING":
             self.motion_owner = "NONE"
             self.last_turn_command = (0.0, 0.0)
+            self.last_turn_command_monotonic = now
             self.navigation_velocity.publish(Twist())
             self.turn_motion_tracker.reset()
             self.execution_turn_stall_active = False
@@ -10463,6 +10898,8 @@ class NavigationAdapter(Node):
             )
             self.latest_feedback["execution_phase"] = "WAIT_FOR_TURN_CLEAR"
             self.motion_owner = "NONE"
+            self.last_turn_command = (0.0, 0.0)
+            self.last_turn_command_monotonic = now
             self.navigation_velocity.publish(Twist())
             self._nav_debug(
                 "TURN_RECOVERY",
@@ -10494,6 +10931,7 @@ class NavigationAdapter(Node):
             self.latest_feedback["execution_phase"] = "WAIT_FOR_TURN_CLEAR"
             self.motion_owner = "NONE"
             self.last_turn_command = (0.0, 0.0)
+            self.last_turn_command_monotonic = now
             self.navigation_velocity.publish(Twist())
             observed_yaw = self._actual_odom_yaw()
             self.turn_motion_tracker.reset(
@@ -10542,6 +10980,7 @@ class NavigationAdapter(Node):
         if transition == "TURN_SETTLING":
             self.motion_owner = "NONE"
             self.last_turn_command = (0.0, 0.0)
+            self.last_turn_command_monotonic = now
             self.navigation_velocity.publish(Twist())
             self.execution_phase = "TURN_SETTLING"
             self.execution_phase_started = now
@@ -10578,7 +11017,38 @@ class NavigationAdapter(Node):
                 proportional_speed,
             )
         )
-        command.angular.z = direction * commanded_speed
+        target_angular = direction * commanded_speed
+        previous_angular = float(self.last_turn_command[1])
+        command_elapsed = (
+            0.05
+            if self.last_turn_command_monotonic <= 0.0
+            else max(
+                0.001,
+                min(0.25, now - self.last_turn_command_monotonic),
+            )
+        )
+        same_direction = (
+            previous_angular == 0.0
+            or target_angular == 0.0
+            or previous_angular * target_angular > 0.0
+        )
+        speeding_up = (
+            same_direction
+            and abs(target_angular) > abs(previous_angular)
+        )
+        turn_slew_rate = (
+            self.execution_turn_angular_acceleration
+            if speeding_up
+            else self.execution_turn_angular_deceleration
+        )
+        maximum_change = turn_slew_rate * command_elapsed
+        angular_change = target_angular - previous_angular
+        command.angular.z = (
+            target_angular
+            if abs(angular_change) <= maximum_change
+            else previous_angular
+            + math.copysign(maximum_change, angular_change)
+        )
         if turn_motion.stalled and not self.execution_turn_stall_active:
             self._nav_debug(
                 "TURN_STALL_BOOST",
@@ -10595,6 +11065,7 @@ class NavigationAdapter(Node):
         self.execution_turn_stall_active = turn_motion.stalled
         self.motion_owner = "NAVIGATION"
         self.last_turn_command = (0.0, float(command.angular.z))
+        self.last_turn_command_monotonic = now
         self.navigation_velocity.publish(command)
         if now - self.last_turn_command_log_monotonic >= 0.5:
             self._nav_debug(
@@ -10669,7 +11140,7 @@ class NavigationAdapter(Node):
         # validates the complete segment before it is dispatched.
         minimum_relocation_distance = (
             step
-            if self.latest_corridor.can_rotate
+            if self._turn_bay_rotation_available(pose)
             else max(step, self.footprint_half_length)
         )
         minimum_relocation_index = max(
@@ -11140,6 +11611,43 @@ class NavigationAdapter(Node):
             )
         )
         if (
+            live_validation.valid
+            and static_validation is not None
+            and not static_validation.valid
+            and self.saved_map is not None
+            and not start_escape
+        ):
+            # Re-anchoring from a fresh AMCL pose can shift the centerline by
+            # one raster cell and consume only the optional 1 cm planning
+            # reserve. Accept that reserve-only disagreement only when the
+            # complete physical chassis still passes Saved Map validation.
+            # The fresh master costmap above and raw LiDAR motion-safety remain
+            # authoritative for live obstacles.
+            physical_static_validation = validate_stop_turn_route(
+                self.saved_map,
+                candidate,
+                half_length=self.footprint_half_length,
+                half_width=self.footprint_half_width,
+                padding=self.planning_footprint_padding,
+                segment_directions=(motion_direction,),
+            )
+            if physical_static_validation.valid:
+                self._nav_debug(
+                    "REANCHOR_MARGIN_FALLBACK",
+                    segment_index=self.execution_segment_index,
+                    reserved_code=static_validation.code,
+                    reserved_sample_x=static_validation.sample_x,
+                    reserved_sample_y=static_validation.sample_y,
+                    reserved_collision_x=static_validation.collision_x,
+                    reserved_collision_y=static_validation.collision_y,
+                    translation_lateral_margin=(
+                        self.translation_lateral_margin
+                    ),
+                    physical_footprint_valid=True,
+                    live_costmap_valid=True,
+                )
+                static_validation = physical_static_validation
+        if (
             not live_validation.valid
             or (
                 not start_escape
@@ -11325,6 +11833,8 @@ class NavigationAdapter(Node):
                 self.execution_segment_reanchors
                 < self.stop_turn_max_reanchors_per_segment
             )
+            self.last_turn_command = (0.0, 0.0)
+            self.last_turn_command_monotonic = now
             self.latest_feedback["execution_phase"] = self.execution_phase
             self.motion_owner = "NAVIGATION"
             if direction:
@@ -11349,6 +11859,8 @@ class NavigationAdapter(Node):
         self.execution_turn_stable_since = now
         self.execution_turn_reentry_since = None
         self.execution_reanchor_after_turn = False
+        self.last_turn_command = (0.0, 0.0)
+        self.last_turn_command_monotonic = now
         self.latest_feedback["execution_phase"] = "TURN_SETTLING"
 
     def _turn_static_safe(
@@ -11493,11 +12005,15 @@ class NavigationAdapter(Node):
                 if pose is None or not goal
                 else self._live_start_escape_directions(pose, goal)
             )
+            turn_available = bool(
+                pose is not None
+                and self._turn_bay_rotation_available(pose)
+            )
             continue_narrow_translation = bool(
                 relocation_reason == "TURN_BAY"
                 and active is not None
                 and pose is not None
-                and not self.latest_corridor.can_rotate
+                and not turn_available
                 and active.motion_direction in translation_directions
                 and (
                     active.motion_direction < 0
@@ -11519,6 +12035,7 @@ class NavigationAdapter(Node):
                     ),
                     can_go_straight=self.latest_corridor.can_go_straight,
                     can_rotate=self.latest_corridor.can_rotate,
+                    exact_turn_available=turn_available,
                     destination=goal,
                     destination_preserved=True,
                 )

@@ -3253,6 +3253,37 @@ def test_only_turns_strictly_below_thirty_degrees_are_shallow(
     assert planner._has_short_shallow_corner_pair(route) is expected
 
 
+def test_corner_reduction_also_checks_a_short_sharp_goal_connector() -> None:
+    saved = _manual_map(60, 60, _free_rectangle(2, 57, 2, 57))
+    planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)
+    points = [
+        {"x": 0.40, "y": 0.40},
+        {"x": 0.80, "y": 0.40},
+        {"x": 1.00, "y": 0.45},
+        {"x": 1.20, "y": 1.00},
+        {"x": 1.60, "y": 1.00},
+    ]
+    baseline = planner._route_result(points, start_yaw=0.0)
+
+    assert baseline is not None
+    assert not planner._has_short_shallow_corner_pair(baseline)
+    reduced = planner._reduce_shallow_route_corners(
+        baseline,
+        (),
+        start_yaw=0.0,
+        goal_yaw=None,
+        deadline_monotonic=None,
+    )
+
+    assert reduced is not None
+    assert reduced.points[0] == baseline.points[0]
+    assert reduced.points[-1] == baseline.points[-1]
+    assert (
+        planner._route_internal_turn_count(reduced)
+        < planner._route_internal_turn_count(baseline)
+    )
+
+
 def test_axis_straightening_replaces_heading_lattice_staircase() -> None:
     saved = _manual_map(60, 60, _free_rectangle(2, 57, 2, 57))
     planner = StopTurnStateLatticePlanner(saved, saved.navigation_geometry)

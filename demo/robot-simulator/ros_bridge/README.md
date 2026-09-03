@@ -47,10 +47,12 @@ Obstacle detector -> /rovera/obstacle_* -> motion-safety (mọi nguồn)
   `/rovera/obstacle_stop`: `true` khóa và phát zero liên tục, `false` mở khóa.
   Lệnh velocity của Web không thể tự xóa khóa này. Motion safety nhận tín hiệu
   trực tiếp nên khóa áp dụng cho Web, joystick và Nav2.
-- Production mặc định `ROS_OBSTACLE_WATCHDOG_MS=500` và nguồn cảm biến phải
-  publish cả `true` lẫn `false` định kỳ; bridge khóa ngay từ lúc khởi động và
-  khóa lại nếu heartbeat quá hạn. Chỉ đặt `0` trong bench/service mode khi
-  nguồn obstacle ngoài chủ ý không được lắp và motion output đã bị cô lập.
+- Production mặc định `ROS_OBSTACLE_WATCHDOG_MS=500`. Bridge nhận heartbeat
+  `/safety/bridge_interlock` từ motion-safety, vì vậy nó khóa ngay khi node
+  safety chưa sẵn sàng, phát hard-stop hoặc mất heartbeat. Các nguồn cảm biến
+  ngoài vẫn publish định kỳ vào `/rovera/obstacle_*`; motion-safety hợp nhất
+  chúng với LiDAR rồi mới phát heartbeat cuối. Chỉ đặt watchdog bằng `0` trong
+  bench/service mode khi motion output đã bị cô lập.
 - Để chỉ khóa chiều gần vật cản, publish `std_msgs/UInt8` lên
   `/rovera/obstacle_directions`: bit 0 chặn tiến, bit 1 chặn lùi, bit 2 chặn
   quay trái và bit 3 chặn quay phải. Các thành phần vận tốc không hướng vào vật

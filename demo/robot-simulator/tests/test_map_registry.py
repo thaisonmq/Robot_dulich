@@ -407,6 +407,58 @@ def test_runtime_restores_active_map_with_recent_verified_navigation_pose(
 
 
 @pytest.mark.asyncio
+async def test_runtime_repairs_legacy_active_cache_before_restore(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    content = _bundle(map_id="MAP-LEGACY", version=5)
+    checksum = hashlib.sha256(content).hexdigest()
+    config = SimulatorConfig(
+        motion_backend="simulator",
+        navigation_backend="simulator",
+        center_api_url="https://center",
+        map_cache_dir=str(tmp_path / "cache"),
+        robot_state_file=str(tmp_path / "device.json"),
+    )
+    client = RobotConnectionClient(config)
+    client.map_cache.token_provider = _token
+    destination = Path(config.map_cache_dir) / "MAP-LEGACY" / "v5"
+    destination.mkdir(parents=True)
+    # Old releases retained only extracted artifacts and the marker.  New
+    # restore validation also requires the immutable source bundle.
+    with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
+        archive.extractall(destination)
+    (destination / ".sha256").write_text(checksum)
+    client.map_cache.mark_active("MAP-LEGACY", 5, checksum, destination)
+    client.map_registry_ready.set()
+    client.navigation_backend.current_state = "NO_ACTIVE_MAP"  # type: ignore[attr-defined]
+
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return httpx.Response(200, content=content)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "simulator.map_cache.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(handler), **kwargs
+        ),
+    )
+
+    result = await client._restore_active_navigation_map(
+        {"state": "NO_ACTIVE_MAP", "mode": "NAVIGATION"}
+    )
+
+    assert result is not None
+    assert result["current_state"] == "READY"
+    assert requests == ["/api/maps/MAP-LEGACY/versions/5/download"]
+    assert (destination / ".map-bundle.tar.gz").read_bytes() == content
+    assert client.map_cache.active_load_payload()["map_id"] == "MAP-LEGACY"
+
+
+@pytest.mark.asyncio
 async def test_download_checksum_and_atomic_install(tmp_path: Path, monkeypatch) -> None:
     content = _bundle()
     checksum = hashlib.sha256(content).hexdigest()

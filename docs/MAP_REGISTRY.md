@@ -33,8 +33,9 @@ Edge giữ lại bản archive đã được Center ký danh tính bằng whole-
 trong cache. Mỗi fast path và mỗi lần khôi phục active map đều kiểm lại hash
 archive, cấu trúc tar, byte `metadata.json` giữa archive và cache, rồi hash/decode
 toàn bộ artifact. Marker `.sha256` một mình không còn đủ để cấp quyền load. Cache
-cũ thiếu archive tin cậy hoặc cache bị sửa sẽ bị từ chối; lần `map.load` kế tiếp
-sẽ tải lại bundle từ Center thay vì dùng dữ liệu không chứng minh được.
+cũ thiếu archive tin cậy hoặc cache bị sửa sẽ bị từ chối; `map.load` hoặc luồng
+khôi phục active map sau restart sẽ tải lại bundle từ Center bằng checksum đã
+lưu, cài atomic rồi mới cấp quyền load cho Nav2.
 
 ## State đồng bộ
 

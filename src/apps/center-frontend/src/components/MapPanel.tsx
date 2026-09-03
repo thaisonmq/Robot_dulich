@@ -821,6 +821,10 @@ export function MapPanel({
           onClick={onRetryLocalization}>{t("Quét lại vị trí hiện tại")}</button>
         {activeMission && <button type="button" className="is-danger" onClick={onCancel}>
           <X /> {t("Dừng điều hướng")}</button>}</>
+        : recovering ? <><button type="button" className="button button--primary"
+          disabled={readOnly || loading || !onFindAlternatives} onClick={onFindAlternatives}>
+          <RouteIcon /> {t("Tìm đường khác")}</button>
+          <button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
         : activeMission ? <><button type="button" onClick={onPause}><Pause /> {t("Tạm dừng")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button></>
         : paused ? <><button type="button" onClick={onResume}><Play /> {t("Tiếp tục")}</button><button type="button" className="is-danger" onClick={onCancel}><X /> {t("Dừng điều hướng")}</button>
           <button type="button" disabled={readOnly || loading || rescanBlocked || !onRetryLocalization}

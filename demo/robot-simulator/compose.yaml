@@ -158,9 +158,10 @@ services:
       ROS_LEGACY_JOY_AXES: ${ROS_LEGACY_JOY_AXES:-1,2}
       ROS_LEGACY_OVERRIDE_MS: ${ROS_LEGACY_OVERRIDE_MS:-350}
       ROS_ESTOP_TOPIC: /safety/estop
-      # Chương trình tránh vật cản phát Bool liên tục: true=dừng, false=an toàn.
-      # Đặt watchdog > 0 để mất heartbeat cũng khóa chuyển động (fail closed).
-      ROS_OBSTACLE_STOP_TOPIC: /rovera/obstacle_stop
+      # Motion-safety phát heartbeat Bool liên tục: true=dừng, false=an toàn.
+      # Mất node/heartbeat vẫn khóa bridge; các nguồn vật cản ngoài tiếp tục đi
+      # vào motion-safety qua /rovera/obstacle_* trước khi tới heartbeat này.
+      ROS_OBSTACLE_STOP_TOPIC: /safety/bridge_interlock
       ROS_OBSTACLE_DIRECTIONS_TOPIC: /rovera/obstacle_directions
       ROS_OBSTACLE_WATCHDOG_MS: ${ROS_OBSTACLE_WATCHDOG_MS:-500}
       ROS_SAFETY_CMD_VEL_TOPIC: /cmd_vel_safety

@@ -92,8 +92,8 @@ NAVIGATION_TRANSITIONS: dict[str, frozenset[str]] = {
         "CANCELED", "FAILED", "FAULT",
     }),
     "RECOVERY": frozenset({
-        "NAVIGATING", "PAUSED", "BLOCKED", "ROUTE_SELECTION", "CANCELED",
-        "FAILED", "FAULT",
+        "NAVIGATING", "PAUSED", "BLOCKED", "COMPUTING_ALTERNATIVES",
+        "ROUTE_SELECTION", "CANCELED", "FAILED", "FAULT",
     }),
     "SUCCEEDED": frozenset(),
     "PLAN_FAILED": frozenset(),

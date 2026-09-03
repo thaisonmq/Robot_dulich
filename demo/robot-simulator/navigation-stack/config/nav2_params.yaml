@@ -294,7 +294,11 @@ rovera_navigation_adapter:
     # instead of repeatedly attempting the same unsafe turn.
     stop_turn_safety_block_timeout_seconds: 1.0
     stop_turn_heading_kp: 1.8
-    stop_turn_max_angular_speed: 0.50
+    stop_turn_max_angular_speed: 0.40
+    # Ramp pivots inside the stop-turn executor. The downstream smoother still
+    # enforces the hardware envelope, but this lower Auto-only slope avoids a
+    # zero-to-pivot step at every segment boundary.
+    stop_turn_angular_acceleration: 0.80
     # The Pi chassis did not move reliably below ~0.13 rad/s. If wheel odom
     # shows no useful yaw progress for a bounded dwell, apply one effective
     # pivot command; normal braking and every safety gate remain authoritative.
@@ -304,7 +308,7 @@ rovera_navigation_adapter:
     stop_turn_rate_window_seconds: 0.10
     # Brake a pivot before the settle band so smoother/chassis momentum does
     # not carry it past the target and cause a reverse correction.
-    stop_turn_angular_deceleration: 2.0
+    stop_turn_angular_deceleration: 1.20
     stop_turn_angular_reaction_seconds: 0.30
     straight_max_angular_correction: 0.18
     straight_path_pose_spacing: 0.05

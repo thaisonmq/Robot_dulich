@@ -4985,8 +4985,18 @@ class StopTurnStateLatticePlanner:
         goal_yaw: float | None,
         deadline_monotonic: float | None,
     ) -> StopTurnRoute | None:
-        """Remove bounded short/shallow stop-turn pairs before execution."""
-        if not self._has_short_shallow_corner_pair(baseline):
+        """Remove bounded redundant stop-turn pairs before execution.
+
+        A goal-specific visibility seed can contain a short connector whose
+        second turn is sharper than the shallow-corner threshold.  The exact
+        replacement search is still cheap for a route with three or more
+        internal turns, and it can recover the common lower-turn corridor
+        used by a nearby destination without weakening any collision check.
+        """
+        if (
+            not self._has_short_shallow_corner_pair(baseline)
+            and self._route_internal_turn_count(baseline) < 3
+        ):
             return None
         maximum_total_length = baseline.metadata.total_length + 2.0 * (
             self.half_length + self.padding
@@ -4996,7 +5006,13 @@ class StopTurnStateLatticePlanner:
         )
         current = baseline
         changed = False
-        while self._has_short_shallow_corner_pair(current):
+        while (
+            self._has_short_shallow_corner_pair(current)
+            or (
+                not changed
+                and self._route_internal_turn_count(current) >= 3
+            )
+        ):
             if (
                 deadline_monotonic is not None
                 and time.monotonic() >= deadline_monotonic
@@ -5598,10 +5614,18 @@ class StopTurnStateLatticePlanner:
             if selected is None:
                 return selected
             has_shallow_pair = self._has_short_shallow_corner_pair(selected)
+            has_redundant_pair_candidate = (
+                len(selected.points) >= 5
+                and self._route_internal_turn_count(selected) >= 3
+            )
             has_heading_staircase = (
                 self._route_internal_turn_count(selected) >= 4
             )
-            if not has_shallow_pair and not has_heading_staircase:
+            if (
+                not has_shallow_pair
+                and not has_redundant_pair_candidate
+                and not has_heading_staircase
+            ):
                 return selected
             refinement_started = time.monotonic()
             # Leave headroom for one in-flight swept-footprint validation,
@@ -5664,7 +5688,13 @@ class StopTurnStateLatticePlanner:
 
             if (
                 time.monotonic() < refinement_deadline
-                and self._has_short_shallow_corner_pair(selected)
+                and (
+                    self._has_short_shallow_corner_pair(selected)
+                    or (
+                        len(selected.points) >= 5
+                        and self._route_internal_turn_count(selected) >= 3
+                    )
+                )
             ):
                 self._last_plan_diagnostics["corner_reduction_attempted"] = True
                 before_reduction_turns = self._route_internal_turn_count(
