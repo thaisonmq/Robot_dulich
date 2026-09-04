@@ -719,6 +719,68 @@ def position_within_tolerance(
     )
 
 
+def blocked_goal_standoff_is_safe(
+    *,
+    goal_distance: float,
+    blocker_goal_distance: float,
+    blocker_radius: float,
+    front_clearance: float,
+    heading_error: float,
+    normal_goal_tolerance: float,
+    maximum_standoff_distance: float,
+    minimum_front_clearance: float,
+    corridor_blockage_limit: float,
+    blocked_duration: float,
+    confirmation_duration: float,
+    safety_fresh: bool,
+    robot_stationary: bool,
+    current_footprint_valid: bool,
+) -> bool:
+    """Allow arrival only at a proven safe stand-off from a blocked goal.
+
+    This is deliberately narrower than increasing the normal goal tolerance:
+    the robot must already be close to the requested destination, stationary,
+    aligned with it, and facing a persistent located blocker whose keepout
+    actually contains that destination.
+    """
+    values = (
+        goal_distance,
+        blocker_goal_distance,
+        blocker_radius,
+        front_clearance,
+        heading_error,
+        normal_goal_tolerance,
+        maximum_standoff_distance,
+        minimum_front_clearance,
+        corridor_blockage_limit,
+        blocked_duration,
+        confirmation_duration,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        return False
+    normal_limit = max(0.0, float(normal_goal_tolerance))
+    standoff_limit = max(normal_limit, float(maximum_standoff_distance))
+    return bool(
+        safety_fresh
+        and robot_stationary
+        and current_footprint_valid
+        and float(goal_distance) > normal_limit
+        and float(goal_distance) <= standoff_limit
+        and float(blocker_radius) > 0.0
+        and float(blocker_goal_distance) <= float(blocker_radius)
+        and float(front_clearance) >= max(
+            0.0, float(minimum_front_clearance)
+        )
+        and float(front_clearance) <= max(
+            0.0, float(corridor_blockage_limit)
+        )
+        and abs(float(heading_error)) <= math.radians(20.0)
+        and float(blocked_duration) >= max(
+            0.0, float(confirmation_duration)
+        )
+    )
+
+
 def controller_abort_is_live_blockage(
     *,
     error_code: Any,
@@ -1030,6 +1092,54 @@ def post_turn_reanchor_requires_turn(
         abs(float(heading_delta)) > abs(float(straight_entry_heading_limit))
         or abs(float(cross_track))
         > abs(float(straight_entry_cross_track_limit))
+    )
+
+
+def steering_correction_blocked(
+    angular_command: float,
+    direction_mask: int,
+    *,
+    minimum_angular_command: float = 0.03,
+) -> bool:
+    """Return whether safety forbids the requested straight-line correction.
+
+    Direction bits 4/8 are the left/right rotation contract shared with
+    motion-safety. A blocked correction must stop translation too; otherwise
+    the chassis continues away from the fixed segment while its only steering
+    authority is being removed downstream.
+    """
+    angular = float(angular_command)
+    if abs(angular) < max(0.0, float(minimum_angular_command)):
+        return False
+    requested_mask = 4 if angular > 0.0 else 8
+    return bool(int(direction_mask) & requested_mask)
+
+
+def planning_pose_changed(
+    initial: dict[str, float],
+    current: dict[str, float],
+    *,
+    minimum_translation: float,
+    minimum_yaw: float,
+) -> bool:
+    """Detect a materially newer stationary planning snapshot.
+
+    Exact stop-turn feasibility includes the measured start pose. AMCL can
+    refine that pose while a bounded search is running, especially beside a
+    wall where a centimetre changes the first legal action. Retrying only
+    when the snapshot moved keeps genuine no-route results deterministic.
+    """
+    translation = math.hypot(
+        float(current["x"]) - float(initial["x"]),
+        float(current["y"]) - float(initial["y"]),
+    )
+    yaw_delta = abs(_angle_delta(
+        float(current.get("yaw", 0.0)),
+        float(initial.get("yaw", 0.0)),
+    ))
+    return bool(
+        translation >= max(0.0, float(minimum_translation))
+        or yaw_delta >= max(0.0, float(minimum_yaw))
     )
 
 

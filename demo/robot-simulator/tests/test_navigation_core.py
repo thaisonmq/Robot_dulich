@@ -30,6 +30,7 @@ from navigation_core import (  # noqa: E402
     TurnMotionTracker,
     UnwrappedYawProgress,
     bounded_heading_evidence,
+    blocked_goal_standoff_is_safe,
     canonicalize_stop_turn_path,
     choose_turn_direction,
     classify_planning_failure,
@@ -60,6 +61,7 @@ from navigation_core import (  # noqa: E402
     normalize_trinary_unknown_metadata,
     path_maximum_deviation,
     path_overlap_ratio,
+    planning_pose_changed,
     particle_cloud_uniqueness,
     point_cloud_rotation_sweep_clear,
     point_cloud_translation_sweep_clear,
@@ -74,6 +76,7 @@ from navigation_core import (  # noqa: E402
     scan_to_map_match,
     segment_departs_exclusions,
     segment_travel_watchdog,
+    steering_correction_blocked,
     straight_heading_lock,
     straight_segment_progress,
     turn_braking_speed_limit,
@@ -1832,6 +1835,60 @@ def test_live_point_sweeps_distinguish_rotation_and_translation_direction() -> N
         half_length=0.155,
         half_width=0.11,
     )
+
+
+def test_blocked_goal_standoff_replays_latest_destination_obstruction() -> None:
+    assert blocked_goal_standoff_is_safe(
+        goal_distance=0.173,
+        blocker_goal_distance=0.044,
+        blocker_radius=0.18,
+        front_clearance=0.072,
+        heading_error=math.radians(6.3),
+        normal_goal_tolerance=0.12,
+        maximum_standoff_distance=0.22,
+        minimum_front_clearance=0.04,
+        corridor_blockage_limit=0.17,
+        blocked_duration=0.80,
+        confirmation_duration=0.75,
+        safety_fresh=True,
+        robot_stationary=True,
+        current_footprint_valid=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"blocker_goal_distance": 0.19},
+        {"goal_distance": 0.23},
+        {"front_clearance": 0.03},
+        {"heading_error": math.radians(21.0)},
+        {"blocked_duration": 0.70},
+        {"safety_fresh": False},
+        {"robot_stationary": False},
+        {"current_footprint_valid": False},
+    ],
+)
+def test_blocked_goal_standoff_rejects_unproven_arrival(override: dict) -> None:
+    evidence = {
+        "goal_distance": 0.173,
+        "blocker_goal_distance": 0.044,
+        "blocker_radius": 0.18,
+        "front_clearance": 0.072,
+        "heading_error": 0.0,
+        "normal_goal_tolerance": 0.12,
+        "maximum_standoff_distance": 0.22,
+        "minimum_front_clearance": 0.04,
+        "corridor_blockage_limit": 0.17,
+        "blocked_duration": 0.80,
+        "confirmation_duration": 0.75,
+        "safety_fresh": True,
+        "robot_stationary": True,
+        "current_footprint_valid": True,
+    }
+    evidence.update(override)
+
+    assert not blocked_goal_standoff_is_safe(**evidence)
 
 
 @pytest.mark.parametrize("wall_y", [0.11, -0.11])
@@ -3683,6 +3740,32 @@ def test_post_turn_reanchor_uses_straight_band_for_small_drift() -> None:
         straight_entry_heading_limit=math.radians(6.0),
         straight_entry_cross_track_limit=0.08,
     )
+
+
+def test_directional_safety_blocks_the_requested_steering_correction() -> None:
+    assert steering_correction_blocked(0.08, 4)
+    assert not steering_correction_blocked(0.08, 8)
+    assert steering_correction_blocked(-0.08, 8)
+    assert not steering_correction_blocked(-0.08, 4)
+    assert not steering_correction_blocked(0.02, 4)
+
+
+def test_exact_plan_retry_requires_a_materially_new_start_pose() -> None:
+    initial = {"x": 1.75, "y": 0.895, "yaw": -1.81}
+    assert planning_pose_changed(
+        initial,
+        {"x": 1.739, "y": 0.902, "yaw": -1.796},
+        minimum_translation=0.005,
+        minimum_yaw=math.radians(0.5),
+    )
+    assert not planning_pose_changed(
+        initial,
+        {"x": 1.748, "y": 0.896, "yaw": -1.807},
+        minimum_translation=0.005,
+        minimum_yaw=math.radians(0.5),
+    )
+
+
 def test_actual_project_map_rejects_direct_line_and_finds_exact_detour() -> None:
     project = Path(__file__).parents[3]
     saved = SavedOccupancyMap.load(project / "sample-data/maps/map-bundle/map.yaml")

@@ -1,0 +1,14 @@
+{
+  "source": "design-previews/source/map-v5.pgm",
+  "source_free_cells": 13131,
+  "display_free_cells": 13131,
+  "source_connected_components": 255,
+  "display_connected_components": 255,
+  "topology_preserved": true,
+  "crop": {
+    "x0": 0,
+    "y0": 0,
+    "x1": 161,
+    "y1": 218
+  }
+}

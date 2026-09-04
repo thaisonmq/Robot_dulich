@@ -966,7 +966,7 @@ def test_compute_path_uses_cached_stop_turn_geometry_and_live_validation() -> No
     assert "_request_path_once" not in compute_path
 
 
-def test_compute_path_retries_only_bounded_stop_turn_search_failures() -> None:
+def test_compute_path_retries_only_bounded_or_new_pose_search_failures() -> None:
     compute_path = _method_source("_compute_path", "_navigate")
 
     assert 'planner_result.status == "SEARCH_EXPANSION_LIMIT"' in compute_path
@@ -979,6 +979,10 @@ def test_compute_path_retries_only_bounded_stop_turn_search_failures() -> None:
     assert "self.stop_turn_retry_planning_budget" in compute_path
     assert "and not live_obstacle_search" in compute_path
     assert "self.stop_turn_live_obstacle_planning_budget" in compute_path
+    assert 'planner_result.status == "NO_EXACT_STOP_TURN_ROUTE"' in compute_path
+    assert "planning_pose_changed(" in compute_path
+    assert 'reason="FRESH_START_POSE"' in compute_path
+    assert "self.stop_turn_exact_retry_planning_budget" in compute_path
 
 
 def test_measured_start_turn_matches_executor_physical_footprint() -> None:
@@ -1628,7 +1632,7 @@ def test_dynamic_clear_requires_sustained_route_aligned_samples() -> None:
     assert parameters["dynamic_obstacle_clear_dwell_seconds"] >= 1.0
 
 
-def test_auto_route_uses_two_centimetre_hard_and_seven_centimetre_preferred_margin() -> None:
+def test_auto_route_uses_safety_aligned_hard_and_seven_centimetre_preferred_margin() -> None:
     project = Path(__file__).parents[1]
     navigation = yaml.safe_load(
         (project / "navigation-stack/config/nav2_params.yaml").read_text()
@@ -1643,7 +1647,8 @@ def test_auto_route_uses_two_centimetre_hard_and_seven_centimetre_preferred_marg
     )
 
     assert parameters["corridor_side_margin"] == 0.07
-    assert parameters["stop_turn_minimum_route_side_clearance"] == 0.02
+    assert parameters["corridor_hard_side_margin"] == 0.04
+    assert parameters["stop_turn_minimum_route_side_clearance"] == 0.04
     assert "self._hard_route_side_clearance()" in compute
     assert "self._stop_turn_planner_for_clearance(" in compute
     assert "request_planner.plan_result(" in compute
@@ -1901,14 +1906,29 @@ def test_static_disconnect_remains_retryable_and_preserves_runtime_mission() -> 
 
 def test_runtime_detects_lost_steering_and_turn_hard_stop_as_recovery() -> None:
     safety = _method_source("_safety_status_callback", "_safety_source_callback")
+    velocity = _method_source("_auto_velocity_callback", "_update_motion_metrics")
     turn = _method_source("_segment_execution_tick", "_start_turn_bay_recovery")
 
     assert 'reason="STEERING_AUTHORITY_LOST"' in safety
     assert '"STEERING_AUTHORITY_LOST", self.navigation_goal_generation' in safety
+    assert "steering_correction_blocked(" in velocity
+    assert '"STEERING_SAFETY_STOP"' in velocity
+    assert 'action="STOP_AND_CONFIRM"' in velocity
+    assert '"RELOCATE_TO_STEERING_BAY"' in safety
+    assert 'recovery_reason="STEERING_AUTHORITY_LOST"' in safety
     assert 'action="RELOCATE_AFTER_HARD_STOP"' in safety
     assert "self._start_turn_bay_recovery(" in safety
     assert 'action="REJECT_ERROR_INCREASING_DIRECTION"' in turn
     assert 'self.execution_phase = "WAIT_FOR_TURN_CLEAR"' in turn
+
+
+def test_successful_segment_resets_only_the_consecutive_replan_budget() -> None:
+    complete = _method_source(
+        "_complete_active_segment", "_finish_execution_success"
+    )
+
+    assert "if not relocation_reason:" in complete
+    assert "self.execution_replan_attempts = 0" in complete
 
 
 def test_turn_block_recovery_searches_safe_local_maneuvers_before_replanning() -> None:
@@ -2271,6 +2291,49 @@ def test_adapter_visualization_contract_always_identifies_route_authority() -> N
     assert '"route_id": (' in dispatch
     assert "self.execution_route_id" in dispatch
     assert "self.selected_route_id" in dispatch
+
+
+def test_local_recovery_and_reanchor_publish_the_executed_path() -> None:
+    turn_bay = _method_source("_find_and_start_turn_bay", "_odom_pose")
+    prepare = _method_source("_prepare_active_segment", "_begin_turn_or_settling")
+
+    relocation_update = turn_bay.index(
+        "self.latest_global_path = list(self.execution_relocation_plan)"
+    )
+    assert turn_bay.index(
+        "self.visualization_revision += 1", relocation_update
+    ) > relocation_update
+    assert "dict(active.effective_start)" in prepare
+    assert "self.execution_segment_index + 1:" in prepare
+    assert "self.latest_global_path = displayed_execution" in prepare
+    assert "self.visualization_revision += 1" in prepare
+
+
+def test_persistent_blocker_on_goal_uses_only_bounded_safe_standoff() -> None:
+    standoff = _method_source(
+        "_complete_blocked_goal_standoff", "_restart_segment_from_current"
+    )
+    recovery_tick = _method_source(
+        "_dynamic_recovery_tick", "_dynamic_route_relation"
+    )
+
+    for required in (
+        "blocked_goal_standoff_is_safe(",
+        "self.dynamic_blocked_keepout",
+        "self._live_front_keepout_for_route(",
+        'self.localization_state != "READY"',
+        "self.execution_pose_monotonic",
+        "self._corridor_sample_fresh_for_path(now)",
+        'self.safety_snapshot.get("measured_velocity_fresh", False)',
+        "self._atomic_safety_fresh(now)",
+        "self._critical_sensor_time_healthy()",
+        'completion_mode="SAFE_STANDOFF"',
+        "self.blocked_goal_standoff_max_distance",
+    ):
+        assert required in standoff
+    observe = recovery_tick.index("self._observe_controller_blocker()")
+    complete = recovery_tick.index("self._complete_blocked_goal_standoff(")
+    assert observe < complete
 
 
 def test_edge_health_keeps_route_selection_bound_to_its_mission() -> None:

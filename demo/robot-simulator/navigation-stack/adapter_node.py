@@ -66,6 +66,7 @@ from navigation_core import (
     TurnMotionTracker,
     UnwrappedYawProgress,
     bounded_heading_evidence,
+    blocked_goal_standoff_is_safe,
     canonicalize_stop_turn_path,
     classify_planning_failure,
     compact_lethal_cells,
@@ -94,6 +95,7 @@ from navigation_core import (
     normalize_trinary_unknown_metadata,
     path_maximum_deviation,
     path_overlap_ratio,
+    planning_pose_changed,
     point_cloud_rotation_sweep_clear,
     point_cloud_translation_sweep_clear,
     position_within_tolerance,
@@ -106,6 +108,7 @@ from navigation_core import (
     scan_to_map_match,
     segment_departs_exclusions,
     segment_travel_watchdog,
+    steering_correction_blocked,
     straight_heading_lock,
     straight_segment_progress,
     turn_braking_speed_limit,
@@ -873,14 +876,14 @@ class NavigationAdapter(Node):
             "planning_footprint_padding", 0.0
         ).value)
         self.corridor_hard_side_margin = configured(
-            "corridor_hard_side_margin", 0.02
+            "corridor_hard_side_margin", 0.04
         )
         self.translation_lateral_margin = configured(
             "translation_lateral_margin", 0.01
         )
         self.corridor_side_margin = configured("corridor_side_margin", 0.07)
         self.stop_turn_minimum_route_side_clearance = configured(
-            "stop_turn_minimum_route_side_clearance", 0.02
+            "stop_turn_minimum_route_side_clearance", 0.04
         )
         self.corridor_localization_uncertainty_max = configured(
             "corridor_localization_uncertainty_max", 0.04
@@ -933,6 +936,15 @@ class NavigationAdapter(Node):
                 "stop_turn_retry_expansion_multiplier", 4
             ).value
         ))
+        self.stop_turn_exact_retry_planning_budget = configured(
+            "stop_turn_exact_retry_planning_budget_seconds", 6.0
+        )
+        self.stop_turn_exact_retry_minimum_translation = configured(
+            "stop_turn_exact_retry_minimum_translation_m", 0.005
+        )
+        self.stop_turn_exact_retry_minimum_yaw = math.radians(configured(
+            "stop_turn_exact_retry_minimum_yaw_degrees", 0.5
+        ))
         self.stop_turn_turn_robustness_radius = configured(
             "stop_turn_turn_robustness_radius", 0.01
         )
@@ -941,6 +953,16 @@ class NavigationAdapter(Node):
         ).value)
         self.stop_turn_final_position_tolerance = configured(
             "stop_turn_final_position_tolerance", 0.12
+        )
+        self.blocked_goal_standoff_max_distance = max(
+            self.stop_turn_final_position_tolerance,
+            configured("blocked_goal_standoff_max_distance", 0.22),
+        )
+        self.blocked_goal_standoff_confirmation = configured(
+            "blocked_goal_standoff_confirmation_seconds", 0.75
+        )
+        self.blocked_goal_standoff_minimum_clearance = configured(
+            "blocked_goal_standoff_minimum_front_clearance", 0.04
         )
         self.stop_turn_max_reanchors_per_segment = max(0, int(
             self.declare_parameter(
@@ -1098,7 +1120,7 @@ class NavigationAdapter(Node):
             "stop_turn_safety_block_timeout_seconds", 1.0
         )
         self.straight_steering_authority_timeout = configured(
-            "straight_steering_authority_timeout_seconds", 0.20
+            "straight_steering_authority_timeout_seconds", 0.40
         )
         self.execution_turn_kp = configured("stop_turn_heading_kp", 1.8)
         self.execution_turn_max_speed = configured(
@@ -1145,7 +1167,7 @@ class NavigationAdapter(Node):
             "straight_hard_heading_error_degrees", 12.0
         ))
         self.straight_hard_cross_track = configured(
-            "straight_hard_cross_track", 0.08
+            "straight_hard_cross_track", 0.05
         )
         self.straight_endpoint_tolerance = configured(
             "straight_endpoint_tolerance", 0.03
@@ -1730,6 +1752,46 @@ class NavigationAdapter(Node):
                         reasons = tuple(reasons) + (
                             "DIRECTIONAL_SAFETY_BLOCK",
                         )
+                    requested_linear = linear
+                    requested_angular = angular
+                    steering_blocked = bool(
+                        self._atomic_safety_fresh(now)
+                        and steering_correction_blocked(
+                            requested_angular,
+                            self.safety_direction_mask,
+                        )
+                    )
+                    if steering_blocked:
+                        # Do not keep translating after motion-safety has
+                        # removed the correction that holds this centerline.
+                        # Confirm while stationary, then move along the
+                        # current chassis heading to a proven steering bay.
+                        linear = 0.0
+                        angular = 0.0
+                        reasons = tuple(reasons) + (
+                            "STEERING_SAFETY_STOP",
+                        )
+                        if self.straight_steering_authority_lost_since is None:
+                            self.straight_steering_authority_lost_since = now
+                            self._nav_debug(
+                                "STRAIGHT_RECOVERY",
+                                reason="STEERING_DIRECTION_BLOCKED",
+                                action="STOP_AND_CONFIRM",
+                                requested_linear=requested_linear,
+                                requested_angular=requested_angular,
+                                direction_mask=self.safety_direction_mask,
+                            )
+                        elif (
+                            not self.straight_steering_authority_recovery_active
+                            and now - self.straight_steering_authority_lost_since
+                            >= self.straight_steering_authority_timeout
+                        ):
+                            self._recover_lost_straight_steering(
+                                (requested_linear, requested_angular, now),
+                                self.pipeline_samples.get("motion_safety"),
+                            )
+                    elif not self.straight_steering_authority_recovery_active:
+                        self.straight_steering_authority_lost_since = None
                 corridor_blocked, _ = self._fresh_corridor_blockage(now)
                 if (
                     corridor_blocked
@@ -5939,8 +6001,12 @@ class NavigationAdapter(Node):
             )
         )
         if not steering_clipped:
-            self.straight_steering_authority_lost_since = None
-            self.straight_steering_authority_recovery_active = False
+            # _auto_velocity_callback may already have stopped both velocity
+            # components from the directional mask. Its zero profile is not a
+            # recovered steering sample, so retain the confirmation timer.
+            if "STEERING_SAFETY_STOP" not in self.profile_clamp_reasons:
+                self.straight_steering_authority_lost_since = None
+                self.straight_steering_authority_recovery_active = False
             return
         if self.straight_steering_authority_lost_since is None:
             self.straight_steering_authority_lost_since = now
@@ -5951,17 +6017,47 @@ class NavigationAdapter(Node):
             < self.straight_steering_authority_timeout
         ):
             return
+        self._recover_lost_straight_steering(profile, final)
+
+    def _recover_lost_straight_steering(
+        self,
+        profile_command: tuple[float, float, float],
+        final_command: tuple[float, float, float] | None,
+    ) -> None:
+        """Stop, then relocate along the corridor before replanning."""
+        if self.straight_steering_authority_recovery_active:
+            return
         self.straight_steering_authority_recovery_active = True
         self.navigation_velocity.publish(Twist())
+        active = self.active_segment
+        pose = None if self.pose is None else dict(self.pose)
         self._nav_debug(
             "STRAIGHT_RECOVERY",
             reason="STEERING_AUTHORITY_LOST",
-            profile_command=profile,
-            final_command=final,
+            action=(
+                "RELOCATE_TO_STEERING_BAY"
+                if active is not None and pose is not None
+                else "REPLAN_FROM_CURRENT"
+            ),
+            profile_command=profile_command,
+            final_command=final_command,
             safety_reason=self.safety_stop_reason,
             direction_mask=self.safety_direction_mask,
             destination_preserved=bool(self.paused_goal),
         )
+        if active is not None and pose is not None:
+            # Replanning at the same constrained pose selected essentially the
+            # same line in the field logs. The existing bay worker proves a
+            # forward/reverse relocation and the complete target turn against
+            # both the Saved Map and fresh LiDAR before granting motion.
+            self._start_turn_bay_recovery(
+                pose,
+                self.navigation_goal_generation,
+                preferred_translation_direction=active.motion_direction,
+                recovery_reason="STEERING_AUTHORITY_LOST",
+                target_heading=active.fixed_heading,
+            )
+            return
         self._schedule_execution_replan(
             "STEERING_AUTHORITY_LOST", self.navigation_goal_generation
         )
@@ -10105,6 +10201,64 @@ class NavigationAdapter(Node):
                 live_start_clear=live_start_clear,
                 live_start_directions=live_start_directions,
             )
+        if (
+            planner_result.route is None
+            and planner_result.status == "NO_EXACT_STOP_TURN_ROUTE"
+            and not live_obstacle_search
+            and self.pose is not None
+        ):
+            # Exact feasibility includes the measured start pose. During the
+            # failed field request AMCL refined that pose by 1.3 cm while the
+            # first search ran, but the stale snapshot was returned as a hard
+            # no-route result. Retry once only for a materially newer pose;
+            # genuine static disconnections are not retried.
+            fresh_start = dict(self.pose)
+            if planning_pose_changed(
+                start_pose,
+                fresh_start,
+                minimum_translation=(
+                    self.stop_turn_exact_retry_minimum_translation
+                ),
+                minimum_yaw=self.stop_turn_exact_retry_minimum_yaw,
+            ):
+                fresh_directions = self._live_start_escape_directions(
+                    fresh_start, resolved_goal
+                )
+                live_start_directions = fresh_directions
+                live_start_clear = bool(fresh_directions)
+                self._nav_debug(
+                    "PLAN_SEARCH_RETRY",
+                    first_status=planner_result.status,
+                    first_expansions=planner_result.expansions,
+                    first_duration_ms=round(
+                        planner_result.elapsed_seconds * 1000.0, 3
+                    ),
+                    reason="FRESH_START_POSE",
+                    old_start=start_pose,
+                    new_start=fresh_start,
+                    planning_time_budget=(
+                        self.stop_turn_exact_retry_planning_budget
+                    ),
+                )
+                start_pose = fresh_start
+                request_planner = self._stop_turn_planner_for_clearance(
+                    self._hard_route_side_clearance()
+                )
+                planner_result = request_planner.plan_result(
+                    start_pose,
+                    resolved_goal,
+                    exclusions=planning_exclusions,
+                    planning_time_budget=(
+                        self.stop_turn_exact_retry_planning_budget
+                    ),
+                    allow_start_escape=True,
+                    maximum_start_escape_distance=(
+                        self.start_escape_max_distance
+                    ),
+                    maximum_start_escape_new_overlap_cells=1,
+                    live_start_clear=bool(fresh_directions),
+                    live_start_directions=fresh_directions,
+                )
         if planner_result.route is not None:
             live_front_keepout = self._live_front_keepout_for_route(
                 [dict(point) for point in planner_result.route.points],
@@ -11597,6 +11751,10 @@ class NavigationAdapter(Node):
             # reverse-first escape used for a one-sided corridor violation.
             self.execution_narrow_segments = {0}
             self.latest_global_path = list(self.execution_relocation_plan)
+            # Edge transmits visualization only when this revision changes.
+            # Publish the maneuver that is actually about to execute instead
+            # of leaving the frontend on the superseded global route.
+            self.visualization_revision += 1
             self._set_state("NAVIGATING", "move_to_turn_bay")
         self._nav_debug(
             "TURN_BAY_RECOVERY",
@@ -12106,6 +12264,21 @@ class NavigationAdapter(Node):
                 return
         self.active_segment = active
         self.execution_target_heading = active.fixed_heading
+        # Re-anchoring deliberately changes the executed centerline to the
+        # latest trusted pose. Keep the displayed remaining route under the
+        # same authority as FollowPath, including after local recovery.
+        displayed_execution = canonicalize_stop_turn_path([
+            dict(active.effective_start),
+            *(
+                dict(point)
+                for point in self.execution_points[
+                    self.execution_segment_index + 1:
+                ]
+            ),
+        ])
+        if displayed_execution != self.latest_global_path:
+            self.latest_global_path = displayed_execution
+            self.visualization_revision += 1
         self._nav_debug(
             "SEGMENT_REANCHOR",
             planned_start=active.planned_start,
@@ -12319,6 +12492,12 @@ class NavigationAdapter(Node):
                 self.segment_positive_travel = 0.0
                 self.segment_last_travel_pose = None
                 relocation_reason = self.execution_relocation_reason
+                if not relocation_reason:
+                    # This budget covers consecutive failed replans, not the
+                    # whole mission. A completed normal segment proves useful
+                    # progress and must not later masquerade as a dynamic
+                    # obstacle cooldown.
+                    self.execution_replan_attempts = 0
                 relocation_target_heading = (
                     self.turn_bay_recovery_target_heading
                     if relocation_reason == "TURN_BAY"
@@ -12433,6 +12612,9 @@ class NavigationAdapter(Node):
         goal_generation: int,
         position_distance: float | None = None,
         cancel_active: bool = False,
+        position_tolerance: float | None = None,
+        completion_mode: str = "",
+        allowed_states: tuple[str, ...] = ("NAVIGATING",),
     ) -> bool:
         # Capture transaction fields before clearing them. The completion log
         # runs after cleanup; reading the cleared route/goal there previously
@@ -12447,9 +12629,14 @@ class NavigationAdapter(Node):
             completed_pose = None if self.pose is None else dict(self.pose)
             completion_current = bool(
                 goal_generation == self.navigation_goal_generation
-                and self.current_state == "NAVIGATING"
+                and self.current_state in allowed_states
                 and completed_goal is not None
                 and len(self.execution_points) >= 2
+            )
+            effective_position_tolerance = (
+                self.stop_turn_final_position_tolerance
+                if position_tolerance is None
+                else max(0.0, float(position_tolerance))
             )
             authoritative_distance = position_distance
             if completed_pose is not None and completed_goal is not None:
@@ -12463,7 +12650,7 @@ class NavigationAdapter(Node):
                 authoritative_distance is not None
                 and math.isfinite(float(authoritative_distance))
                 and float(authoritative_distance)
-                <= self.stop_turn_final_position_tolerance
+                <= effective_position_tolerance
             )
             footprint_valid = False
             footprint_code = "POSE_OR_SAVED_MAP_UNAVAILABLE"
@@ -12510,8 +12697,15 @@ class NavigationAdapter(Node):
                 self.active_segment = None
                 self.motion_owner = "NONE"
                 self._set_state(
-                    "SUCCEEDED", "goal_reached_by_stop_turn_segments"
+                    "SUCCEEDED",
+                    (
+                        "goal_reached_safe_standoff"
+                        if completion_mode == "SAFE_STANDOFF"
+                        else "goal_reached_by_stop_turn_segments"
+                    ),
                 )
+                if completion_mode:
+                    self.latest_feedback["arrival_mode"] = completion_mode
                 self.paused_goal = None
                 self.execution_goal = None
                 self.execution_route_id = ""
@@ -12532,7 +12726,7 @@ class NavigationAdapter(Node):
                 reason=rejection_reason,
                 route_id=completed_route_id,
                 distance=authoritative_distance,
-                position_tolerance=self.stop_turn_final_position_tolerance,
+                position_tolerance=effective_position_tolerance,
                 footprint_code=footprint_code,
                 callback_generation=goal_generation,
                 current_generation=self.navigation_goal_generation,
@@ -12547,7 +12741,15 @@ class NavigationAdapter(Node):
         if cancel_active and handle is not None:
             handle.cancel_goal_async()
         self._clear_active_navigation_mission("goal_succeeded")
-        if physical_final_turn:
+        if completion_mode == "SAFE_STANDOFF":
+            self._nav_debug(
+                "GOAL_REACHED",
+                mode="SAFE_STANDOFF",
+                distance=authoritative_distance,
+                position_tolerance=effective_position_tolerance,
+                route_id=completed_route_id,
+            )
+        elif physical_final_turn:
             self._nav_debug(
                 "EXECUTION_PHASE",
                 phase="FINAL_TURN_END",
@@ -12569,6 +12771,138 @@ class NavigationAdapter(Node):
                 route_id=completed_route_id,
             )
         return True
+
+    def _complete_blocked_goal_standoff(
+        self,
+        goal_generation: int,
+        now: float,
+    ) -> bool:
+        """Finish near a destination only when that destination is occupied."""
+        if (
+            goal_generation != self.navigation_goal_generation
+            or self.current_state not in {
+                "WAIT_FOR_DYNAMIC_CLEAR", "WAITING_FOR_DYNAMIC_CLEAR"
+            }
+            or self.pose is None
+            or self.dynamic_blocked_keepout is None
+            or self.dynamic_wait_started is None
+            or not self.localized
+            or self.localization_state != "READY"
+            or (
+                now - self.execution_pose_monotonic
+                > self.execution_pose_freshness
+            )
+            or not self._corridor_sample_fresh_for_path(now)
+        ):
+            return False
+        goal = dict(self.execution_goal or self.paused_goal or {})
+        if "x" not in goal or "y" not in goal:
+            return False
+        pose = dict(self.pose)
+        # Reproject the route-aligned return now. The latched keepout proves
+        # repeated location, while this fresh projection prevents a different
+        # later obstacle from completing against stale goal evidence.
+        fresh_keepout = self._live_front_keepout_for_route(
+            self.dynamic_blocked_route,
+            self.dynamic_blocked_segment_directions,
+            blocked_only=True,
+        )
+        if fresh_keepout is None:
+            return False
+        blocker_x, blocker_y, blocker_radius = fresh_keepout
+        goal_distance = math.hypot(
+            float(goal["x"]) - float(pose["x"]),
+            float(goal["y"]) - float(pose["y"]),
+        )
+        blocker_goal_distance = math.hypot(
+            float(goal["x"]) - blocker_x,
+            float(goal["y"]) - blocker_y,
+        )
+        goal_heading = math.atan2(
+            float(goal["y"]) - float(pose["y"]),
+            float(goal["x"]) - float(pose["x"]),
+        )
+        heading_error = self._yaw_delta(
+            goal_heading, float(pose.get("yaw", goal_heading))
+        )
+        corridor_blocked, front_clearance = self._fresh_corridor_blockage(now)
+        try:
+            measured_linear = float(self.safety_snapshot.get("measured_linear"))
+            measured_angular = float(self.safety_snapshot.get("measured_angular"))
+        except (TypeError, ValueError):
+            measured_linear = math.inf
+            measured_angular = math.inf
+        robot_stationary = bool(
+            self.safety_snapshot.get("measured_velocity_fresh", False)
+            and math.isfinite(measured_linear)
+            and math.isfinite(measured_angular)
+            and abs(measured_linear) <= 0.01
+            and abs(measured_angular) <= 0.03
+        )
+        footprint_valid = bool(
+            self.saved_map is not None
+            and self.saved_map.validate_footprint(
+                float(pose["x"]),
+                float(pose["y"]),
+                float(pose.get("yaw", 0.0)),
+                half_length=self.footprint_half_length,
+                half_width=self.footprint_half_width,
+                padding=self.planning_footprint_padding,
+                allow_unknown=False,
+                code_prefix="GOAL_STANDOFF",
+            ).valid
+        )
+        eligible = blocked_goal_standoff_is_safe(
+            goal_distance=goal_distance,
+            blocker_goal_distance=blocker_goal_distance,
+            blocker_radius=blocker_radius,
+            front_clearance=front_clearance,
+            heading_error=heading_error,
+            normal_goal_tolerance=self.stop_turn_final_position_tolerance,
+            maximum_standoff_distance=self.blocked_goal_standoff_max_distance,
+            minimum_front_clearance=(
+                self.blocked_goal_standoff_minimum_clearance
+            ),
+            corridor_blockage_limit=(
+                self.corridor_front_clearance
+                + self.straight_endpoint_tolerance
+            ),
+            blocked_duration=max(0.0, now - self.dynamic_wait_started),
+            confirmation_duration=self.blocked_goal_standoff_confirmation,
+            safety_fresh=bool(
+                corridor_blocked
+                and self._atomic_safety_fresh(now)
+                and self._critical_sensor_time_healthy()
+                and self.safety_health.startswith("HEALTHY")
+                and not self.estop_active
+            ),
+            robot_stationary=robot_stationary,
+            current_footprint_valid=footprint_valid,
+        )
+        if not eligible:
+            return False
+        self._nav_debug(
+            "GOAL_STANDOFF",
+            result="CONFIRMED",
+            destination=goal,
+            blocker_center=[round(blocker_x, 3), round(blocker_y, 3)],
+            blocker_radius=round(blocker_radius, 3),
+            blocker_goal_distance=round(blocker_goal_distance, 3),
+            robot_goal_distance=round(goal_distance, 3),
+            front_clearance=round(front_clearance, 3),
+            blocked_seconds=round(now - self.dynamic_wait_started, 3),
+        )
+        return self._finish_execution_success(
+            0.0,
+            goal_generation=goal_generation,
+            position_distance=goal_distance,
+            cancel_active=True,
+            position_tolerance=self.blocked_goal_standoff_max_distance,
+            completion_mode="SAFE_STANDOFF",
+            allowed_states=(
+                "WAIT_FOR_DYNAMIC_CLEAR", "WAITING_FOR_DYNAMIC_CLEAR"
+            ),
+        )
 
     def _restart_segment_from_current(
         self,
@@ -13230,6 +13564,14 @@ class NavigationAdapter(Node):
             # swept-footprint validator still gate every candidate; do not turn
             # missing classification into an infinite wait.
             self._observe_controller_blocker()
+            # A persistent obstacle may occupy the semantic destination
+            # itself. Once the stopped chassis is already inside the bounded
+            # stand-off envelope, repeated routes to the same blocked point
+            # cannot improve the outcome and must not loop forever.
+            if self._complete_blocked_goal_standoff(
+                self.navigation_goal_generation, now
+            ):
+                return
         self.dynamic_recovery_state = "REPLAN_PENDING"
         self.dynamic_replan_requires_alternative = requires_alternative
         self.dynamic_last_replan = now
