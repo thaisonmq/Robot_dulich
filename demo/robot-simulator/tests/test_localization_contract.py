@@ -1271,13 +1271,13 @@ def test_turn_hysteresis_and_persistent_safety_block_are_bounded() -> None:
     assert "self.execution_turn_safety_block_timeout" in tick
     assert '"PERSISTENT_SAFETY_BLOCK"' in tick
     assert 'action="RELOCATE_TO_TURN_BAY"' in tick
-    assert "self._start_turn_bay_recovery(pose, generation)" in tick
+    assert "target_heading=target" in tick
     assert 'action="ALTERNATIVE_DIRECTION"' not in tick
     assert "self._schedule_execution_replan" in tick
     assert '"TURN_CMD"' in tick
     assert "self.latest_corridor.can_rotate" in sweep
-    assert "self._live_rotation_sweep_clear(now)" in tick
-    assert "self._live_rotation_sweep_clear(now)" in turn_start
+    assert "self._live_rotation_to_heading_clear(" in tick
+    assert "self._live_rotation_to_heading_clear(" in turn_start
 
     project = Path(__file__).parents[1]
     parameters = yaml.safe_load(
@@ -1470,7 +1470,8 @@ def test_turn_bay_rotation_exit_requires_live_and_static_clearance() -> None:
     )
 
     assert "self._atomic_safety_fresh()" in turn_exit
-    assert "self._live_rotation_sweep_clear()" in turn_exit
+    assert "self.latest_base_scan_points_monotonic" in turn_exit
+    assert "point_cloud_rotation_sweep_clear(" in turn_exit
     assert "self._safety_blocks_turn(turn_direction)" in turn_exit
     assert "validate_rotation_sweep(" in turn_exit
     assert "self._hard_route_side_clearance()" in turn_exit
@@ -1910,7 +1911,7 @@ def test_runtime_detects_lost_steering_and_turn_hard_stop_as_recovery() -> None:
     assert 'self.execution_phase = "WAIT_FOR_TURN_CLEAR"' in turn
 
 
-def test_turn_block_recovery_moves_one_safe_step_before_global_replanning() -> None:
+def test_turn_block_recovery_searches_safe_local_maneuvers_before_replanning() -> None:
     relocate = _method_source(
         "_find_and_start_turn_bay", "_odom_pose"
     )
@@ -1931,7 +1932,7 @@ def test_turn_block_recovery_moves_one_safe_step_before_global_replanning() -> N
 
     assert "self._dynamic_planning_exclusions()" in relocate
     assert "segment_departs_exclusions(" in relocate
-    assert "endpoint_clearance=self.planning_footprint_padding" in relocate
+    assert "self.planning_footprint_padding" in relocate
     assert 'self._enter_dynamic_wait("TURN_BLOCKED_NO_SAFE_RELOCATION")' in relocate
     assert "dynamic_block_requires_alternative(reason)" in wait
     assert '== "TURN_BLOCKED_NO_SAFE_RELOCATION"' in tick
@@ -1941,17 +1942,19 @@ def test_turn_block_recovery_moves_one_safe_step_before_global_replanning() -> N
     assert "self.dynamic_local_bypass_minimum_deviation" in candidates
     assert '"START_ESCAPE", "TURN_BAY"' in prepare
     assert "allow_monotonic_initial_overlap=active_relocation" in prepare
-    assert "minimum_relocation_distance" in relocate
-    assert "self.footprint_half_length" in relocate
+    assert "candidate_headings" in relocate
+    assert "point_cloud_rotation_sweep_clear(" in relocate
+    assert "point_cloud_translation_sweep_clear(" in relocate
+    assert "target_turn_clear" in relocate
     assert "planner.plan_result" not in relocate
-    assert "selected = (candidate, direction)" in relocate
+    assert "selected = (" in relocate
     assert "display = [dict(pose), dict(candidate)]" in relocate
     assert 'relocation_reason == "TURN_BAY"' in complete
-    assert "self.latest_corridor.can_go_straight" in complete
     assert "not turn_available" in complete
-    assert "self._turn_bay_rotation_available(pose)" in complete
-    assert 'status="CONTINUE_NARROW_TRANSLATION"' in complete
+    assert "relocation_target_heading" in complete
+    assert 'status="CONTINUE_LOCAL_MANEUVER"' in complete
     assert "preferred_translation_direction=active.motion_direction" in complete
+    assert "target_heading=relocation_target_heading" in complete
     assert "preferred_translation_direction in live_directions" in relocate
 
 
@@ -2395,7 +2398,7 @@ def test_operator_motion_interrupts_clear_every_automatic_resume_context() -> No
 def test_turn_bay_worker_checks_generation_inside_atomic_state_commit() -> None:
     start = _method_source("_start_turn_bay_recovery", "_find_and_start_turn_bay")
     worker = _method_source("_find_and_start_turn_bay", "_odom_pose")
-    commit = worker.split("        candidate, direction = selected", 1)[1]
+    commit = worker.split("        display = [dict(pose), dict(candidate)]", 1)[1]
 
     assert "with self.state_lock:" in start
     assert "goal_generation != self.navigation_goal_generation" in start

@@ -61,6 +61,8 @@ from navigation_core import (  # noqa: E402
     path_maximum_deviation,
     path_overlap_ratio,
     particle_cloud_uniqueness,
+    point_cloud_rotation_sweep_clear,
+    point_cloud_translation_sweep_clear,
     position_within_tolerance,
     preferred_turn_bay_directions,
     post_turn_reanchor_requires_turn,
@@ -1745,6 +1747,91 @@ def test_corridor_geometry_reports_all_three_decision_states() -> None:
     assert front_blocked.front_clearance == pytest.approx(0.13)
     assert front_blocked.classification == "PHYSICALLY_BLOCKED"
     assert front_blocked.reason == "FRONT_CLEARANCE"
+
+
+def test_reverse_corridor_uses_rear_as_direction_of_travel() -> None:
+    points = [
+        (0.0, -0.20),
+        (0.0, 0.20),
+        (0.18, 0.0),
+    ]
+    forward = evaluate_corridor(
+        points,
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.05,
+        hard_side_margin=0.02,
+        front_clearance_required=0.04,
+    )
+    reverse = evaluate_corridor(
+        points,
+        half_length=0.15,
+        half_width=0.10,
+        side_margin=0.05,
+        hard_side_margin=0.02,
+        front_clearance_required=0.04,
+        motion_direction=-1,
+    )
+
+    assert forward.reason == "FRONT_CLEARANCE"
+    assert not forward.can_go_straight
+    assert reverse.front_clearance == math.inf
+    assert reverse.can_go_straight
+
+
+def test_corridor_rotation_radius_matches_axis_expanded_safety_envelope() -> None:
+    # Replays the front-right return that stopped the latest return mission.
+    # Its 22.4 cm radius is outside hypot(body) + margin, but inside the corner
+    # of the rectangle after both axes receive the same 3 cm safety margin.
+    assessment = evaluate_corridor(
+        [(0.1379081562, -0.1765144287)],
+        half_length=0.155,
+        half_width=0.10,
+        side_margin=0.05,
+        rotation_margin=0.03,
+        front_clearance_required=0.14,
+    )
+
+    assert math.hypot(0.1379081562, -0.1765144287) > (
+        math.hypot(0.155, 0.10) + 0.03
+    )
+    assert not assessment.can_rotate
+
+
+def test_live_point_sweeps_distinguish_rotation_and_translation_direction() -> None:
+    rotation_blocker = [(0.1379081562, -0.1765144287)]
+    assert not point_cloud_rotation_sweep_clear(
+        rotation_blocker,
+        pose_x=0.0,
+        pose_y=0.0,
+        start_yaw=0.0,
+        end_yaw=-0.30,
+        half_length=0.185,
+        half_width=0.13,
+        direction=-1,
+    )
+
+    rear_wall = [(-0.25, 0.0)]
+    assert not point_cloud_translation_sweep_clear(
+        rear_wall,
+        start_x=0.0,
+        start_y=0.0,
+        end_x=-0.10,
+        end_y=0.0,
+        pose_yaw=0.0,
+        half_length=0.155,
+        half_width=0.11,
+    )
+    assert point_cloud_translation_sweep_clear(
+        rear_wall,
+        start_x=0.0,
+        start_y=0.0,
+        end_x=0.10,
+        end_y=0.0,
+        pose_yaw=0.0,
+        half_length=0.155,
+        half_width=0.11,
+    )
 
 
 @pytest.mark.parametrize("wall_y", [0.11, -0.11])
@@ -5335,6 +5422,27 @@ def test_scan_self_filter_masks_only_points_inside_calibrated_body() -> None:
     assert filtered[1:] == ranges[1:]
 
 
+def test_scan_self_filter_masks_last_run_rear_right_body_return() -> None:
+    point_x = -0.15300876173118183
+    point_y = -0.04677945798190974
+    distance = math.hypot(point_x, point_y)
+    filtered, masked = mask_scan_self_returns(
+        [distance],
+        angle_min=math.atan2(point_y, point_x),
+        angle_increment=0.0,
+        range_min=0.05,
+        range_max=8.0,
+        laser_x=0.0,
+        laser_y=0.0,
+        laser_yaw=0.0,
+        half_length=0.155,
+        half_width=0.10,
+    )
+
+    assert masked == 1
+    assert math.isnan(filtered[0])
+
+
 def test_scan_self_filter_never_masks_points_outside_physical_body() -> None:
     laser_x = 0.0
 
@@ -5351,11 +5459,11 @@ def test_scan_self_filter_never_masks_points_outside_physical_body() -> None:
             laser_x=laser_x,
             laser_y=0.0,
             laser_yaw=0.0,
-            half_length=0.15,
+            half_length=0.155,
             half_width=0.10,
         )
 
-    for body_point in ((-0.14, 0.0), (0.0, -0.09)):
+    for body_point in ((-0.153, -0.047), (0.0, -0.09)):
         filtered, masked = filter_point(*body_point)
         assert masked == 1
         assert math.isnan(filtered[0])
@@ -5364,6 +5472,9 @@ def test_scan_self_filter_never_masks_points_outside_physical_body() -> None:
     filtered, masked = filter_point(0.0, -0.11)
     assert masked == 0
     assert filtered == pytest.approx([outside_distance])
+    filtered, masked = filter_point(-0.156, 0.0)
+    assert masked == 0
+    assert filtered == pytest.approx([0.156])
 
 
 def test_motion_safety_startup_recovers_inactive_velocity_smoother() -> None:
@@ -5484,7 +5595,7 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert limits["smoothing_frequency"] >= controller["controller_frequency"]
     assert abs(limits["max_decel"][0]) >= 0.5
     localization = navigation["rovera_navigation_adapter"]["ros__parameters"]
-    assert localization["footprint_half_length"] == 0.15
+    assert localization["footprint_half_length"] == 0.155
     assert localization["footprint_half_width"] == 0.10
     assert localization["localization_rotation_minimum_obstacle_distance"] == safety[
         "rotation_margin"
@@ -5505,7 +5616,7 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
         element.attrib["size"]
         for element in robot.findall(".//geometry/box")
     }
-    assert box_sizes == {"0.30 0.20 0.15"}
+    assert box_sizes == {"0.31 0.20 0.15"}
     joints = {joint.attrib["name"]: joint for joint in robot.findall("joint")}
     assert joints["base_footprint_to_base_link"].find("origin").attrib["xyz"] == (
         "0 0 0.075"
@@ -5530,9 +5641,9 @@ def test_navigation_motion_tuning_stays_within_final_smoother_limits() -> None:
     assert safety["clear_hysteresis"] == 0.20
     assert localization["corridor_hard_side_margin"] <= safety["side_margin"]
     assert safety["side_margin"] <= localization["corridor_side_margin"]
-    # Collision planning uses the physical body without reusing scan-mask size.
+    # Collision planning and the scan self-mask share one operational body.
     expected_collision_footprint = (
-        "[[0.15, 0.10], [0.15, -0.10], [-0.15, -0.10], [-0.15, 0.10]]"
+        "[[0.155, 0.10], [0.155, -0.10], [-0.155, -0.10], [-0.155, 0.10]]"
     )
     assert local_costmap["footprint"] == expected_collision_footprint
     assert global_costmap["footprint"] == expected_collision_footprint

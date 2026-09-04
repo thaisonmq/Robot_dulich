@@ -31,7 +31,7 @@ def protective_input_timeout_reason(
 
 @dataclass(frozen=True, slots=True)
 class SafetyConfig:
-    half_length: float = 0.15
+    half_length: float = 0.155
     half_width: float = 0.10
     clearance: float = 0.04
     side_margin: float = 0.04
@@ -296,7 +296,7 @@ def _rotation_direction_blocked(
         # Preview enough of a sustained in-place command to cover the long
         # rectangular corner.  Braking angle alone is only a few degrees at
         # low speed and would incorrectly approve rotation in a corridor that
-        # the 0.30 x 0.20 m body cannot rotate inside.
+        # the 0.31 x 0.20 m body cannot rotate inside.
         yaw = direction * max(config.rotation_preview_angle, stop_angle) * sample / samples
         if any(
             _point_in_pose_footprint(

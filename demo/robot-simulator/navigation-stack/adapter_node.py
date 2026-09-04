@@ -94,6 +94,8 @@ from navigation_core import (
     normalize_trinary_unknown_metadata,
     path_maximum_deviation,
     path_overlap_ratio,
+    point_cloud_rotation_sweep_clear,
+    point_cloud_translation_sweep_clear,
     position_within_tolerance,
     preferred_turn_bay_directions,
     post_turn_reanchor_requires_turn,
@@ -856,7 +858,7 @@ class NavigationAdapter(Node):
         self.nearest_rotation_obstacle = math.inf
         self.motion_owner = "NONE"
         self.footprint_half_length = float(self.declare_parameter(
-            "footprint_half_length", 0.15
+            "footprint_half_length", 0.155
         ).value)
         self.footprint_half_width = float(self.declare_parameter(
             "footprint_half_width", 0.10
@@ -1005,6 +1007,11 @@ class NavigationAdapter(Node):
             hard_side_margin=self.corridor_hard_side_margin,
             translation_lateral_margin=self.translation_lateral_margin,
         )
+        # Immutable external returns in the current base frame. Recovery
+        # workers validate short local maneuvers against one coherent scan;
+        # motion-safety remains authoritative during execution.
+        self.latest_base_scan_points: tuple[tuple[float, float], ...] = ()
+        self.latest_base_scan_points_monotonic = 0.0
         self.last_corridor_log_monotonic = 0.0
         self.failed_segments: list[dict[str, Any]] = []
         self.navigation_recovery_attempts = 0
@@ -1054,6 +1061,7 @@ class NavigationAdapter(Node):
         self.execution_goal: dict[str, float] | None = None
         self.execution_relocation_reason = ""
         self.execution_relocation_plan: list[dict[str, float]] = []
+        self.turn_bay_recovery_target_heading: float | None = None
         self.pending_start_escape: dict[str, Any] | None = None
         self.pending_segment_directions: list[int] = []
         self.pending_initial_reverse_clearance_recovery = False
@@ -3545,7 +3553,7 @@ class NavigationAdapter(Node):
             for item in message.poses
         ]
         # Nav2 publishes the raw planner candidate before this adapter can
-        # validate the 0.30 x 0.20 m swept footprint. Keep it for diagnostics,
+        # validate the 0.31 x 0.20 m operational swept footprint. Keep it for diagnostics,
         # but never let it replace the frontend/FollowPath route.
         self.latest_planner_raw_path = path
 
@@ -5644,8 +5652,26 @@ class NavigationAdapter(Node):
                 nearest_rotation_obstacle = min(
                     nearest_rotation_obstacle, clearance
                 )
+        self.latest_base_scan_points = tuple(
+            (point_x, point_y)
+            for point_x, point_y in base_points
+            if not (
+                abs(point_x) < self.footprint_half_length
+                and abs(point_y) < self.footprint_half_width
+            )
+        )
+        self.latest_base_scan_points_monotonic = callback_started
         _, heading_error = self._current_path_heading()
         path_error = 0.0 if heading_error is None else float(heading_error)
+        active = self.active_segment
+        motion_direction = (
+            active.motion_direction
+            if active is not None
+            and self.execution_phase in {
+                "STRAIGHT", "NARROW_STRAIGHT", "DISPATCHING_STRAIGHT",
+            }
+            else 1
+        )
         cosine, sine = math.cos(path_error), math.sin(path_error)
         path_points = [
             (cosine * x + sine * y, -sine * x + cosine * y)
@@ -5676,6 +5702,7 @@ class NavigationAdapter(Node):
             hard_side_margin=self.corridor_hard_side_margin,
             translation_lateral_margin=self.translation_lateral_margin,
             localization_uncertainty=localization_uncertainty,
+            motion_direction=motion_direction,
         )
         self.latest_corridor = corridor
         self.corridor_samples.append((callback_started, corridor, path_error))
@@ -5705,6 +5732,7 @@ class NavigationAdapter(Node):
                 linear_cmd=None if requested is None else requested[0],
                 angular_cmd=None if requested is None else requested[1],
                 heading_error_deg=math.degrees(path_error),
+                motion=("REVERSE" if motion_direction < 0 else "FORWARD"),
                 can_go_straight=(
                     corridor.can_go_straight and abs(path_error) <= math.radians(20)
                 ),
@@ -5875,8 +5903,8 @@ class NavigationAdapter(Node):
         ):
             # A swept-rotation collision is geometric evidence that this is
             # not a turn bay. Do not keep retrying the same rotation as
-            # snapshots alternate; retain the mission and relocate with the
-            # chassis heading fixed.
+            # snapshots alternate; retain the mission and search a bounded
+            # partial-turn plus forward/reverse maneuver.
             self.navigation_velocity.publish(Twist())
             self._nav_debug(
                 "TURN_RECOVERY",
@@ -5886,7 +5914,9 @@ class NavigationAdapter(Node):
                 destination_preserved=bool(self.paused_goal),
             )
             self._start_turn_bay_recovery(
-                dict(self.pose), self.navigation_goal_generation
+                dict(self.pose),
+                self.navigation_goal_generation,
+                target_heading=self.execution_target_heading,
             )
             return
 
@@ -6025,6 +6055,39 @@ class NavigationAdapter(Node):
             timestamp - self.last_scan_monotonic <= 0.30
             and self._critical_sensor_time_healthy()
             and self.latest_corridor.can_rotate
+        )
+
+    def _live_rotation_to_heading_clear(
+        self,
+        current_yaw: float,
+        target_heading: float,
+        direction: int,
+        now: float | None = None,
+    ) -> bool:
+        """Validate only the requested turn arc against one fresh scan."""
+        timestamp = time.monotonic() if now is None else float(now)
+        scan_points = tuple(self.latest_base_scan_points)
+        if (
+            not scan_points
+            or timestamp - self.latest_base_scan_points_monotonic > 0.30
+            or not self._critical_sensor_time_healthy()
+        ):
+            return False
+        return point_cloud_rotation_sweep_clear(
+            scan_points,
+            pose_x=0.0,
+            pose_y=0.0,
+            start_yaw=0.0,
+            end_yaw=self._yaw_delta(target_heading, current_yaw),
+            half_length=(
+                self.footprint_half_length
+                + self.rotation_minimum_obstacle_distance
+            ),
+            half_width=(
+                self.footprint_half_width
+                + self.rotation_minimum_obstacle_distance
+            ),
+            direction=direction,
         )
 
     def _manual_takeover_callback(self, message: Bool) -> None:
@@ -9394,32 +9457,68 @@ class NavigationAdapter(Node):
     def _turn_bay_rotation_available(
         self,
         pose: dict[str, float],
+        target_heading: float | None = None,
     ) -> bool:
-        """Return true only when one first turn step is live and static safe."""
+        """Check the actual required turn, or one step for generic callers."""
         if (
             self.saved_map is None
             or self.stop_turn_planner is None
             or self.estop_active
             or not self._atomic_safety_fresh()
-            or not self._live_rotation_sweep_clear()
         ):
             return False
         yaw = float(pose.get("yaw", 0.0))
         heading_step = float(self.stop_turn_planner.heading_step)
-        reserved_half_width = (
-            self.footprint_half_width + self._hard_route_side_clearance()
+        hard_clearance = self._hard_route_side_clearance()
+        scan_points = tuple(self.latest_base_scan_points)
+        scan_fresh = bool(
+            scan_points
+            and time.monotonic() - self.latest_base_scan_points_monotonic
+            <= 0.30
+            and self._critical_sensor_time_healthy()
         )
-        for turn_direction in (1, -1):
+        if not scan_fresh:
+            return False
+        if target_heading is None:
+            turns = (
+                (1, yaw + heading_step),
+                (-1, yaw - heading_step),
+            )
+        else:
+            angular_error = self._yaw_delta(float(target_heading), yaw)
+            if abs(angular_error) <= self.execution_turn_tolerance:
+                return True
+            turn_direction = 1 if angular_error > 0.0 else -1
+            turns = ((turn_direction, float(target_heading)),)
+        for turn_direction, end_heading in turns:
             if self._safety_blocks_turn(turn_direction):
+                continue
+            live_turn = point_cloud_rotation_sweep_clear(
+                scan_points,
+                pose_x=0.0,
+                pose_y=0.0,
+                start_yaw=0.0,
+                end_yaw=self._yaw_delta(end_heading, yaw),
+                half_length=(
+                    self.footprint_half_length
+                    + self.rotation_minimum_obstacle_distance
+                ),
+                half_width=(
+                    self.footprint_half_width
+                    + self.rotation_minimum_obstacle_distance
+                ),
+                direction=turn_direction,
+            )
+            if not live_turn:
                 continue
             turn = validate_rotation_sweep(
                 self.saved_map,
                 float(pose["x"]),
                 float(pose["y"]),
                 yaw,
-                yaw + turn_direction * heading_step,
-                half_length=self.footprint_half_length,
-                half_width=reserved_half_width,
+                end_heading,
+                half_length=self.footprint_half_length + hard_clearance,
+                half_width=self.footprint_half_width + hard_clearance,
                 padding=self.planning_footprint_padding,
                 direction=turn_direction,
             )
@@ -10366,6 +10465,7 @@ class NavigationAdapter(Node):
             self.execution_goal = dict(goal_payload)
             self.execution_relocation_reason = ""
             self.execution_relocation_plan = []
+            self.turn_bay_recovery_target_heading = None
             self.execution_route_id = route_id
             self.execution_narrow_segments = {
                 int(item["segment_index"])
@@ -10804,14 +10904,19 @@ class NavigationAdapter(Node):
                 left_static = self._turn_static_safe(pose, target, 1)
                 right_static = self._turn_static_safe(pose, target, -1)
                 snapshot_fresh = self._atomic_safety_fresh(now)
-                rotation_sweep_clear = (
-                    snapshot_fresh and self._live_rotation_sweep_clear(now)
-                )
                 left_live = (
-                    rotation_sweep_clear and not self._safety_blocks_turn(1)
+                    snapshot_fresh
+                    and self._live_rotation_to_heading_clear(
+                        current_yaw, target, 1, now
+                    )
+                    and not self._safety_blocks_turn(1)
                 )
                 right_live = (
-                    rotation_sweep_clear and not self._safety_blocks_turn(-1)
+                    snapshot_fresh
+                    and self._live_rotation_to_heading_clear(
+                        current_yaw, target, -1, now
+                    )
+                    and not self._safety_blocks_turn(-1)
                 )
                 direction = choose_turn_direction(
                     error,
@@ -10912,7 +11017,9 @@ class NavigationAdapter(Node):
             return
         atomic_fresh = self._atomic_safety_fresh(now)
         live_safe_sample = (
-            self._live_rotation_sweep_clear(now)
+            self._live_rotation_to_heading_clear(
+                current_yaw, target, direction, now
+            )
             and not self.estop_active
             and atomic_fresh
             and not self._safety_blocks_turn(direction)
@@ -10955,16 +11062,19 @@ class NavigationAdapter(Node):
                 # A persistent block is geometric evidence that this pose is
                 # not a usable turning bay. Switching rotation direction here
                 # can merely drive to the other blocked side, then switch back
-                # forever. Keep the chassis heading fixed and relocate along
-                # it instead; the bay search considers both forward and
-                # reverse and motion-safety still gates the chosen translation.
+                # forever. Search a fresh local maneuver that may align by one
+                # safe angular step before moving forward or reverse.
                 self._nav_debug(
                     "TURN_RECOVERY",
                     action="RELOCATE_TO_TURN_BAY",
                     blocked_direction=direction,
                     target_heading=target,
                 )
-                self._start_turn_bay_recovery(pose, generation)
+                self._start_turn_bay_recovery(
+                    pose,
+                    generation,
+                    target_heading=target,
+                )
             return
         self.execution_phase = "TURN"
         self.latest_feedback["execution_phase"] = "TURN"
@@ -11088,6 +11198,7 @@ class NavigationAdapter(Node):
         goal_generation: int,
         preferred_translation_direction: int | None = None,
         recovery_reason: str = "PERSISTENT_TURN_SAFETY_BLOCK",
+        target_heading: float | None = None,
     ) -> None:
         with self.state_lock:
             if (
@@ -11099,6 +11210,9 @@ class NavigationAdapter(Node):
             self.latest_feedback["execution_phase"] = "TURN_BAY_RECOVERY"
             self.latest_feedback["recovery_reason"] = recovery_reason
             self.motion_owner = "NONE"
+            self.turn_bay_recovery_target_heading = (
+                None if target_heading is None else float(target_heading)
+            )
             self._set_state("TURN_BAY_RECOVERY", recovery_reason.lower())
         self.navigation_velocity.publish(Twist())
         threading.Thread(
@@ -11107,6 +11221,7 @@ class NavigationAdapter(Node):
                 dict(pose),
                 goal_generation,
                 preferred_translation_direction,
+                self.turn_bay_recovery_target_heading,
             ),
             daemon=True,
         ).start()
@@ -11116,10 +11231,12 @@ class NavigationAdapter(Node):
         pose: dict[str, float],
         goal_generation: int,
         preferred_translation_direction: int | None = None,
+        target_heading: float | None = None,
     ) -> None:
         saved_map = self.saved_map
+        planner = self.stop_turn_planner
         goal = dict(self.execution_goal or self.paused_goal or {})
-        if saved_map is None or not goal:
+        if saved_map is None or planner is None or not goal:
             return
         if not self._atomic_safety_fresh() or self.estop_active:
             with self.state_lock:
@@ -11132,22 +11249,21 @@ class NavigationAdapter(Node):
             return
         yaw = float(pose.get("yaw", 0.0))
         step = max(saved_map.resolution, 0.025)
-        # When a side obstacle prevents rotation but translation is still
-        # allowed, a 5 cm relocation is too short: it stops the chassis in the
-        # same narrow slice and immediately launches another expensive global
-        # replan. Move at least one half-body length along the fixed heading;
-        # motion-safety still gates every centimetre and the exact static sweep
-        # validates the complete segment before it is dispatched.
-        minimum_relocation_distance = (
-            step
-            if self._turn_bay_rotation_available(pose)
-            else max(step, self.footprint_half_length)
+        required_heading = (
+            yaw if target_heading is None else float(target_heading)
         )
-        minimum_relocation_index = max(
-            1, math.ceil(minimum_relocation_distance / step)
-        )
+        scan_points = tuple(self.latest_base_scan_points)
+        if (
+            not scan_points
+            or time.monotonic() - self.latest_base_scan_points_monotonic > 0.30
+            or not self._critical_sensor_time_healthy()
+        ):
+            self._enter_dynamic_wait("TURN_BAY_SCAN_UNAVAILABLE")
+            return
         exclusions = self._dynamic_planning_exclusions()
-        selected: tuple[dict[str, float], int] | None = None
+        selected: tuple[
+            dict[str, float], int, float, bool, float,
+        ] | None = None
         live_directions = tuple(
             direction
             for direction in preferred_turn_bay_directions(pose, goal)
@@ -11170,48 +11286,279 @@ class NavigationAdapter(Node):
                     if direction != preferred_translation_direction
                 ),
             )
-        for direction in directions:
-            for index in range(
-                minimum_relocation_index,
-                math.floor(self.turn_bay_max_distance / step) + 1,
+        if not directions:
+            self._enter_dynamic_wait("TURN_BAY_TRANSLATION_BLOCKED")
+            return
+
+        # One local maneuver may rotate to a nearby lattice heading before
+        # translating. Re-running the search after each segment permits general
+        # rotate/translate/rotate sequences while every action still uses a
+        # fresh scan and the ordinary executor/safety pipeline.
+        heading_step = float(planner.heading_step)
+        target_error = self._yaw_delta(required_heading, yaw)
+        toward_target = 1 if target_error >= 0.0 else -1
+        heading_offsets = [0.0]
+        maximum_alignment_steps = min(6, planner.HEADING_BINS // 4)
+        for alignment_step in range(1, maximum_alignment_steps + 1):
+            heading_offsets.extend((
+                toward_target * alignment_step * heading_step,
+                -toward_target * alignment_step * heading_step,
+            ))
+        if abs(target_error) > self.execution_turn_tolerance:
+            heading_offsets.append(target_error)
+        candidate_headings: list[float] = []
+        for offset in heading_offsets:
+            candidate_heading = self._yaw_delta(yaw + offset, 0.0)
+            if not any(
+                abs(self._yaw_delta(candidate_heading, existing)) <= 1e-6
+                for existing in candidate_headings
             ):
-                distance = direction * index * step
-                candidate = {
-                    "x": float(pose["x"]) + distance * math.cos(yaw),
-                    "y": float(pose["y"]) + distance * math.sin(yaw),
-                    "yaw": yaw,
-                }
-                straight = validate_stop_turn_route(
+                candidate_headings.append(candidate_heading)
+
+        hard_clearance = self._hard_route_side_clearance()
+        current_cell = saved_map.world_to_cell(
+            float(pose["x"]), float(pose["y"])
+        )
+        current_clearance = (
+            0.0
+            if current_cell is None or self.map_navigation_geometry is None
+            else self.map_navigation_geometry.clearance_at_cell(*current_cell)
+        )
+        current_goal_distance = math.hypot(
+            float(goal["x"]) - float(pose["x"]),
+            float(goal["y"]) - float(pose["y"]),
+        )
+        ranked: list[tuple[Any, ...]] = []
+        maximum_index = max(
+            1, math.floor(self.turn_bay_max_distance / step)
+        )
+        for candidate_heading in candidate_headings:
+            start_delta = self._yaw_delta(candidate_heading, yaw)
+            start_turn_direction = (
+                0
+                if abs(start_delta) <= self.execution_turn_tolerance
+                else 1 if start_delta > 0.0 else -1
+            )
+            if (
+                start_turn_direction
+                and self._safety_blocks_turn(start_turn_direction)
+            ):
+                continue
+            if start_turn_direction:
+                static_start_turn = validate_rotation_sweep(
                     saved_map,
-                    (pose, candidate),
-                    half_length=self.footprint_half_length,
+                    float(pose["x"]),
+                    float(pose["y"]),
+                    yaw,
+                    candidate_heading,
+                    half_length=(
+                        self.footprint_half_length
+                        + self.rotation_minimum_obstacle_distance
+                    ),
                     half_width=(
                         self.footprint_half_width
-                        + self.translation_lateral_margin
+                        + self.rotation_minimum_obstacle_distance
                     ),
                     padding=self.planning_footprint_padding,
-                    segment_directions=(direction,),
+                    direction=start_turn_direction,
                 )
-                if (
-                    not straight.valid
-                    or not segment_departs_exclusions(
-                        pose,
-                        candidate,
-                        exclusions,
-                        endpoint_clearance=self.planning_footprint_padding,
-                    )
-                ):
+                live_start_turn = point_cloud_rotation_sweep_clear(
+                    scan_points,
+                    pose_x=0.0,
+                    pose_y=0.0,
+                    start_yaw=0.0,
+                    end_yaw=start_delta,
+                    half_length=(
+                        self.footprint_half_length
+                        + self.rotation_minimum_obstacle_distance
+                    ),
+                    half_width=(
+                        self.footprint_half_width
+                        + self.rotation_minimum_obstacle_distance
+                    ),
+                    direction=start_turn_direction,
+                )
+                if not static_start_turn.valid or not live_start_turn:
                     continue
-                # Move to the nearest locally safe bay first. Requiring a
-                # complete global route for every 5 cm candidate can spend
-                # minutes in planner searches while the robot is already
-                # allowed to translate. Segment execution rechecks live
-                # motion safety, and completion either turns/replans from the
-                # new pose or continues another bounded step in this direction.
-                selected = (candidate, direction)
-                break
-            if selected is not None:
-                break
+            for direction in directions:
+                for index in range(1, maximum_index + 1):
+                    signed_distance = direction * index * step
+                    candidate = {
+                        "x": float(pose["x"])
+                        + signed_distance * math.cos(candidate_heading),
+                        "y": float(pose["y"])
+                        + signed_distance * math.sin(candidate_heading),
+                        "yaw": candidate_heading,
+                    }
+                    straight = validate_stop_turn_route(
+                        saved_map,
+                        (pose, candidate),
+                        half_length=self.footprint_half_length,
+                        half_width=(
+                            self.footprint_half_width
+                            + self.translation_lateral_margin
+                        ),
+                        padding=self.planning_footprint_padding,
+                        segment_directions=(direction,),
+                    )
+                    if (
+                        not straight.valid
+                        or not segment_departs_exclusions(
+                            pose,
+                            candidate,
+                            exclusions,
+                            endpoint_clearance=(
+                                self.planning_footprint_padding
+                            ),
+                        )
+                    ):
+                        continue
+                    delta_world_x = candidate["x"] - float(pose["x"])
+                    delta_world_y = candidate["y"] - float(pose["y"])
+                    cosine, sine = math.cos(yaw), math.sin(yaw)
+                    local_x = cosine * delta_world_x + sine * delta_world_y
+                    local_y = -sine * delta_world_x + cosine * delta_world_y
+                    relative_heading = self._yaw_delta(
+                        candidate_heading, yaw
+                    )
+                    if not point_cloud_translation_sweep_clear(
+                        scan_points,
+                        start_x=0.0,
+                        start_y=0.0,
+                        end_x=local_x,
+                        end_y=local_y,
+                        pose_yaw=relative_heading,
+                        half_length=self.footprint_half_length,
+                        half_width=(
+                            self.footprint_half_width
+                            + self.translation_lateral_margin
+                        ),
+                    ):
+                        continue
+
+                    end_error = self._yaw_delta(
+                        required_heading, candidate_heading
+                    )
+                    end_directions = (
+                        (0,)
+                        if abs(end_error) <= self.execution_turn_tolerance
+                        else (
+                            (1, -1)
+                            if math.isclose(
+                                abs(end_error), math.pi, abs_tol=1e-6
+                            )
+                            else (1 if end_error > 0.0 else -1,)
+                        )
+                    )
+                    target_turn_clear = False
+                    for end_direction in end_directions:
+                        if end_direction == 0:
+                            target_turn_clear = True
+                            break
+                        static_end_turn = validate_rotation_sweep(
+                            saved_map,
+                            candidate["x"],
+                            candidate["y"],
+                            candidate_heading,
+                            required_heading,
+                            half_length=(
+                                self.footprint_half_length + hard_clearance
+                            ),
+                            half_width=(
+                                self.footprint_half_width + hard_clearance
+                            ),
+                            padding=self.planning_footprint_padding,
+                            direction=end_direction,
+                        )
+                        live_end_turn = point_cloud_rotation_sweep_clear(
+                            scan_points,
+                            pose_x=local_x,
+                            pose_y=local_y,
+                            start_yaw=relative_heading,
+                            end_yaw=self._yaw_delta(required_heading, yaw),
+                            half_length=(
+                                self.footprint_half_length
+                                + self.rotation_minimum_obstacle_distance
+                            ),
+                            half_width=(
+                                self.footprint_half_width
+                                + self.rotation_minimum_obstacle_distance
+                            ),
+                            direction=end_direction,
+                        )
+                        if static_end_turn.valid and live_end_turn:
+                            target_turn_clear = True
+                            break
+
+                    candidate_cell = saved_map.world_to_cell(
+                        candidate["x"], candidate["y"]
+                    )
+                    endpoint_clearance = (
+                        0.0
+                        if candidate_cell is None
+                        or self.map_navigation_geometry is None
+                        else self.map_navigation_geometry.clearance_at_cell(
+                            *candidate_cell
+                        )
+                    )
+                    goal_distance = math.hypot(
+                        float(goal["x"]) - candidate["x"],
+                        float(goal["y"]) - candidate["y"],
+                    )
+                    heading_improvement = (
+                        abs(target_error) - abs(end_error)
+                    )
+                    clearance_improvement = (
+                        endpoint_clearance - current_clearance
+                    )
+                    goal_progress = current_goal_distance - goal_distance
+                    if not target_turn_clear and (
+                        clearance_improvement < 0.5 * saved_map.resolution
+                        and heading_improvement
+                        < 0.5 * self.execution_turn_tolerance
+                        and goal_progress < 0.25 * step
+                    ):
+                        continue
+                    direction_penalty = (
+                        0.0 if direction == directions[0] else 0.20
+                    )
+                    rank = (
+                        (
+                            0.0,
+                            abs(signed_distance) + direction_penalty,
+                            goal_distance,
+                            abs(start_delta),
+                            -endpoint_clearance,
+                        )
+                        if target_turn_clear
+                        else (
+                            1.0,
+                            -endpoint_clearance,
+                            goal_distance + direction_penalty,
+                            abs(end_error),
+                            abs(signed_distance),
+                        )
+                    )
+                    ranked.append((
+                        rank,
+                        candidate,
+                        direction,
+                        candidate_heading,
+                        target_turn_clear,
+                        endpoint_clearance,
+                    ))
+        if ranked:
+            (
+                _, candidate, direction, maneuver_heading,
+                target_turn_clear, endpoint_clearance,
+            ) = min(ranked, key=lambda item: item[0])
+            selected = (
+                candidate,
+                direction,
+                maneuver_heading,
+                target_turn_clear,
+                endpoint_clearance,
+            )
         if selected is None:
             if goal_generation != self.navigation_goal_generation:
                 return
@@ -11223,7 +11570,13 @@ class NavigationAdapter(Node):
             )
             self._enter_dynamic_wait("TURN_BLOCKED_NO_SAFE_RELOCATION")
             return
-        candidate, direction = selected
+        (
+            candidate,
+            direction,
+            maneuver_heading,
+            target_turn_clear,
+            endpoint_clearance,
+        ) = selected
         display = [dict(pose), dict(candidate)]
         with self.state_lock:
             # Cancel, E-stop and manual takeover all invalidate this worker by
@@ -11247,9 +11600,14 @@ class NavigationAdapter(Node):
             self._set_state("NAVIGATING", "move_to_turn_bay")
         self._nav_debug(
             "TURN_BAY_RECOVERY",
-            result="MOVE_TO_TURN_BAY",
+            result="EXECUTE_LOCAL_MANEUVER",
             candidate=candidate,
             motion=("REVERSE" if direction < 0 else "FORWARD"),
+            start_heading=yaw,
+            maneuver_heading=maneuver_heading,
+            required_heading=required_heading,
+            target_turn_clear=target_turn_clear,
+            endpoint_clearance=endpoint_clearance,
             distance=math.hypot(
                 candidate["x"] - float(pose["x"]),
                 candidate["y"] - float(pose["y"]),
@@ -11792,14 +12150,19 @@ class NavigationAdapter(Node):
             left_static = self._turn_static_safe(pose, target, 1)
             right_static = self._turn_static_safe(pose, target, -1)
             snapshot_fresh = self._atomic_safety_fresh(now)
-            rotation_sweep_clear = (
-                snapshot_fresh and self._live_rotation_sweep_clear(now)
-            )
             left_live = (
-                rotation_sweep_clear and not self._safety_blocks_turn(1)
+                snapshot_fresh
+                and self._live_rotation_to_heading_clear(
+                    current_yaw, target, 1, now
+                )
+                and not self._safety_blocks_turn(1)
             )
             right_live = (
-                rotation_sweep_clear and not self._safety_blocks_turn(-1)
+                snapshot_fresh
+                and self._live_rotation_to_heading_clear(
+                    current_yaw, target, -1, now
+                )
+                and not self._safety_blocks_turn(-1)
             )
             direction = choose_turn_direction(
                 error,
@@ -11956,6 +12319,11 @@ class NavigationAdapter(Node):
                 self.segment_positive_travel = 0.0
                 self.segment_last_travel_pose = None
                 relocation_reason = self.execution_relocation_reason
+                relocation_target_heading = (
+                    self.turn_bay_recovery_target_heading
+                    if relocation_reason == "TURN_BAY"
+                    else None
+                )
                 relocation_complete = bool(
                     relocation_reason
                     and self.execution_segment_index
@@ -12000,34 +12368,26 @@ class NavigationAdapter(Node):
         if relocation_complete:
             goal = dict(self.execution_goal or self.paused_goal or {})
             pose = None if self.pose is None else dict(self.pose)
-            translation_directions = (
-                ()
-                if pose is None or not goal
-                else self._live_start_escape_directions(pose, goal)
-            )
             turn_available = bool(
                 pose is not None
-                and self._turn_bay_rotation_available(pose)
+                and self._turn_bay_rotation_available(
+                    pose,
+                    relocation_target_heading,
+                )
             )
-            continue_narrow_translation = bool(
+            continue_local_maneuver = bool(
                 relocation_reason == "TURN_BAY"
                 and active is not None
                 and pose is not None
                 and not turn_available
-                and active.motion_direction in translation_directions
-                and (
-                    active.motion_direction < 0
-                    or self.latest_corridor.can_go_straight
-                )
             )
-            if continue_narrow_translation:
-                # Side clearance can forbid rotation while the rectangular
-                # forward/reverse sweep is still valid. Keep translating with
-                # the chassis heading fixed instead of stopping after one bay
-                # probe and burning a full global-planner timeout.
+            if continue_local_maneuver:
+                # Do not confuse one safe angular step with the complete turn
+                # required by the next route. Replan another short local
+                # rotate/translate maneuver from fresh pose and LiDAR data.
                 self._nav_debug(
                     "TURN_BAY",
-                    status="CONTINUE_NARROW_TRANSLATION",
+                    status="CONTINUE_LOCAL_MANEUVER",
                     motion=(
                         "REVERSE"
                         if active.motion_direction < 0
@@ -12036,6 +12396,7 @@ class NavigationAdapter(Node):
                     can_go_straight=self.latest_corridor.can_go_straight,
                     can_rotate=self.latest_corridor.can_rotate,
                     exact_turn_available=turn_available,
+                    required_heading=relocation_target_heading,
                     destination=goal,
                     destination_preserved=True,
                 )
@@ -12043,8 +12404,10 @@ class NavigationAdapter(Node):
                     pose,
                     goal_generation,
                     preferred_translation_direction=active.motion_direction,
+                    target_heading=relocation_target_heading,
                 )
                 return True
+            self.turn_bay_recovery_target_heading = None
             self._nav_debug(
                 relocation_reason,
                 status="COMPLETE",
@@ -13252,10 +13615,9 @@ class NavigationAdapter(Node):
         # obstacle can legitimately return no serializable candidate: the live
         # costmap includes the current footprint in the inflated obstacle even
         # though a short, directionally-safe departure is possible.  Do not
-        # turn that start-condition into a terminal standstill.  Move for real
-        # to the nearest exact-valid turn bay (normally a short reverse when
-        # the front is blocked), then the relocation executor replans the
-        # preserved destination from that clear pose.
+        # turn that start-condition into a terminal standstill. Execute one
+        # exact-valid local alignment/translation maneuver, then continue from
+        # fresh LiDAR until the required exit turn is genuinely available.
         if (
             self.pose is not None
             and self.dynamic_replan_attempt_count

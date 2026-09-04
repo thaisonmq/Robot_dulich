@@ -13,11 +13,11 @@ rovera_sensor_normalizer:
     scan_arrival_timeout_seconds: 0.30
     odom_arrival_timeout_seconds: 0.25
     imu_arrival_timeout_seconds: 0.25
-    # Physical body is 0.30 x 0.20 x 0.15 m and the LiDAR is centered on its
-    # top face. Never mask beyond the collision footprint: doing so would hide
-    # a real obstacle beside the chassis. Points inside the physical body are
-    # impossible free-space observations and may be discarded as self-return.
-    scan_self_filter_half_length: 0.15
+    # Operational collision envelope is 0.31 x 0.20 m: the extra 5 mm at each
+    # end contains the repeatable rear-right self-return measured at x=-0.153 m.
+    # Planning and motion-safety use the same envelope, so the self mask never
+    # hides a point outside the declared collision body.
+    scan_self_filter_half_length: 0.155
     scan_self_filter_half_width: 0.10
     scan_laser_x: 0.0
     scan_laser_y: 0.0

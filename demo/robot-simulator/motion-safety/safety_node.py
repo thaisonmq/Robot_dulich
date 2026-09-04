@@ -33,7 +33,7 @@ class MotionSafetyNode(Node):
         self.declare_parameter("scan_timeout", 0.28)
         self.declare_parameter("clear_hysteresis", 0.20)
         self.declare_parameter("lidar_obstacle_avoidance_enabled", True)
-        self.declare_parameter("half_length", 0.15)
+        self.declare_parameter("half_length", 0.155)
         self.declare_parameter("half_width", 0.10)
         self.declare_parameter("clearance", 0.04)
         self.declare_parameter("side_margin", 0.04)

@@ -235,7 +235,7 @@ def test_scan_points_are_transformed_from_laser_to_chassis_frame() -> None:
         measured_linear_x=0.0,
         config=config,
     )
-    assert math.isclose(decision.front_clearance, 0.145, abs_tol=1e-6)
+    assert math.isclose(decision.front_clearance, 0.14, abs_tol=1e-6)
 
 
 def test_obstacle_beyond_slow_envelope_does_not_create_far_stop() -> None:
@@ -268,7 +268,7 @@ def test_stopping_distance_and_slowdown_are_progressive_by_speed() -> None:
 
 
 def test_stationary_robot_gets_a_usable_speed_cap_instead_of_command_latch() -> None:
-    # The bumper has 5 cm free while the requested 16 cm/s command would need
+    # The bumper has 4.5 cm free while the requested 16 cm/s command would need
     # more room.  Measured odometry is stationary, so safety must issue the
     # physically admissible speed rather than treating the request as current
     # momentum and latching the direction at zero forever.
@@ -284,7 +284,7 @@ def test_stationary_robot_gets_a_usable_speed_cap_instead_of_command_latch() -> 
     assert 0.03 < output_speed < 0.08
     assert math.isclose(
         stopping_clearance(output_speed, CONFIG),
-        0.05,
+        0.045,
         abs_tol=1e-6,
     )
 
@@ -317,6 +317,16 @@ def test_lidar_self_return_inside_footprint_is_ignored() -> None:
     assert not result.stop
     assert result.blocked == Direction.NONE
     assert result.nearest_clearance > 0.5
+
+
+def test_last_run_rear_right_body_return_is_ignored() -> None:
+    # Replay the fixed 160 mm return that followed the chassis during the
+    # 2026-09-04 run. It is inside the shared 0.31 x 0.20 m envelope.
+    scan = scan_with_points([(-0.1530087617, -0.0467794580), (1.0, 0.0)])
+    result = evaluate_scan(scan, linear_x=-0.08, angular_z=0.0, config=CONFIG)
+
+    assert not result.stop
+    assert not result.blocked & Direction.REAR
 
 
 def test_scan_with_only_self_returns_still_fails_closed() -> None:

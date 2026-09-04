@@ -1619,14 +1619,14 @@ class MapNavigationGeometry:
     component_ids: tuple[int, ...]
     turn_safe_mask: tuple[bool, ...]
     identity: str
-    _robot_shape: tuple[float, float, float] = field(default=(0.15, 0.10, 0.0))
+    _robot_shape: tuple[float, float, float] = field(default=(0.155, 0.10, 0.0))
 
     @classmethod
     def build(
         cls,
         saved_map: "SavedOccupancyMap",
         *,
-        half_length: float = 0.15,
+        half_length: float = 0.155,
         half_width: float = 0.10,
         padding: float = 0.0,
     ) -> "MapNavigationGeometry":
@@ -1770,6 +1770,106 @@ def validate_rotation_sweep(
                 False, "TURN_SWEEP_COLLISION", index + 1, yaw
             )
     return RotationSweepValidation(True, samples_checked=sample_count + 1)
+
+
+def point_cloud_pose_clear(
+    points: Iterable[tuple[float, float]],
+    *,
+    pose_x: float,
+    pose_y: float,
+    pose_yaw: float,
+    half_length: float,
+    half_width: float,
+) -> bool:
+    """Check a rectangular chassis pose against points in one fixed frame."""
+    cosine = math.cos(float(pose_yaw))
+    sine = math.sin(float(pose_yaw))
+    length = max(0.0, float(half_length))
+    width = max(0.0, float(half_width))
+    for point_x, point_y in points:
+        delta_x = float(point_x) - float(pose_x)
+        delta_y = float(point_y) - float(pose_y)
+        local_x = cosine * delta_x + sine * delta_y
+        local_y = -sine * delta_x + cosine * delta_y
+        if abs(local_x) <= length and abs(local_y) <= width:
+            return False
+    return True
+
+
+def point_cloud_rotation_sweep_clear(
+    points: Iterable[tuple[float, float]],
+    *,
+    pose_x: float,
+    pose_y: float,
+    start_yaw: float,
+    end_yaw: float,
+    half_length: float,
+    half_width: float,
+    direction: int = 0,
+    maximum_corner_step: float = 0.0125,
+) -> bool:
+    """Check an exact directional rotation sweep against a live point cloud."""
+    cloud = tuple((float(x), float(y)) for x, y in points)
+    delta = _angle_delta(float(end_yaw), float(start_yaw))
+    if int(direction) > 0 and delta < 0.0:
+        delta += 2.0 * math.pi
+    elif int(direction) < 0 and delta > 0.0:
+        delta -= 2.0 * math.pi
+    radius = math.hypot(float(half_length), float(half_width))
+    angular_step = (
+        math.pi
+        if radius <= 1e-9
+        else min(
+            math.pi,
+            max(1e-4, float(maximum_corner_step)) / radius,
+        )
+    )
+    samples = max(1, math.ceil(abs(delta) / angular_step))
+    return all(
+        point_cloud_pose_clear(
+            cloud,
+            pose_x=pose_x,
+            pose_y=pose_y,
+            pose_yaw=float(start_yaw) + delta * index / samples,
+            half_length=half_length,
+            half_width=half_width,
+        )
+        for index in range(samples + 1)
+    )
+
+
+def point_cloud_translation_sweep_clear(
+    points: Iterable[tuple[float, float]],
+    *,
+    start_x: float,
+    start_y: float,
+    end_x: float,
+    end_y: float,
+    pose_yaw: float,
+    half_length: float,
+    half_width: float,
+    maximum_step: float = 0.025,
+) -> bool:
+    """Check a fixed-heading translation sweep against a live point cloud."""
+    cloud = tuple((float(x), float(y)) for x, y in points)
+    distance = math.hypot(
+        float(end_x) - float(start_x),
+        float(end_y) - float(start_y),
+    )
+    samples = max(1, math.ceil(distance / max(1e-4, float(maximum_step))))
+    return all(
+        point_cloud_pose_clear(
+            cloud,
+            pose_x=float(start_x)
+            + (float(end_x) - float(start_x)) * index / samples,
+            pose_y=float(start_y)
+            + (float(end_y) - float(start_y)) * index / samples,
+            pose_yaw=pose_yaw,
+            half_length=half_length,
+            half_width=half_width,
+        )
+        for index in range(samples + 1)
+    )
 
 
 def choose_turn_direction(
@@ -2179,7 +2279,7 @@ class StopTurnStateLatticePlanner:
         saved_map: "SavedOccupancyMap",
         geometry: MapNavigationGeometry,
         *,
-        half_length: float = 0.15,
+        half_length: float = 0.155,
         half_width: float = 0.10,
         padding: float = 0.0,
         primitive_length: float | None = None,
@@ -7693,22 +7793,25 @@ def evaluate_corridor(
     hard_side_margin: float = 0.02,
     translation_lateral_margin: float = 0.01,
     localization_uncertainty: float = 0.0,
+    motion_direction: int = 1,
 ) -> CorridorAssessment:
     """Evaluate straight and in-place-rotation envelopes independently.
 
-    Points are expressed in a frame whose +X axis follows the immediate path.
-    Side walls constrain width, while only points inside the forward swept
-    rectangle constrain forward braking. This distinction is what lets a
-    physically valid corridor remain traversable without weakening collision
-    safety for an object in the path.
+    Points are expressed in the chassis/path-heading frame. ``motion_direction``
+    turns that frame by 180 degrees for a reverse segment, so "front" always
+    means the direction of travel. Side walls constrain width, while only
+    points inside the driven swept rectangle constrain braking. This
+    distinction is what lets a physically valid corridor remain traversable
+    without weakening collision safety for an object in the path.
     """
     length = max(0.0, float(half_length))
     width = max(0.0, float(half_width))
     margin = max(0.0, float(side_margin))
     forward_required = max(0.0, float(front_clearance_required))
     forward_limit = length + max(forward_required, float(lookahead))
+    direction = -1.0 if int(motion_direction) < 0 else 1.0
     values = [
-        (float(x), float(y))
+        (direction * float(x), direction * float(y))
         for x, y in points
         if math.isfinite(float(x)) and math.isfinite(float(y))
         and not (abs(float(x)) < length and abs(float(y)) < width)
@@ -7828,7 +7931,14 @@ def evaluate_corridor(
     rotate_margin = margin if rotation_margin is None else max(
         0.0, float(rotation_margin)
     )
-    rotation_radius = math.hypot(length, width) + rotate_margin
+    # Motion-safety expands both rectangle axes before sweeping. Adding the
+    # margin after taking the corner radius is smaller at diagonal corners and
+    # can report ``can_rotate`` while the authoritative rectangular sweep
+    # correctly stops the same turn.
+    rotation_radius = math.hypot(
+        length + rotate_margin,
+        width + rotate_margin,
+    )
     nearest_radius = min((math.hypot(x, y) for x, y in values), default=math.inf)
     return CorridorAssessment(
         left_clearance=left_clearance,

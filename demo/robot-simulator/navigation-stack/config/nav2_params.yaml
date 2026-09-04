@@ -224,10 +224,10 @@ rovera_navigation_adapter:
     # when this rotation gate is closed.
     localization_rotation_minimum_obstacle_distance: 0.03
     localization_rotation_blocked_timeout_seconds: 5.0
-    footprint_half_length: 0.15
+    footprint_half_length: 0.155
     footprint_half_width: 0.10
-    # Physical body is 0.30 x 0.20 m. LiDAR self-returns are removed by the
-    # scan mask and must not inflate the chassis footprint a second time.
+    # Operational body is 0.31 x 0.20 m, including the measured rear lip.
+    # LiDAR self-returns are removed only inside this same collision envelope.
     planning_footprint_padding: 0.0
     corridor_hard_side_margin: 0.02
     # Must match motion-safety's hard straight swept-body envelope. The wider
@@ -272,7 +272,7 @@ rovera_navigation_adapter:
     stop_turn_retry_expansion_multiplier: 4
     # Reject corners that work only at one exact localization coordinate.
     # This affects in-place turns only; straight narrow-corridor clearance is
-    # still checked with the directional 0.30 x 0.20 m rectangle.
+    # still checked with the directional 0.31 x 0.20 m rectangle.
     stop_turn_turn_robustness_radius: 0.01
     # Arrival is position-based. The approach segment already determines a
     # safe chassis heading, so no final in-place orientation adjustment runs.
@@ -492,7 +492,7 @@ local_costmap:
       # endpoint lands on different cells in the global and local grids.
       resolution: 0.025
       # Physical body; explicit safety margins are applied separately.
-      footprint: "[[0.15, 0.10], [0.15, -0.10], [-0.15, -0.10], [-0.15, 0.10]]"
+      footprint: "[[0.155, 0.10], [0.155, -0.10], [-0.155, -0.10], [-0.155, 0.10]]"
       footprint_padding: 0.0
       # The robot has a planar LaserScan, not a 3D point cloud. Use the same
       # 2D obstacle model as the global costmap so the planner and RPP do not
@@ -537,8 +537,8 @@ global_costmap:
       robot_base_frame: base_footprint
       resolution: 0.05
       track_unknown_space: true
-      # Same physical 0.30 x 0.20 m body as local costmap and safety.
-      footprint: "[[0.15, 0.10], [0.15, -0.10], [-0.15, -0.10], [-0.15, 0.10]]"
+      # Same operational 0.31 x 0.20 m body as local costmap and safety.
+      footprint: "[[0.155, 0.10], [0.155, -0.10], [-0.155, -0.10], [-0.155, 0.10]]"
       footprint_padding: 0.0
       plugins: [static_layer, failed_segment_layer, obstacle_layer, inflation_layer]
       static_layer:
